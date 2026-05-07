@@ -1,0 +1,82 @@
+// sigil: 0.1
+//
+// std/process.sigil — Plan C addendum (CLI external-system effects, EE4).
+//
+// User-facing wrapper around the `Process` effect's `run` op. The
+// effect-op return is a flat 4-tuple `(error_tag, exit_code, stdout,
+// stderr)`; this wrapper translates to `Result[ProcessResult,
+// ProcessError]` where `ProcessResult` is the binary-tuple-shaped
+// triple `(exit_code, stdout, stderr)`.
+//
+// ## `ProcessError` variant tag mapping
+//
+// Keep the variant order aligned with the runtime tag mapping at
+// `runtime/src/process.rs`:
+//
+//   tag 1 → NotFound
+//   tag 2 → PermissionDenied
+//   tag 3+ → Other(message)  (carries the OS error display)
+//
+// ## `ProcessResult` shape
+//
+// `(exit_code, stdout, stderr)` — a 3-tuple.
+// - `exit_code` is `Int`. Conventionally 0 = success; non-zero is a
+//   user-defined failure indicator (the child ran fine but reported
+//   trouble). Processes killed by signal report `-1` since the OS
+//   has no exit code in that case.
+// - `stdout` and `stderr` are captured as Strings (lossy UTF-8 —
+//   invalid bytes become `U+FFFD`, matching `string_chars`'s policy).
+//
+// ## Example
+//
+// ```sigil
+// import std.process
+// import std.io
+// import std.array
+//
+// fn main() -> Int ![IO, Process, Mem] {
+//   // No shell invocation — direct exec only.
+//   let args: Array[String] = array_alloc(2, "");
+//   let args: Array[String] = array_set(args, 0, "status");
+//   let args: Array[String] = array_set(args, 1, "--porcelain");
+//   match run("git", args) {
+//     Ok((code, out, _err)) => match code {
+//       0 => perform IO.println(out),
+//       _ => perform IO.println("git status failed"),
+//     },
+//     Err(NotFound) => perform IO.println("git not installed"),
+//     Err(_) => perform IO.println("error launching git"),
+//   };
+//   0
+// }
+// ```
+//
+// ## Scope guardrails
+//
+// - **No shell invocation.** `run("ls", args)` directly execs `ls`;
+//   it does not invoke `bash -c`. If the user wants shell behavior,
+//   they pass `("bash", ["-c", "..."])` explicitly.
+// - **No stdin piping in v1.** Stdin is closed (empty input).
+// - **No streaming in v1.** Captures full stdout / stderr after the
+//   child exits.
+
+import std.array
+import std.result
+
+type ProcessError =
+  | NotFound
+  | PermissionDenied
+  | Other(String)
+
+// `run(cmd, args)` runs `cmd` with `args` as direct argv. Returns
+// `Ok((exit_code, stdout, stderr))` on launch success (regardless
+// of the child's exit status) and `Err(ProcessError)` on launch
+// failure (executable not found, permission denied, fork failure).
+fn run(cmd: String, args: Array[String]) -> Result[(Int, String, String), ProcessError] ![Process] {
+  match perform Process.run(cmd, args) {
+    (0, code, out, err) => Ok((code, out, err)),
+    (1, _, _, _) => Err(NotFound),
+    (2, _, _, _) => Err(PermissionDenied),
+    (_, _, _, err) => Err(Other(err)),
+  }
+}

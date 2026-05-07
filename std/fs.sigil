@@ -1,0 +1,177 @@
+// sigil: 0.1
+//
+// std/fs.sigil — Plan C addendum (CLI external-system effects, EE4).
+//
+// User-facing wrappers around the `Fs` effect's raw-shape ops. Each
+// fallible op returns `(Int, T)` where tag 0 = success and tag>0
+// indexes one of the `FsError` variants below. The wrappers
+// translate to idiomatic `Result[T, FsError]` / `Bool` returns.
+//
+// ## `FsError` variant tag mapping
+//
+// The runtime arm fns at `runtime/src/fs.rs` produce these tags;
+// keep the variant order here aligned with that mapping (changing
+// either side without the other would mis-classify errors).
+//
+//   tag 1 → NotFound
+//   tag 2 → PermissionDenied
+//   tag 3 → AlreadyExists
+//   tag 4 → NotADirectory
+//   tag 5 → IsADirectory
+//   tag 6 → InvalidUtf8
+//   tag 7+ → Other(message)
+//
+// ## Example
+//
+// ```sigil
+// import std.fs
+// import std.io
+//
+// fn main() -> Int ![IO, Fs] {
+//   match read_file("config.toml") {
+//     Ok(s) => perform IO.println(s),
+//     Err(NotFound) => perform IO.println("config missing"),
+//     Err(_) => perform IO.println("error reading config"),
+//   };
+//   0
+// }
+// ```
+//
+// ## Scope guardrails
+//
+// - `mkdir` is single-level only. Recursive `mkdir -p` is a stdlib
+//   helper to be added in a future plan, not an `Fs` op.
+// - `read_dir` returns entry names only (one path component each),
+//   not full paths. Caller joins with parent.
+// - Symlinks are followed transparently by the underlying syscalls;
+//   no `is_symlink` / `read_link` ops in v1.
+// - No path manipulation ops (no `join` / `basename` / `normalize`)
+//   in this plan — separate `std/path.sigil` follow-up.
+
+import std.array
+import std.list
+import std.result
+
+// `FsError` variants — keep ordered so variant index N corresponds
+// to runtime tag N (NotFound = variant 0 = tag 1, etc.). Note: the
+// runtime tags are 1-indexed because tag 0 is reserved for `Ok`;
+// the variant ordering here is internal and matched at the
+// `match (tag) { 1 => ..., 2 => ..., ... }` dispatch below.
+type FsError =
+  | NotFound
+  | PermissionDenied
+  | AlreadyExists
+  | NotADirectory
+  | IsADirectory
+  | InvalidUtf8
+  | Other(String)
+
+// ── Predicates ─────────────────────────────────────────────────────
+
+// `exists(p)` — `true` if a file or directory exists at `p`.
+fn exists(p: String) -> Bool ![Fs] {
+  perform Fs.exists(p)
+}
+
+// `is_file(p)` — `true` if `p` exists and is a regular file.
+fn is_file(p: String) -> Bool ![Fs] {
+  perform Fs.is_file(p)
+}
+
+// `is_dir(p)` — `true` if `p` exists and is a directory.
+fn is_dir(p: String) -> Bool ![Fs] {
+  perform Fs.is_dir(p)
+}
+
+// ── Metadata ──────────────────────────────────────────────────────
+
+// `file_size(p)` returns the file's byte length as `Int64` (file
+// sizes can exceed `Int`'s 63-bit range on huge volumes).
+fn file_size(p: String) -> Result[Int64, FsError] ![Fs] {
+  match perform Fs.file_size(p) {
+    (0, n) => Ok(n),
+    (t, _) => Err(__tag_to_fs_error(t, "")),
+  }
+}
+
+// ── Directory ops ──────────────────────────────────────────────────
+
+// `mkdir(p)` creates a single-level directory at `p`. Fails if
+// `p`'s parent doesn't exist (`NotFound`) or `p` already exists
+// (`AlreadyExists`).
+fn mkdir(p: String) -> Result[Unit, FsError] ![Fs] {
+  match perform Fs.mkdir(p) {
+    (0, _) => Ok(()),
+    (t, msg) => Err(__tag_to_fs_error(t, msg)),
+  }
+}
+
+// `read_dir(p)` returns the entry names directly inside `p` (one
+// path component each, no recursive walk; symlinks followed).
+fn read_dir(p: String) -> Result[List[String], FsError] ![Fs] {
+  match perform Fs.read_dir(p) {
+    (0, arr) => Ok(__array_to_list_string(arr, 0, array_length(arr))),
+    (t, _) => Err(__tag_to_fs_error(t, "")),
+  }
+}
+
+// `remove_dir(p)` removes an empty directory at `p`. Use a
+// recursive helper if the directory may have contents.
+fn remove_dir(p: String) -> Result[Unit, FsError] ![Fs] {
+  match perform Fs.remove_dir(p) {
+    (0, _) => Ok(()),
+    (t, msg) => Err(__tag_to_fs_error(t, msg)),
+  }
+}
+
+// ── File ops ───────────────────────────────────────────────────────
+
+// `read_file(p)` returns the file contents as a `String`. Fails
+// with `InvalidUtf8` if the file's bytes aren't valid UTF-8.
+fn read_file(p: String) -> Result[String, FsError] ![Fs] {
+  match perform Fs.read_file(p) {
+    (0, content) => Ok(content),
+    (t, msg) => Err(__tag_to_fs_error(t, msg)),
+  }
+}
+
+// `remove_file(p)` deletes a regular file at `p`.
+fn remove_file(p: String) -> Result[Unit, FsError] ![Fs] {
+  match perform Fs.remove_file(p) {
+    (0, _) => Ok(()),
+    (t, msg) => Err(__tag_to_fs_error(t, msg)),
+  }
+}
+
+// `write_file(p, data)` writes `data` to `p`, replacing any existing
+// contents. Creates the file if absent.
+fn write_file(p: String, data: String) -> Result[Unit, FsError] ![Fs] {
+  match perform Fs.write_file(p, data) {
+    (0, _) => Ok(()),
+    (t, msg) => Err(__tag_to_fs_error(t, msg)),
+  }
+}
+
+// ── Internal helpers ───────────────────────────────────────────────
+
+// Map an FsError tag (1..) to the corresponding variant.
+// `msg` is consumed by the `Other` variant; ignored otherwise.
+fn __tag_to_fs_error(tag: Int, msg: String) -> FsError ![] {
+  match tag {
+    1 => NotFound,
+    2 => PermissionDenied,
+    3 => AlreadyExists,
+    4 => NotADirectory,
+    5 => IsADirectory,
+    6 => InvalidUtf8,
+    _ => Other(msg),
+  }
+}
+
+// Array[String] → List[String] (for `read_dir`'s entry list).
+fn __array_to_list_string(arr: Array[String], idx: Int, n: Int) -> List[String] ![] {
+  match idx < n {
+    true => Cons(array_get(arr, idx), __array_to_list_string(arr, idx + 1, n)),
+    false => Nil,
+  }
+}

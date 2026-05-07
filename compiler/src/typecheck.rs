@@ -14799,6 +14799,81 @@ mod tests {
     // CLI-effects-EE6 (e2e tests for the user-facing surface).
 
     #[test]
+    fn import_std_env_typechecks_cleanly() {
+        // Plan C addendum (CLI external-system effects, EE4) — the
+        // `std.env` wrappers translate `Env`'s raw-shape ops to
+        // `List[String]` / `Option[String]` returns. Pin that the
+        // user-facing surface typechecks end-to-end.
+        let src = "import std.env\n\
+                   import std.option\n\
+                   fn main() -> Int ![Env] {\n  \
+                     match var(\"HOME\") {\n    \
+                       Some(_h) => 0,\n    \
+                       None => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn import_std_fs_typechecks_cleanly() {
+        let src = "import std.fs\n\
+                   import std.result\n\
+                   fn main() -> Int ![Fs] {\n  \
+                     match read_file(\"/dev/null\") {\n    \
+                       Ok(_s) => 0,\n    \
+                       Err(NotFound) => 1,\n    \
+                       Err(PermissionDenied) => 2,\n    \
+                       Err(AlreadyExists) => 3,\n    \
+                       Err(NotADirectory) => 4,\n    \
+                       Err(IsADirectory) => 5,\n    \
+                       Err(InvalidUtf8) => 6,\n    \
+                       Err(Other(_msg)) => 7,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn import_std_process_typechecks_cleanly() {
+        let src = "import std.process\n\
+                   import std.array\n\
+                   import std.result\n\
+                   fn main() -> Int ![Process] {\n  \
+                     let args: Array[String] = array_alloc(0, \"\");\n  \
+                     match run(\"true\", args) {\n    \
+                       Ok((_code, _out, _err)) => 0,\n    \
+                       Err(NotFound) => 1,\n    \
+                       Err(PermissionDenied) => 2,\n    \
+                       Err(Other(_msg)) => 3,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn fs_exists_returns_bool() {
+        let src = "import std.fs\n\
+                   fn main() -> Int ![Fs] {\n  \
+                     match exists(\"/tmp\") { true => 0, false => 1 }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn cli_main_row_allowed() {
+        // Plan C addendum EE1 — main allow-list extended with
+        // Env / Fs / Process. Pin all three combinations.
+        let src = "fn main() -> Int ![IO, Env, Fs, Process] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
     fn io_read_file_removed_is_e0042() {
         // Pre-EE1 test pinned `IO.read_file` typechecks; post-removal
         // we pin the rejection so a future regression that adds it
