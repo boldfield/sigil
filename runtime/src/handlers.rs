@@ -163,12 +163,28 @@ pub struct NextStep {
 #[repr(C)]
 pub struct HandlerFrame {
     pub effect_id: u32,
+    /// Plotkin fix — `arm_count` lives in low 16 bits. The high
+    /// bit (bit 31) encodes the effect's `resumes: many` flag so
+    /// `wrap_continuation_with_outer_post_arm_k` can determine
+    /// whether the crossed frame's effect is multi-shot at perform
+    /// time. Cap-aware: arm_count caps at MAX_HANDLER_ARMS = 14
+    /// (well under 16-bit range), so the high bit is free for the
+    /// resumes_many flag without ABI churn. Codegen masks the
+    /// flag in via the new
+    /// `sigil_handler_frame_new_with_resumes_many` entry; legacy
+    /// `sigil_handler_frame_new` keeps the flag clear (single-shot
+    /// default).
     pub arm_count: u32,
     pub return_fn: *mut u8,
     pub return_closure: *mut u8,
     pub prev: *mut HandlerFrame,
     // arms follow: [(fn_ptr: *mut u8, closure_ptr: *mut u8); arm_count]
 }
+
+/// Mask for the arm_count's low bits (excluding the resumes_many flag
+/// at bit 31).
+const ARM_COUNT_MASK: u32 = 0x7FFF_FFFF;
+const RESUMES_MANY_BIT: u32 = 1u32 << 31;
 
 // Thread-local handler stack head. Frames link via `prev`. Null = no
 // active handlers (top-level user code).
@@ -343,6 +359,18 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+
+    /// Stack of `outer_post_arm_k_entry_depth` snapshots pushed by
+    /// each `sigil_run_loop` invocation at entry, popped at exit.
+    /// `wrap_continuation_with_outer_post_arm_k` reads the top entry
+    /// to determine how many `OUTER_POST_ARM_K` entries the current
+    /// run_loop owns — only those may be popped into the wrapper
+    /// chain. Entries below the current run_loop's entry depth
+    /// belong to enclosing run_loops and must not be moved (doing
+    /// so would silently underflow the parent's `outer_post_arm_k_entry_depth`
+    /// invariant and dereference garbage on the next pop).
+    static RUN_LOOP_ENTRY_DEPTH_STACK: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::with_capacity(64));
 }
 
 /// Plan D Task 117 (b) Phase 4 — snapshot the current
@@ -806,6 +834,22 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     effect_id: u32,
     arm_count: u32,
 ) -> *mut HandlerFrame {
+    sigil_handler_frame_new_with_resumes_many(effect_id, arm_count, 0)
+}
+
+/// Plotkin fix — variant of `sigil_handler_frame_new` that records
+/// the effect's `resumes: many` flag in the frame header. Codegen
+/// emits this entry instead of the legacy one when the effect
+/// declaration has `resumes: many`. Read at perform time by
+/// `wrap_continuation_with_outer_post_arm_k` to decide whether to
+/// preserve the crossed-frame's chain entries (multi-shot semantics)
+/// or let them flow through as normal Done routing (single-shot).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
+    effect_id: u32,
+    arm_count: u32,
+    resumes_many: u32,
+) -> *mut HandlerFrame {
     if arm_count > MAX_HANDLER_ARMS {
         eprintln!(
             "sigil_handler_frame_new: arm_count {arm_count} exceeds MAX_HANDLER_ARMS ({})",
@@ -843,7 +887,9 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     // the pointer is not stored or returned beyond this initialisation).
     let frame_ptr = obj.add(8) as *mut HandlerFrame;
     (*frame_ptr).effect_id = effect_id;
-    (*frame_ptr).arm_count = arm_count;
+    let arm_count_with_flag = (arm_count & ARM_COUNT_MASK)
+        | (if resumes_many != 0 { RESUMES_MANY_BIT } else { 0 });
+    (*frame_ptr).arm_count = arm_count_with_flag;
     (*frame_ptr).return_fn = ptr::null_mut();
     (*frame_ptr).return_closure = ptr::null_mut();
     (*frame_ptr).prev = ptr::null_mut();
@@ -890,7 +936,7 @@ pub unsafe extern "C" fn sigil_handler_frame_set_arm(
         eprintln!("sigil_handler_frame_set_arm: null frame");
         std::process::abort();
     }
-    let arm_count = (*frame).arm_count;
+    let arm_count = (*frame).arm_count & ARM_COUNT_MASK;
     if op_id >= arm_count {
         eprintln!(
             "sigil_handler_frame_set_arm: op_id {op_id} out of range (arm_count={arm_count})"
@@ -1597,17 +1643,61 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
         return (k_closure, k_fn);
     }
 
-    // Pop all entries (top-first). entries[0] = top, entries[count-1]
-    // = bottom.
+    // Only pop entries owned by the current run_loop — entries
+    // below the current entry_depth belong to enclosing run_loops
+    // and would silently break their invariants if moved into the
+    // wrapper chain (the parent's `outer_post_arm_k_entry_depth`
+    // is set at entry; popping below it underflows the depth and
+    // dereferences a null fn_ptr at the next pop).
+    let entry_depth = RUN_LOOP_ENTRY_DEPTH_STACK
+        .with(|s| s.borrow().last().copied().unwrap_or(0));
+    let owned = depth - entry_depth;
+    if owned == 0 {
+        return (k_closure, k_fn);
+    }
+
+    // Skip re-wrapping when ANY owned entry is already a
+    // continuation wrapper. Without this, deep cross-handler
+    // recursion accumulates one wrapper layer per crossed
+    // perform; each layer's invocation re-pushes its saved
+    // entry plus the body's chain pushes another, blowing
+    // OUTER_POST_ARM_K_STACK_SIZE. The existing wrapper(s)
+    // already captured the outer arm chain; a fresh wrap would
+    // just repackage them again under a new layer. Let the
+    // existing wrappers drain naturally on their run_loop's
+    // terminal.
+    let wrapper_fn_addr_check = sigil_k_continuation_wrapper as *mut u8;
+    let any_wrapper = OUTER_POST_ARM_K_STACK.with(|cell| {
+        let stack = cell.get();
+        let mut i = depth;
+        while i > entry_depth {
+            i -= 1;
+            if stack[i].fn_ptr == wrapper_fn_addr_check {
+                return true;
+            }
+        }
+        false
+    });
+    if any_wrapper {
+        return (k_closure, k_fn);
+    }
+
+    // Pop owned entries (top-first). entries[0] = top,
+    // entries[owned-1] = bottom-of-owned (just above entry_depth).
     let mut entries: [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] =
         [OuterPostArmKEntry {
             closure_ptr: ptr::null_mut(),
             fn_ptr: ptr::null_mut(),
         }; OUTER_POST_ARM_K_STACK_SIZE];
     let mut count = 0usize;
-    while let Some(entry) = outer_post_arm_k_try_pop() {
-        entries[count] = entry;
-        count += 1;
+    while count < owned {
+        match outer_post_arm_k_try_pop() {
+            Some(entry) => {
+                entries[count] = entry;
+                count += 1;
+            }
+            None => break,
+        }
     }
 
     let wrapper_fn_addr = sigil_k_continuation_wrapper as *mut u8;
@@ -1982,11 +2072,11 @@ pub unsafe extern "C" fn sigil_perform(
                     }
                 });
             }
-            if op_id >= (*frame).arm_count {
+            if op_id >= ((*frame).arm_count & ARM_COUNT_MASK) {
                 eprintln!(
                     "sigil_perform: op_id {op_id} out of range for effect_id {effect_id} \
                      (arm_count={})",
-                    (*frame).arm_count
+                    (*frame).arm_count & ARM_COUNT_MASK
                 );
                 std::process::abort();
             }
@@ -2011,7 +2101,37 @@ pub unsafe extern "C" fn sigil_perform(
             // the continuation is later invoked (by the outer arm
             // calling k(s)), the wrappers re-push the entries, then
             // the inner chain runs correctly.
-            let (actual_k_closure, actual_k_fn) = if crossed
+            // Plotkin fix — wrap_continuation only fires when:
+            //   (1) the perform crosses one or more handler frames,
+            //   (2) OUTER_POST_ARM_K has entries (an inner-arm chain
+            //       might be in progress that needs preservation), AND
+            //   (3) at least one of the crossed frames belongs to a
+            //       `resumes: many` handler.
+            //
+            // (3) discriminates the case that needs wrap (Plotkin's
+            //   State perform crossing Amb's multi-shot frame, where
+            //   Amb's chain step entries must survive the outer-arm
+            //   discharge and be replayed when the captured k is
+            //   invoked) from cases that don't (json's State perform
+            //   crossing catch's single-shot Raise frame, where the
+            //   chain entries belong to body's own chain steps and
+            //   wrap would just accumulate wrappers per perform until
+            //   OUTER_POST_ARM_K_STACK overflows on deep recursion).
+            let crossed_is_multi_shot = if crossed {
+                let mut cf = top_frame;
+                let mut found = false;
+                while cf != frame && !cf.is_null() {
+                    if (*cf).arm_count & RESUMES_MANY_BIT != 0 {
+                        found = true;
+                        break;
+                    }
+                    cf = (*cf).prev;
+                }
+                found
+            } else {
+                false
+            };
+            let (actual_k_closure, actual_k_fn) = if crossed_is_multi_shot
                 && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0
             {
                 wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
@@ -2137,6 +2257,15 @@ pub unsafe extern "C" fn sigil_run_loop(
         out
     );
     let mut current = initial_step;
+    // Plotkin fix — push this run_loop's entry depth onto the
+    // RUN_LOOP_ENTRY_DEPTH_STACK so wrap_continuation_with_outer_post_arm_k
+    // can determine which OUTER_POST_ARM_K entries this run_loop owns
+    // (entries above entry_depth) versus inherited from enclosing
+    // run_loops (entries at-or-below entry_depth). Popped at every
+    // return path below.
+    let _entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    RUN_LOOP_ENTRY_DEPTH_STACK
+        .with(|s| s.borrow_mut().push(_entry_depth_for_wrap));
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
     // Layer 3c to preserve algebraic-effects discharge semantics
@@ -2233,6 +2362,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
+                    RUN_LOOP_ENTRY_DEPTH_STACK.with(|s| { s.borrow_mut().pop(); });
                     return v;
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
@@ -2335,6 +2465,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
+                RUN_LOOP_ENTRY_DEPTH_STACK.with(|s| { s.borrow_mut().pop(); });
                 return v;
             }
             NEXT_STEP_TAG_CALL => {

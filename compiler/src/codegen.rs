@@ -8134,16 +8134,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // arm-fn synthesis + `sigil_perform` lowering + arm dispatch;
     // Phase 4+ adds continuation-using arms + multi-shot.
 
-    // sigil_handler_frame_new(effect_id: u32, arm_count: u32) -> *mut HandlerFrame
+    // Plotkin fix — wire to the resumes_many-aware runtime entry.
+    // sigil_handler_frame_new_with_resumes_many(effect_id: u32, arm_count: u32, resumes_many: u32)
+    //   -> *mut HandlerFrame
+    // Codegen passes 1 for `resumes: many` effects, 0 for default
+    // single-shot effects. The runtime sets a bit on the frame's
+    // arm_count so wrap_continuation_with_outer_post_arm_k can
+    // discriminate at perform time.
     let mut handler_frame_new_sig = Signature::new(isa_call_conv(&module));
     handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // effect_id
     handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // arm_count
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // resumes_many
     handler_frame_new_sig
         .returns
         .push(AbiParam::new(pointer_ty));
     let handler_frame_new = module
         .declare_function(
-            "sigil_handler_frame_new",
+            "sigil_handler_frame_new_with_resumes_many",
             Linkage::Import,
             &handler_frame_new_sig,
         )
@@ -11360,9 +11367,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // mod_by_zero alphabetically).
         let arith_effect_id_v = builder.ins().iconst(types::I32, 0);
         let arith_arm_count_v = builder.ins().iconst(types::I32, 2);
-        let arith_frame_new_call = builder
-            .ins()
-            .call(frame_new_ref, &[arith_effect_id_v, arith_arm_count_v]);
+        let arith_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let arith_frame_new_call = builder.ins().call(
+            frame_new_ref,
+            &[arith_effect_id_v, arith_arm_count_v, arith_resumes_many_v],
+        );
         stackmap.push_placeholder(function_code_offset(&builder, arith_frame_new_call));
         let arith_frame_ptr = builder.inst_results(arith_frame_new_call)[0];
 
@@ -11409,9 +11418,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // alphabetical positions shifted `println` from op_id 0 to 1.)
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
         let io_arm_count_v = builder.ins().iconst(types::I32, 5);
-        let io_frame_new_call = builder
-            .ins()
-            .call(frame_new_ref, &[io_effect_id_v, io_arm_count_v]);
+        let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let io_frame_new_call = builder.ins().call(
+            frame_new_ref,
+            &[io_effect_id_v, io_arm_count_v, io_resumes_many_v],
+        );
         stackmap.push_placeholder(function_code_offset(&builder, io_frame_new_call));
         let io_frame_ptr = builder.inst_results(io_frame_new_call)[0];
 
@@ -19262,12 +19273,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         ),
                     };
                     let arm_count = arms_in_effect.len() as u32;
+                    let resumes_many = self
+                        .effects
+                        .get(effect_name)
+                        .map(|e| e.resumes_many)
+                        .unwrap_or(false);
                     let effect_id_v = self.builder.ins().iconst(types::I32, effect_id as i64);
                     let arm_count_v = self.builder.ins().iconst(types::I32, arm_count as i64);
-                    let frame_call = self
+                    let resumes_many_v = self
                         .builder
                         .ins()
-                        .call(self.handler_frame_new_ref, &[effect_id_v, arm_count_v]);
+                        .iconst(types::I32, if resumes_many { 1 } else { 0 });
+                    let frame_call = self.builder.ins().call(
+                        self.handler_frame_new_ref,
+                        &[effect_id_v, arm_count_v, resumes_many_v],
+                    );
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, frame_call));
                     let frame_ptr = self.builder.inst_results(frame_call)[0];
