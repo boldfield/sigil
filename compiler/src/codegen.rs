@@ -14395,18 +14395,35 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // Plan C Task 81 — lower arm-
                                         // body pure-let stmts BEFORE
                                         // dispatching the leaf. Skip
-                                        // for PerformChain: that path
-                                        // has its own stmt-lowering
-                                        // loop (line ~14652) that
-                                        // handles pure-before-yield
-                                        // stmts and delegates performs
-                                        // to the branch-chain synth-
-                                        // conts. Running this loop for
-                                        // PerformChain would fire each
-                                        // perform TWICE: once here via
-                                        // lower_perform_to_value, once
-                                        // in the PerformChain emit via
-                                        // sigil_perform.
+                                        // for PerformChain: the
+                                        // PerformChain match arm
+                                        // (~80 lines below in the
+                                        // sibling `match leaf_kind`
+                                        // — search for
+                                        // `BranchedCpsLeaf::PerformChain
+                                        // =>`) has its own
+                                        // stmt-lowering loop that
+                                        // walks `leaf_stmts`,
+                                        // lowering pure-before-yield
+                                        // lets directly and
+                                        // delegating yields to the
+                                        // branch-chain synth-conts.
+                                        // Re-running this loop here
+                                        // would fire each pure-RHS
+                                        // expression twice and (more
+                                        // damagingly for any
+                                        // subsequent re-introduction
+                                        // of perform-bearing RHS
+                                        // through this site) issue
+                                        // each `lower_perform_to_value`
+                                        // ahead of the PerformChain's
+                                        // own `sigil_perform`,
+                                        // double-dispatching the arm.
+                                        // The asymmetry is
+                                        // intentional, not a
+                                        // divergence — do NOT add a
+                                        // "for completeness" pure-let
+                                        // pass here.
                                         if !matches!(leaf_kind, BranchedCpsLeaf::PerformChain) {
                                         for stmt in leaf_stmts {
                                             if let crate::ast::Stmt::Let(l) = stmt {
@@ -21191,6 +21208,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 if self.user_fn_refs.contains_key(name)
                     && !self.env.contains_key(name) =>
             {
+                // The `!self.env.contains_key(name)` guard
+                // honours lexical shadowing: when a local
+                // (`let foo = ...`) or a fn parameter shadows a
+                // top-level user fn `foo`, the call falls through
+                // to the indirect-call match arm at the catch-all
+                // below, which lowers `foo` as a closure value
+                // and loads `code_ptr` at offset 8. The shadowing
+                // local must be fn-typed for that to be valid;
+                // typecheck rejects calling a non-fn-typed value
+                // (E0119 / "callee is not callable" diagnostics)
+                // before codegen sees it, so the indirect-call
+                // path's offset-8 dereference is safe by
+                // construction. The catch-all's
+                // `unreachable!("codegen invariant: walker
+                // accepted callee shape but no signature source
+                // registered ...")` panic is the belt-and-braces
+                // guard if a future typecheck-side regression
+                // ever lets a non-callable through.
+                //
                 // Plan B Task 55, Phase 4e — branch on the callee's
                 // ABI. Sync callees use the existing closure-
                 // convention direct call. Cps callees use the
