@@ -360,17 +360,33 @@ thread_local! {
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
 
-    /// Stack of `outer_post_arm_k_entry_depth` snapshots pushed by
-    /// each `sigil_run_loop` invocation at entry, popped at exit.
-    /// `wrap_continuation_with_outer_post_arm_k` reads the top entry
-    /// to determine how many `OUTER_POST_ARM_K` entries the current
-    /// run_loop owns — only those may be popped into the wrapper
-    /// chain. Entries below the current run_loop's entry depth
-    /// belong to enclosing run_loops and must not be moved (doing
-    /// so would silently underflow the parent's `outer_post_arm_k_entry_depth`
+    /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
+    /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
+    /// this to determine how many `OUTER_POST_ARM_K` entries the
+    /// current run_loop owns — only those may be popped into the
+    /// wrapper chain. Entries below this depth belong to enclosing
+    /// run_loops and must not be moved (doing so would silently
+    /// underflow the parent's `outer_post_arm_k_entry_depth`
     /// invariant and dereference garbage on the next pop).
-    static RUN_LOOP_ENTRY_DEPTH_STACK: std::cell::RefCell<Vec<usize>> =
-        std::cell::RefCell::new(Vec::with_capacity(64));
+    ///
+    /// Single `Cell<usize>` rather than a TLS stack: nested
+    /// run_loops save the prior value into the run_loop's local
+    /// Rust stack frame at entry and restore it at every return
+    /// path. The save/restore is naturally bounded by C-stack
+    /// depth (no separate stack-overflow surface), and the read
+    /// path from `wrap_continuation_with_outer_post_arm_k` cannot
+    /// panic on a `RefCell` borrow.
+    static RUN_LOOP_ENTRY_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[inline]
+fn run_loop_entry_depth_get() -> usize {
+    RUN_LOOP_ENTRY_DEPTH.with(|c| c.get())
+}
+
+#[inline]
+fn run_loop_entry_depth_set(value: usize) {
+    RUN_LOOP_ENTRY_DEPTH.with(|c| c.set(value));
 }
 
 /// Plan D Task 117 (b) Phase 4 — snapshot the current
@@ -1649,23 +1665,27 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
     // wrapper chain (the parent's `outer_post_arm_k_entry_depth`
     // is set at entry; popping below it underflows the depth and
     // dereferences a null fn_ptr at the next pop).
-    let entry_depth = RUN_LOOP_ENTRY_DEPTH_STACK
-        .with(|s| s.borrow().last().copied().unwrap_or(0));
+    let entry_depth = run_loop_entry_depth_get();
     let owned = depth - entry_depth;
     if owned == 0 {
         return (k_closure, k_fn);
     }
 
-    // Skip re-wrapping when ANY owned entry is already a
-    // continuation wrapper. Without this, deep cross-handler
-    // recursion accumulates one wrapper layer per crossed
-    // perform; each layer's invocation re-pushes its saved
-    // entry plus the body's chain pushes another, blowing
-    // OUTER_POST_ARM_K_STACK_SIZE. The existing wrapper(s)
-    // already captured the outer arm chain; a fresh wrap would
-    // just repackage them again under a new layer. Let the
-    // existing wrappers drain naturally on their run_loop's
-    // terminal.
+    // CORRECTNESS — skip re-wrapping when ANY owned entry is
+    // already a continuation wrapper. Not just an optimization:
+    // a fresh wrap on top of an existing wrapper chain would
+    // repackage the SAME saved outer-arm chain entries under a
+    // new layer, so when the outer wrapper later invokes inner,
+    // the inner wrapper would re-push entries already pushed by
+    // the outer one — duplicating the chain on
+    // OUTER_POST_ARM_K_STACK and routing the next Done through
+    // the wrong (duplicated) chain step. The stack-overflow
+    // symptom on json-shaped deep cross-handler recursion is the
+    // visible failure mode; the silent invariant break (chain
+    // step double-fire) is the load-bearing reason this guard
+    // matters. The existing wrapper(s) already captured the
+    // outer arm chain; let them drain naturally on their
+    // run_loop's terminal.
     let wrapper_fn_addr_check = sigil_k_continuation_wrapper as *mut u8;
     let any_wrapper = OUTER_POST_ARM_K_STACK.with(|cell| {
         let stack = cell.get();
@@ -2263,9 +2283,12 @@ pub unsafe extern "C" fn sigil_run_loop(
     // (entries above entry_depth) versus inherited from enclosing
     // run_loops (entries at-or-below entry_depth). Popped at every
     // return path below.
+    // Save the prior run_loop's entry_depth into our local frame
+    // and install ours; restore at every return path so nested
+    // run_loops nest correctly via C-stack save/restore.
+    let prior_run_loop_entry_depth = run_loop_entry_depth_get();
     let _entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-    RUN_LOOP_ENTRY_DEPTH_STACK
-        .with(|s| s.borrow_mut().push(_entry_depth_for_wrap));
+    run_loop_entry_depth_set(_entry_depth_for_wrap);
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
     // Layer 3c to preserve algebraic-effects discharge semantics
@@ -2362,7 +2385,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                     );
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
-                    RUN_LOOP_ENTRY_DEPTH_STACK.with(|s| { s.borrow_mut().pop(); });
+                    run_loop_entry_depth_set(prior_run_loop_entry_depth);
                     return v;
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
@@ -2465,7 +2488,7 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
-                RUN_LOOP_ENTRY_DEPTH_STACK.with(|s| { s.borrow_mut().pop(); });
+                run_loop_entry_depth_set(prior_run_loop_entry_depth);
                 return v;
             }
             NEXT_STEP_TAG_CALL => {
@@ -2533,6 +2556,20 @@ fn handler_frame_pointer_bitmap(arm_count: usize) -> u32 {
     // Word 2: return_closure — GC pointer.
     // Word 3: prev — GC pointer (to another HandlerFrame, also GC-allocated).
     // Words 4+: arms — even slots are fn_ptrs (skip), odd slots are closure_ptrs (track).
+    //
+    // Defensive check: `arm_count` must be the masked count (low 16
+    // bits of `HandlerFrame::arm_count`), NOT the raw field with the
+    // `RESUMES_MANY_BIT` flag set. A caller passing the raw u32 would
+    // iterate ~2^31 times here (silently producing garbage); catch
+    // that misuse early in dev builds.
+    debug_assert!(
+        arm_count <= MAX_HANDLER_ARMS as usize,
+        "handler_frame_pointer_bitmap: arm_count {arm_count} exceeds \
+         MAX_HANDLER_ARMS ({}); caller likely passed a raw \
+         arm_count field with RESUMES_MANY_BIT set instead of the \
+         masked value",
+        MAX_HANDLER_ARMS
+    );
     let mut bitmap: u32 = 0;
     bitmap |= 1 << 2;
     bitmap |= 1 << 3;
