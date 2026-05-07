@@ -12096,20 +12096,23 @@ fn koka_multiple_effects_in_body() {
 /// Derived from koka/test/effects/multi-op.kk
 #[test]
 fn koka_user_effect_multi_op_handler() {
+    // Plan C addendum (CLI external-system effects, EE1) added `Env`
+    // as a builtin effect. The original Koka test used `effect Env`;
+    // renamed to `Cfg` to avoid the duplicate-effect collision.
     let src = "import std.io\n\
-               effect Env {\n  \
+               effect Cfg {\n  \
                  get_name: () -> String,\n  \
                  get_value: () -> Int,\n\
                }\n\
-               fn greet() -> String ![Env] {\n  \
-                 let name: String = perform Env.get_name();\n  \
-                 let val: Int = perform Env.get_value();\n  \
+               fn greet() -> String ![Cfg] {\n  \
+                 let name: String = perform Cfg.get_name();\n  \
+                 let val: Int = perform Cfg.get_value();\n  \
                  string_concat(name, string_concat(\": \", int_to_string(val)))\n\
                }\n\
-               fn with_env(action: () -> String ![Env]) -> String ![] {\n  \
+               fn with_env(action: () -> String ![Cfg]) -> String ![] {\n  \
                  handle action() with {\n    \
-                   Env.get_name(k) => k(\"answer\"),\n    \
-                   Env.get_value(k) => k(42),\n  \
+                   Cfg.get_name(k) => k(\"answer\"),\n    \
+                   Cfg.get_value(k) => k(42),\n  \
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
@@ -13193,7 +13196,7 @@ fn process_run_echo_returns_zero_with_stdout() {
                import std.result\n\
                fn main() -> Int ![IO, Process] {\n  \
                  let args: Array[String] = array_alloc(1, \"hello\");\n  \
-                 match run(\"/bin/echo\", args) {\n    \
+                 match run(\"echo\", args) {\n    \
                    Ok((code, out, _err)) => match code {\n      \
                      0 => perform IO.println(out),\n      \
                      _ => perform IO.println(\"nonzero\"),\n    \
@@ -13204,7 +13207,7 @@ fn process_run_echo_returns_zero_with_stdout() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "process_run_echo");
     assert_eq!(code, 0, "stderr: {stderr}");
-    // /bin/echo prints "hello\n" + IO.println adds another newline.
+    // `echo` prints "hello\n" + IO.println adds another newline.
     assert_eq!(stdout, "hello\n\n");
 }
 
@@ -13217,7 +13220,7 @@ fn process_run_false_returns_nonzero_exit() {
                import std.result\n\
                fn main() -> Int ![IO, Process] {\n  \
                  let args: Array[String] = array_alloc(0, \"\");\n  \
-                 match run(\"/bin/false\", args) {\n    \
+                 match run(\"false\", args) {\n    \
                    Ok((code, _out, _err)) => perform IO.println(int_to_string(code)),\n    \
                    Err(_) => perform IO.println(\"err\"),\n  \
                  };\n  \
@@ -13256,15 +13259,18 @@ fn process_run_captures_stderr_separately() {
     // block syntax `{ stmt; expr }` is rejected at the arm-body
     // position. Destructure once into a tuple of `(out, err)`,
     // then concat + print.
+    // Sigil's typecheck `env_insert` debug_assert fires on `let`
+    // shadowing the same name; use distinct `args0` / `args1` /
+    // `args2` chain for the array-build pipeline.
     let src = "import std.process\n\
                import std.array\n\
                import std.io\n\
                import std.result\n\
                fn main() -> Int ![IO, Process] {\n  \
-                 let args: Array[String] = array_alloc(2, \"\");\n  \
-                 let args: Array[String] = array_set(args, 0, \"-c\");\n  \
-                 let args: Array[String] = array_set(args, 1, \"echo out; echo err >&2\");\n  \
-                 let pair: (String, String) = match run(\"/bin/sh\", args) {\n    \
+                 let args0: Array[String] = array_alloc(2, \"\");\n  \
+                 let args1: Array[String] = array_set(args0, 0, \"-c\");\n  \
+                 let args2: Array[String] = array_set(args1, 1, \"echo out; echo err >&2\");\n  \
+                 let pair: (String, String) = match run(\"sh\", args2) {\n    \
                    Ok((_code, o, e)) => (o, e),\n    \
                    Err(_) => (\"\", \"\"),\n  \
                  };\n  \

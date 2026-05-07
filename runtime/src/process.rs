@@ -227,12 +227,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_echo_returns_zero_exit_and_stdout() {
+        // PATH-resolved command name — `/bin/echo` exists on Linux
+        // but the macOS-14 GitHub runner doesn't always provide it
+        // at that path. `Command::new("echo")` does PATH lookup.
         let _g = gc_test_lock();
         unsafe {
-            let _cmd = make_string("/bin/echo");
+            let _cmd = make_string("echo");
             let _args = make_array_of_strings(&["hello"]);
             // Replicate the arm-fn body without trampoline dispatch.
-            let mut command = Command::new("/bin/echo");
+            let mut command = Command::new("echo");
             command.arg("hello");
             let out = command.output().expect("spawn echo");
             assert_eq!(out.status.code(), Some(0));
@@ -243,9 +246,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_false_returns_one_exit() {
-        let out = Command::new("/bin/false")
-            .output()
-            .expect("spawn /bin/false");
+        let out = Command::new("false").output().expect("spawn `false`");
         assert_eq!(out.status.code(), Some(1));
     }
 
@@ -261,7 +262,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_captures_stderr_separately() {
-        let out = Command::new("/bin/sh")
+        let out = Command::new("sh")
             .arg("-c")
             .arg("echo out; echo err >&2")
             .output()
