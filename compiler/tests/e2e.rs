@@ -12923,7 +12923,15 @@ fn cli_temp_path(suffix: &str) -> std::path::PathBuf {
 
 #[test]
 fn env_var_present_returns_some() {
-    std::env::set_var("__SIGIL_E2E_VAR_PRESENT__", "ok");
+    // SAFETY: `set_var`/`remove_var` are flagged unsafe in newer
+    // Rust because they're not thread-safe vs. concurrent reads;
+    // here the var name is unique to this test so cargo's parallel
+    // test runner can't collide on it, and the surrounding test
+    // harness reads it only via the spawned child process (which
+    // inherits the variable but doesn't share Rust's `environ`).
+    unsafe {
+        std::env::set_var("__SIGIL_E2E_VAR_PRESENT__", "ok");
+    }
     let src = "import std.env\n\
                import std.io\n\
                import std.option\n\
@@ -12935,14 +12943,20 @@ fn env_var_present_returns_some() {
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "env_var_present");
-    std::env::remove_var("__SIGIL_E2E_VAR_PRESENT__");
+    // SAFETY: see set_var note above.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_VAR_PRESENT__");
+    }
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "ok\n");
 }
 
 #[test]
 fn env_var_absent_returns_none() {
-    std::env::remove_var("__SIGIL_E2E_VAR_DEFINITELY_ABSENT__");
+    // SAFETY: see env_var_present_returns_some.
+    unsafe {
+        std::env::remove_var("__SIGIL_E2E_VAR_DEFINITELY_ABSENT__");
+    }
     let src = "import std.env\n\
                import std.io\n\
                import std.option\n\
