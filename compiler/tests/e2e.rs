@@ -12895,3 +12895,385 @@ fn char_doc_only_import() {
     assert_eq!(code, 0, "stderr: {_stderr}");
     assert_eq!(stdout, "A\n");
 }
+
+// ===== Plan C addendum (CLI external-system effects, EE6) ============
+//
+// User-facing surface for the `Env` / `Fs` / `Process` effects via
+// stdlib wrappers in `std/env.sigil` / `std/fs.sigil` /
+// `std/process.sigil`. Each test compiles a small Sigil program and
+// runs it against the test binary's host environment + a per-test
+// tempdir.
+
+#[cfg(unix)]
+fn cli_temp_path(suffix: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "sigil_cli_e2e_{}_{}_{suffix}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    p
+}
+
+#[test]
+fn env_var_present_returns_some() {
+    std::env::set_var("__SIGIL_E2E_VAR_PRESENT__", "ok");
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 match var(\"__SIGIL_E2E_VAR_PRESENT__\") {\n    \
+                   Some(v) => perform IO.println(v),\n    \
+                   None => perform IO.println(\"absent\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_var_present");
+    std::env::remove_var("__SIGIL_E2E_VAR_PRESENT__");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "ok\n");
+}
+
+#[test]
+fn env_var_absent_returns_none() {
+    std::env::remove_var("__SIGIL_E2E_VAR_DEFINITELY_ABSENT__");
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.option\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 match var(\"__SIGIL_E2E_VAR_DEFINITELY_ABSENT__\") {\n    \
+                   Some(_v) => perform IO.println(\"present\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_var_absent");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "none\n");
+}
+
+#[test]
+fn env_args_returns_at_least_one() {
+    let src = "import std.env\n\
+               import std.io\n\
+               import std.list\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 let xs: List[String] = args();\n  \
+                 perform IO.println(int_to_string(length(xs)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "env_args_count");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let n: i64 = stdout.trim().parse().expect("argv count");
+    assert!(
+        n >= 1,
+        "argv must always carry at least program name; got {n}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_exists_known_unknown() {
+    let path = cli_temp_path("exists");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, b"x").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match exists(\"{path_str}\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           match exists(\"/nonexistent/path/__sigil_e2e_no__\") {{ true => perform IO.println(\"yes\"), false => perform IO.println(\"no\") }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_exists");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "yes\nno\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_existing_file() {
+    let path = cli_temp_path("read");
+    std::fs::write(&path, b"hello, fs").expect("write fixture");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(s) => perform IO.println(s),\n    \
+             Err(_e) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_existing");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "hello, fs\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_missing_is_not_found() {
+    let path = cli_temp_path("missing");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(_s) => perform IO.println(\"unexpected ok\"),\n    \
+             Err(NotFound) => perform IO.println(\"not_found\"),\n    \
+             Err(_) => perform IO.println(\"other_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_missing");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "not_found\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_write_then_read_round_trip() {
+    let path = cli_temp_path("rw");
+    let _ = std::fs::remove_file(&path);
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match write_file(\"{path_str}\", \"hello, file\") {{\n    \
+             Ok(_) => 0,\n    \
+             Err(_) => 0,\n  \
+           }};\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(s) => perform IO.println(s),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_rw_round_trip");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "hello, file\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_invalid_utf8_returns_invalid_utf8() {
+    let path = cli_temp_path("invalid_utf8");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0xFFu8, 0xFE]).expect("write invalid bytes");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_file(\"{path_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"unexpected ok\"),\n    \
+             Err(InvalidUtf8) => perform IO.println(\"invalid_utf8\"),\n    \
+             Err(_) => perform IO.println(\"other_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_invalid_utf8");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "invalid_utf8\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_mkdir_remove_round_trip() {
+    let dir = cli_temp_path("mkrm");
+    let _ = std::fs::remove_dir(&dir);
+    let dir_str = dir.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match mkdir(\"{dir_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"created\"),\n    \
+             Err(_) => perform IO.println(\"mkdir_err\"),\n  \
+           }};\n  \
+           match remove_dir(\"{dir_str}\") {{\n    \
+             Ok(_) => perform IO.println(\"removed\"),\n    \
+             Err(_) => perform IO.println(\"rm_err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_mkdir_rm");
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "created\nremoved\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_file_size_returns_byte_count() {
+    let path = cli_temp_path("size");
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, [0u8; 100]).expect("write 100 bytes");
+    let path_str = path.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.int64\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match file_size(\"{path_str}\") {{\n    \
+             Ok(n) => perform IO.println(int64_to_string(n)),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_size");
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "100\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_read_dir_lists_entries() {
+    let dir = cli_temp_path("readdir");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).expect("create temp dir");
+    std::fs::write(dir.join("a"), b"a").expect("write a");
+    std::fs::write(dir.join("b"), b"b").expect("write b");
+    std::fs::write(dir.join("c"), b"c").expect("write c");
+    let dir_str = dir.to_str().expect("utf-8 path");
+    let src = format!(
+        "import std.fs\n\
+         import std.io\n\
+         import std.list\n\
+         import std.result\n\
+         fn main() -> Int ![IO, Fs] {{\n  \
+           match read_dir(\"{dir_str}\") {{\n    \
+             Ok(xs) => perform IO.println(int_to_string(length(xs))),\n    \
+             Err(_) => perform IO.println(\"err\"),\n  \
+           }};\n  \
+           0\n\
+         }}\n"
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "fs_read_dir");
+    let _ = std::fs::remove_file(dir.join("a"));
+    let _ = std::fs::remove_file(dir.join("b"));
+    let _ = std::fs::remove_file(dir.join("c"));
+    let _ = std::fs::remove_dir(&dir);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "3\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_echo_returns_zero_with_stdout() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(1, \"hello\");\n  \
+                 match run(\"/bin/echo\", args) {\n    \
+                   Ok((code, out, _err)) => match code {\n      \
+                     0 => perform IO.println(out),\n      \
+                     _ => perform IO.println(\"nonzero\"),\n    \
+                   },\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_echo");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    // /bin/echo prints "hello\n" + IO.println adds another newline.
+    assert_eq!(stdout, "hello\n\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_false_returns_nonzero_exit() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(0, \"\");\n  \
+                 match run(\"/bin/false\", args) {\n    \
+                   Ok((code, _out, _err)) => perform IO.println(int_to_string(code)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_false");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "1\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_missing_executable_is_not_found() {
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(0, \"\");\n  \
+                 match run(\"/nonexistent/path/__sigil_e2e_missing__\", args) {\n    \
+                   Ok(_) => perform IO.println(\"unexpected ok\"),\n    \
+                   Err(NotFound) => perform IO.println(\"not_found\"),\n    \
+                   Err(_) => perform IO.println(\"other_err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_missing");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "not_found\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_captures_stderr_separately() {
+    // Sigil v1's match arm body must be a single expression —
+    // block syntax `{ stmt; expr }` is rejected at the arm-body
+    // position. Destructure once into a tuple of `(out, err)`,
+    // then concat + print.
+    let src = "import std.process\n\
+               import std.array\n\
+               import std.io\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 let args: Array[String] = array_alloc(2, \"\");\n  \
+                 let args: Array[String] = array_set(args, 0, \"-c\");\n  \
+                 let args: Array[String] = array_set(args, 1, \"echo out; echo err >&2\");\n  \
+                 let pair: (String, String) = match run(\"/bin/sh\", args) {\n    \
+                   Ok((_code, o, e)) => (o, e),\n    \
+                   Err(_) => (\"\", \"\"),\n  \
+                 };\n  \
+                 match pair {\n    \
+                   (o, e) => perform IO.print(string_concat(o, e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "process_run_stderr");
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "out\nerr\n");
+}

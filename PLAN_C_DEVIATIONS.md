@@ -654,3 +654,32 @@ The parser / per-op-generics / row-poly-Fn lifts (constraints #1, #5, #6) are or
 **Sudoku impact.** Plan C Task 81 (`examples/sudoku.sigil`, scheduled for Stage 8) defers with this entry — Sudoku's `Choose.choose(9)` per-cell + `first_choice` orchestration requires both constraint #2 (runtime-N arm body) and constraint #4 (short-circuit) lifted. Captured under PLAN_C_PROGRESS.md's plan-completion note (Task 81 will reference this deviation when the Stage 8 work begins).
 
 **Implementing commit(s).** [HEAD].
+
+## 2026-05-07 — [DEVIATION Task EE] CLI external-system effects use raw-shape ops + stdlib Sigil wrappers (path 4) instead of codegen-synthesized arm fns (path 1)
+
+**Context.** Plan C addendum (CLI external-system effects) Task EE2 says fallible `Fs` / `Process` ops "construct a `Result` heap record" and references `runtime/src/result.rs` as the model. That file does not exist; the runtime crate has no analog for runtime-side construction of Sigil sum-type values. `Result` and `FsError` / `ProcessError` are user / builtin sum types whose layout is monomorphization-dependent (`Result$$String$$FsError`, `Option$$String`, etc.); the runtime cannot construct them from the existing fixed-tag-only allocator surface.
+
+**What ships.** Effect-op return shapes are restricted to fixed-tag types only (TAG_TUPLE for tuples, TAG_ARRAY for arrays, TAG_STRING / TAG_INT64 / Bool / Int for scalars). The runtime arm fns build raw `(Int, T)` / `(Int, Int, String, String)` / `Array[T]` shapes the runtime can construct directly. User-facing `Result[T, FsError]` / `Option[T]` / `List[T]` returns are constructed in stdlib Sigil source files (`std/env.sigil`, `std/fs.sigil`, `std/process.sigil`) — same convention as `std/random.sigil`'s `random_int()` wrapper around `perform Random.rand_int()` and `std/clock.sigil`'s `now()` wrapper.
+
+The user-facing call surface is unchanged from the plan: `match read_file(p) { Ok(s) => ..., Err(NotFound) => ... }` works exactly as the plan body shows. The only difference is naming: `read_file` is a stdlib fn (call without `perform`), not a direct effect-op invocation. The same pattern is already established for Random / Clock / Raise / State / Choose, so this is consistent with the existing stdlib convention.
+
+**Why accepted.**
+
+- **User-facing surface is identical.** LLM authors write `read_file(p)` either way; they don't see whether the underlying op returns a tuple or a sum type.
+- **Convention consistency.** Every existing builtin effect (Random / Clock / Raise / State / Choose) uses stdlib Sigil wrappers. Path 1 would introduce an inconsistent rule ("Env / Fs / Process use perform directly; the others use wrappers") that the LLM has to learn.
+- **Implementation cost.** Path 4 ships at ~1500 LOC. Path 1 would require new compiler architecture (`BuiltinEffectArmSynth`, raw-result ABIs, IR-level sum-type construction in synthesized arm-fn bodies) at ~3000–4000 LOC.
+
+**What's lost vs the plan body's literal architecture.**
+
+- **Effect ops cannot return arbitrary user-defined sum types.** Path 1 would have demonstrated that effect ops can return any user type (with codegen-synthesized arm fns translating the runtime-built raw shapes to the declared sum-type return). Path 4 says: effect ops return only fixed-tag types; sum types are constructed in user-Sigil code. This is an internal-to-the-language restriction; LLM-authored programs don't observe it.
+
+**Closure path.** A future plan can adopt path 1 if the language ever needs effect ops returning user sum types directly. Hooks for that work:
+- `BuiltinEffectArmSynth` parallel to `HandlerArmSynth` (but per-builtin-effect-op).
+- Raw-result FFI ABI between runtime arm helpers (currently the `*_arm` symbols) and codegen-synthesized arm fns.
+- Sum-type construction in synthesized arm fns via `lower_ctor_alloc` against the monomorphized type layouts.
+
+The current path-4 stdlib wrappers are a clean bridge: the future architectural lift can replace them in place by upgrading the effect-op signatures to declared sum types, with the user-facing call surface unchanged.
+
+**Failure mode.** A user who pokes through stdlib source and discovers `perform Fs.read_file(p)` (the raw effect op) gets a `(Int, String)` tuple back, which won't pattern-match against `Result[..]`. Workaround: call the wrapper `read_file(p)` (the canonical surface).
+
+**Implementing commit(s).** [plan-c-cli-effects branch].
