@@ -363,10 +363,15 @@ impl EnvSlotKind {
     /// Whether this slot holds a GC-managed pointer. Codegen ORs bit `k+1`
     /// (past the code_ptr word at bit 0) into the closure header's pointer
     /// bitmap iff this returns `true` for slot `k`.
+    ///
+    /// Plan C addendum (Char): `EnvSlotKind::Char` is pointer-typed
+    /// because boxed `Char` (`TAG_CHAR`) is heap-allocated. Slot
+    /// widening / narrowing skips the I32 narrow path; the bitmap bit
+    /// is set so a precise GC walker would trace the boxed Char.
     pub fn is_pointer(self) -> bool {
         matches!(
             self,
-            EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User
+            EnvSlotKind::Char | EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User
         )
     }
 }

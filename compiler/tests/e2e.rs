@@ -2832,24 +2832,17 @@ fn arm_reads_multi_args_in_declared_order() {
 
 #[test]
 fn arm_reads_char_arg_branches_on_codepoint() {
-    // Phase 4c — arg-content verification (2b/4): Char arg goes
-    // through `uextend(I64, _)` (perform side, I32 → I64) → u64
-    // slot → `ireduce(I32, _)` (arm side) → branch via `==`.
-    //
-    // Bool (test 2a above) exercises the I8 width of the widen/
-    // ireduce path; this test exercises the I32 (Char) width of
-    // the same path. They are distinct Cranelift instructions
-    // operating on distinct value widths, so the Bool test
-    // alone leaves the I32 leg verifier-checked but not value-
-    // checked. A wrong-direction extend (`sextend` vs `uextend`)
-    // or a width-swap regression on the Char path would land
-    // green under Bool-only coverage.
-    //
-    // Closes part of PR #24 review MF1 (Char arg-readback).
+    // Phase 4c — arg-content verification (2b/4): pre-Plan-C-addendum
+    // this test exercised the I32 (Char) width of the perform-side
+    // widen → arm-side ireduce path. Post-addendum Char is boxed
+    // (`pointer_ty`), so the arm-side path is now a pointer-store —
+    // same width as String args (test 3 below). The arm-body branch
+    // dispatches through `char_eq` (Plan C addendum surface) which
+    // derefs both Chars and compares codepoints via `sigil_char_eq`.
     let src = "effect E { op: (Char) -> Int }\n\
                fn main() -> Int ![IO] {\n  \
                  let n: Int = handle (perform E.op('Z')) with {\n    \
-                   E.op(c, k) => if c == 'Z' { 1 } else { 0 },\n  \
+                   E.op(c, k) => if char_eq(c, 'Z') { 1 } else { 0 },\n  \
                  };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
@@ -2897,20 +2890,20 @@ fn perform_side_narrow_to_bool_value_checked() {
 #[test]
 fn perform_side_narrow_to_char_value_checked() {
     // Phase 4c — perform-side narrow value-check (closes PR #24
-    // review MF2 second leg). Mirror of `perform_side_narrow_to_bool_value_checked`
-    // for the I32 (Char) width. Op is declared `(Int) -> Char`;
-    // arm body returns the Char `'Y'`; perform-side narrow uses
-    // `ireduce(I32, widened)` to restore the Char Cranelift
-    // type so the subsequent `c == 'Y'` equality check operates
-    // on matching widths. Bool covers the I8 width, this covers
-    // the I32 width — symmetric to MF1's Bool-vs-Char split on
-    // the perform→arm widen leg.
+    // review MF2 second leg). Char became boxed in the Plan C
+    // addendum (`TAG_CHAR`); pointer comparison via `==` would no
+    // longer match codepoint equality, so the post-handle test
+    // dispatches through `char_eq` (which compares the boxed
+    // payloads' codepoints via `sigil_char_eq`). The handle's
+    // arm-body return path still exercises the boxed-Char widen /
+    // narrow symmetry through `args_ptr` since the op's declared
+    // return is `Char`.
     let src = "effect E { op: (Int) -> Char }\n\
                fn main() -> Int ![IO] {\n  \
                  let c: Char = handle (perform E.op(1)) with {\n    \
                    E.op(n, k) => 'Y',\n  \
                  };\n  \
-                 let n: Int = if c == 'Y' { 11 } else { 22 };\n  \
+                 let n: Int = if char_eq(c, 'Y') { 11 } else { 22 };\n  \
                  perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
@@ -3647,25 +3640,19 @@ fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() 
 #[test]
 fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() {
     // PR #26 mid-flight at 73c7e53 (no-context) review item #4:
-    // parallel coverage to the Bool capture test for the other
-    // sub-I64 width-discrepant kind. Char captures store as I32 in
-    // the closure record's slot:
-    //   - On the WRITE side (helper's body emit alloc): widen
-    //     I32 → I64 via uextend.
-    //   - On the READ side (synth-cont's capture-load): narrow
-    //     I64 → I32 via ireduce.
-    // A regression in either side would surface as wrong upper
-    // bits leaking into the Char comparison at runtime.
-    //
-    // helper takes `marker: Char` user param, captures it; tail
-    // `if marker == 'A' then x else 0`. use-k arm `=> k(99)` →
-    // synth-cont loads marker from closure record (offset 16,
-    // narrows I64→I32), binds x=99, lowers the conditional with
-    // marker='A' → 99 / marker='B' → 0.
+    // originally parallel coverage to the Bool capture test for the
+    // I32 (Char) sub-I64 width-discrepant kind. Plan C addendum
+    // boxed `Char`, so a Char capture is now a `pointer_ty` slot
+    // (no widen / narrow symmetry to exercise on the closure-record
+    // boundary for this width). The test still pins the captured-
+    // value flow through synth-cont closure records — every Char
+    // capture is a pointer to a `TAG_CHAR` record — and the
+    // post-resume comparison runs through `char_eq` (which derefs
+    // both Chars and compares codepoints via `sigil_char_eq`).
     let src = "effect Raise { fail: () -> Int }\n\
                fn helper(marker: Char) -> Int ![Raise, IO] {\n  \
                  let x: Int = perform Raise.fail();\n  \
-                 if marker == 'A' { x } else { 0 }\n\
+                 if char_eq(marker, 'A') { x } else { 0 }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n  \
@@ -3678,9 +3665,9 @@ fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() 
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "99\n0\n",
-        "Char capture's widen/narrow symmetry: helper('A') k(99) → \
-         marker=='A' so x=99 returned; helper('B') k(99) → marker=='B' \
-         is false so 0 returned. stderr={stderr:?}"
+        "boxed-Char capture flows through synth-cont's closure record: \
+         helper('A') k(99) → char_eq(marker,'A') so x=99 returned; \
+         helper('B') k(99) → char_eq false so 0 returned. stderr={stderr:?}"
     );
 }
 
@@ -10316,22 +10303,17 @@ fn task_78_5_g4_approach6_nested_handles_each_return_arm_fires_for_its_own_body(
 /// `IO.println(result)` then dereferences a corrupt pointer and either
 /// segfaults or prints garbage.
 ///
-/// **Setup**: body is `body_returning_char()` — a Cps fn returning
-/// `Char` (I32) that performs `E.op` and tails on a Char literal. The
-/// handle declares `result: String` and `return(_c) => "ok"` — so R =
-/// String (pointer_ty = I64). The arm `E.op(k) => k(0)` keeps the body
-/// running so its tail Char `'a'` becomes the helper's argument, then
-/// the helper invokes return_arm which yields the String "ok".
+/// **Setup** (post-Plan-C-addendum): body is `body_returning_char()` —
+/// a Cps fn returning `Char` (now `pointer_ty`, boxed) that performs
+/// `E.op` and tails on a Char literal. The handle declares `result:
+/// String` and `return(_c) => "ok"`. Pre-Plan-C-addendum, this exercised
+/// B != R width discrepancy (B = Char = I32; R = String = pointer_ty);
+/// post-addendum both B and R are `pointer_ty`, so the value-flow
+/// discrepancy collapses but the wrapper / return-arm composition still
+/// runs end-to-end and the test pins the smoke shape.
 ///
-/// The wrapper now returns `(body_val, raw_u64, fired_v)`: `body_val`
-/// stays narrowed to B for Phase 4g's non-suppression paths, but the
-/// suppression branch consumes `raw_u64` directly (full 64 bits) and
-/// narrows once to handler_overall_ty.
-///
-/// **Invariant**: stdout = `"ok\n"`, exit 0. Pre-fix output is
-/// non-deterministic (segfault, garbage bytes, or panic) depending on
-/// the host's pointer layout — any non-`"ok\n"` outcome surfaces the
-/// regression.
+/// **Invariant**: stdout = `"ok\n"`, exit 0. Any non-`"ok\n"` outcome
+/// surfaces a wrapper-composition regression.
 #[test]
 fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
     let src = "import std.io\n\
@@ -10358,12 +10340,8 @@ fn task_78_5_g4_approach6_b_neq_r_pointer_return_arm_through_char_body() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "ok\n",
-        "B != R: body returns Char (I32, narrower), handler returns \
-         String (pointer_ty = I64, wider). Pre-fix wrapper narrowed \
-         raw_u64 to Char and the suppression branch's re-widen via \
-         uextend lost the upper 32 bits of the \"ok\" String pointer. \
-         Wrong stdout (or segfault) surfaces the regression. \
-         stderr={stderr:?}"
+        "wrapper composition end-to-end with body→Char and handler→String \
+         (both pointer_ty post-Plan-C-addendum). stderr={stderr:?}"
     );
 }
 

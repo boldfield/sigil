@@ -10790,13 +10790,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             };
                             let slot_val = match capture.kind {
                                 EnvSlotKind::Int => raw,
-                                EnvSlotKind::Bool
-                                | EnvSlotKind::Byte
-                                | EnvSlotKind::Unit
-                                | EnvSlotKind::Char => builder.ins().uextend(types::I64, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                                    raw
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().uextend(types::I64, raw)
                                 }
+                                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => raw,
                             };
                             let offset: i32 = 16 + 8 * i as i32;
                             builder
@@ -10881,13 +10882,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             };
                             let slot_val = match capture.kind {
                                 EnvSlotKind::Int => raw,
-                                EnvSlotKind::Bool
-                                | EnvSlotKind::Byte
-                                | EnvSlotKind::Unit
-                                | EnvSlotKind::Char => builder.ins().uextend(types::I64, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                                    raw
+                                EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
+                                    builder.ins().uextend(types::I64, raw)
                                 }
+                                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => raw,
                             };
                             let offset: i32 = 16 + 8 * i as i32;
                             builder
@@ -12136,11 +12138,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             crate::ast::EnvSlotKind::Int => val,
                             crate::ast::EnvSlotKind::Bool
                             | crate::ast::EnvSlotKind::Byte
-                            | crate::ast::EnvSlotKind::Unit
-                            | crate::ast::EnvSlotKind::Char => {
+                            | crate::ast::EnvSlotKind::Unit => {
                                 lowerer.builder.ins().uextend(types::I64, val)
                             }
-                            crate::ast::EnvSlotKind::String
+                            // Plan C addendum (Char) — boxed Char is pointer-typed.
+                            crate::ast::EnvSlotKind::Char
+                            | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
                             | crate::ast::EnvSlotKind::User => val,
                         };
@@ -12380,15 +12383,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 crate::ast::EnvSlotKind::Int => raw,
                                 crate::ast::EnvSlotKind::Bool
                                 | crate::ast::EnvSlotKind::Byte
-                                | crate::ast::EnvSlotKind::Unit
-                                | crate::ast::EnvSlotKind::Char => {
+                                | crate::ast::EnvSlotKind::Unit => {
                                     if needs_widen {
                                         lowerer.builder.ins().uextend(types::I64, raw)
                                     } else {
                                         raw
                                     }
                                 }
-                                crate::ast::EnvSlotKind::String
+                                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                                crate::ast::EnvSlotKind::Char
+                                | crate::ast::EnvSlotKind::String
                                 | crate::ast::EnvSlotKind::Closure
                                 | crate::ast::EnvSlotKind::User => raw,
                             };
@@ -13104,8 +13108,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         crate::ast::EnvSlotKind::Bool
                         | crate::ast::EnvSlotKind::Byte
                         | crate::ast::EnvSlotKind::Unit => builder.ins().ireduce(types::I8, raw),
-                        crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                        crate::ast::EnvSlotKind::String
+                        // Plan C addendum (Char) — boxed Char is pointer-typed.
+                        crate::ast::EnvSlotKind::Char
+                        | crate::ast::EnvSlotKind::String
                         | crate::ast::EnvSlotKind::Closure
                         | crate::ast::EnvSlotKind::User => {
                             if pointer_ty == types::I64 {
@@ -13481,8 +13486,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             | crate::ast::EnvSlotKind::Unit => {
                                 builder.ins().ireduce(types::I8, raw)
                             }
-                            crate::ast::EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                            crate::ast::EnvSlotKind::String
+                            // Plan C addendum (Char) — boxed Char is pointer-typed.
+                            crate::ast::EnvSlotKind::Char
+                            | crate::ast::EnvSlotKind::String
                             | crate::ast::EnvSlotKind::Closure
                             | crate::ast::EnvSlotKind::User => {
                                 if pointer_ty == types::I64 {
@@ -14279,8 +14285,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => {
                                     if pointer_ty == types::I64 {
                                         raw
                                     } else {
@@ -14476,18 +14485,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             );
                                             raw_v
                                         }
-                                        EnvSlotKind::Char => {
-                                            debug_assert_eq!(
-                                                lowerer.builder.func.dfg.value_type(raw_v),
-                                                types::I32,
-                                                "Plan C Task 81 tail-prefix-let: lower_expr \
-                                                 contract — Char must produce I32 (got {:?}); \
-                                                 fix lower_expr or update this dispatch",
-                                                lowerer.builder.func.dfg.value_type(raw_v)
-                                            );
-                                            raw_v
-                                        }
-                                        EnvSlotKind::String
+                                        // Plan C addendum (Char) — boxed Char is pointer-typed,
+                                        // matching String / Closure / User.
+                                        EnvSlotKind::Char
+                                        | EnvSlotKind::String
                                         | EnvSlotKind::Closure
                                         | EnvSlotKind::User => {
                                             debug_assert_eq!(
@@ -16888,8 +16889,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                                     builder.ins().ireduce(types::I8, raw)
                                 }
-                                EnvSlotKind::Char => builder.ins().ireduce(types::I32, raw),
-                                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+                                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                                EnvSlotKind::Char
+                                | EnvSlotKind::String
+                                | EnvSlotKind::Closure
+                                | EnvSlotKind::User => {
                                     if pointer_ty == types::I64 {
                                         raw
                                     } else {
@@ -23088,8 +23092,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
-                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => *raw,
+                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                EnvSlotKind::Char
+                | EnvSlotKind::String
+                | EnvSlotKind::Closure
+                | EnvSlotKind::User => *raw,
             };
             let offset: i32 = 16 + 8 * i as i32;
             self.builder
@@ -23246,8 +23253,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // unsigned in their bit-level storage).
                     self.builder.ins().uextend(types::I64, *raw)
                 }
-                EnvSlotKind::Char => self.builder.ins().uextend(types::I64, *raw),
-                EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => *raw,
+                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                EnvSlotKind::Char
+                | EnvSlotKind::String
+                | EnvSlotKind::Closure
+                | EnvSlotKind::User => *raw,
             };
             let offset: i32 = 16 + 8 * i as i32;
             self.builder
@@ -23603,8 +23613,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
                 self.builder.ins().ireduce(types::I8, raw)
             }
-            EnvSlotKind::Char => self.builder.ins().ireduce(types::I32, raw),
-            EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
+            // Plan C addendum (Char) — boxed Char is pointer-typed; the
+            // slot already holds a pointer_ty value, so no narrow.
+            EnvSlotKind::Char | EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
                 if self.pointer_ty == types::I64 {
                     raw
                 } else {
@@ -23942,8 +23953,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         Ty::Bool | Ty::Byte | Ty::Unit => {
                             self.builder.ins().ireduce(types::I8, raw)
                         }
-                        Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-                        Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        // Plan C addendum (Char) — boxed Char is pointer-typed.
+                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
                         // Plan D Task 117 — Continuation in a tuple
                         // element would require storing k in a heap-
                         // allocated tuple, which the E0145 escape
@@ -24004,8 +24015,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match field_ty {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
-            Ty::Char => self.builder.ins().ireduce(types::I32, raw),
-            Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+            // Plan C addendum (Char) — boxed Char is pointer-typed.
+            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
             // Plan D Task 117 — Continuation in a user-type field
             // would require storing k in a heap record, which the
             // E0145 escape barrier rejects at typecheck.
@@ -24568,8 +24579,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 crate::ast::EnvSlotKind::Bool
                 | crate::ast::EnvSlotKind::Byte
                 | crate::ast::EnvSlotKind::Unit => types::I8,
-                crate::ast::EnvSlotKind::Char => types::I32,
-                crate::ast::EnvSlotKind::String
+                // Plan C addendum (Char) — boxed Char is pointer-typed.
+                crate::ast::EnvSlotKind::Char
+                | crate::ast::EnvSlotKind::String
                 | crate::ast::EnvSlotKind::Closure
                 | crate::ast::EnvSlotKind::User => self.pointer_ty,
             },
