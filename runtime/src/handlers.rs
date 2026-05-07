@@ -1504,16 +1504,140 @@ pub unsafe extern "C" fn sigil_continuation_identity(
     );
     // SAFETY: caller (codegen tail-k lowering or synth-cont post-arm-k
     // dispatch) guarantees args_ptr points to >= 1 readable u64
-    // holding the captured arg at slot 0. Trailing slots, if any
-    // (Slice A's post-arm-k pair at slots 1..3), are ignored —
-    // identity is the terminal continuation.
+    // holding the captured arg at slot 0.
     let value = *args_ptr;
+    // Plotkin fix — when called as the k_fn for an arm's k-call with
+    // a multi-shot post_arm_k chain trailing pair (args_len == 3 with
+    // a non-null, non-identity fn at slot 2), dispatch through the
+    // trailing pair so chain step_0 fires. This is necessary for
+    // tail-perform body shapes (e.g., `body() => perform Effect.op()`)
+    // where the body has no chain step that would otherwise push the
+    // trailing pair onto OUTER_POST_ARM_K via the
+    // `outer_post_arm_k_push_ref` call at codegen.rs:16014. Without
+    // this dispatch, the arm's `k(arg)` lands here (the identity k_fn
+    // selected by `lower_handle_body_direct_cps_call` / Sync-side
+    // body call), and chain step_0 is silently dropped — the multi-
+    // shot enumeration produces only the first branch's value.
+    if args_len == 3 {
+        let post_arm_k_closure = *args_ptr.add(1) as *mut u8;
+        let post_arm_k_fn = *args_ptr.add(2) as *mut u8;
+        let self_addr = sigil_continuation_identity as *mut u8;
+        if !post_arm_k_fn.is_null() && post_arm_k_fn != self_addr {
+            let ns = sigil_next_step_call(post_arm_k_closure, post_arm_k_fn, 1);
+            let ns_args = sigil_next_step_args_ptr(ns);
+            ns_args.write(value);
+            return ns;
+        }
+    }
     sigil_next_step_done(value)
 }
 
 // ---------------------------------------------------------------------
 // Builtin top-level handler arm fns (Plan B Task 57)
 // ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
+// Plotkin fix — continuation wrapper for OUTER_POST_ARM_K save
+// ---------------------------------------------------------------------
+
+/// CPS function that re-pushes a saved OUTER_POST_ARM_K entry and then
+/// delegates to an inner continuation. Used by `sigil_perform` when a
+/// perform crosses handlers AND OUTER_POST_ARM_K has entries — those
+/// entries belong to the inner-handler chain that the perform crosses
+/// through; consuming them at the outer-handler arm's Done would
+/// dispatch the wrong value to the inner chain. Instead, perform pops
+/// all entries and embeds them into a chain of wrappers around the
+/// captured continuation. When the continuation is eventually invoked
+/// (e.g., via the outer arm's lambda `fn(s) => k(s)(s)` body), the
+/// wrappers re-push the entries in the original bottom-to-top order
+/// before delegating to the original continuation. This preserves the
+/// inner chain across the outer-handler termination boundary.
+///
+/// Closure layout (TAG_CLOSURE, count=5, bitmap=0b01010):
+///   offset  8: code_ptr (null — never read; required by closure ABI)
+///   offset 16: inner_closure (GC ptr — bitmap bit 1)
+///   offset 24: inner_fn (code addr — bit 2 clear)
+///   offset 32: saved_closure (GC ptr — bitmap bit 3)
+///   offset 40: saved_fn (code addr — bit 4 clear)
+#[no_mangle]
+pub unsafe extern "C" fn sigil_k_continuation_wrapper(
+    closure_ptr: *mut u8,
+    args_ptr: *const u64,
+    args_len: u32,
+    _terminal_out: *mut TerminalResult,
+) -> *mut NextStep {
+    let inner_closure = *(closure_ptr.add(16) as *const *mut u8);
+    let inner_fn = *(closure_ptr.add(24) as *const *mut u8);
+    let saved_closure = *(closure_ptr.add(32) as *const *mut u8);
+    let saved_fn = *(closure_ptr.add(40) as *const *mut u8);
+
+    sigil_outer_post_arm_k_push(saved_closure, saved_fn);
+
+    let ns = sigil_next_step_call(inner_closure, inner_fn, args_len);
+    let ns_args = sigil_next_step_args_ptr(ns);
+    for i in 0..args_len as usize {
+        ns_args.add(i).write(*args_ptr.add(i));
+    }
+    ns
+}
+
+/// Pop all OUTER_POST_ARM_K entries and build a chain of wrapper
+/// closures around `(k_closure, k_fn)`. When the outermost wrapper is
+/// invoked, it re-pushes entries in the original bottom-to-top order
+/// before delegating to the original continuation. Returns
+/// `(k_closure, k_fn)` unchanged when OUTER_POST_ARM_K is empty.
+unsafe fn wrap_continuation_with_outer_post_arm_k(
+    k_closure: *mut u8,
+    k_fn: *mut u8,
+) -> (*mut u8, *mut u8) {
+    use crate::gc::sigil_alloc;
+
+    let depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    if depth == 0 {
+        return (k_closure, k_fn);
+    }
+
+    // Pop all entries (top-first). entries[0] = top, entries[count-1]
+    // = bottom.
+    let mut entries: [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] =
+        [OuterPostArmKEntry {
+            closure_ptr: ptr::null_mut(),
+            fn_ptr: ptr::null_mut(),
+        }; OUTER_POST_ARM_K_STACK_SIZE];
+    let mut count = 0usize;
+    while let Some(entry) = outer_post_arm_k_try_pop() {
+        entries[count] = entry;
+        count += 1;
+    }
+
+    let wrapper_fn_addr = sigil_k_continuation_wrapper as *mut u8;
+    let mut current_closure = k_closure;
+    let mut current_fn = k_fn;
+
+    // Iterate from top (i=0) to bottom (i=count-1). Each wrapper
+    // pushes its saved entry then delegates to the previous wrapper
+    // (or original k). Execution order: outermost (= bottom-saved)
+    // pushes bottom entry first, innermost (= top-saved) pushes top
+    // entry last → restored stack = [bottom..top] = original.
+    for i in 0..count {
+        // bitmap=0b01010: bits 1 and 3 set (inner_closure at slot 1,
+        // saved_closure at slot 3 are GC-managed pointers). Slot 0 is
+        // code_ptr (null), slot 2 is inner_fn (code addr), slot 4 is
+        // saved_fn (code addr).
+        let h = Header::new(TAG_CLOSURE, 5, 0b01010);
+        let wrapper = sigil_alloc(h.raw(), 40);
+        *(wrapper.add(8) as *mut *mut u8) = ptr::null_mut();
+        *(wrapper.add(16) as *mut *mut u8) = current_closure;
+        *(wrapper.add(24) as *mut *mut u8) = current_fn;
+        *(wrapper.add(32) as *mut *mut u8) = entries[i].closure_ptr;
+        *(wrapper.add(40) as *mut *mut u8) = entries[i].fn_ptr;
+
+        current_closure = wrapper;
+        current_fn = wrapper_fn_addr;
+    }
+
+    (current_closure, current_fn)
+}
 
 /// Plan B Task 57 — runtime-side default handler for `IO.println`.
 ///
@@ -1876,6 +2000,25 @@ pub unsafe extern "C" fn sigil_perform(
                 );
                 std::process::abort();
             }
+            // Plotkin fix — when this perform crosses handlers AND
+            // OUTER_POST_ARM_K has entries, the entries belong to the
+            // inner-handler chain that this perform crosses through.
+            // Consuming them at the outer-handler arm's Done would
+            // dispatch the wrong value (e.g., State arm's lambda
+            // closure) to the inner arm chain (which expects body's
+            // natural value). Wrap the continuation: pop all entries
+            // and embed them into a chain of wrapper closures. When
+            // the continuation is later invoked (by the outer arm
+            // calling k(s)), the wrappers re-push the entries, then
+            // the inner chain runs correctly.
+            let (actual_k_closure, actual_k_fn) = if crossed
+                && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0
+            {
+                wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
+            } else {
+                (k_closure_ptr, k_fn_ptr)
+            };
+
             // Build a NextStep::Call to the arm with the args followed
             // by (k_closure_ptr, k_fn_ptr) packed as two u64s. The arm
             // prologue (Task 55 codegen) reads the trailing two slots
@@ -1891,8 +2034,8 @@ pub unsafe extern "C" fn sigil_perform(
                 ns_args.add(i).write(*args_ptr.add(i));
             }
             // Append k_closure_ptr, k_fn_ptr.
-            ns_args.add(args_len as usize).write(k_closure_ptr as u64);
-            ns_args.add(args_len as usize + 1).write(k_fn_ptr as u64);
+            ns_args.add(args_len as usize).write(actual_k_closure as u64);
+            ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
             return ns;
         }
         frame = (*frame).prev;
