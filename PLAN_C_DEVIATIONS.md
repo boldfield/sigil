@@ -683,3 +683,69 @@ The current path-4 stdlib wrappers are a clean bridge: the future architectural 
 **Failure mode.** A user who pokes through stdlib source and discovers `perform Fs.read_file(p)` (the raw effect op) gets a `(Int, String)` tuple back, which won't pattern-match against `Result[..]`. Workaround: call the wrapper `read_file(p)` (the canonical surface).
 
 **Implementing commit(s).** [plan-c-cli-effects branch].
+
+## 2026-05-07 — [DEVIATION Task TCO-3] User-fn tail calls are NOT tail-call-optimized — `return_call` is never emitted
+
+**Context.** Plan `done/2026-05-07-01-sigil-tco-verify.md` ran the diagnostic e2e tests added in TCO-1 (`tail_recursive_count_down_one_million`, `tail_recursive_mutual_ping_pong_one_million` — match-arm tail recursion in `![]` Sync-ABI fns, depth 1,000,000). CI verdict on `plan-c-tco-verify` (PR #108):
+
+| target | result |
+|---|---|
+| `build + test (ubuntu-24.04)` x86_64 | **PASS** |
+| `cold-checkout test (ubuntu-24.04)` x86_64 | **PASS** |
+| `build + test (macos-14)` aarch64 | **FAIL** — exit code `-1`, empty stderr (signal-kill, classic stack overflow) |
+| `cold-checkout test (macos-14)` aarch64 | **FAIL** — same |
+
+The Linux pass is **not** evidence of TCO. It is incidental: x86_64 callee-saved-register frames at trivial recursion are small enough that 1M frames happen to fit inside the 8 MB default thread stack. aarch64 frames are larger (different callee-saved set, different prologue spill pattern), and the same recursion overflows. A diagnostic at depth 1.5M would surface the same failure on Linux.
+
+**Diagnosis.** Audited `compiler/src/codegen.rs`:
+
+- Zero `return_call` or `return_call_indirect` emissions exist in the file. The grep `\.return_call(` returns no hits; the only `return_call` substring match (line 19829) is a Rust local variable named `set_return_call` whose RHS is a regular `.ins().call(self.handler_frame_set_return_ref, ...)` — i.e., a normal call to the runtime helper that registers a handler return arm. It is not a tail-call IR emission.
+- `Lowerer::lower_call` (line 21604) has no `TailPos` / `is_tail_position` parameter and does no tail-position detection. The `UserFnAbi::Sync` direct-call branch (line ~21759) unconditionally emits `self.builder.ins().call(func_ref, &all_args)` and uses `inst_results(call)[0]` as a value. The `UserFnAbi::Cps` branch (line ~21850) similarly emits `.ins().call(...)` for the CPS-shape callee.
+- The closure-indirect path (line 23178) unconditionally emits `.ins().call_indirect(sig_ref, code_ptr, &all_args)`, also non-tail.
+- The 35+ "tail position" string mentions in `codegen.rs` all refer to perform-site / continuation-resume tail-position detection (Plan B's `is_simple_let_yield_then_pure_tail_body` colorer-side classifier and friends), not user-fn-call tail-position detection. They drive whether a `perform … ; tail` body lowers as a chained-let-yield Cps shape, not whether the *recursive call* in a fn body is a tail call.
+
+**Conclusion.** Sigil's user-fn calls are never tail-call-optimized. The lack of stack overflow on x86_64 at 1M depth is incidental. Programs that recurse deeper than the per-platform / per-frame-size budget will overflow on either platform. The plan's "Branch A is the expected outcome" forecast is wrong; the codegen evidence the design doc cites (the existing `set_return_call` mention) is a false positive — it was the runtime helper name, not Cranelift IR.
+
+**Affected shapes (verified failing on macOS aarch64):**
+
+- ✗ Self-recursive Sync ABI, `match`-arm tail position (`count_down`).
+- ✗ Mutual-recursive Sync ABI, `match`-arm tail position (`ping` ⇄ `pong`).
+
+**Affected shapes (not yet diagnosed — TCO-4 must verify before fixing):**
+
+- Self-recursive Sync ABI, `if`-arm tail position.
+- Mutual-recursive Sync ABI, `if`-arm tail position.
+- Self/mutual-recursive **Cps ABI** at depth. The trampoline (`sigil_run_loop`) is plausibly stack-bounded for chained-let-yield-shape Cps fns but **was never measured for direct user-fn-call tail recursion through Cps fns**. A separate Cps-shape diagnostic test at depth 1M (e.g., a Cps fn whose only `perform` is a single `State.get` and which tail-recurses) is needed before TCO-4 can claim Cps coverage; the plan's note "verify the trampoline-based dispatch already provides effective TCO for Cps" is the unverified premise.
+- Tail recursion through `let x = … ; tail_call(x)` (let-block-tail position) — the lowerer would need to detect that the let body's tail expression is the recursive call.
+
+**Proposed fix surface (per Plan TCO-4, not yet implemented).**
+
+1. `compiler/src/codegen.rs`: introduce `enum TailPos { Tail, NonTail }` (or `bool is_tail`), threaded as a new parameter through:
+   - `lower_expr(e, ctx)` — pivots all dispatch on `ctx`.
+   - `lower_block(b, ctx)` — non-tail stmts are `NonTail`; the trailing tail expression inherits `ctx`.
+   - `lower_match(scrut, arms, ctx)` — `scrut` is `NonTail`; each arm body inherits `ctx`.
+   - `lower_if(cond, then_b, else_b, ctx)` — `cond` is `NonTail`; `then_b` and `else_b` inherit `ctx`.
+   - `lower_let(binding, body, ctx)` — `binding.value` is `NonTail`; `body` inherits `ctx`.
+   - `lower_call(callee, args, ctx)` — `args` are `NonTail`; the call itself inspects `ctx`.
+   - `lower_fn_body(body)` — top-level entry that seeds `ctx = Tail`.
+2. At `lower_call` direct-Sync branch (~21759): when `ctx == Tail`, emit `.ins().return_call(func_ref, &all_args)` instead of `.ins().call(...)` and skip the `inst_results` extraction (Cranelift's `return_call` does not produce results — it transfers control out of the current frame). The enclosing block must NOT then emit a `return` — Cranelift validates that a block ending in `return_call` has no successor instruction.
+3. Indirect path (~23181): same treatment with `.ins().return_call_indirect(sig_ref, code_ptr, &all_args)`.
+4. CPS direct-call branch (~21850): more delicate. The CPS callee returns `*mut NextStep`, which the *caller* unwraps via `sigil_run_loop`. A naive `return_call` here would skip the `run_loop` driver and leak NextStep state. The architectural lift here is either (a) require Cps tail calls to forward through a single shared `run_loop` instance (i.e., the trampoline already running in the caller, so a `return_call` to the next CPS fn is safe because the trampoline catches the result), OR (b) leave Cps tail calls non-TCO'd and rely on the trampoline's NextStep dispatch to provide effective TCO via continuation-passing. The trampoline path's empirical depth limit needs measurement before TCO-4 ships.
+5. Cranelift versions: `return_call` lands cleanly on x86_64 + aarch64 in cranelift-codegen ≥ 0.94. Verify the Sigil workspace's pinned cranelift version supports both targets before relying on emission. (Workspace `Cargo.toml` lock should be checked.)
+
+**Why accepted (this deviation).** The plan's design-doc forecast (Branch A — "expected outcome") was based on a misread of `set_return_call` in codegen.rs. The actual codegen has no TCO. TCO-3's plan-required action is "pause for human review before proceeding to TCO-4" — fix scope is architectural (a TailPos thread through the entire `lower_expr` family is non-trivial; the Cps branch is genuinely uncertain), and the plan body explicitly carves out the pause as the gate. This deviation is the surface that asks: do we proceed with TCO-4 as scoped, or scope-down (e.g., Sync-only first), or rescope entirely (e.g., document the limit + add a depth-bounded recursion lint)?
+
+**Open questions for the human reviewer:**
+
+1. **Cps coverage gate.** TCO-4 as written claims Cps + Sync coverage. The trampoline's depth behavior under tail-recursive Cps fns is unverified. Should TCO-4 require an additional Cps-shape diagnostic (depth-1M tail-recursive Cps fn with a single `perform State.get`) **before** the fix lands, or should TCO-4 ship Sync-only and treat Cps-TCO as a separate follow-up?
+2. **"No partial-TCO" guardrail.** The plan declares: "If TCO-4 ships, it covers self + mutual + Cps + Sync." Sync-only-then-Cps would violate this guardrail. Three options:
+   - (a) Hold TCO-4 until Cps shape is diagnosed and fixable in one PR.
+   - (b) Relax the guardrail to "self + mutual + Sync now; Cps follow-up in a numbered Plan C addendum".
+   - (c) If Cps tail recursion via the trampoline is *already* depth-bounded (just not measured), document that as the Cps TCO mechanism and ship Sync `return_call` as the gap-closer.
+3. **Stack-depth assertions in the e2e tests.** The current TCO-1 tests pass at depth 1M on Linux x86_64 today *despite no TCO* because the program incidentally fits in the default 8 MB thread stack. If TCO-4 ships, should the regression tests bump the depth (10M? 100M?) so a future TCO regression can't pass-by-incidental-stack-fit on x86_64 the way today's evidence is misleading?
+
+**Closure path.** This deviation closes when the human reviewer signs off on TCO-4's scope (or rescopes / closes the plan). The plan stays in `in-progress/` until then.
+
+**Failure mode.** Without TCO-4 (or a successor), Sigil's recursion-only iteration model is depth-bounded by default thread stack divided by per-frame size. Today: ~1M depth on x86_64 Linux, sub-1M on aarch64 macOS. Future LLM-authored programs that recurse over large structures (fold over a 10M-element list, walk a 5M-node tree) will silently overflow at runtime — no diagnostic, just a SIGSEGV process exit. The fight-the-priors guardrail (no `for`/`while`/`loop`) is load-bearing here: there is no escape hatch for the user.
+
+**Implementing commit(s).** [HEAD] (this commit lands the deviation entry alongside TCO-1's diagnostic tests; TCO-4's implementing commits gated on human signoff).
