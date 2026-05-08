@@ -13672,6 +13672,42 @@ fn tco4_debug_cps_colored_count_down_one_hundred_thousand() {
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
 
+// Isolation: handler installed INSIDE the recursive fn, not in
+// main. Each iteration pushes/pops its own handler frame for the
+// perform; the original count_down_cps test has main install ONE
+// frame and count_down_cps recurses under it. If this test passes
+// at 100K but the original fails, the leak is "stable handler
+// frame across recursion"-specific (something about the long-lived
+// frame interacting with the perform machinery). If it fails at
+// the same depth, the leak is per-perform regardless of frame
+// lifetime.
+
+#[test]
+fn tco4_diag_cps_colored_handler_inside_at_one_hundred_thousand() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps_handle_inside(n: Int) -> Int ![] {\n  \
+                 let _: Int = handle (perform State.get()) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps_handle_inside(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down_cps_handle_inside(100000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "tco4_diag_cps_colored_handler_inside_at_one_hundred_thousand",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
 // Isolation: tail-recursive Sync fn with TWO intervening Cranelift
 // builtin calls per iteration. Same number of `.call(...)` sites
 // per iter as `count_down_cps`'s perform site (sigil_perform +
