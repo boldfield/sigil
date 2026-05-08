@@ -3843,12 +3843,17 @@ impl Tc {
                     "E0145",
                     span.clone(),
                     format!(
-                        "continuation `k` cannot escape its handle's arm body — tried to \
-                         use a value of type `{}` where `{}` was expected. Keep `k` inside \
-                         the handle's arm body (do not store it in a record/ctor field, \
-                         pass it to a function expecting a non-continuation parameter, or \
-                         return it from a function whose declared return type is not a \
-                         continuation)",
+                        "continuation `k` cannot escape its handle's arm body — tried \
+                         to use a value of type `{}` where `{}` was expected. `k` is \
+                         dynamic-extent: it remains valid only while the arm body that \
+                         introduced it is executing. Reifying `k` (storing it, returning \
+                         it, passing it to a non-Continuation parameter) would let it \
+                         outlive the arm. Keep all `k` uses inline in the arm body — \
+                         invoke `k(arg)` and use its result directly, or use the \
+                         multi-shot let-chain shape `{{ let r1 = k(a); let r2 = k(b); \
+                         pure_tail }}` (with `resumes: many` on the effect). \
+                         First-class `k` (passing `k` as a value through helpers) is \
+                         deferred to v2.",
                         ty_display(&a),
                         ty_display(&b)
                     ),
@@ -5911,11 +5916,14 @@ impl Tc {
                         "E0145",
                         arg_span.clone(),
                         "continuation `k` cannot escape its handle's arm body — \
-                         passing `k` to a generic-typed parameter would propagate \
-                         Continuation through the generic instantiation, escaping \
-                         the arm body's dynamic extent. Keep `k` inside the \
-                         handle's arm body (do not pass it to a function whose \
-                         parameter type is a generic type variable)"
+                         passed to a generic-typed parameter, which would let `k` \
+                         flow through the generic instantiation into a context \
+                         where the arm's frame may have been popped. Pass `k`'s \
+                         result instead: invoke `k(arg)` first, then pass the \
+                         resumed value. If you need to express \"a function that \
+                         takes a continuation,\" the parameter type must be \
+                         `Continuation[op_ret, ret]` explicitly — but that surface \
+                         (passing `k` through helpers) is deferred to v2."
                             .to_string(),
                     );
                     continue;
