@@ -16049,6 +16049,28 @@ mod tests {
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
+    // ===== Plan C addendum (Tier 2) — `std.string` source-level helpers =====
+
+    #[test]
+    fn import_std_string_codepoint_helpers_typecheck_cleanly() {
+        // Pin the Tier 2 follow-up `string_split` / `string_replace`
+        // source-level helpers added to `std.string`. The module
+        // moved off `BUILTIN_INJECTED` so its source is parsed at
+        // import time; the existing builtin String surface
+        // (`string_concat`, `string_length`, etc.) continues to be
+        // registered via `register_builtin_string_schemes`.
+        let src = "import std.string\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _parts: List[String] = string_split(\"a,b,c\", \",\");\n  \
+                     let _replaced: String = string_replace(\"hello\", \"ell\", \"ELL\");\n  \
+                     let _empty_sep: List[String] = string_split(\"abc\", \"\");\n  \
+                     let _empty_find: String = string_replace(\"abc\", \"\", \"X\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
     // ===== Plan C addendum (Stage SET) — `std.set` =====
 
     #[test]

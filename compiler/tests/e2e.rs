@@ -15140,6 +15140,189 @@ fn std_int_sub_safe_at_int_min_special_case() {
     );
 }
 
+// ===== Plan C addendum (Tier 2) — `std.string` source-level helpers =====
+//
+// `string_split` / `string_replace` are pure-Sigil helpers added to
+// `std.string`'s loaded source (the module was moved off
+// `BUILTIN_INJECTED` to make this possible). Codepoint-correct for
+// valid UTF-8 by virtue of byte-level substring matching (UTF-8's
+// self-synchronizing property).
+
+#[test]
+fn std_string_split_basic_three_way() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_split(\"a,b,c\", \",\") {\n    \
+                   Cons(p1, Cons(p2, Cons(p3, Nil))) => {\n      \
+                     perform IO.println(p1);\n      \
+                     perform IO.println(p2);\n      \
+                     perform IO.println(p3);\n    \
+                   },\n    \
+                   _ => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "a\nb\nc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_split_no_match_returns_singleton() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_split(\"abc\", \"z\") {\n    \
+                   Cons(p, Nil) => perform IO.println(p),\n    \
+                   _ => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_no_match");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "abc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_split_empty_input_returns_singleton_empty() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_split(\"\", \",\") {\n    \
+                   Cons(p, Nil) => perform IO.println(string_concat(\"[\", string_concat(p, \"]\"))),\n    \
+                   _ => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_empty_input");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[]\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_split_empty_separator_is_noop() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_split(\"abc\", \"\") {\n    \
+                   Cons(p, Nil) => perform IO.println(p),\n    \
+                   _ => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_empty_sep");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "abc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_split_leading_and_trailing_separators_yield_empty_parts() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(length(string_split(\",a,\", \",\"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_lead_trail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // ",a," splits to ["", "a", ""] — three parts.
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_split_multibyte_utf8_preserves_codepoints() {
+    let src = "import std.string\n\
+               import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 match string_split(\"café,日本,abc\", \",\") {\n    \
+                   Cons(p1, Cons(p2, Cons(p3, Nil))) => {\n      \
+                     perform IO.println(p1);\n      \
+                     perform IO.println(p2);\n      \
+                     perform IO.println(p3);\n    \
+                   },\n    \
+                   _ => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_split_utf8");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "café\n日本\nabc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_basic() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"hello\", \"ell\", \"ELL\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hELLo\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_multiple_occurrences() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"aaa\", \"a\", \"bb\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_multi");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "bbbbbb\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_no_match_is_identity() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"xyz\", \"q\", \"Q\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_no_match");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "xyz\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_empty_find_is_noop() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"abc\", \"\", \"X\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_empty_find");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "abc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_empty_input() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"\", \"x\", \"y\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_empty_input");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Empty input → empty output, then the println adds \n.
+    assert_eq!(stdout, "\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_string_replace_multibyte_utf8() {
+    let src = "import std.string\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(string_replace(\"café-pause-café\", \"café\", \"tea\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_replace_utf8");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "tea-pause-tea\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C addendum (Stage FMT) — `std.format` =====
 
 #[test]
