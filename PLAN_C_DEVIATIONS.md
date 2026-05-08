@@ -842,3 +842,90 @@ match tail_result {
 **Failure mode.** If a future codegen change introduces a path that emits `return_call` outside the four guards above (direct user-fn Ident + Sync ABI + matching signature + tail position propagated through Block/Match/Call only), Cranelift's verifier rejects the IR at finalize time and every test using the affected lowering crashes loudly. The fallback path (non-tail `lower_call`) is correctness-safe at the cost of one stack frame per recursion level; missed tail-call detection is a slow-not-broken regression.
 
 **Implementing commit(s).** [HEAD] (TCO-4 implementing commit; closes the TCO-3 + TCO-3-follow-up + TCO-4 deviations).
+
+## 2026-05-08 — [DEVIATION Task TCO-4 in-flight] Cps-colored recursion still depth-bounded — root cause: nested `sigil_run_loop` per Cps→Cps tail call in synth_cont's body
+
+**Context.** TCO-4 ships Sync-only `return_call` for direct user-fn tail calls. Pure-Sync recursive shapes pass at depth 10M. The Cps-colored test `tail_recursive_cps_colored_count_down_one_million` still fails (test stays in CI as-is, not `#[ignore]`'d, per the user's "honest CI visibility" directive while the architectural fix is investigated).
+
+**Diagnostic walk** (PR #108 commits `910ad82` → `4f01ac9`):
+
+| test | result | depth |
+|---|---|---|
+| pure-Sync count_down (no perform) | PASS | 10M |
+| mutual ping/pong (Sync, no perform) | PASS | 10M |
+| Sync with `mut_array_get` per iter (`![Mem]` row) | PASS | 10M |
+| Sync with TWO builtin calls per iter (matches perform's call shape) | PASS | 10M |
+| handler-IN-MAIN with NO perform inside recursive fn | PASS | 10M |
+| handler-INSIDE recursive fn (per-iter push/pop + perform) | PASS | 1M |
+| **`count_down_cps` (handler-IN-MAIN + perform-per-iter)** | **FAIL** | **1K passes; 100K fails; 1M fails** |
+
+The discriminator data narrowed the leak to "long-lived handler frame in main × per-iter perform inside the recursive fn." A `SIGIL_DUMP_IR` env-var-controlled Cranelift-IR dump pinned the actual mechanism.
+
+**Root cause.** `count_down_cps` is **`UserFnAbi::Cps`** (chained-let-yield), NOT `UserFnAbi::Sync`. The body shape `let _ = perform State.get(); match { … recurse(n-1) }` matches `is_simple_chained_let_yield_then_pure_tail_body` because `expr_is_pure`'s `Call` arm's permissive constructor handling lets the recursive arm pass the classifier (my earlier analysis was wrong). The Cranelift IR for count_down_cps's body (Cps ABI, SystemV CC):
+
+```text
+function u0:147(closure, args_ptr, args_len, terminal_out) -> *NextStep system_v {
+    block0(v0, v1, v2, v3):
+        v4 = load.i64 v1                      ; n
+        v5 = func_addr fn130                  ; synth_cont addr
+        v8 = call sigil_alloc(0x10403, 32)    ; alloc synth_cont closure
+        store v9, v8+8 ; null code_ptr
+        store v4, v8+16 ; capture n
+        store v1+8, v8+24 ; capture caller's k_closure
+        store v1+16, v8+32 ; capture caller's k_fn
+        v16 = call sigil_perform(6, 0, null, 0, v8 /*k_closure*/, v5 /*k_fn=synth_cont*/)
+        return v16 ; return *mut NextStep
+}
+```
+
+count_down_cps's body returns a `NextStep::Call(get_arm, [], k=synth_cont/fn130)`. The trampoline dispatches the get-arm; the get-arm returns `NextStep::Call(synth_cont, [0])`; the trampoline dispatches `synth_cont`. `synth_cont`'s body lowers the original tail expression — the `Match`. For the recursive arm `count_down_cps(n - 1)`, codegen invokes `lower_call`'s **Cps direct branch** (`compiler/src/codegen.rs:22214+`). That branch:
+
+1. Packs args + (null, identity) trailing pair into a stack slot.
+2. Calls the Cps fn → `*mut NextStep`.
+3. Pushes `body_return_arm`.
+4. **Calls `sigil_run_loop` (a NESTED trampoline drive)**.
+5. Pops `body_return_arm`.
+6. Narrows the result.
+
+**Step 4 is the leak.** Each Cps→Cps call from a Cps fn's body nests a fresh `sigil_run_loop` invocation. Each nested run_loop is a Rust stack frame. 100K iterations of count_down_cps → 100K nested run_loops → ~80 bytes/iter from the run_loop's Rust frame → SIGSEGV at 8 MB default thread stack.
+
+This matches the memory `feedback_sigil_trampoline_charter.md` warning verbatim:
+
+> `sigil_run_loop` must stay stack-bounded; do NOT nest it inside arm-body lowering. Lambda-lift continuations.
+
+The chained-let-yield synth_cont's body lowers the recursive arm via the standard `lower_call` path (`codegen.rs:13978: lower_expr(tail_expr)` for the Final-step), which routes a Cps→Cps direct call through the run_loop-nesting wrapper. This is correct for non-tail Cps→Cps calls (the surrounding Sync caller needs the value). For TAIL-position Cps→Cps calls FROM A CPS FN, the right behavior is to return `NextStep::Call(callee, args)` and let the OUTER trampoline iterate — preserving stack-boundedness.
+
+**Why this only manifests for handler-in-main + per-iter perform.** `count_down_cps` is Cps-colored because its body performs a non-IO effect that escapes the fn (handled in main). The `count_down_cps_handle_inside` variant has `handle ... with` *inside* the recursive fn, which DISCHARGES the State effect — the colorer flags the fn `Color::Sync`, the ABI is Sync, my TCO-4 applies, and the recursive call is `return_call` (no nested run_loop). Pure-Sync fns (count_down) have no perform → also Sync ABI → also TCO'd. The unique combination "handler in main × perform per iter (escaping the recursive fn)" is what forces Cps ABI on the recursive fn.
+
+**Affected shapes** (depth-bounded by per-iter run_loop overhead):
+
+- Tail-recursive Cps-ABI fns whose body is `let _ = perform Eff.op(); recurse(...)` shape (chained-let-yield with N=1 + tail Match containing recursive call).
+- More generally: any Cps fn whose tail expression contains a direct call to another Cps fn — the inner call nests a run_loop.
+
+**Unaffected shapes**:
+
+- Pure-Sync recursion (no perform) — TCO'd via `return_call` to unbounded depth.
+- Sync fn calling another Sync fn in tail — TCO'd via `return_call`.
+- Sync fn calling a Cps fn in tail — Sync surrounding fn returns the user value type, not a NextStep, so the synchronous wrapper IS correct (no TCO possible without an ABI change).
+
+**Fix architecture** (deferred to follow-up plan `queue/2026-05-08-sigil-tco-cps-colored-leak.md`):
+
+The fix is at `lower_call`'s Cps direct branch (codegen.rs:~22214) and the synth_cont body emission paths (codegen.rs:13978 for chained-let-yield Final-step). When the surrounding fn returns `*mut NextStep` (Cps ABI) AND the call is in tail position, emit:
+
+```text
+let callee_addr = func_addr callee
+let ns = sigil_next_step_call(null, callee_addr, total_arg_count)
+let ns_args = sigil_next_step_args_ptr(ns)
+copy args + trailing pair into ns_args
+return ns           // surrounding fn returns NextStep::Call directly
+```
+
+Wiring this requires: (a) extending `lower_call_in_tail_pos` to handle the Cps→Cps case when surrounding fn is Cps; (b) routing synth_cont's tail-expression lowering through the tail-position infrastructure (currently `lower_expr` directly).
+
+**Why accepted to ship TCO-4 with this gap.** The fix is architectural (changes synth_cont body emission paths) and out of TCO-4's reasonable scope. Pure-Sync recursion is the canonical use case (data-structure folds, list traversals, parse loops); shipping it now unblocks every LLM-authored program that doesn't put a `perform` inside a recursive fn whose effect escapes to a long-lived handler. The narrow gap is well-documented (this entry + spec §12.1 + the failing CI test as a regression beacon).
+
+**Closure path.** Closes when the follow-up plan ships the Cps→Cps tail-call NextStep::Call return mechanism.
+
+**Failure mode.** A Cps-colored recursive fn whose tail performs a recursive Cps call (the chained-let-yield + match-recurse shape) caps at ~10K-100K iterations on an 8 MB default thread stack. Failure mode: SIGSEGV with empty stderr (generic stack overflow). Workarounds: (a) hoist the perform out of the recursive fn so the inner recursion is pure-Sync; (b) install the handler INSIDE the recursive fn so it's discharged each iteration (forces the colorer to Sync, enabling TCO-4); (c) cap input size with a runtime check.
+
+**Implementing commit(s).** [HEAD] (this entry alongside the failing CI regression beacon; the architectural fix lands in the follow-up plan).

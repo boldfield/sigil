@@ -191,6 +191,9 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
 /// TCO-4 debug — compile with `SIGIL_DUMP_IR` set so codegen prints
 /// the Cranelift IR for matching fns to stderr. Returns `compile.stderr`
 /// (which contains the IR plus any other compile diagnostics).
+/// Currently unused after the IR-dump panic test was removed; kept for
+/// future debugging without re-plumbing the env-var pass-through.
+#[allow(dead_code)]
 fn compile_with_ir_dump(source: &str, test_name: &str, dump_filter: &str) -> String {
     let root = workspace_root();
     let sigil_bin = sigil_binary();
@@ -13797,52 +13800,6 @@ fn tco4_diag_cps_colored_handler_inside_at_one_million() {
         compile_and_run(src, "tco4_diag_cps_colored_handler_inside_at_one_million");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// TCO-4 debug — dump the Cranelift IR for the leaking fn
-// (`count_down_cps`) AND a control fn (`count_down_pure`) in the
-// SAME compilation unit so we can compare side-by-side in CI logs.
-// `count_down_pure` is a pure-Sync recursion (passes at 10M);
-// `count_down_cps` adds a per-iter `perform State.get()` (leaks at
-// 100K). The IR diff should reveal what perform-emission is
-// generating that doesn't get cleaned up by `return_call`'s
-// epilogue. Test passes iff compile succeeds — the panic
-// message at the end forces the captured stderr (containing the
-// IR dump) into the CI log.
-
-#[test]
-fn tco4_diag_dump_ir_for_count_down_pair() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_pure(n: Int) -> Int ![] {\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_pure(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn count_down_cps(n: Int) -> Int ![State, IO] {\n  \
-                 let _: Int = perform State.get();\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_cps(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let r1: Int = count_down_pure(0);\n  \
-                 let r2: Int = handle count_down_cps(0) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(r1 + r2));\n  \
-                 0\n\
-               }\n";
-    let stderr = compile_with_ir_dump(src, "tco4_dump_ir_pair", "count_down");
-    // Force the stderr (with IR dumps) into the test failure output.
-    // This panic is intentional — it surfaces the IR in CI logs so
-    // we can compare the perform-bearing fn vs the pure-Sync fn.
-    panic!(
-        "TCO-4 IR dump (intentional panic to surface stderr in CI logs):\n{}",
-        stderr
-    );
 }
 
 // Isolation: tail-recursive Sync fn with TWO intervening Cranelift
