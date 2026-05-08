@@ -13743,17 +13743,34 @@ fn tail_recursive_through_match_literal_arms() {
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
 
-// PR #108 review MUST-FIX 2 follow-up — Cps→Cps tail recursion under
-// nested handlers. The Cps→Cps tail-call branch in
-// `lower_call_in_tail_pos` forwards the surrounding synth-cont's
+// PR #108 review MUST-FIX 2 + re-review code-review caveat — Cps→Cps
+// tail recursion under nested handlers, with discriminating return-arm
+// and per-iteration inner-handled effect. The Cps→Cps tail-call branch
+// in `lower_call_in_tail_pos` forwards the surrounding synth-cont's
 // incoming `(post_arm_k_closure, post_arm_k_fn)` pair (loaded from
 // `args_ptr+8` / `args_ptr+16`) instead of hardcoding `(null,
-// identity)`. This test composes two handlers (State + Choose) around
-// a tail-recursive Cps fn that performs effects from both rows. The
-// outer Choose handler, the inner State handler, and the recursive
-// fn all participate in the same continuation chain. Pins that
-// terminal values flow through the captured chain at unbounded depth,
-// preserving correctness when the outer continuation is non-identity.
+// identity)`.
+//
+// The test composes two handlers (State + Choose) around a tail-
+// recursive Cps fn that performs BOTH effects every iteration:
+//   - `perform State.get()` (outer-handled — adds State to the row).
+//   - `perform Choose.decide()` (inner-handled — adds Choose).
+// The chained-let-yield body has 2 lets + tail Match, exercising the
+// N=2 chain shape. The recursive arm is a tail Cps→Cps call, routed
+// through the k-forwarding branch.
+//
+// **Discriminating return-arm.** The inner Choose handler has a
+// `return(v) => v + 7` arm that transforms the body's terminal value.
+// Without correct k-forwarding, the recursive call's terminal value
+// would NOT route through the Choose return arm — it would emerge
+// unchanged. With correct k-forwarding (and correct handle-exit
+// dispatch), every recursion's terminal flows through the captured
+// chain, lands on the Choose return arm, and produces v + 7. At depth
+// 10M, the body returns 0 from arm `0 => 0`; the Choose return arm
+// transforms to 7; the State handler passes through unchanged.
+// Expected result: 7. A regression that re-introduces hardcoded
+// (null, identity) or otherwise bypasses the Choose return arm
+// produces 0 (or some other wrong value), failing the assertion.
 
 #[test]
 fn tail_recursive_cps_colored_under_nested_handlers() {
@@ -13761,6 +13778,7 @@ fn tail_recursive_cps_colored_under_nested_handlers() {
                effect Choose { decide: () -> Int }\n\
                fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n  \
                  let _: Int = perform State.get();\n  \
+                 let _: Int = perform Choose.decide();\n  \
                  match n {\n    \
                    0 => 0,\n    \
                    _ => count_down_compose(n - 1),\n  \
@@ -13769,7 +13787,8 @@ fn tail_recursive_cps_colored_under_nested_handlers() {
                fn main() -> Int ![IO] {\n  \
                  let result: Int = handle (\n    \
                    handle count_down_compose(10000000) with {\n      \
-                     Choose.decide(k) => k(0),\n    \
+                     Choose.decide(k) => k(0),\n      \
+                     return(v) => v + 7,\n    \
                    }\n  \
                  ) with {\n    \
                    State.get(k) => k(0),\n    \
@@ -13781,7 +13800,7 @@ fn tail_recursive_cps_colored_under_nested_handlers() {
     let (stdout, stderr, code) =
         compile_and_run(src, "tail_recursive_cps_colored_under_nested_handlers");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
 }
 
 // PR #108 review MUST-FIX 3 — indirect-call TCO via
