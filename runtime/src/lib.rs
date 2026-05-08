@@ -18,6 +18,8 @@
 //!   ArithError handler-arm fns in `handlers` (see below).
 //! - `byte` — Plan A2 task 25: `Byte` conversion and wrapping arith
 //!   primitives.
+//! - `panic` — Plan C addendum: `sigil_panic(msg_ptr) -> !` for
+//!   user-facing `panic` / `assert` (hard abort, not catchable).
 //!
 //! FFI exports for the compiler:
 //!
@@ -70,6 +72,7 @@ pub mod header;
 pub mod int64;
 pub mod io;
 pub mod mem;
+pub mod panic;
 pub mod process;
 pub mod random;
 pub mod stackmap;

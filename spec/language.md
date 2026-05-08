@@ -1249,6 +1249,7 @@ files are the authoritative API reference.
 | `std.raise` | `Raise[E]` effect (generic over error type) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-polymorphic residual). |
 | `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> A ![]`. |
 | `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
+| `std.panic` | Doc-only header for the `panic` / `assert` builtins (see §13.2.1). Importing it is a no-op — both names are available without `import`. |
 
 #### §13.2 — Builtin primitives (not in stdlib modules)
 
@@ -1265,6 +1266,32 @@ These functions are available without any `import`:
 | `byte_in_range(n)` | `(Int) -> Bool ![]` | Range check: `0 <= n < 256`. |
 | `byte_to_int(b)` | `(Byte) -> Int ![]` | Widen byte to integer. |
 | `random_pseudo_int()` | `() -> Int ![]` | Process-global xorshift64. **Not cryptographic.** |
+
+#### §13.2.1 — Diagnostics: `panic` and `assert`
+
+These builtins close the recurring "bail out with a clear message"
+gap without polluting effect rows with `Raise[String]`. Both are
+available without any `import`.
+
+| Function | Type | Description |
+|----------|------|-------------|
+| `panic[A](msg)` | `(String) -> A ![]` | Aborts the program. Writes `msg` to stderr followed by `\n`; exits with status 1. The per-call generic `A` instantiates fresh at each call site (same idiom as `Raise.fail[A]`), so `panic("oops")` typechecks anywhere any expression typechecks. |
+| `assert(cond, msg)` | `(Bool, String) -> Unit ![]` | Sugar over `if cond { unit } else { panic(msg) }`. `assert(true, _)` is a no-op; `assert(false, msg)` calls `panic(msg)`. |
+
+`panic` is a **hard abort**. It is not catchable: there is no
+`catch_panic`, no `try`, no way to observe the abort from sigil
+code. `Raise[E]` (see §13 / `std.raise`) is the catchable error
+mechanism — use it when the caller may want to recover; use
+`panic` when the program's invariants have been violated and
+continuing would be unsafe or nonsensical.
+
+`panic` carries effect row `![]` — aborting is not an effect
+users handle.
+
+`assert` is shipped as a top-level builtin because LLMs reach for
+it specifically; the `if !cond { panic(msg) }` form one inversion
+away has the same semantics, but `assert` is the prior every LLM
+has.
 
 ### §14 — v1 limits
 
@@ -1297,6 +1324,7 @@ The following limits are permanent v1 design choices:
 | Format specifiers (`{:.2}`, `{:>10}`, `{:#x}`) — width, precision, alignment, fill, base prefix | Future format-specifiers plan. v1 ships only positional `{}` (each placeholder consumes the next `FormatArg`); width / precision / alignment / fill / base would extend the placeholder grammar and the per-`FormatArg`-variant render path. |
 | Named args (`{name}`) and positional indices (`{0}`, `{1}`) | Future format-specifiers plan. v1's `{}` is strictly positional — each placeholder consumes the next `FormatArg`. |
 | Compiler-level f-string syntax (`f"x = {x}"`) | Future plan. v1 ships only the runtime `format` family in `std.format`; a compile-time f-string surface would lower to `format` calls but requires lexer + parser changes. |
+| Stack traces on `panic` | Future plan. v1's `panic` prints only the user-supplied `msg` and exits — caller-context information has to be encoded into `msg` itself (or built via `format(...)` + `panic(...)`). Precise stack traces require stackmap v1 content (currently `STACKMAP_VERSION_PLACEHOLDER` per §12); deferred to v2 alongside the precise-GC stackmap rework. |
 
 ### §15 — Build and run
 

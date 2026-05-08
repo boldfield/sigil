@@ -14963,3 +14963,217 @@ fn std_format_trailing_close_brace_at_eof_is_literal() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "done }\n", "stderr={stderr:?}");
 }
+
+// ===== Plan C addendum (Stage PA) — `panic` / `assert` ===============
+
+/// Calling `panic` from main aborts the process: exit status 1,
+/// message + newline on stderr. The runtime primitive
+/// (`runtime/src/panic.rs::sigil_panic`) writes via `std::io::stderr`
+/// and exits via `process::exit(1)`.
+#[test]
+fn panic_aborts_with_message_on_stderr() {
+    let src = "fn main() -> Int ![] {\n  \
+                 panic(\"oops\")\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_aborts_with_message_on_stderr");
+    assert_eq!(code, 1, "panic exits with 1; stderr={stderr:?}");
+    assert!(
+        stderr.contains("oops"),
+        "stderr should contain panic message; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.ends_with("oops\n"),
+        "panic message must be terminated by newline; stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "",
+        "panic should not write to stdout; stdout={stdout:?}"
+    );
+}
+
+/// `panic[A]` instantiates `A` to a sub-pointer-width type (Bool → I8).
+/// All other panic tests use A=Int / A=String, both of which lower to
+/// I64 / pointer_ty (also I64 on 64-bit) — they would not catch a
+/// regression where `lookup_call_callee_ty` returns None for a panic
+/// call and the placeholder silently widens to pointer_ty. With A=Bool
+/// the placeholder must be I8 so the surrounding lowering's downstream
+/// merge / store / branch on the (dead) value stays well-typed in the
+/// Cranelift IR. Pin via the `if` taking the Bool dead value as its
+/// condition; if the placeholder were the wrong width the verifier
+/// rejects the IR before the program ever runs.
+#[test]
+fn panic_returns_a_as_bool_typechecks() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Bool = panic(\"unreachable bool\");\n  \
+                 if b {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_returns_a_as_bool_typechecks");
+    assert_eq!(code, 1, "panic exits with 1; stderr={stderr:?}");
+    assert!(
+        stderr.contains("unreachable bool"),
+        "stderr should contain panic message; stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "",
+        "panic should preempt the IO.println; stdout={stdout:?}"
+    );
+}
+
+/// `panic[A]` instantiates `A` against the surrounding context.
+/// `let x: Int = panic("never"); int_to_string(x)` typechecks (A=Int)
+/// even though the let-binding never produces a real value at runtime —
+/// the panic exits before any code that consumes `x` runs. Verifies the
+/// per-call generic-A return-type pattern is wired correctly through
+/// codegen's `lookup_call_callee_ty` lookup.
+#[test]
+fn panic_returns_a_in_let_typechecks() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let x: Int = panic(\"never\");\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_returns_a_in_let_typechecks");
+    // The program panics before reaching int_to_string, so behavior at
+    // runtime is "abort with message"; the type-level claim being tested
+    // is that compilation succeeds (which the `compile_and_run` harness
+    // panics on otherwise).
+    assert_eq!(code, 1, "panic exits with 1; stderr={stderr:?}");
+    assert!(
+        stderr.contains("never"),
+        "stderr should contain panic message; stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "",
+        "panic should preempt the IO.println; stdout={stdout:?}"
+    );
+}
+
+/// `panic` in a non-tail match arm typechecks against the match's
+/// overall return type (here: `String`). With `k = 0`, the matching arm
+/// returns `"zero"` and the program exits cleanly with stdout `"zero\n"`;
+/// `panic`'s arm is never reached. Pins the codegen invariant that the
+/// post-trap unreachable block does not pollute the merge block's block-
+/// param value flow on the success-path side.
+#[test]
+fn panic_in_match_default_arm_zero_path() {
+    let src = "fn lookup(k: Int) -> String ![] {\n  \
+                 match k {\n    \
+                   0 => \"zero\",\n    \
+                   _ => panic(\"invalid key\"),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(lookup(0));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_in_match_default_arm_zero_path");
+    assert_eq!(code, 0, "k=0 should not panic; stderr={stderr:?}");
+    assert_eq!(stdout, "zero\n", "stderr={stderr:?}");
+}
+
+/// Same fn shape as the zero-path test; with `k = 1` the wildcard arm
+/// fires and `panic` aborts. Verifies the per-call A=String
+/// instantiation lowers correctly when the panic arm is the one taken
+/// at runtime.
+#[test]
+fn panic_in_match_default_arm_panic_path() {
+    let src = "fn lookup(k: Int) -> String ![] {\n  \
+                 match k {\n    \
+                   0 => \"zero\",\n    \
+                   _ => panic(\"invalid key\"),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(lookup(1));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_in_match_default_arm_panic_path");
+    assert_eq!(code, 1, "panic arm should abort; stderr={stderr:?}");
+    assert!(stderr.contains("invalid key"), "stderr={stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "panic should preempt the IO.println; stdout={stdout:?}"
+    );
+}
+
+/// `assert(true, _)` is a no-op; the program continues normally.
+/// Verifies the brif's success branch falls through to the merge block
+/// without hitting the panic-leg.
+#[test]
+fn assert_true_no_op() {
+    let src = "fn main() -> Int ![] {\n  \
+                 assert(true, \"x\");\n  \
+                 42\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "assert_true_no_op");
+    assert_eq!(code, 42, "assert(true, _) is a no-op; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "",
+        "assert should not print on success; stdout={stdout:?}"
+    );
+    assert_eq!(
+        stderr, "",
+        "assert should not print on success; stderr={stderr:?}"
+    );
+}
+
+/// `assert(false, msg)` calls `panic(msg)`. Verifies the brif's
+/// fail branch exits with the same semantics as a direct `panic`.
+#[test]
+fn assert_false_aborts_with_msg() {
+    let src = "fn main() -> Int ![] {\n  \
+                 assert(false, \"bad\");\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "assert_false_aborts_with_msg");
+    assert_eq!(code, 1, "assert(false, _) aborts; stderr={stderr:?}");
+    assert!(
+        stderr.ends_with("bad\n"),
+        "stderr should be `bad\\n`; stderr={stderr:?}"
+    );
+    assert_eq!(stdout, "", "stdout should be empty; stdout={stdout:?}");
+}
+
+/// `assert` works inside a non-main fn; the success path is a real
+/// runtime no-op. Pins the wider lowering — no requirement that
+/// `assert` only appear at top level.
+#[test]
+fn assert_in_function_validation_passes() {
+    let src = "fn validate(n: Int) -> Unit ![] {\n  \
+                 assert(n > 0, \"need positive\")\n\
+               }\n\
+               fn main() -> Int ![] {\n  \
+                 validate(5);\n  \
+                 7\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "assert_in_function_validation_passes");
+    assert_eq!(code, 7, "validate(5) passes; stderr={stderr:?}");
+    assert_eq!(stdout, "", "stdout={stdout:?}");
+}
+
+/// Companion to the passing case: `validate(-1)` triggers the assert's
+/// panic-leg from inside a callee fn frame. Verifies abort propagates
+/// through the call stack — `sigil_panic`'s `process::exit(1)` doesn't
+/// care which fn frame triggered it.
+#[test]
+fn assert_in_function_validation_fails() {
+    let src = "fn validate(n: Int) -> Unit ![] {\n  \
+                 assert(n > 0, \"need positive\")\n\
+               }\n\
+               fn main() -> Int ![] {\n  \
+                 validate(-1);\n  \
+                 7\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "assert_in_function_validation_fails");
+    assert_eq!(code, 1, "validate(-1) aborts; stderr={stderr:?}");
+    assert!(
+        stderr.ends_with("need positive\n"),
+        "stderr should be `need positive\\n`; stderr={stderr:?}"
+    );
+    assert_eq!(stdout, "", "stdout={stdout:?}");
+}

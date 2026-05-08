@@ -1453,6 +1453,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     register_builtin_clock_schemes(&mut tc);
     // Plan C Stage 7 — Int bitwise / shift / abs builtins.
     register_builtin_int_bitwise_schemes(&mut tc);
+    // Plan C addendum (panic / assert) — diagnostic builtins.
+    register_builtin_diagnostic_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -2725,6 +2727,52 @@ fn register_builtin_int_bitwise_schemes(tc: &mut Tc) {
     );
     tc.fn_schemes
         .insert("int_abs".to_string(), make_scheme(vec![Ty::Int], Ty::Int));
+}
+
+/// Plan C addendum (panic / assert) — diagnostic-shaped builtin schemes.
+///
+/// - `panic[A](String) -> A ![]` — hard abort. Per-call generic `A` so
+///   `panic("oops")` typechecks anywhere any expression typechecks (the
+///   same idiom used by `Raise.fail[A]`).
+/// - `assert(Bool, String) -> Unit ![]` — pure check; sugar over
+///   `if cond { unit } else { panic(msg) }`. Concrete signature (no
+///   `forall A`); the lowering's `panic`-leg unifies its A with `Unit`
+///   inside `lower_call`'s assert arm.
+///
+/// Both carry an empty effect row: aborting the program is not an
+/// effect users handle.
+fn register_builtin_diagnostic_schemes(tc: &mut Tc) {
+    {
+        let a = tc.fresh_ty_var();
+        tc.fn_schemes.insert(
+            "panic".to_string(),
+            Scheme {
+                type_vars: vec![a],
+                row_vars: Vec::new(),
+                scope_vars: Vec::new(),
+                body: Ty::Fn(Box::new(FnSig {
+                    params: vec![Ty::String],
+                    ret: Ty::Var(a),
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                })),
+            },
+        );
+    }
+    tc.fn_schemes.insert(
+        "assert".to_string(),
+        Scheme {
+            type_vars: Vec::new(),
+            row_vars: Vec::new(),
+            scope_vars: Vec::new(),
+            body: Ty::Fn(Box::new(FnSig {
+                params: vec![Ty::Bool, Ty::String],
+                ret: Ty::Unit,
+                effects: Vec::new(),
+                effect_row_var: None,
+            })),
+        },
+    );
 }
 
 struct Tc {
@@ -5703,10 +5751,19 @@ impl Tc {
         // wastefully. Resolution happens *after* arg-type unification
         // so generic-param `Ty::Var`s pick up their concrete
         // bindings.
+        //
+        // Plan C addendum (panic / assert) — `panic[A]` is the one
+        // direct-call builtin whose return type is a per-call generic
+        // `A`. Codegen needs the resolved A type to emit a Cranelift
+        // placeholder of the right type after the `sigil_panic` call's
+        // trap (see `lower_call`'s `panic` arm). Force population of
+        // `call_callee_tys` for `panic` calls so the codegen-side
+        // `lookup_call_callee_ty` returns the post-unification `Ty`.
         let is_direct_call = matches!(
             callee,
             Expr::Ident(name, _)
-                if self.fn_schemes.contains_key(name) || self.fn_env.contains_key(name)
+                if (self.fn_schemes.contains_key(name) || self.fn_env.contains_key(name))
+                    && name != "panic"
         );
         if !is_direct_call {
             let resolved_sig = FnSig {
