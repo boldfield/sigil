@@ -13846,3 +13846,37 @@ fn tail_recursive_indirect_mutual_ten_million() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
+
+// =====================================================================
+// Stage MOS — `Ordering`, `list_sort`, and `Map[K, V]`. Plan C addendum.
+//
+// `std.ordering` ships the `Ordering` sum type plus per-type
+// comparators. `std.list` adds `list_sort` (merge sort) and the
+// `list_sort_*` convenience wrappers. `std.map` ships a persistent
+// AA-tree `Map[K, V]`. Tests cover the comparators, sort, and Map
+// operations end-to-end.
+// =====================================================================
+
+/// Pin `Ordering` constructors typecheck and `int_compare` returns
+/// the three states (`Less`, `Equal`, `Greater`). Encodes Less=1,
+/// Equal=2, Greater=3 and exits with the encoded value to assert
+/// each branch fires.
+#[test]
+fn std_ordering_int_compare_basic_three_way() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = encode(int_compare(1, 2));\n  \
+                 let b: Int = encode(int_compare(2, 2));\n  \
+                 let c: Int = encode(int_compare(3, 2));\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
+                 perform IO.println(int_to_string(c));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_int_compare_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n", "stderr={stderr:?}");
+}

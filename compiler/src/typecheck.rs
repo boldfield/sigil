@@ -15790,4 +15790,28 @@ mod tests {
             "expected E0060 (int64 !=); got {errs:?}"
         );
     }
+
+    // ===== Plan C addendum (Stage MOS) — `std.ordering` =====
+
+    #[test]
+    fn import_std_ordering_typechecks_cleanly() {
+        // Pin the Ordering surface end-to-end: import the module,
+        // exercise every per-type comparator, and assert each
+        // returns a value of the shared `Ordering` sum.
+        let src = "import std.ordering\n\
+                   fn encode(o: Ordering) -> Int ![] {\n  \
+                     match o { Less => 1, Equal => 2, Greater => 3 }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _i: Int = encode(int_compare(1, 2));\n  \
+                     let _s: Int = encode(string_compare(\"a\", \"b\"));\n  \
+                     let _c: Int = encode(char_compare('a', 'b'));\n  \
+                     let _b: Int = encode(bool_compare(false, true));\n  \
+                     let _f: Int = encode(float_compare(1.0, 2.0));\n  \
+                     let _l: Int = encode(int64_compare(int64_from_int(1), int64_from_int(2)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }
