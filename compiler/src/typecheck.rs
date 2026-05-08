@@ -1567,7 +1567,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             // construction). The list is read at call-site resolution
             // in `check_call`'s `Expr::Ident` callee lookup; if 2+
             // distinct source files registered the same bare name, the
-            // bare-name lookup is ambiguous and emits E0140.
+            // bare-name lookup is ambiguous and emits E0147.
             let origin = f.span.file.clone();
             let origins = tc.bare_name_origins.entry(f.name.clone()).or_default();
             if !origins.contains(&origin) {
@@ -2863,7 +2863,7 @@ struct Tc {
     /// paths that registered a fn under that name. When a call site
     /// resolves a bare name and finds 2+ source files defining it,
     /// the call is ambiguous (silent-wrong-dispatch class) and
-    /// `check_call`'s callee resolution emits E0140 naming the
+    /// `check_call`'s callee resolution emits E0147 naming the
     /// conflicting modules. Built up by the user-fn pre-pass at
     /// `register_fn_scheme_with_origin`. Builtins (registered in
     /// compiler code via `register_builtin_*_schemes`) do NOT
@@ -5122,13 +5122,13 @@ impl Tc {
                 // key first so a fn body's recursive call to a same-
                 // named sibling-module fn resolves to its own module's
                 // scheme. Falls back to the bare name (Plan C Tier 1
-                // addendum: ambiguous bare-name lookups now emit E0140
+                // addendum: ambiguous bare-name lookups now emit E0147
                 // instead of silently picking last-registered).
                 let file_qualified_hit = self
                     .current_fn_file
                     .as_ref()
                     .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned());
-                let scheme_opt = file_qualified_hit.clone().or_else(|| {
+                let scheme_opt = file_qualified_hit.or_else(|| {
                     // Bare-name fallback path. Check ambiguity BEFORE
                     // returning the last-wins entry: if 2+ source
                     // files registered the same bare name, the lookup
