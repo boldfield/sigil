@@ -1093,13 +1093,15 @@ Tail-call optimization covers:
   for tail-position calls; cross-arity tail calls fall back to a
   non-tail call (one stack frame per call), since Cranelift's
   `return_call` rejects signature mismatches at verifier time.
-- **Cps-colored fns whose body contains tail recursion**. Such fns
-  lower as Sync ABI (the recursive arm fails the `pure_tail`
-  predicate that selects Cps ABI; see `compute_user_fn_abi` in
-  `compiler/src/codegen.rs`); the recursive call routes through
-  the same Sync direct-call branch as pure-Sync recursion. Per-
-  iteration `perform` machinery occurs and unwinds within one
-  iteration's frame, then `return_call` reuses the slot.
+- **Cps-colored fns whose body has the chained-let-yield + tail-
+  match shape** (e.g., `let _ = perform Eff.op(); match { ...
+  recurse }`). Such fns lower as `UserFnAbi::Cps`, but the
+  chained-let-yield Final-step's tail expression goes through
+  tail-position lowering. A recursive Cps→Cps call in a tail
+  match-arm body emits `return_(NextStep::Call(callee, args))`
+  directly. The OUTER trampoline iterates without nesting
+  `sigil_run_loop` per call — stack-bounded to the same
+  unbounded depth as pure-Sync recursion.
 
 Tail-call optimization does **not** apply to:
 
@@ -1107,24 +1109,22 @@ Tail-call optimization does **not** apply to:
   follow-up may extend the optimization to `return_call_indirect`
   when a closure-typed callee in tail position has a signature
   matching the current fn.
-- Calls to Cps-ABI user fns (those returning `*mut NextStep` rather
-  than the user's value type). The Cps ABI wraps each call in a
-  synchronous `sigil_run_loop` driver; tail-jumping over the driver
-  would skip the trampoline. By construction Sigil today has no
-  tail-recursive Cps-ABI fn body shape — the three Cps-ABI body
-  shapes (`is_simple_tail_perform_with_pure_args_body`,
-  `is_simple_yield_then_constant_tail_body`,
-  `is_simple_let_yield_then_pure_tail_body`) all exclude recursive
-  calls in their tail position.
+- Sync→Cps cross-ABI calls in tail position. The surrounding Sync
+  fn returns the user's value type, not `*mut NextStep`; tail-
+  jumping to a Cps callee would lose the trampoline drive that
+  unwraps the NextStep into the user value. Such call sites use
+  the synchronous `sigil_run_loop` wrapper (one nested run_loop
+  per call), which is correct but stack-bounded.
 
 Regression tests in `compiler/tests/e2e.rs` pin the guarantee at
-depth 10,000,000 for pure-Sync shapes (self, mutual, let-block
-tail, if-arm tail, match-arm tail, `Mem`-effect-row body) and
-1,000,000 for the Cps-colored shape (per-iteration `State.get`
-overhead). See `done/2026-05-07-01-sigil-tco-verify.md` and
-`[DEVIATION Task TCO-3 follow-up]` in `PLAN_C_DEVIATIONS.md` for
-the diagnostic-first plan and the architectural rationale behind
-covering Cps-colored fns through the Sync direct-call branch.
+depth 10,000,000 for all seven shapes (Sync self, Sync mutual,
+let-block tail, if-arm tail, match-arm tail, `Mem`-effect-row
+body, AND Cps-colored chained-let-yield with tail recursion).
+See `done/2026-05-07-01-sigil-tco-verify.md` for the
+diagnostic-first plan and `[DEVIATION Task TCO-4 in-flight]` in
+`PLAN_C_DEVIATIONS.md` for the architectural walk through both
+TCO mechanisms (Sync `return_call` and Cps→Cps `NextStep::Call`
+return).
 
 ### §13 — Stdlib reference
 

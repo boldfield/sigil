@@ -13537,26 +13537,26 @@ fn cli_combined_env_and_fs_imports() {
 //
 // Plan: `done/2026-05-07-01-sigil-tco-verify.md` in `boldfield/designs`.
 //
-// Three diagnostic tests (TCO-1) plus four shape-coverage tests (TCO-4)
-// pin Sigil's user-fn tail-call optimization. Pre-TCO-4, the diagnostic
-// tests overflowed at depth 1M (frame size × 1M frames > 8 MB default
-// thread stack); post-TCO-4, `lower_call`'s Sync direct branch emits
-// Cranelift `return_call` for tail-position user-fn calls, eliminating
-// the per-iteration frame entirely. Depth 10M is past any default
-// thread stack budget (× any plausible per-frame size), so a future
-// regression that loses TCO can't pass-by-incidental-stack-fit on
-// either Linux x86_64 or macOS aarch64.
+// Sigil's user-fn tail-call optimization spans two mechanisms, both
+// pinned at depth **10,000,000** here:
 //
-// `count_down_cps` keeps its 1M depth: per-call `perform State.get()`
-// drives a synchronous `sigil_run_loop` dispatch (~hundreds of cycles
-// per iteration); 10M iterations would push CI runtime past sensible
-// bounds without adding regression signal. 1M is enough to demonstrate
-// that TCO survives Cps-colored Sync-ABI body shapes (the recursive
-// call routes through the same Sync direct-call branch the pure-Sync
-// tests pin; per-perform machinery occurs and unwinds within one
-// iteration's frame, then `return_call` reuses the slot). See
-// `[DEVIATION Task TCO-3 follow-up]` in `PLAN_C_DEVIATIONS.md` for
-// the full Cps coverage analysis.
+// 1. **Sync→Sync** (pure-Sync recursive shapes — count_down,
+//    ping/pong, let-intermediate, through-if, through-match,
+//    with-effect-row). `lower_call_in_tail_pos`'s Sync→Sync branch
+//    emits Cranelift `return_call`, eliminating the per-iteration
+//    C frame entirely.
+//
+// 2. **Cps→Cps via trampoline** (Cps-colored body with `let _ =
+//    perform; match { ... recurse }` shape — count_down_cps). The
+//    chained-let-yield Final-step's tail expression goes through
+//    `lower_expr_in_tail_pos`; the recursive Match-arm body emits
+//    `return_(NextStep::Call(callee, args))` so the OUTER trampoline
+//    iterates without nesting `sigil_run_loop` per call.
+//
+// Depth 10M is past any default thread stack budget × any plausible
+// per-frame size, so a future regression that loses either TCO
+// mechanism can't pass-by-incidental-stack-fit on either Linux
+// x86_64 or macOS aarch64.
 
 #[test]
 fn tail_recursive_count_down_ten_million() {
@@ -13603,13 +13603,16 @@ fn tail_recursive_mutual_ping_pong_ten_million() {
 
 // Cps-colored body shape — closest-shape passing test:
 // `examples/fib_cps_perf.sigil`. `compute_user_fn_abi`
-// (codegen.rs:189) picks `UserFnAbi::Sync` because the recursive
-// match arm fails the `pure_tail` predicate; the recursive call
-// uses the same Sync direct-call branch as the pure-Sync diagnostic
-// above. Depth held at 1M — see the suite header comment.
+// (codegen.rs:189) picks `UserFnAbi::Cps` (chained-let-yield
+// classifier accepts the body shape). The recursive Match-arm Cps
+// fn call goes through the chained-let-yield Final-step path,
+// which routes through `lower_expr_in_tail_pos` →
+// `lower_match_in_tail_pos` → `lower_call_in_tail_pos`'s Cps→Cps
+// branch → `return_(NextStep::Call(callee, args))`. The OUTER
+// trampoline iterates without nesting `sigil_run_loop`.
 
 #[test]
-fn tail_recursive_cps_colored_count_down_one_million() {
+fn tail_recursive_cps_colored_count_down_ten_million() {
     let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
                fn count_down_cps(n: Int) -> Int ![State, IO] {\n  \
                  let _: Int = perform State.get();\n  \
@@ -13619,7 +13622,7 @@ fn tail_recursive_cps_colored_count_down_one_million() {
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
-                 let result: Int = handle count_down_cps(1000000) with {\n    \
+                 let result: Int = handle count_down_cps(10000000) with {\n    \
                    State.get(k) => k(0),\n    \
                    State.set(arg, k) => k(arg),\n  \
                  };\n  \
@@ -13627,209 +13630,7 @@ fn tail_recursive_cps_colored_count_down_one_million() {
                  0\n\
                }\n";
     let (stdout, stderr, code) =
-        compile_and_run(src, "tail_recursive_cps_colored_count_down_one_million");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// TCO-4 debug — depth bisects + isolation tests for the
-// Cps-colored failure. Bisect data from PR #108 commit `910ad82`:
-//
-//   `tail_recursive_cps_colored_count_down_one_million` (1M):    FAIL on both
-//   `tco4_debug_cps_colored_count_down_one_hundred_thousand` (100K): FAIL on both
-//   `tco4_debug_cps_colored_count_down_one_thousand` (1K):       PASS on both
-//
-// So TCO is firing for the Cps-colored shape (1K passes), but
-// something leaks per iteration (~24-80 bytes/iter = 8 MB stack /
-// 100K iters). The cause is unverified — could be a Cranelift
-// `return_call` epilogue issue (spill area not deallocated), a
-// codegen-side bug in `lower_perform_to_value`, a runtime-side
-// leak in `sigil_perform`/`sigil_run_loop`, or something else.
-//
-// Isolation tests (below) discriminate among hypotheses:
-//
-//   `tco4_diag_two_builtins_per_iter_at_ten_million` — recursive
-//   Sync fn calling TWO builtins (`int_xor` + `int_shl`) per iter
-//   at depth 10M. Same Cranelift call-site structure as perform
-//   (two `.call(...)` instructions per iter, SSA values live
-//   across them). If this passes at 10M, the leak is NOT
-//   "two-Cranelift-calls-per-iter"; it's specific to perform
-//   machinery (sigil_perform / sigil_run_loop / arena / TLS state).
-//   If this fails at the same threshold, the leak is per-call.
-
-#[test]
-fn tco4_debug_cps_colored_count_down_one_thousand() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_cps_1k(n: Int) -> Int ![State, IO] {\n  \
-                 let _: Int = perform State.get();\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_cps_1k(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = handle count_down_cps_1k(1000) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "tco4_debug_cps_colored_count_down_one_thousand");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-#[test]
-fn tco4_debug_cps_colored_count_down_one_hundred_thousand() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_cps_100k(n: Int) -> Int ![State, IO] {\n  \
-                 let _: Int = perform State.get();\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_cps_100k(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = handle count_down_cps_100k(100000) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(
-        src,
-        "tco4_debug_cps_colored_count_down_one_hundred_thousand",
-    );
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// Isolation: handler installed INSIDE the recursive fn, not in
-// main. Each iteration pushes/pops its own handler frame for the
-// perform; the original count_down_cps test has main install ONE
-// frame and count_down_cps recurses under it. If this test passes
-// at 100K but the original fails, the leak is "stable handler
-// frame across recursion"-specific (something about the long-lived
-// frame interacting with the perform machinery). If it fails at
-// the same depth, the leak is per-perform regardless of frame
-// lifetime.
-
-#[test]
-fn tco4_diag_cps_colored_handler_inside_at_one_hundred_thousand() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_cps_handle_inside(n: Int) -> Int ![] {\n  \
-                 let _: Int = handle (perform State.get()) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_cps_handle_inside(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = count_down_cps_handle_inside(100000);\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(
-        src,
-        "tco4_diag_cps_colored_handler_inside_at_one_hundred_thousand",
-    );
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// Isolation: handler in main, NO perform inside the recursive fn.
-// Tests whether the long-lived handler frame in main alone (no
-// perform interaction) causes the leak. If passes at 10M, the
-// long-lived frame ALONE is fine; the leak requires the
-// long-lived-frame × perform combination.
-
-#[test]
-fn tco4_diag_long_lived_handler_no_perform_at_ten_million() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_no_perform(n: Int) -> Int ![] {\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_no_perform(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = handle count_down_no_perform(10000000) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(
-        src,
-        "tco4_diag_long_lived_handler_no_perform_at_ten_million",
-    );
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// Isolation: handler installed inside the recursive fn at 1M depth
-// (the prior test was at 100K; this checks whether per-iter handler
-// push/pop scales further).
-
-#[test]
-fn tco4_diag_cps_colored_handler_inside_at_one_million() {
-    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_cps_handle_inside_1m(n: Int) -> Int ![] {\n  \
-                 let _: Int = handle (perform State.get()) with {\n    \
-                   State.get(k) => k(0),\n    \
-                   State.set(arg, k) => k(arg),\n  \
-                 };\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => count_down_cps_handle_inside_1m(n - 1),\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = count_down_cps_handle_inside_1m(1000000);\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "tco4_diag_cps_colored_handler_inside_at_one_million");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
-}
-
-// Isolation: tail-recursive Sync fn with TWO intervening Cranelift
-// builtin calls per iteration. Same number of `.call(...)` sites
-// per iter as `count_down_cps`'s perform site (sigil_perform +
-// sigil_run_loop), and the same SSA-spill pattern (`n` and
-// `terminal_out` live across both calls), but to builtins
-// (no runtime perform machinery, no TLS state, no arena
-// allocation). Pass/fail at depth 10M discriminates per-call leaks
-// from perform-machinery leaks.
-
-#[test]
-fn tco4_diag_two_builtins_per_iter_at_ten_million() {
-    let src = "fn count_down_two_builtins(n: Int) -> Int ![] {\n  \
-                 match n {\n    \
-                   0 => 0,\n    \
-                   _ => {\n      \
-                     let _a: Int = int_xor(n, n);\n      \
-                     let _b: Int = int_shl(n, 1);\n      \
-                     count_down_two_builtins(n - 1)\n    \
-                   },\n  \
-                 }\n\
-               }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let result: Int = count_down_two_builtins(10000000);\n  \
-                 perform IO.println(int_to_string(result));\n  \
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "tco4_diag_two_builtins_per_iter_at_ten_million");
+        compile_and_run(src, "tail_recursive_cps_colored_count_down_ten_million");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }

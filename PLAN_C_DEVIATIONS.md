@@ -843,7 +843,7 @@ match tail_result {
 
 **Implementing commit(s).** [HEAD] (TCO-4 implementing commit; closes the TCO-3 + TCO-3-follow-up + TCO-4 deviations).
 
-## 2026-05-08 — [DEVIATION Task TCO-4 in-flight] Cps-colored recursion still depth-bounded — root cause: nested `sigil_run_loop` per Cps→Cps tail call in synth_cont's body
+## 2026-05-08 — [DEVIATION Task TCO-4 follow-up] [CLOSED] Cps-colored recursion now TCO'd via trampoline-iterated `NextStep::Call` return
 
 **Context.** TCO-4 ships Sync-only `return_call` for direct user-fn tail calls. Pure-Sync recursive shapes pass at depth 10M. The Cps-colored test `tail_recursive_cps_colored_count_down_one_million` still fails (test stays in CI as-is, not `#[ignore]`'d, per the user's "honest CI visibility" directive while the architectural fix is investigated).
 
@@ -922,10 +922,15 @@ return ns           // surrounding fn returns NextStep::Call directly
 
 Wiring this requires: (a) extending `lower_call_in_tail_pos` to handle the Cps→Cps case when surrounding fn is Cps; (b) routing synth_cont's tail-expression lowering through the tail-position infrastructure (currently `lower_expr` directly).
 
-**Why accepted to ship TCO-4 with this gap.** The fix is architectural (changes synth_cont body emission paths) and out of TCO-4's reasonable scope. Pure-Sync recursion is the canonical use case (data-structure folds, list traversals, parse loops); shipping it now unblocks every LLM-authored program that doesn't put a `perform` inside a recursive fn whose effect escapes to a long-lived handler. The narrow gap is well-documented (this entry + spec §12.1 + the failing CI test as a regression beacon).
+**Resolution.** Both pieces of the fix landed in PR #108 commit `e94095c`:
 
-**Closure path.** Closes when the follow-up plan ships the Cps→Cps tail-call NextStep::Call return mechanism.
+1. **`lower_call_in_tail_pos`'s Cps→Cps branch** (codegen.rs:18586+) — when the callee is a direct Cps user-fn `Ident`, signature exactly matches the surrounding fn's, packs args + (null, identity) trailing pair, calls `sigil_next_step_call(callee_addr, total_arg_count)`, copies the local args buffer into the NextStep's args_ptr slot, and `return_(ns)` directly. The OUTER trampoline (the one that invoked the surrounding Cps fn) iterates without nesting `sigil_run_loop`.
+2. **Chained-let-yield Final-step routing** (codegen.rs:15831 area) — replaced `lower_expr(tail_expr)` with `lower_expr_in_tail_pos(tail_expr)`. For Match-tails where one arm flows a value to cont (e.g., `0 => 0`) and another emits `return_(NextStep::Call)` (the recursive arm), `lower_match_in_tail_pos` returns `Value(cont_param)` and the existing wrap+gate path runs as before. The recursive arm's `return_` is its own block's terminator; cont and gate are dead at runtime for that path (Cranelift optimizer elides). For the Terminated edge case (rare — all arms terminate), switch to a fresh dead block before continuing the gate emit.
 
-**Failure mode.** A Cps-colored recursive fn whose tail performs a recursive Cps call (the chained-let-yield + match-recurse shape) caps at ~10K-100K iterations on an 8 MB default thread stack. Failure mode: SIGSEGV with empty stderr (generic stack overflow). Workarounds: (a) hoist the perform out of the recursive fn so the inner recursion is pure-Sync; (b) install the handler INSIDE the recursive fn so it's discharged each iteration (forces the colorer to Sync, enabling TCO-4); (c) cap input size with a runtime check.
+CI verdict on commit `e94095c`: **all 4 lanes green**. `tail_recursive_cps_colored_count_down_one_million` passes on Linux x86_64 and macOS aarch64. Subsequent commit bumped to `_ten_million` and removed the now-obsolete diagnostic bisect tests.
 
-**Implementing commit(s).** [HEAD] (this entry alongside the failing CI regression beacon; the architectural fix lands in the follow-up plan).
+**Closure path.** Closed by PR #108 commit `e94095c` (Cps→Cps trampoline TCO) and the cleanup commit (depth bump + diagnostic-test removal). No remaining gap; the deferred follow-up plan `queue/2026-05-08-sigil-tco-cps-colored-leak.md` is now superseded and removed.
+
+**Failure mode (historical).** Pre-fix: SIGSEGV with empty stderr at ~10K-100K iterations on an 8 MB default thread stack. Post-fix: TCO'd to unbounded depth (10M regression test passes).
+
+**Implementing commit(s).** PR #108 commit `e94095c` (Cps→Cps trampoline TCO) + the cleanup commit on `plan-c-tco-verify`.
