@@ -15840,6 +15840,48 @@ mod tests {
     }
 
     #[test]
+    fn spec_e16_word_frequency_counter_typechecks() {
+        // Pin the worked example E16 from `spec/language.md`. The
+        // spec sample must continue to compile, so any breaking
+        // change to the Map / Char / String / List interaction
+        // surfaces here.
+        let src = "import std.io\n\
+                   import std.list\n\
+                   import std.map\n\
+                   fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {\n  \
+                     match cs {\n    \
+                       Nil => m,\n    \
+                       Cons(c, rest) => {\n      \
+                         let next: Int = match map_get(m, c) {\n        \
+                           Some(n) => n + 1,\n        \
+                           None => 1,\n      \
+                         };\n      \
+                         count_chars(rest, map_insert(m, c, next))\n    \
+                       },\n  \
+                     }\n\
+                   }\n\
+                   fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {\n  \
+                     match xs {\n    \
+                       Nil => 0,\n    \
+                       Cons(p, rest) => match p {\n        \
+                         (c, n) => {\n          \
+                           perform IO.println(string_concat(char_to_string(c),\n            \
+                             string_concat(\": \", int_to_string(n))));\n          \
+                           print_pairs(rest)\n        \
+                         },\n      \
+                       },\n    \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let cs: List[Char] = string_chars(\"banana\");\n  \
+                     let counts: Map[Char, Int] = count_chars(cs, map_char_keys());\n  \
+                     print_pairs(map_to_list(counts))\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
     fn import_std_map_typechecks_cleanly() {
         // Pin the full Map surface (constructor + lookup + insert +
         // remove + iteration + transformations + convenience

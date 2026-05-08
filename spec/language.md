@@ -452,6 +452,54 @@ output prints via `IO.println`. Replace `read_dir` with
 `read_file(p)` to read a file; replace with `run("cmd", argv)` to
 spawn a subprocess.
 
+### E16 — Word-frequency counter with `Map[Char, Int]`
+
+```sigil
+import std.io
+import std.list
+import std.map
+
+fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {
+  match cs {
+    Nil => m,
+    Cons(c, rest) => {
+      let next: Int = match map_get(m, c) {
+        Some(n) => n + 1,
+        None => 1,
+      };
+      count_chars(rest, map_insert(m, c, next))
+    },
+  }
+}
+
+fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {
+  match xs {
+    Nil => 0,
+    Cons(p, rest) => match p {
+      (c, n) => {
+        perform IO.println(string_concat(char_to_string(c),
+          string_concat(": ", int_to_string(n))));
+        print_pairs(rest)
+      },
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let cs: List[Char] = string_chars("banana");
+  let counts: Map[Char, Int] = count_chars(cs, map_char_keys());
+  print_pairs(map_to_list(counts))
+}
+```
+
+`Map[Char, Int]` keys each unique codepoint to its running count.
+`map_get` + `map_insert` is the canonical histogram-update pattern;
+because the persistent map carries its comparator (`char_compare`,
+threaded through `map_char_keys`) every lookup is O(log n) without
+the caller threading an equality predicate. `map_to_list` returns
+the entries sorted ascending by key, so the output is deterministic
+across runs.
+
 ---
 
 ## Reference
@@ -1151,7 +1199,9 @@ files are the authoritative API reference.
 |--------|---------|
 | `std.option` | `Option[A]`, `map`, `and_then`, `unwrap_or`. |
 | `std.result` | `Result[A, E]`, `map`, `map_err`, `and_then`. |
-| `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`. |
+| `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
+| `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` shadows the builtin Int-returning `string_compare` with an `Ordering`-returning version when `std.ordering` is imported. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
+| `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |
 | `std.array` | `Array[A]`, `array_alloc`, `array_get`, `array_set` (returns new), `array_length`. |
 | `std.mut_array` | `MutArray[A]` (Mem-gated). |
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
@@ -1215,6 +1265,8 @@ The following limits are permanent v1 design choices:
 | Filesystem path manipulation (`join`, `basename`, `dirname`, `normalize`) | Future `std/path.sigil` plan. The CLI-effects plan ships only the `Fs` effect's primitive ops. |
 | Recursive `mkdir -p` and recursive `rm -rf` | Future stdlib helpers layered on top of `mkdir` / `remove_dir` / `read_dir`. v1 `Fs.mkdir` / `remove_dir` are single-level. |
 | Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
+| `MutMap`, range queries on `Map` (`map_range`, prefix scans), set operations (`map_union`, `map_intersect`, `map_difference`), `map_for_each`, `map_eq` | Future map-extensions plan. v1 ships only the persistent immutable `Map[K, V]` plus the closed-row pure-helper surface (`map_get` / `map_insert` / `map_remove` / `map_keys` / `map_to_list` / `map_fold` / `map_map` / `map_filter` etc.). |
+| `mut_array_sort` (in-place sort over `MutArray[A]`) | Future plan. v1 ships only the pure functional `list_sort`; an in-place sort would force `![Mem]` onto every call site, which the LLM-default surface chose to avoid. |
 
 ### §15 — Build and run
 
