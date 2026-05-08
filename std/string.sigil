@@ -44,8 +44,10 @@
 //   allocation.
 //
 // Comparison:
-// - `string_compare(a: String, b: String) -> Int ![]`  —
-//   lexicographic byte compare; returns -1, 0, or 1.
+// - `string_compare(a: String, b: String) -> Ordering ![]` lives in
+//   `std.ordering` (Plan C addendum Stage MOS). Lexicographic byte
+//   compare returning the `Ordering` sum (`Less` / `Equal` /
+//   `Greater`).
 // - `string_starts_with(s: String, prefix: String) -> Bool ![]`
 // - `string_ends_with(s: String, suffix: String) -> Bool ![]`
 // - `string_contains(s: String, needle: String) -> Bool ![]`

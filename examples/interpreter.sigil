@@ -22,6 +22,7 @@
 
 import std.raise
 import std.result
+import std.ordering
 
 type Expr =
   | EVar(String)
@@ -42,7 +43,7 @@ fn lookup(env: Env, name: String) -> Int ![Raise[String]] {
     ENil => raise(string_concat("unbound variable: ", name)),
     ECons(n, v, rest) =>
       match string_compare(n, name) {
-        0 => v,
+        Equal => v,
         _ => lookup(rest, name),
       },
   }

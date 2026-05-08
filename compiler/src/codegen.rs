@@ -1121,7 +1121,6 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("string_concat".to_string());
     globals.insert("string_substring".to_string());
     globals.insert("string_byte_at".to_string());
-    globals.insert("string_compare".to_string());
     globals.insert("string_starts_with".to_string());
     globals.insert("string_ends_with".to_string());
     globals.insert("string_contains".to_string());
@@ -8166,15 +8165,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_string_byte_at", Linkage::Import, &string_byte_at_sig)
         .map_err(|e| format!("declare sigil_string_byte_at: {e}"))?;
 
-    // sigil_string_compare(a, b) -> i64
-    let mut string_compare_sig = Signature::new(isa_call_conv(&module));
-    string_compare_sig.params.push(AbiParam::new(pointer_ty));
-    string_compare_sig.params.push(AbiParam::new(pointer_ty));
-    string_compare_sig.returns.push(AbiParam::new(types::I64));
-    let string_compare = module
-        .declare_function("sigil_string_compare", Linkage::Import, &string_compare_sig)
-        .map_err(|e| format!("declare sigil_string_compare: {e}"))?;
-
     // sigil_string_starts_with(s, prefix) -> bool
     let mut string_starts_with_sig = Signature::new(isa_call_conv(&module));
     string_starts_with_sig
@@ -9659,7 +9649,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             string_concat,
             string_substring,
             string_byte_at,
-            string_compare,
             string_starts_with,
             string_ends_with,
             string_contains,
@@ -23769,16 +23758,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.string_byte_at_ref, &[s, i]);
                 self.builder.inst_results(call)[0]
             }
-            Expr::Ident(name, _) if name == "string_compare" => {
-                assert_eq!(args.len(), 2, "string_compare builtin arg count is not 2");
-                let a = self.lower_expr(&args[0]);
-                let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_compare_ref, &[a, b]);
-                self.builder.inst_results(call)[0]
-            }
             Expr::Ident(name, _) if name == "string_starts_with" => {
                 assert_eq!(
                     args.len(),
@@ -25671,8 +25650,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 Expr::Ident(name, _)
                     if matches!(
                         name.as_str(),
-                        "string_compare"
-                            | "string_index_of"
+                        "string_index_of"
                             | "string_to_int_validate"
                             | "string_to_int_parse"
                             | "string_length"
@@ -26268,7 +26246,6 @@ struct BuiltinFuncIds {
     string_concat: cranelift_module::FuncId,
     string_substring: cranelift_module::FuncId,
     string_byte_at: cranelift_module::FuncId,
-    string_compare: cranelift_module::FuncId,
     string_starts_with: cranelift_module::FuncId,
     string_ends_with: cranelift_module::FuncId,
     string_contains: cranelift_module::FuncId,
@@ -26410,7 +26387,6 @@ struct BuiltinFuncRefs {
     string_concat_ref: FuncRef,
     string_substring_ref: FuncRef,
     string_byte_at_ref: FuncRef,
-    string_compare_ref: FuncRef,
     string_starts_with_ref: FuncRef,
     string_ends_with_ref: FuncRef,
     string_contains_ref: FuncRef,
@@ -26706,7 +26682,6 @@ fn prepare_builtin_func_refs(
         string_concat_ref: module.declare_func_in_func(ids.string_concat, builder.func),
         string_substring_ref: module.declare_func_in_func(ids.string_substring, builder.func),
         string_byte_at_ref: module.declare_func_in_func(ids.string_byte_at, builder.func),
-        string_compare_ref: module.declare_func_in_func(ids.string_compare, builder.func),
         string_starts_with_ref: module.declare_func_in_func(ids.string_starts_with, builder.func),
         string_ends_with_ref: module.declare_func_in_func(ids.string_ends_with, builder.func),
         string_contains_ref: module.declare_func_in_func(ids.string_contains, builder.func),

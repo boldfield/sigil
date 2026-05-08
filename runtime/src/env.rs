@@ -22,7 +22,7 @@ use crate::effect_helpers::{
     alloc_array_with_capacity, alloc_string_from_str, alloc_tuple, array_set_slot_raw,
 };
 use crate::gc::string_bytes;
-use crate::handlers::{sigil_next_step_args_ptr, sigil_next_step_call, NextStep, TerminalResult};
+use crate::handlers::{write_k_dispatch_value, NextStep, TerminalResult};
 
 /// `Env.args()` arm fn. Op id 0. No user args; returns `Array[String]`.
 ///
@@ -58,9 +58,7 @@ pub unsafe extern "C" fn sigil_env_args_arm(
         array_set_slot_raw(arr, i, sigil_str as u64);
     }
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = arr as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, arr as u64)
 }
 
 /// `Env.var(name: String) -> (Int, String)` arm fn. Op id 1.
@@ -102,9 +100,7 @@ pub unsafe extern "C" fn sigil_env_var_arm(
     };
     let tup = alloc_tuple(&[tag as u64, value as u64], 0b10);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 /// `Env.vars() -> Array[(String, String)]` arm fn. Op id 2.
@@ -140,9 +136,7 @@ pub unsafe extern "C" fn sigil_env_vars_arm(
         array_set_slot_raw(arr, i, tup as u64);
     }
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = arr as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, arr as u64)
 }
 
 #[cfg(test)]

@@ -267,11 +267,12 @@ are inferred from the call site (e.g. `run_state(5, comp)` instantiates
 
 ```sigil
 import std.raise
+import std.ordering
 
 fn pipeline(s: String) -> Int ![IO, Raise[String]] {
   perform IO.println(string_concat("processing: ", s));
   match string_compare(s, "") {
-    0 => raise("empty input"),
+    Equal => raise("empty input"),
     _ => string_length(s),
   }
 }
@@ -451,6 +452,54 @@ names (no path joining); pattern-match handles each FsError variant;
 output prints via `IO.println`. Replace `read_dir` with
 `read_file(p)` to read a file; replace with `run("cmd", argv)` to
 spawn a subprocess.
+
+### E16 — Word-frequency counter with `Map[Char, Int]`
+
+```sigil
+import std.io
+import std.list
+import std.map
+
+fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {
+  match cs {
+    Nil => m,
+    Cons(c, rest) => {
+      let next: Int = match map_get(m, c) {
+        Some(n) => n + 1,
+        None => 1,
+      };
+      count_chars(rest, map_insert(m, c, next))
+    },
+  }
+}
+
+fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {
+  match xs {
+    Nil => 0,
+    Cons(p, rest) => match p {
+      (c, n) => {
+        perform IO.println(string_concat(char_to_string(c),
+          string_concat(": ", int_to_string(n))));
+        print_pairs(rest)
+      },
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let cs: List[Char] = string_chars("banana");
+  let counts: Map[Char, Int] = count_chars(cs, map_char_keys());
+  print_pairs(map_to_list(counts))
+}
+```
+
+`Map[Char, Int]` keys each unique codepoint to its running count.
+`map_get` + `map_insert` is the canonical histogram-update pattern;
+because the persistent map carries its comparator (`char_compare`,
+threaded through `map_char_keys`) every lookup is O(log n) without
+the caller threading an equality predicate. `map_to_list` returns
+the entries sorted ascending by key, so the output is deterministic
+across runs.
 
 ---
 
@@ -740,7 +789,7 @@ suggested fix.
 | Arithmetic | `+`, `-`, `*`, `/`, `%` | `(Int, Int) -> Int ![]` (or `![ArithError]` for `/` and `%`) |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` | `(Int, Int) -> Bool ![]` |
 | Logic | `&&`, `\|\|`, `!` | `(Bool, Bool) -> Bool ![]` |
-| String compare | `string_compare(a, b)` | `(String, String) -> Int ![]` |
+| String compare | `string_compare(a, b)` (from `std.ordering`) | `(String, String) -> Ordering ![]` |
 
 `/` and `%` perform `ArithError.div_by_zero` / `mod_by_zero` on
 zero divisors; the top-level `main` shim installs default handlers
@@ -1151,12 +1200,14 @@ files are the authoritative API reference.
 |--------|---------|
 | `std.option` | `Option[A]`, `map`, `and_then`, `unwrap_or`. |
 | `std.result` | `Result[A, E]`, `map`, `map_err`, `and_then`. |
-| `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`. |
+| `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
+| `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` is the canonical string comparator (returns `Ordering`) — the legacy Int-returning builtin was retired in this addendum. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
+| `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |
 | `std.array` | `Array[A]`, `array_alloc`, `array_get`, `array_set` (returns new), `array_length`. |
 | `std.mut_array` | `MutArray[A]` (Mem-gated). |
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
 | `std.mut_byte_array` | `MutByteArray` (Mem-gated). |
-| `std.string` | Byte-indexed string ops: `string_concat`, `string_substring`, `string_byte_at`, `string_compare`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. Codepoint-indexed: `string_chars`, `string_char_at`, `string_from_chars`. |
+| `std.string` | Byte-indexed string ops: `string_concat`, `string_substring`, `string_byte_at`, `string_starts_with`, `string_ends_with`, `string_contains`, `string_index_of`, `string_trim`, `string_to_int_validate`, `string_to_int_parse`, `string_length`. Lexicographic comparison is `string_compare` from `std.ordering` (returns `Ordering`). Codepoint-indexed: `string_chars`, `string_char_at`, `string_from_chars`. |
 | `std.char` | Boxed `Char` (`TAG_CHAR`): equality / ordering (`char_eq`/`lt`/`le`/`gt`/`ge`), conversion (`char_to_int`, `int_to_char` → `Option[Char]`, `char_to_string`), ASCII classifiers (`is_ascii`, `is_ascii_digit`, `is_ascii_alpha`, `is_ascii_alphanumeric`, `is_ascii_whitespace`), ASCII case (`to_lower_ascii`, `to_upper_ascii`). See §3.1.1. |
 | `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`float_to_int`/`float_to_string`/`string_to_float_validate`/`string_to_float_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
@@ -1215,6 +1266,8 @@ The following limits are permanent v1 design choices:
 | Filesystem path manipulation (`join`, `basename`, `dirname`, `normalize`) | Future `std/path.sigil` plan. The CLI-effects plan ships only the `Fs` effect's primitive ops. |
 | Recursive `mkdir -p` and recursive `rm -rf` | Future stdlib helpers layered on top of `mkdir` / `remove_dir` / `read_dir`. v1 `Fs.mkdir` / `remove_dir` are single-level. |
 | Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
+| `MutMap`, range queries on `Map` (`map_range`, prefix scans), set operations (`map_union`, `map_intersect`, `map_difference`), `map_for_each`, `map_eq` | Future map-extensions plan. v1 ships only the persistent immutable `Map[K, V]` plus the closed-row pure-helper surface (`map_get` / `map_insert` / `map_remove` / `map_keys` / `map_to_list` / `map_fold` / `map_map` / `map_filter` etc.). |
+| `mut_array_sort` (in-place sort over `MutArray[A]`) | Future plan. v1 ships only the pure functional `list_sort`; an in-place sort would force `![Mem]` onto every call site, which the LLM-default surface chose to avoid. |
 
 ### §15 — Build and run
 

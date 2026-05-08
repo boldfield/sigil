@@ -1,0 +1,553 @@
+// sigil: 0.1
+//
+// std/map.sigil — Plan C addendum (Stage MOS).
+//
+// `Map[K, V]` is Sigil's persistent (immutable) ordered key-value
+// map. Backed by an AA tree (Andersson 1993, "Balanced Search
+// Trees Made Simple") for O(log n) lookup, insert, and remove.
+// The map carries its comparator inside the value, so all
+// operations are consistent with the ordering chosen at
+// construction time — there is no implicit equality assumption
+// on `K`.
+//
+// All operations are persistent: every op returns a fresh
+// `Map[K, V]` and the input is unchanged. In-order traversal
+// yields keys sorted ascending per the stored comparator.
+//
+// ## Why AA tree
+//
+// AA trees use two rebalancing rules (`__map_skew` and
+// `__map_split`) instead of red-black's four-to-six cases.
+// O(log n) for all operations; ~80–100 lines of pure-Sigil code
+// once removal lands. No new runtime FFI is required.
+//
+// ## Scope (v1)
+//
+// Ships: `map_empty`, `map_size`, `map_is_empty`, `map_get`,
+// `map_contains`, `map_insert`, `map_remove`, `map_keys`,
+// `map_values`, `map_to_list`, `map_from_list`, `map_fold`,
+// `map_map`, `map_filter`, plus convenience constructors
+// `map_int_keys`, `map_string_keys`, `map_char_keys`.
+//
+// Deferred (follow-up plan): `MutMap`, range queries (`map_range`,
+// prefix scans), set operations (`map_union`, `map_intersect`,
+// `map_difference`), bulk iteration helpers (`map_for_each`),
+// equality predicate `map_eq`.
+
+import std.option
+import std.list
+import std.ordering
+
+// AA-tree node. `MapLeaf` is the empty subtree (its implicit
+// level is 0); `MapBranch` carries the AA-tree level invariant
+// required by `__map_skew` / `__map_split`. The variant name is
+// `MapBranch` rather than `MapNode` so it does not collide with
+// the surrounding type name.
+type MapNode[K, V] =
+  | MapLeaf
+  | MapBranch { level: Int, key: K, value: V, left: MapNode[K, V], right: MapNode[K, V] }
+
+// Persistent map surface. The comparator is stored once at
+// construction time and threaded through every op. `size` is
+// maintained incrementally so `map_size` is O(1).
+type Map[K, V] = { cmp: (K, K) -> Ordering ![], root: MapNode[K, V], size: Int }
+
+// `map_empty(cmp)` returns the empty map keyed by `cmp`.
+fn map_empty[K, V](cmp: (K, K) -> Ordering ![]) -> Map[K, V] ![] {
+  Map { cmp: cmp, root: MapLeaf, size: 0 }
+}
+
+// `map_size(m)` returns the number of entries. O(1).
+fn map_size[K, V](m: Map[K, V]) -> Int ![] {
+  match m {
+    Map { cmp: _, root: _, size } => size,
+  }
+}
+
+// `map_is_empty(m)` — true iff `map_size(m) == 0`.
+fn map_is_empty[K, V](m: Map[K, V]) -> Bool ![] {
+  match m {
+    Map { cmp: _, root: _, size } => size == 0,
+  }
+}
+
+// `map_get(m, k)` returns `Some(v)` if `k` is present, `None`
+// otherwise. O(log n).
+fn map_get[K, V](m: Map[K, V], k: K) -> Option[V] ![] {
+  match m {
+    Map { cmp, root, size: _ } => __map_get_node(cmp, root, k),
+  }
+}
+
+fn __map_get_node[K, V](cmp: (K, K) -> Ordering ![], node: MapNode[K, V], k: K) -> Option[V] ![] {
+  match node {
+    MapLeaf => None,
+    MapBranch { level: _, key, value, left, right } => match cmp(k, key) {
+      Less => __map_get_node(cmp, left, k),
+      Greater => __map_get_node(cmp, right, k),
+      Equal => Some(value),
+    },
+  }
+}
+
+// `map_contains(m, k)` — true iff `k` is present. O(log n).
+fn map_contains[K, V](m: Map[K, V], k: K) -> Bool ![] {
+  match map_get(m, k) {
+    Some(_) => true,
+    None => false,
+  }
+}
+
+// `map_insert(m, k, v)` returns a new map with `k -> v`. If `k`
+// was already present, replaces the value (size unchanged).
+// Otherwise adds the entry (size + 1). O(log n).
+fn map_insert[K, V](m: Map[K, V], k: K, v: V) -> Map[K, V] ![] {
+  match m {
+    Map { cmp, root, size } => match __map_insert_node(cmp, root, k, v) {
+      (new_root, was_new) => Map {
+        cmp: cmp,
+        root: new_root,
+        size: if was_new { size + 1 } else { size },
+      },
+    },
+  }
+}
+
+// Returns `(new_node, was_new)` where `was_new` is true iff a
+// fresh entry was added (false if the key was already present
+// and the value was replaced).
+fn __map_insert_node[K, V](
+  cmp: (K, K) -> Ordering ![],
+  node: MapNode[K, V],
+  k: K,
+  v: V,
+) -> (MapNode[K, V], Bool) ![] {
+  match node {
+    MapLeaf => (MapBranch { level: 1, key: k, value: v, left: MapLeaf, right: MapLeaf }, true),
+    MapBranch { level, key, value, left, right } => match cmp(k, key) {
+      Less => match __map_insert_node(cmp, left, k, v) {
+        (new_left, was_new) => (
+          __map_split(__map_skew(MapBranch { level: level, key: key, value: value, left: new_left, right: right })),
+          was_new,
+        ),
+      },
+      Greater => match __map_insert_node(cmp, right, k, v) {
+        (new_right, was_new) => (
+          __map_split(__map_skew(MapBranch { level: level, key: key, value: value, left: left, right: new_right })),
+          was_new,
+        ),
+      },
+      // Replace value, structure unchanged.
+      Equal => (MapBranch { level: level, key: key, value: v, left: left, right: right }, false),
+    },
+  }
+}
+
+// AA-tree skew: right-rotate when the left child has the same
+// level. Eliminates left horizontal links.
+//
+//        T                   L
+//       / \                 / \
+//      L   R    ===>       LL  T
+//     / \                      / \
+//    LL  LR                   LR  R
+fn __map_skew[K, V](t: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match t {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } => match left {
+      MapLeaf => t,
+      MapBranch { level: ll_lvl, key: lk, value: lv, left: ll, right: lr } => {
+        if ll_lvl == level {
+          MapBranch {
+            level: ll_lvl,
+            key: lk,
+            value: lv,
+            left: ll,
+            right: MapBranch { level: level, key: key, value: value, left: lr, right: right },
+          }
+        } else {
+          t
+        }
+      },
+    },
+  }
+}
+
+// AA-tree split: left-rotate + level increment when the right-
+// right grandchild has the same level. Removes consecutive right
+// horizontal links.
+//
+//      T                       R
+//     / \                     / \
+//    L   R                   T   RR
+//       / \      ===>       / \
+//      RL  RR              L   RL    (R.level = R.level + 1)
+fn __map_split[K, V](t: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match t {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } => match right {
+      MapLeaf => t,
+      MapBranch { level: r_lvl, key: rk, value: rv, left: rl, right: rr } => match rr {
+        MapLeaf => t,
+        MapBranch { level: rr_lvl, key: rrk, value: rrv, left: rrl, right: rrr } => {
+          if level == rr_lvl {
+            MapBranch {
+              level: r_lvl + 1,
+              key: rk,
+              value: rv,
+              left: MapBranch { level: level, key: key, value: value, left: left, right: rl },
+              right: MapBranch { level: rr_lvl, key: rrk, value: rrv, left: rrl, right: rrr },
+            }
+          } else {
+            t
+          }
+        },
+      },
+    },
+  }
+}
+
+// `map_remove(m, k)` returns a new map with `k` removed. If `k`
+// was present, size decreases by 1. If `k` was absent, returns
+// the input map unchanged. O(log n).
+fn map_remove[K, V](m: Map[K, V], k: K) -> Map[K, V] ![] {
+  match m {
+    Map { cmp, root, size } => match __map_remove_node(cmp, root, k) {
+      (new_root, was_present) => Map {
+        cmp: cmp,
+        root: new_root,
+        size: if was_present { size - 1 } else { size },
+      },
+    },
+  }
+}
+
+// Returns `(new_node, was_present)`. `was_present` reports
+// whether `k` was found and removed (false → input unchanged).
+fn __map_remove_node[K, V](
+  cmp: (K, K) -> Ordering ![],
+  node: MapNode[K, V],
+  k: K,
+) -> (MapNode[K, V], Bool) ![] {
+  match node {
+    MapLeaf => (MapLeaf, false),
+    MapBranch { level, key, value, left, right } => match cmp(k, key) {
+      Less => match __map_remove_node(cmp, left, k) {
+        (new_left, found) => (
+          __map_rebalance_after_delete(MapBranch { level: level, key: key, value: value, left: new_left, right: right }),
+          found,
+        ),
+      },
+      Greater => match __map_remove_node(cmp, right, k) {
+        (new_right, found) => (
+          __map_rebalance_after_delete(MapBranch { level: level, key: key, value: value, left: left, right: new_right }),
+          found,
+        ),
+      },
+      Equal => (__map_remove_at(cmp, level, left, right), true),
+    },
+  }
+}
+
+// Three-case removal at the matched node:
+//   1. Both children empty: drop the node.
+//   2. Left empty: lift the in-order successor (min of right
+//      subtree) into this node, then delete it from the right.
+//   3. Otherwise: lift the in-order predecessor (max of left
+//      subtree) into this node, then delete it from the left.
+// In all cases the result goes through `__map_rebalance_after_delete`
+// at the caller's level — except case 1 which returns a leaf and
+// has nothing to rebalance.
+fn __map_remove_at[K, V](
+  cmp: (K, K) -> Ordering ![],
+  level: Int,
+  left: MapNode[K, V],
+  right: MapNode[K, V],
+) -> MapNode[K, V] ![] {
+  match left {
+    MapLeaf => match right {
+      MapLeaf => MapLeaf,
+      // Lift the in-order successor (min of right). The right
+      // subtree has size ≥ 1 here so __map_min_branch returns a
+      // MapBranch.
+      _ => match __map_min_branch(right) {
+        MapLeaf => MapLeaf,
+        MapBranch { level: _, key: sk, value: sv, left: _, right: _ } => match __map_remove_node(cmp, right, sk) {
+          (new_right, _) => __map_rebalance_after_delete(MapBranch { level: level, key: sk, value: sv, left: MapLeaf, right: new_right }),
+        },
+      },
+    },
+    // Lift the in-order predecessor (max of left).
+    _ => match __map_max_branch(left) {
+      MapLeaf => MapLeaf,
+      MapBranch { level: _, key: pk, value: pv, left: _, right: _ } => match __map_remove_node(cmp, left, pk) {
+        (new_left, _) => __map_rebalance_after_delete(MapBranch { level: level, key: pk, value: pv, left: new_left, right: right }),
+      },
+    },
+  }
+}
+
+// Find the leftmost (min-key) MapBranch in a subtree. Returns
+// MapLeaf only if the subtree was empty (caller guards against
+// that case).
+fn __map_min_branch[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level: _, key: _, value: _, left, right: _ } => match left {
+      MapLeaf => node,
+      _ => __map_min_branch(left),
+    },
+  }
+}
+
+// Find the rightmost (max-key) MapBranch in a subtree. Returns
+// MapLeaf only if the subtree was empty.
+fn __map_max_branch[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level: _, key: _, value: _, left: _, right } => match right {
+      MapLeaf => node,
+      _ => __map_max_branch(right),
+    },
+  }
+}
+
+// Read a node's level (0 for MapLeaf).
+fn __map_level[K, V](node: MapNode[K, V]) -> Int ![] {
+  match node {
+    MapLeaf => 0,
+    MapBranch { level, key: _, value: _, left: _, right: _ } => level,
+  }
+}
+
+// Replace a node's level (no-op for MapLeaf). Used by
+// `__map_decrease_level` to push down a right child's level
+// after a delete.
+fn __map_set_level[K, V](node: MapNode[K, V], new_level: Int) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level: _, key, value, left, right } =>
+      MapBranch { level: new_level, key: key, value: value, left: left, right: right },
+  }
+}
+
+// AA-tree decrease_level: if either child's level dropped after
+// a delete, the node's level may need to drop too. The right
+// child's level is also pushed down if it overshot (the
+// "horizontal-link cleanup" from Andersson's removal algorithm).
+fn __map_decrease_level[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } => {
+      let ll: Int = __map_level(left);
+      let rl: Int = __map_level(right);
+      let mn: Int = if ll < rl { ll } else { rl };
+      let should_be: Int = mn + 1;
+      if should_be < level {
+        let new_right: MapNode[K, V] = if should_be < rl {
+          __map_set_level(right, should_be)
+        } else {
+          right
+        };
+        MapBranch { level: should_be, key: key, value: value, left: left, right: new_right }
+      } else {
+        node
+      }
+    },
+  }
+}
+
+// Skew the right child (if it's a branch).
+fn __map_skew_right_child[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } =>
+      MapBranch { level: level, key: key, value: value, left: left, right: __map_skew(right) },
+  }
+}
+
+// Skew the right-right grandchild (if both right and right-right
+// are branches).
+fn __map_skew_right_right_grandchild[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } => match right {
+      MapLeaf => node,
+      MapBranch { level: rl, key: rk, value: rv, left: rll, right: rr } =>
+        MapBranch {
+          level: level,
+          key: key,
+          value: value,
+          left: left,
+          right: MapBranch { level: rl, key: rk, value: rv, left: rll, right: __map_skew(rr) },
+        },
+    },
+  }
+}
+
+// Split the right child (if it's a branch).
+fn __map_split_right_child[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } =>
+      MapBranch { level: level, key: key, value: value, left: left, right: __map_split(right) },
+  }
+}
+
+// Andersson's post-delete rebalance. Runs the level-fix, then
+// `__map_skew` over the node + right child + right-right
+// grandchild, then `__map_split` over the node + right child.
+// Each step delegates to a helper that no-ops at a leaf.
+fn __map_rebalance_after_delete[K, V](node: MapNode[K, V]) -> MapNode[K, V] ![] {
+  let n1: MapNode[K, V] = __map_decrease_level(node);
+  let n2: MapNode[K, V] = __map_skew(n1);
+  let n3: MapNode[K, V] = __map_skew_right_child(n2);
+  let n4: MapNode[K, V] = __map_skew_right_right_grandchild(n3);
+  let n5: MapNode[K, V] = __map_split(n4);
+  __map_split_right_child(n5)
+}
+
+// `map_to_list(m)` returns all entries as a `List[(K, V)]`
+// sorted by key. O(n) time, O(n) extra allocation.
+fn map_to_list[K, V](m: Map[K, V]) -> List[(K, V)] ![] {
+  match m {
+    Map { cmp: _, root, size: _ } => __map_inorder(root, Nil),
+  }
+}
+
+// In-order traversal building the result right-to-left so the
+// final list is in ascending key order with no extra reverse.
+// Stack depth bounded by 2 * tree height = O(log n).
+fn __map_inorder[K, V](node: MapNode[K, V], acc: List[(K, V)]) -> List[(K, V)] ![] {
+  match node {
+    MapLeaf => acc,
+    MapBranch { level: _, key, value, left, right } => {
+      let after_right: List[(K, V)] = __map_inorder(right, acc);
+      let with_self: List[(K, V)] = Cons((key, value), after_right);
+      __map_inorder(left, with_self)
+    },
+  }
+}
+
+// `map_keys(m)` — sorted list of keys.
+fn map_keys[K, V](m: Map[K, V]) -> List[K] ![] {
+  __map_keys_of(map_to_list(m))
+}
+
+fn __map_keys_of[K, V](xs: List[(K, V)]) -> List[K] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(p, t) => match p {
+      (k, _) => Cons(k, __map_keys_of(t)),
+    },
+  }
+}
+
+// `map_values(m)` — values, in key order.
+fn map_values[K, V](m: Map[K, V]) -> List[V] ![] {
+  __map_values_of(map_to_list(m))
+}
+
+fn __map_values_of[K, V](xs: List[(K, V)]) -> List[V] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(p, t) => match p {
+      (_, v) => Cons(v, __map_values_of(t)),
+    },
+  }
+}
+
+// `map_from_list(xs, cmp)` builds a map by folding `map_insert`
+// over `xs` starting from `map_empty(cmp)`. If a key appears
+// twice in `xs`, the later occurrence replaces the earlier
+// (same semantics as repeated `map_insert`).
+fn map_from_list[K, V](xs: List[(K, V)], cmp: (K, K) -> Ordering ![]) -> Map[K, V] ![] {
+  __map_from_list_acc(xs, map_empty(cmp))
+}
+
+fn __map_from_list_acc[K, V](xs: List[(K, V)], acc: Map[K, V]) -> Map[K, V] ![] {
+  match xs {
+    Nil => acc,
+    Cons(p, t) => match p {
+      (k, v) => __map_from_list_acc(t, map_insert(acc, k, v)),
+    },
+  }
+}
+
+// `map_fold(m, init, f)` is a left fold over entries in key
+// order: `f(... f(f(init, k0, v0), k1, v1) ..., kN, vN)`.
+fn map_fold[K, V, B](m: Map[K, V], init: B, f: (B, K, V) -> B ![]) -> B ![] {
+  __map_fold_list(map_to_list(m), init, f)
+}
+
+fn __map_fold_list[K, V, B](xs: List[(K, V)], acc: B, f: (B, K, V) -> B ![]) -> B ![] {
+  match xs {
+    Nil => acc,
+    Cons(p, t) => match p {
+      (k, v) => __map_fold_list(t, f(acc, k, v), f),
+    },
+  }
+}
+
+// `map_map(m, f)` transforms each value via `f`. Keys, comparator,
+// size, and tree shape are all preserved — only the V slot is
+// rewritten. O(n) time, O(n) extra allocation (every node is
+// rebuilt).
+fn map_map[K, V, W](m: Map[K, V], f: (V) -> W ![]) -> Map[K, W] ![] {
+  match m {
+    Map { cmp, root, size } => Map {
+      cmp: cmp,
+      root: __map_map_node(root, f),
+      size: size,
+    },
+  }
+}
+
+fn __map_map_node[K, V, W](node: MapNode[K, V], f: (V) -> W ![]) -> MapNode[K, W] ![] {
+  match node {
+    MapLeaf => MapLeaf,
+    MapBranch { level, key, value, left, right } => MapBranch {
+      level: level,
+      key: key,
+      value: f(value),
+      left: __map_map_node(left, f),
+      right: __map_map_node(right, f),
+    },
+  }
+}
+
+// `map_filter(m, pred)` returns a map containing exactly the
+// entries where `pred(k, v)` is true. Implemented by folding
+// over entries and inserting the keepers into a fresh map.
+fn map_filter[K, V](m: Map[K, V], pred: (K, V) -> Bool ![]) -> Map[K, V] ![] {
+  match m {
+    Map { cmp, root: _, size: _ } => __map_filter_acc(map_to_list(m), pred, map_empty(cmp)),
+  }
+}
+
+fn __map_filter_acc[K, V](xs: List[(K, V)], pred: (K, V) -> Bool ![], acc: Map[K, V]) -> Map[K, V] ![] {
+  match xs {
+    Nil => acc,
+    Cons(p, t) => match p {
+      (k, v) => match pred(k, v) {
+        true => __map_filter_acc(t, pred, map_insert(acc, k, v)),
+        false => __map_filter_acc(t, pred, acc),
+      },
+    },
+  }
+}
+
+// Convenience constructors — pre-wired with the matching
+// comparator from `std.ordering`. Save the user the comparator
+// argument for the common per-primitive case.
+fn map_int_keys[V]() -> Map[Int, V] ![] {
+  map_empty(int_compare)
+}
+
+fn map_string_keys[V]() -> Map[String, V] ![] {
+  map_empty(string_compare)
+}
+
+fn map_char_keys[V]() -> Map[Char, V] ![] {
+  map_empty(char_compare)
+}

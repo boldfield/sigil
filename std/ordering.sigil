@@ -1,0 +1,127 @@
+// sigil: 0.1
+//
+// std/ordering.sigil — Plan C addendum (Stage MOS).
+//
+// `Ordering` is a three-way comparison result. Comparators
+// return `Ordering` instead of `Int` (-1 / 0 / +1) so callers
+// dispatch via `match` and the type system rejects the obvious
+// `cmp(a, b) < 0` shape that misses the third case.
+//
+// The convention is `(a, b) -> Ordering`:
+// - `Less`     means a < b
+// - `Equal`    means a == b
+// - `Greater`  means a > b
+//
+// Per-type comparators ship for the built-in primitive types
+// (`Int`, `String`, `Char`, `Bool`, `Float`, `Int64`). Users can
+// write their own comparator over any user-defined type and pass
+// it to the higher-order helpers (`list_sort`, `map_empty`).
+//
+// ## Float NaN convention
+//
+// IEEE 754 says `NaN != NaN` (asymmetric equality). A total-order
+// comparator must pick a treatment; this module defines:
+//
+// - `NaN == NaN`            (i.e. `float_compare(NaN, NaN) = Equal`)
+// - `NaN < any non-NaN`     (i.e. `float_compare(NaN, 0.0) = Less`)
+// - `non-NaN > NaN`         (the symmetric case)
+//
+// This matches Rust's `f64::total_cmp` for finite / NaN inputs and
+// makes `list_sort_float` / float-keyed `Map` deterministic without
+// requiring the caller to scrub NaNs upfront. NaN-detection is
+// derived from the IEEE 754 self-inequality property
+// (`!float_eq(x, x)` is `true` iff `x` is NaN); no new runtime
+// primitive is required.
+//
+// ## `string_compare` is the canonical string comparator
+//
+// Earlier Sigil versions shipped a builtin `string_compare(String,
+// String) -> Int` returning -1 / 0 / +1. Plan C addendum Stage MOS
+// retired that builtin in favour of this module's
+// `Ordering`-returning version, so the names match the rest of
+// the per-type comparators (`int_compare`, `char_compare`,
+// `float_compare`, `bool_compare`, `int64_compare`). Callers that
+// want a numeric form can convert via
+// `match string_compare(a, b) { Less => -1, Equal => 0, Greater => 1 }`.
+
+type Ordering = | Less | Equal | Greater
+
+// `int_compare(a, b)` returns the three-way ordering of two
+// `Int`s. Uses the built-in `<` and `==` operators (Sigil v1
+// defines them on `Int` and `Bool` only).
+fn int_compare(a: Int, b: Int) -> Ordering ![] {
+  if a < b { Less }
+  else { if a == b { Equal } else { Greater } }
+}
+
+// `string_compare(a, b)` byte-lexicographic three-way ordering
+// of two `String`s. Pure-sigil byte walk via `string_byte_at` /
+// `string_length` and `byte_to_int` to widen `Byte` to `Int`.
+//
+// Lengths are computed once at the entry point and threaded
+// through the recursive helper — `string_length` is O(1) on the
+// String header but recomputing it per byte still costs a pair of
+// header reads on every iteration. Threading is cleaner.
+fn string_compare(a: String, b: String) -> Ordering ![] {
+  __string_compare_at(a, b, string_length(a), string_length(b), 0)
+}
+
+fn __string_compare_at(a: String, b: String, la: Int, lb: Int, i: Int) -> Ordering ![] {
+  match (i < la, i < lb) {
+    (false, false) => Equal,
+    (false, true) => Less,
+    (true, false) => Greater,
+    // Tuple-pattern exhaustiveness in v1 doesn't enumerate `(Bool, Bool)`
+    // structurally — a wildcard arm is required even after the three
+    // explicit cases. The wildcard here only matches `(true, true)`.
+    _ => {
+      let ba: Int = byte_to_int(string_byte_at(a, i));
+      let bb: Int = byte_to_int(string_byte_at(b, i));
+      if ba < bb { Less }
+      else { if ba == bb { __string_compare_at(a, b, la, lb, i + 1) } else { Greater } }
+    },
+  }
+}
+
+// `char_compare(a, b)` compares two `Char`s by codepoint.
+// Reuses `int_compare(char_to_int(a), char_to_int(b))`.
+fn char_compare(a: Char, b: Char) -> Ordering ![] {
+  int_compare(char_to_int(a), char_to_int(b))
+}
+
+// `bool_compare(a, b)` orders `false < true`.
+fn bool_compare(a: Bool, b: Bool) -> Ordering ![] {
+  match (a, b) {
+    (false, true) => Less,
+    (true, false) => Greater,
+    // Wildcard covers `(false, false)` and `(true, true)` — both Equal.
+    _ => Equal,
+  }
+}
+
+// `float_compare(a, b)` is a total ordering on `Float`. NaN
+// compares equal to NaN and strictly less than any non-NaN value
+// (see "Float NaN convention" above). NaN is detected via
+// `!float_eq(x, x)` (true iff x is NaN per IEEE 754).
+fn float_compare(a: Float, b: Float) -> Ordering ![] {
+  let a_nan: Bool = !float_eq(a, a);
+  let b_nan: Bool = !float_eq(b, b);
+  match (a_nan, b_nan) {
+    (true, true) => Equal,
+    (true, false) => Less,
+    (false, true) => Greater,
+    // Wildcard covers `(false, false)` — neither arg is NaN.
+    _ => __float_compare_non_nan(a, b),
+  }
+}
+
+fn __float_compare_non_nan(a: Float, b: Float) -> Ordering ![] {
+  if float_lt(a, b) { Less }
+  else { if float_eq(a, b) { Equal } else { Greater } }
+}
+
+// `int64_compare(a, b)` three-way ordering for `Int64`.
+fn int64_compare(a: Int64, b: Int64) -> Ordering ![] {
+  if int64_lt(a, b) { Less }
+  else { if int64_eq(a, b) { Equal } else { Greater } }
+}

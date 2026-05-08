@@ -2576,7 +2576,6 @@ fn register_builtin_string_builder_schemes(tc: &mut Tc) {
 /// - `string_concat(String, String) -> String ![]`
 /// - `string_substring(String, Int, Int) -> String ![]`
 /// - `string_byte_at(String, Int) -> Byte ![]`
-/// - `string_compare(String, String) -> Int ![]`
 /// - `string_starts_with(String, String) -> Bool ![]`
 /// - `string_ends_with(String, String) -> Bool ![]`
 /// - `string_contains(String, String) -> Bool ![]`
@@ -2609,10 +2608,13 @@ fn register_builtin_string_schemes(tc: &mut Tc) {
         "string_byte_at".to_string(),
         make_scheme(vec![Ty::String, Ty::Int], Ty::Byte),
     );
-    tc.fn_schemes.insert(
-        "string_compare".to_string(),
-        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
-    );
+    // `string_compare` was previously a builtin returning `Int` (-1 /
+    // 0 / +1). It is now provided by `std/ordering.sigil` returning
+    // the `Ordering` sum type (Plan C addendum Stage MOS). The builtin
+    // is gone; callers must `import std.ordering` to reach the new
+    // surface, which matches the per-type-comparator naming
+    // convention shared with `int_compare` / `char_compare` /
+    // `float_compare` / `int64_compare` / `bool_compare`.
     tc.fn_schemes.insert(
         "string_starts_with".to_string(),
         make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
@@ -14721,14 +14723,34 @@ mod tests {
     }
 
     #[test]
-    fn string_compare_returns_int_typechecks() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let c: Int = string_compare(\"a\", \"b\");\n  \
-                     perform IO.println(int_to_string(c));\n  \
-                     0\n\
+    fn string_compare_returns_ordering_typechecks() {
+        // The legacy Int-returning `string_compare` builtin was
+        // retired in Plan C addendum Stage MOS; the canonical
+        // `string_compare` lives in `std.ordering` and returns
+        // `Ordering`.
+        let src = "import std.ordering\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let o: Ordering = string_compare(\"a\", \"b\");\n  \
+                     match o { Less => 0, Equal => 1, Greater => 2 }\n\
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_compare_without_import_is_unknown_ident() {
+        // Without `import std.ordering`, calling `string_compare`
+        // is an unknown-ident error — the builtin Int-returning
+        // version was removed in Plan C addendum Stage MOS.
+        let src = "fn main() -> Int ![] {\n  \
+                     let _o: Ordering = string_compare(\"a\", \"b\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !errs.is_empty(),
+            "expected unknown-ident / unknown-type errors; got clean"
+        );
     }
 
     #[test]
@@ -15789,5 +15811,139 @@ mod tests {
             has_code(&errs, "E0060"),
             "expected E0060 (int64 !=); got {errs:?}"
         );
+    }
+
+    // ===== Plan C addendum (Stage MOS) — `std.ordering` =====
+
+    #[test]
+    fn import_std_ordering_typechecks_cleanly() {
+        // Pin the Ordering surface end-to-end: import the module,
+        // exercise every per-type comparator, and assert each
+        // returns a value of the shared `Ordering` sum.
+        let src = "import std.ordering\n\
+                   fn encode(o: Ordering) -> Int ![] {\n  \
+                     match o { Less => 1, Equal => 2, Greater => 3 }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _i: Int = encode(int_compare(1, 2));\n  \
+                     let _s: Int = encode(string_compare(\"a\", \"b\"));\n  \
+                     let _c: Int = encode(char_compare('a', 'b'));\n  \
+                     let _b: Int = encode(bool_compare(false, true));\n  \
+                     let _f: Int = encode(float_compare(1.0, 2.0));\n  \
+                     let _l: Int = encode(int64_compare(int64_from_int(1), int64_from_int(2)));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_list_sort_typechecks_cleanly() {
+        // `list_sort` plus every per-type wrapper compiles end-to-
+        // end. Importing `std.list` should also pull in
+        // `std.ordering` transitively (the wrappers reference its
+        // comparators), so the user program does not need a
+        // second `import`.
+        let src = "import std.list\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n  \
+                     let _i: List[Int] = list_sort_int(xs);\n  \
+                     let ss: List[String] = Cons(\"b\", Cons(\"a\", Nil));\n  \
+                     let _s: List[String] = list_sort_string(ss);\n  \
+                     let cs: List[Char] = Cons('b', Cons('a', Nil));\n  \
+                     let _c: List[Char] = list_sort_char(cs);\n  \
+                     let fs: List[Float] = Cons(2.0, Cons(1.0, Nil));\n  \
+                     let _f: List[Float] = list_sort_float(fs);\n  \
+                     let _g: List[Int] = list_sort(xs, int_compare);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn spec_e16_word_frequency_counter_typechecks() {
+        // Pin the worked example E16 from `spec/language.md`. The
+        // spec sample must continue to compile, so any breaking
+        // change to the Map / Char / String / List interaction
+        // surfaces here.
+        let src = "import std.io\n\
+                   import std.list\n\
+                   import std.map\n\
+                   fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {\n  \
+                     match cs {\n    \
+                       Nil => m,\n    \
+                       Cons(c, rest) => {\n      \
+                         let next: Int = match map_get(m, c) {\n        \
+                           Some(n) => n + 1,\n        \
+                           None => 1,\n      \
+                         };\n      \
+                         count_chars(rest, map_insert(m, c, next))\n    \
+                       },\n  \
+                     }\n\
+                   }\n\
+                   fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {\n  \
+                     match xs {\n    \
+                       Nil => 0,\n    \
+                       Cons(p, rest) => match p {\n        \
+                         (c, n) => {\n          \
+                           perform IO.println(string_concat(char_to_string(c),\n            \
+                             string_concat(\": \", int_to_string(n))));\n          \
+                           print_pairs(rest)\n        \
+                         },\n      \
+                       },\n    \
+                     }\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let cs: List[Char] = string_chars(\"banana\");\n  \
+                     let counts: Map[Char, Int] = count_chars(cs, map_char_keys());\n  \
+                     print_pairs(map_to_list(counts))\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn import_std_map_typechecks_cleanly() {
+        // Pin the full Map surface (constructor + lookup + insert +
+        // remove + iteration + transformations + convenience
+        // constructors). Imports `std.map`, which transitively pulls
+        // in `std.option` (for Option), `std.list` (for List), and
+        // `std.ordering` (for the per-type comparators).
+        let src = "import std.map\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn keep_big(_k: Int, v: Int) -> Bool ![] {\n  \
+                     v > 15\n\
+                   }\n\
+                   fn sum_values(acc: Int, _k: Int, v: Int) -> Int ![] {\n  \
+                     acc + v\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let m0: Map[Int, Int] = map_int_keys();\n  \
+                     let _empty: Bool = map_is_empty(m0);\n  \
+                     let m1: Map[Int, Int] = map_insert(m0, 1, 10);\n  \
+                     let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                     let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
+                     let _sz: Int = map_size(m3);\n  \
+                     let _hit: Option[Int] = map_get(m3, 2);\n  \
+                     let _has: Bool = map_contains(m3, 2);\n  \
+                     let _ks: List[Int] = map_keys(m3);\n  \
+                     let _vs: List[Int] = map_values(m3);\n  \
+                     let pairs: List[(Int, Int)] = map_to_list(m3);\n  \
+                     let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n  \
+                     let _doubled: Map[Int, Int] = map_map(m4, double);\n  \
+                     let _bigs: Map[Int, Int] = map_filter(m4, keep_big);\n  \
+                     let total: Int = map_fold(m4, 0, sum_values);\n  \
+                     let m5: Map[Int, Int] = map_remove(m4, 2);\n  \
+                     let _sz2: Int = map_size(m5);\n  \
+                     let m6: Map[String, Int] = map_string_keys();\n  \
+                     let _m6b: Map[String, Int] = map_insert(m6, \"a\", 1);\n  \
+                     let m7: Map[Char, Int] = map_char_keys();\n  \
+                     let _m7b: Map[Char, Int] = map_insert(m7, 'a', 1);\n  \
+                     perform IO.println(int_to_string(total));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 }
