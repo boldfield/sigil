@@ -1138,6 +1138,9 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
     globals.insert("int_shl".to_string());
     globals.insert("int_shr".to_string());
     globals.insert("int_abs".to_string());
+    // Plan C addendum (panic / assert) — diagnostic builtins.
+    globals.insert("panic".to_string());
+    globals.insert("assert".to_string());
     // Arm body tail purity: extend the ctor set with effect-free user
     // fns and builtins so `expr_is_pure` accepts sync calls like
     // `append(r1, r2)` in post-arm-k tail position. A fn with an
@@ -8333,6 +8336,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_int_abs", Linkage::Import, &int_abs_sig)
         .map_err(|e| format!("declare sigil_int_abs: {e}"))?;
 
+    // Plan C addendum (panic / assert) — runtime hard-abort primitive.
+    // sigil_panic(msg: *const u8) -> !  (no Cranelift returns; the
+    // surrounding lowering emits `trap` immediately after the call so
+    // the basic block is properly terminated; the unreachable
+    // post-trap block exists only to satisfy lower_call's value-flow
+    // contract and is never executed at runtime.)
+    let mut sigil_panic_sig = Signature::new(isa_call_conv(&module));
+    sigil_panic_sig.params.push(AbiParam::new(pointer_ty));
+    let sigil_panic = module
+        .declare_function("sigil_panic", Linkage::Import, &sigil_panic_sig)
+        .map_err(|e| format!("declare sigil_panic: {e}"))?;
+
     // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
     // + load helpers. Used at sites that flow a continuation into a
     // fn-parameter (boxing the (k_closure, k_fn, return_closure,
@@ -9663,6 +9678,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             int_shl,
             int_shr,
             int_abs,
+            sigil_panic,
             cont_alloc,
             cont_invoke,
         },
@@ -23892,6 +23908,71 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.int_abs_ref, &[v]);
                 self.builder.inst_results(call)[0]
             }
+            // Plan C addendum (panic / assert) — diagnostic builtins.
+            //
+            // `panic[A](msg) -> A`: lowers to `call sigil_panic(msg)`
+            // followed by a `trap` (Cranelift block terminator). A
+            // fresh "after-panic" block is created and switched into
+            // so the surrounding lowering can emit follow-on code in
+            // a syntactically-reachable position; that block has no
+            // CFG predecessors and is dead at runtime. The placeholder
+            // value's Cranelift type matches A's per-call resolved
+            // type from `call_callee_tys` so any subsequent jump /
+            // store seeded with it stays well-typed.
+            Expr::Ident(name, _) if name == "panic" => {
+                assert_eq!(args.len(), 1, "panic builtin arg count is not 1");
+                let msg = self.lower_expr(&args[0]);
+                self.builder
+                    .ins()
+                    .call(self.builtins.sigil_panic_ref, &[msg]);
+                self.builder
+                    .ins()
+                    .trap(TrapCode::unwrap_user(TRAP_PANIC_UNREACHABLE));
+                let after = self.builder.create_block();
+                self.builder.switch_to_block(after);
+                self.builder.seal_block(after);
+                let placeholder_ty = match self.lookup_call_callee_ty(call_span) {
+                    Some(crate::typecheck::Ty::Fn(sig)) => {
+                        cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
+                    }
+                    _ => self.pointer_ty,
+                };
+                self.builder.ins().iconst(placeholder_ty, 0)
+            }
+            // `assert(cond, msg)`: brif on cond. Taken-true falls
+            // through to a merge block carrying `unit`; taken-false
+            // calls `sigil_panic(msg)` + traps. The merge block
+            // produces the Unit (I8) result; the panic-arm block has
+            // no jump into the merge so its IR is independent of the
+            // success path's value flow.
+            Expr::Ident(name, _) if name == "assert" => {
+                assert_eq!(args.len(), 2, "assert builtin arg count is not 2");
+                let cond = self.lower_expr(&args[0]);
+                let msg = self.lower_expr(&args[1]);
+                let ok = self.builder.create_block();
+                let fail = self.builder.create_block();
+                let merge = self.builder.create_block();
+                self.builder.append_block_param(merge, types::I8);
+                self.builder.ins().brif(cond, ok, &[], fail, &[]);
+
+                self.builder.switch_to_block(ok);
+                self.builder.seal_block(ok);
+                let unit = self.builder.ins().iconst(types::I8, 0);
+                self.builder.ins().jump(merge, &[unit.into()]);
+
+                self.builder.switch_to_block(fail);
+                self.builder.seal_block(fail);
+                self.builder
+                    .ins()
+                    .call(self.builtins.sigil_panic_ref, &[msg]);
+                self.builder
+                    .ins()
+                    .trap(TrapCode::unwrap_user(TRAP_PANIC_UNREACHABLE));
+
+                self.builder.switch_to_block(merge);
+                self.builder.seal_block(merge);
+                self.builder.block_params(merge)[0]
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -25674,6 +25755,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 {
                     types::I64
                 }
+                // Plan C addendum (panic / assert).
+                // `assert` returns Unit (I8). `panic` returns a per-call
+                // generic A; the resolved type is recorded in
+                // `call_callee_tys` (typecheck carve-out at the
+                // `is_direct_call` filter), so it falls through to the
+                // `_` arm's `Ty::Fn(sig)` lookup below.
+                Expr::Ident(name, _) if name == "assert" => types::I8,
                 Expr::ClosureRecord { code_fn_name, .. } => self
                     .user_fns
                     .get(code_fn_name)
@@ -25778,6 +25866,14 @@ const TRAP_NONEXHAUSTIVE_MATCH: u8 = 0x41;
 /// `[DEVIATION Task 55] Phase 4f` concern #1 in
 /// `PLAN_B_DEVIATIONS.md`.
 const TRAP_HANDLE_DISCIPLINE_VIOLATION: u8 = 0x42;
+/// Plan C addendum (panic / assert) — fires immediately after a call
+/// to `sigil_panic` so the surrounding basic block has a terminator;
+/// the runtime primitive itself never returns (calls
+/// `std::process::exit(1)`), so this trap is unreachable in practice.
+/// Distinguishing trap codes makes a regressed `sigil_panic` (e.g., a
+/// future version that returns instead of exiting) surface as a
+/// recognisable abort signature instead of a generic IR violation.
+const TRAP_PANIC_UNREACHABLE: u8 = 0x43;
 
 /// Widen an SSA value to I64 for closure-slot / args-buffer storage,
 /// using the standard slot encoding shared by every CPS-form packing
@@ -26268,6 +26364,10 @@ struct BuiltinFuncIds {
     int_shl: cranelift_module::FuncId,
     int_shr: cranelift_module::FuncId,
     int_abs: cranelift_module::FuncId,
+    /// Plan C addendum (panic / assert) — `sigil_panic(msg) -> !`.
+    /// Backs the `panic` builtin; `assert` lowers to a brif whose
+    /// taken branch calls this same primitive.
+    sigil_panic: cranelift_module::FuncId,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// `alloc` (boxes the (k_closure, k_fn, return_closure,
     /// return_fn) quadruple at sites that flow a continuation
@@ -26404,6 +26504,8 @@ struct BuiltinFuncRefs {
     int_shl_ref: FuncRef,
     int_shr_ref: FuncRef,
     int_abs_ref: FuncRef,
+    /// Plan C addendum (panic / assert) — `sigil_panic` FuncRef.
+    sigil_panic_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// alloc + invoke helpers (FuncRefs). The load helpers
     /// (`sigil_continuation_load_*`) are called only from inside
@@ -26697,6 +26799,7 @@ fn prepare_builtin_func_refs(
         int_shl_ref: module.declare_func_in_func(ids.int_shl, builder.func),
         int_shr_ref: module.declare_func_in_func(ids.int_shr, builder.func),
         int_abs_ref: module.declare_func_in_func(ids.int_abs, builder.func),
+        sigil_panic_ref: module.declare_func_in_func(ids.sigil_panic, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
     }
