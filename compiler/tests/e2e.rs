@@ -13497,3 +13497,352 @@ fn cli_combined_env_and_fs_imports() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert_eq!(stdout, "ok\n1\n");
 }
+
+// ===== Plan C TCO addendum — regression suite ==============================
+//
+// Plan: `done/2026-05-07-01-sigil-tco-verify.md` in `boldfield/designs`.
+//
+// Sigil's user-fn tail-call optimization spans two mechanisms, both
+// pinned at depth **10,000,000** here:
+//
+// 1. **Sync→Sync** (pure-Sync recursive shapes — count_down,
+//    ping/pong, let-intermediate, through-if, through-match,
+//    with-effect-row). `lower_call_in_tail_pos`'s Sync→Sync branch
+//    emits Cranelift `return_call`, eliminating the per-iteration
+//    C frame entirely.
+//
+// 2. **Cps→Cps via trampoline** (Cps-colored body with `let _ =
+//    perform; match { ... recurse }` shape — count_down_cps). The
+//    chained-let-yield Final-step's tail expression goes through
+//    `lower_expr_in_tail_pos`; the recursive Match-arm body emits
+//    `return_(NextStep::Call(callee, args))` so the OUTER trampoline
+//    iterates without nesting `sigil_run_loop` per call.
+//
+// Depth 10M is past any default thread stack budget × any plausible
+// per-frame size, so a future regression that loses either TCO
+// mechanism can't pass-by-incidental-stack-fit on either Linux
+// x86_64 or macOS aarch64.
+
+#[test]
+fn tail_recursive_count_down_ten_million() {
+    let src = "fn count_down(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_count_down_ten_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn tail_recursive_mutual_ping_pong_ten_million() {
+    let src = "fn ping(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => pong(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn pong(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => ping(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = ping(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_mutual_ping_pong_ten_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// Cps-colored body shape — closest-shape passing test:
+// `examples/fib_cps_perf.sigil`. `compute_user_fn_abi`
+// (codegen.rs:189) picks `UserFnAbi::Cps` (chained-let-yield
+// classifier accepts the body shape). The recursive Match-arm Cps
+// fn call goes through the chained-let-yield Final-step path,
+// which routes through `lower_expr_in_tail_pos` →
+// `lower_match_in_tail_pos` → `lower_call_in_tail_pos`'s Cps→Cps
+// branch → `return_(NextStep::Call(callee, args))`. The OUTER
+// trampoline iterates without nesting `sigil_run_loop`.
+
+#[test]
+fn tail_recursive_cps_colored_count_down_ten_million() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps(n: Int) -> Int ![State, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_cps(10000000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_cps_colored_count_down_ten_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// ===== TCO-4 shape-coverage regression tests ================================
+//
+// Pin the four tail-position shapes that `lower_expr_in_tail_pos`
+// recurses through. Without TCO-4, all four overflow at depth 10M
+// on either supported platform.
+
+// `let x = ...; recurse(x)` — tail expression is a Block with stmts
+// and a tail Call. Exercises `lower_fn_tail_block` recursion via
+// `Expr::Block` arm body.
+
+#[test]
+fn tail_recursive_with_let_intermediate() {
+    let src = "fn count_down_let(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => {\n      \
+                     let m: Int = n - 1;\n      \
+                     count_down_let(m)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down_let(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_with_let_intermediate");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// `if cond { base } else { recurse }` — `Expr::If` is desugared to
+// `Expr::Match` by `elaborate`, so the if-arms reach
+// `lower_match_in_tail_pos` as match arms. Closest-shape passing
+// test: `examples/sudoku.sigil`'s `print_grid` (tail-recursive
+// if-else with `![Mem, IO]` row).
+
+#[test]
+fn tail_recursive_through_if() {
+    let src = "fn count_down_if(n: Int) -> Int ![] {\n  \
+                 if n == 0 {\n    \
+                   0\n  \
+                 } else {\n    \
+                   count_down_if(n - 1)\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down_if(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_through_if");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// Multi-arm match with multiple tail-recursive arms. Pins the
+// conditional-arm-chain path of `lower_match_in_tail_pos`: the
+// first two arms test for specific Int literals (each arm body
+// is a tail call), the third is the catchall.
+
+#[test]
+fn tail_recursive_through_match() {
+    let src = "fn count_match(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   1 => count_match(0),\n    \
+                   _ => count_match(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_match(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_through_match");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// Tail recursion through a fn with `![Mem]` row. Mem is ambient
+// (no handler required at the call site; runtime drives MutArray
+// primitives natively). Pins that effect-row threading via
+// `terminal_out_param` doesn't break TCO. Closest-shape passing
+// test: `examples/sudoku.sigil`'s `print_grid` (`![Mem, IO]` row,
+// tail-recursive `if` body).
+
+#[test]
+fn tail_recursive_with_effect_row() {
+    let src = "fn count_down_mem(grid: MutArray[Int], n: Int) -> Int ![Mem] {\n  \
+                 if n == 0 {\n    \
+                   mut_array_get(grid, 0)\n  \
+                 } else {\n    \
+                   count_down_mem(grid, n - 1)\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![Mem, IO] {\n  \
+                 let grid: MutArray[Int] = mut_array_new(1, 0);\n  \
+                 let result: Int = count_down_mem(grid, 10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_with_effect_row");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review follow-up #4 — sibling for `tail_recursive_through_match`
+// that bounces between two LITERAL-pattern arms each iteration (not just
+// the catchall). The original test's `_ => count_match(n - 1)` arm fires
+// for the bulk of the iteration; literal-pattern arms (`0 => 0`,
+// `1 => count_match(0)`) only fire at the very tail. This test exercises
+// `emit_pattern_test` on EVERY iteration via mutual recursion: `count_even`
+// and `count_odd` each scrutinize n with a literal `0 =>` base arm + a
+// catchall `_ =>` arm that tail-calls the OTHER fn with `n - 1`. The
+// alternation alone — not `n % 2` arithmetic — drives the parity switch.
+// Cleaner shape: pins multi-arm match with literal-pattern testing AND
+// mutual recursion in tail position together.
+
+#[test]
+fn tail_recursive_through_match_literal_arms() {
+    let src = "fn count_even(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_odd(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn count_odd(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => count_even(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_even(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_through_match_literal_arms");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review MUST-FIX 2 + re-review code-review caveat — Cps→Cps
+// tail recursion under nested handlers, with discriminating return-arm
+// and per-iteration inner-handled effect. The Cps→Cps tail-call branch
+// in `lower_call_in_tail_pos` forwards the surrounding synth-cont's
+// incoming `(post_arm_k_closure, post_arm_k_fn)` pair (loaded from
+// `args_ptr+8` / `args_ptr+16`) instead of hardcoding `(null,
+// identity)`.
+//
+// The test composes two handlers (State + Choose) around a tail-
+// recursive Cps fn that performs BOTH effects every iteration:
+//   - `perform State.get()` (outer-handled — adds State to the row).
+//   - `perform Choose.decide()` (inner-handled — adds Choose).
+// The chained-let-yield body has 2 lets + tail Match, exercising the
+// N=2 chain shape. The recursive arm is a tail Cps→Cps call, routed
+// through the k-forwarding branch.
+//
+// **Discriminating return-arm.** The inner Choose handler has a
+// `return(v) => v + 7` arm that transforms the body's terminal value.
+// Without correct k-forwarding, the recursive call's terminal value
+// would NOT route through the Choose return arm — it would emerge
+// unchanged. With correct k-forwarding (and correct handle-exit
+// dispatch), every recursion's terminal flows through the captured
+// chain, lands on the Choose return arm, and produces v + 7. At depth
+// 10M, the body returns 0 from arm `0 => 0`; the Choose return arm
+// transforms to 7; the State handler passes through unchanged.
+// Expected result: 7. A regression that re-introduces hardcoded
+// (null, identity) or otherwise bypasses the Choose return arm
+// produces 0 (or some other wrong value), failing the assertion.
+
+#[test]
+fn tail_recursive_cps_colored_under_nested_handlers() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               effect Choose { decide: () -> Int }\n\
+               fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n  \
+                 let _s: Int = perform State.get();\n  \
+                 let _c: Int = perform Choose.decide();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_compose(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle (\n    \
+                   handle count_down_compose(10000000) with {\n      \
+                     Choose.decide(k) => k(0),\n      \
+                     return(v) => v + 7,\n    \
+                   }\n  \
+                 ) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_cps_colored_under_nested_handlers");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review MUST-FIX 3 — indirect-call TCO via
+// `return_call_indirect`. Two equal-arity Sync fns `bounce_a` and
+// `bounce_b` each tail-dispatch through a fn-typed let-binding to
+// the OTHER fn. The let-binding shape (`let g: (Int) -> Int ![] = b`
+// inside `bounce_a`'s tail) drives `lower_call_in_tail_pos`'s
+// indirect branch: `g`'s callee shape is `Expr::Ident` registered
+// in `local_fn_types`, the constructed indirect sig (CC=Tail,
+// `(closure_ptr, Int, terminal_out) -> Int`) equals the surrounding
+// fn's sig, so we emit `return_call_indirect`. Pre-fix (no indirect
+// TCO) the indirect call falls back to non-tail `call_indirect`,
+// leaking one C frame per dispatch — at depth 10M, both linux x86_64
+// (8 MB stack) and macos aarch64 (~8 MB) overflow. Post-fix, every
+// indirect dispatch reuses the current frame.
+
+#[test]
+fn tail_recursive_indirect_mutual_ten_million() {
+    let src = "fn bounce_a(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => {\n      \
+                     let g: (Int) -> Int ![] = bounce_b;\n      \
+                     g(n - 1)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn bounce_b(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => {\n      \
+                     let f: (Int) -> Int ![] = bounce_a;\n      \
+                     f(n - 1)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = bounce_a(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_indirect_mutual_ten_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
