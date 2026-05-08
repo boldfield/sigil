@@ -13597,11 +13597,30 @@ fn tail_recursive_cps_colored_count_down_one_million() {
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
 
-// TCO-4 debug bisects — same shape as the 1M test but at smaller
-// depths. If 1K passes and 1M fails, there's a per-iteration leak
-// (something not unwinding under TCO); if 1K also fails, TCO isn't
-// active for the Cps-colored shape at all. Once the cause is
-// understood and fixed, these debug tests can be removed.
+// TCO-4 debug — depth bisects + isolation tests for the
+// Cps-colored failure. Bisect data from PR #108 commit `910ad82`:
+//
+//   `tail_recursive_cps_colored_count_down_one_million` (1M):    FAIL on both
+//   `tco4_debug_cps_colored_count_down_one_hundred_thousand` (100K): FAIL on both
+//   `tco4_debug_cps_colored_count_down_one_thousand` (1K):       PASS on both
+//
+// So TCO is firing for the Cps-colored shape (1K passes), but
+// something leaks per iteration (~24-80 bytes/iter = 8 MB stack /
+// 100K iters). The cause is unverified — could be a Cranelift
+// `return_call` epilogue issue (spill area not deallocated), a
+// codegen-side bug in `lower_perform_to_value`, a runtime-side
+// leak in `sigil_perform`/`sigil_run_loop`, or something else.
+//
+// Isolation tests (below) discriminate among hypotheses:
+//
+//   `tco4_diag_two_builtins_per_iter_at_ten_million` — recursive
+//   Sync fn calling TWO builtins (`int_xor` + `int_shl`) per iter
+//   at depth 10M. Same Cranelift call-site structure as perform
+//   (two `.call(...)` instructions per iter, SSA values live
+//   across them). If this passes at 10M, the leak is NOT
+//   "two-Cranelift-calls-per-iter"; it's specific to perform
+//   machinery (sigil_perform / sigil_run_loop / arena / TLS state).
+//   If this fails at the same threshold, the leak is per-call.
 
 #[test]
 fn tco4_debug_cps_colored_count_down_one_thousand() {
@@ -13649,6 +13668,38 @@ fn tco4_debug_cps_colored_count_down_one_hundred_thousand() {
         src,
         "tco4_debug_cps_colored_count_down_one_hundred_thousand",
     );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// Isolation: tail-recursive Sync fn with TWO intervening Cranelift
+// builtin calls per iteration. Same number of `.call(...)` sites
+// per iter as `count_down_cps`'s perform site (sigil_perform +
+// sigil_run_loop), and the same SSA-spill pattern (`n` and
+// `terminal_out` live across both calls), but to builtins
+// (no runtime perform machinery, no TLS state, no arena
+// allocation). Pass/fail at depth 10M discriminates per-call leaks
+// from perform-machinery leaks.
+
+#[test]
+fn tco4_diag_two_builtins_per_iter_at_ten_million() {
+    let src = "fn count_down_two_builtins(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => {\n      \
+                     let _a: Int = int_xor(n, n);\n      \
+                     let _b: Int = int_shl(n, 1);\n      \
+                     count_down_two_builtins(n - 1)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down_two_builtins(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tco4_diag_two_builtins_per_iter_at_ten_million");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
