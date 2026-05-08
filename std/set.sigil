@@ -111,14 +111,13 @@ fn __set_from_list_acc[T](xs: List[T], acc: Set[T]) -> Set[T] ![] {
 
 // `set_fold(s, init, f)` is a left fold over elements in
 // ascending order: `f(... f(f(init, x0), x1) ..., xN)`.
+// Delegates to `map_fold` and discards the Unit value slot;
+// avoids the redundant `set_to_list` materialization that an
+// intermediate `__set_fold_list` walker would require.
 fn set_fold[T, B](s: Set[T], init: B, f: (B, T) -> B ![]) -> B ![] {
-  __set_fold_list(set_to_list(s), init, f)
-}
-
-fn __set_fold_list[T, B](xs: List[T], acc: B, f: (B, T) -> B ![]) -> B ![] {
-  match xs {
-    Nil => acc,
-    Cons(h, t) => __set_fold_list(t, f(acc, h), f),
+  match s {
+    Set { underlying } =>
+      map_fold(underlying, init, fn (acc: B, k: T, _v: Unit) -> B ![] => f(acc, k)),
   }
 }
 
