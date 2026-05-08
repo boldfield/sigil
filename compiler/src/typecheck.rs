@@ -16136,4 +16136,36 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    // ===== Plan C addendum (Tier 2) — `std.json` =====
+
+    #[test]
+    fn import_std_json_typechecks_cleanly() {
+        // Pin the public surface of `std.json`: type constructors
+        // (JNull / JBool / JInt / JString / JArray / JObject;
+        // JLNil / JLCons; JONil / JOCons), and the two top-level
+        // entry points `json_render` (Mem) and `json_parse`
+        // (closed-row Result return).
+        let src = "import std.json\n\
+                   fn build_doc() -> JValue ![] {\n  \
+                     JObject(\n    \
+                       JOCons(\"k\", JInt(1),\n    \
+                       JOCons(\"arr\", JArray(\n      \
+                         JLCons(JString(\"x\"),\n      \
+                         JLCons(JBool(true),\n      \
+                         JLCons(JNull,\n        \
+                           JLNil)))),\n      \
+                         JONil)))\n\
+                   }\n\
+                   fn main() -> Int ![IO, Mem] {\n  \
+                     let s: String = json_render(build_doc());\n  \
+                     let r: Result[JValue, String] = json_parse(string_to_bytes(s));\n  \
+                     match r {\n    \
+                       Ok(_) => 0,\n    \
+                       Err(_) => 1,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }

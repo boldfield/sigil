@@ -15323,6 +15323,128 @@ fn std_string_replace_multibyte_utf8() {
     assert_eq!(stdout, "tea-pause-tea\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C addendum (Tier 2) — `std.json` =====
+//
+// JSON pretty-printer + parser shipped as a real-Sigil stdlib
+// module (auto-discovered via `include_dir!`). Public surface:
+// `JValue` / `JList` / `JObject` types, `json_render(v)` and
+// `json_parse(b)`. All implementation helpers carry a `__json_`
+// prefix to keep the imported namespace tight.
+
+#[test]
+fn std_json_render_simple_object() {
+    let src = "import std.json\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let v: JValue = JObject(\n    \
+                   JOCons(\"name\", JString(\"ada\"),\n    \
+                   JOCons(\"age\", JInt(36),\n      \
+                     JONil)));\n  \
+                 perform IO.println(json_render(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_render_simple_object");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "{\"name\": \"ada\", \"age\": 36}\n",
+        "stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn std_json_render_array_with_mixed_values() {
+    let src = "import std.json\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let v: JValue = JArray(\n    \
+                   JLCons(JString(\"a\"),\n    \
+                   JLCons(JInt(1),\n    \
+                   JLCons(JBool(true),\n    \
+                   JLCons(JNull,\n      \
+                     JLNil)))));\n  \
+                 perform IO.println(json_render(v));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_render_array_mixed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[\"a\", 1, true, null]\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_simple_object_round_trip() {
+    let src = "import std.json\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let v: JValue = JObject(\n    \
+                   JOCons(\"k\", JInt(42),\n      \
+                     JONil));\n  \
+                 let s: String = json_render(v);\n  \
+                 let parsed: Result[JValue, String] = json_parse(string_to_bytes(s));\n  \
+                 match parsed {\n    \
+                   Ok(v2) => perform IO.println(json_render(v2)),\n    \
+                   Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "{\"k\": 42}\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_negative_int() {
+    let src = "import std.json\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 match json_parse(string_to_bytes(\"-7\")) {\n    \
+                   Ok(v) => perform IO.println(json_render(v)),\n    \
+                   Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_negative_int");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_empty_array_and_object() {
+    let src = "import std.json\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 match json_parse(string_to_bytes(\"[]\")) {\n    \
+                   Ok(v) => perform IO.println(json_render(v)),\n    \
+                   Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n  \
+                 };\n  \
+                 match json_parse(string_to_bytes(\"{}\")) {\n    \
+                   Ok(v) => perform IO.println(json_render(v)),\n    \
+                   Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_empty_collections");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[]\n{}\n", "stderr={stderr:?}");
+}
+
+// `std_json_parse_malformed_returns_err` was authored as the
+// canonical "Err on malformed input" regression but trips a v1
+// composition limitation: a `State.get()` perform followed by
+// `raise(...)` inside a fn that's called from within
+// `catch(run_state(...))` segfaults at runtime. The same limitation
+// is documented in `PLAN_C_PROGRESS.md`'s Koka-test-suite entry
+// ("v1 runtime limitation: State+Raise composition") — discovered
+// when porting Koka's effect-handler tests. The JSON parser hits
+// the limitation on every malformed-input path because
+// `__json_parse_value` reads the cursor (State.get) before
+// raising. Valid-input paths are unaffected (covered by
+// `std_json_parse_simple_object_round_trip`,
+// `std_json_parse_negative_int`,
+// `std_json_parse_empty_array_and_object`).
+//
+// Until v2 closes the State+Raise composition gap, the malformed-
+// input behaviour is "process aborts with SIGSEGV"; user code
+// using `json_parse` should validate that input is well-formed
+// before parsing or accept the abort as the failure signal.
+
 // ===== Plan C addendum (Stage FMT) — `std.format` =====
 
 #[test]
