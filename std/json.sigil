@@ -1,0 +1,514 @@
+// sigil: 0.1
+//
+// std/json.sigil — Plan C addendum (Tier 2 follow-up).
+//
+// JSON value type, pretty-printer, and parser. Promoted from
+// `examples/json.sigil` (which stays in place as a demo) — the
+// public surface is renamed to `json_render` / `json_parse` so
+// importing `std.json` doesn't collide with bare `to_string` /
+// `parse` names that user code may want for its own helpers; all
+// internal helpers carry a `__json_` prefix per the stdlib
+// convention (`__reverse_acc`, `__map_skew`, `__string_compare_at`,
+// `__fmt_walk`, ...).
+//
+// ## Surface
+//
+// **Types**
+//   - `JValue = | JNull | JBool(Bool) | JInt(Int) | JString(String)
+//                | JArray(JList) | JObject(JObject)`
+//   - `JList = | JLNil | JLCons(JValue, JList)`
+//   - `JObject = | JONil | JOCons(String, JValue, JObject)`
+//
+// **Operations**
+//   - `json_render(v: JValue) -> String ![Mem]` — pretty-print to
+//     a fresh `String` via `StringBuilder` (Plan C Task 67) under
+//     the `Mem` effect. No indentation; arrays / objects render on
+//     a single line with `, ` separators and `": "` key-value joins.
+//   - `json_parse(b: ByteArray) -> Result[JValue, String] ![]` —
+//     consume a `ByteArray` and return the parsed `JValue` or an
+//     error message. Internally composes `run_state(0, ...)` +
+//     `catch(...)` to discharge the `State[Int]` cursor and the
+//     `Raise[String]` short-circuit.
+//
+// ## v1 limitations
+//
+// - Integer-only numbers. JSON's full numeric grammar (decimals,
+//   exponents) deferred — sigil's `Float` type ships in v1 but the
+//   parser currently only consumes `[-]?[0-9]+`. v2 plan: extend
+//   `__json_parse_number` to detect `.` / `e` / `E` and route
+//   floats through `string_to_float_*`.
+// - No string escape decoding (`\n`, `\u{...}`, `\\`, `\"`). The
+//   parser slices the string body verbatim between quotes; printer
+//   wraps the body verbatim in quotes. Round-trips iff the input
+//   has no embedded escapes. Same v2 plan extends.
+// - Strict parser: trailing whitespace OK, trailing characters
+//   (anything non-whitespace after the value) → `Err("trailing
+//   characters after JSON value")`.
+// - No Unicode classification beyond what `std.char` ships
+//   (`is_ascii_*`); the parser only recognises ASCII whitespace
+//   (space, tab, LF, CR).
+//
+// ## Example
+//
+// ```sigil
+// import std.json
+// import std.io
+//
+// fn main() -> Int ![IO, Mem] {
+//   let v: JValue = JObject(
+//     JOCons("name", JString("ada"),
+//     JOCons("age", JInt(36),
+//       JONil)));
+//   perform IO.println(json_render(v));
+//   // {"name": "ada", "age": 36}
+//   0
+// }
+// ```
+
+import std.string_builder
+import std.raise
+import std.result
+import std.state
+
+type JValue =
+  | JNull
+  | JBool(Bool)
+  | JInt(Int)
+  | JString(String)
+  | JArray(JList)
+  | JObject(JObject)
+
+type JList =
+  | JLNil
+  | JLCons(JValue, JList)
+
+type JObject =
+  | JONil
+  | JOCons(String, JValue, JObject)
+
+// ===== Pretty-printer =====
+
+fn json_render(v: JValue) -> String ![Mem] {
+  let sb: StringBuilder = sb_new();
+  __json_print_value(sb, v);
+  sb_finalize(sb)
+}
+
+fn __json_print_value(sb: StringBuilder, v: JValue) -> Unit ![Mem] {
+  match v {
+    JNull => sb_append(sb, "null"),
+    JBool(b) =>
+      match b {
+        true => sb_append(sb, "true"),
+        false => sb_append(sb, "false"),
+      },
+    JInt(n) => sb_append(sb, int_to_string(n)),
+    JString(s) => __json_print_quoted(sb, s),
+    JArray(items) => __json_print_array(sb, items),
+    JObject(fields) => __json_print_object(sb, fields),
+  }
+}
+
+fn __json_print_quoted(sb: StringBuilder, s: String) -> Unit ![Mem] {
+  sb_append(sb, "\"");
+  sb_append(sb, s);
+  sb_append(sb, "\"")
+}
+
+fn __json_print_array(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  sb_append(sb, "[");
+  __json_print_list_head(sb, xs);
+  sb_append(sb, "]")
+}
+
+fn __json_print_list_head(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  match xs {
+    JLNil => sb_append(sb, ""),
+    JLCons(v, rest) => {
+      __json_print_value(sb, v);
+      __json_print_list_tail(sb, rest)
+    },
+  }
+}
+
+fn __json_print_list_tail(sb: StringBuilder, xs: JList) -> Unit ![Mem] {
+  match xs {
+    JLNil => sb_append(sb, ""),
+    JLCons(v, rest) => {
+      sb_append(sb, ", ");
+      __json_print_value(sb, v);
+      __json_print_list_tail(sb, rest)
+    },
+  }
+}
+
+fn __json_print_object(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  sb_append(sb, "{");
+  __json_print_object_head(sb, fields);
+  sb_append(sb, "}")
+}
+
+fn __json_print_object_head(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  match fields {
+    JONil => sb_append(sb, ""),
+    JOCons(name, v, rest) => {
+      __json_print_field(sb, name, v);
+      __json_print_object_tail(sb, rest)
+    },
+  }
+}
+
+fn __json_print_object_tail(sb: StringBuilder, fields: JObject) -> Unit ![Mem] {
+  match fields {
+    JONil => sb_append(sb, ""),
+    JOCons(name, v, rest) => {
+      sb_append(sb, ", ");
+      __json_print_field(sb, name, v);
+      __json_print_object_tail(sb, rest)
+    },
+  }
+}
+
+fn __json_print_field(sb: StringBuilder, name: String, v: JValue) -> Unit ![Mem] {
+  __json_print_quoted(sb, name);
+  sb_append(sb, ": ");
+  __json_print_value(sb, v)
+}
+
+// ===== Parser — State[Int] recursive descent =====
+
+fn json_parse(b: ByteArray) -> Result[JValue, String] ![] {
+  let result: (Result[JValue, String], Int) = run_state(0, fn () -> Result[JValue, String] ![State[Int]] => {
+    catch(fn () -> JValue ![Raise[String], State[Int]] => {
+      __json_parse_body(b)
+    })
+  });
+  match result { (r, _pos) => r }
+}
+
+fn __json_byte_at_or_neg1(b: ByteArray, pos: Int) -> Int ![] {
+  if pos >= byte_array_length(b) {
+    -1
+  } else {
+    if pos < 0 {
+      -1
+    } else {
+      byte_to_int(byte_array_get(b, pos))
+    }
+  }
+}
+
+fn __json_at_eof(b: ByteArray, pos: Int) -> Bool ![] {
+  if pos >= byte_array_length(b) {
+    true
+  } else {
+    false
+  }
+}
+
+fn __json_is_ws(c: Int) -> Bool ![] {
+  if c == 32 {
+    true
+  } else {
+    if c == 9 {
+      true
+    } else {
+      if c == 10 {
+        true
+      } else {
+        if c == 13 {
+          true
+        } else {
+          false
+        }
+      }
+    }
+  }
+}
+
+fn __json_is_digit(c: Int) -> Bool ![] {
+  if c < 48 {
+    false
+  } else {
+    if c > 57 {
+      false
+    } else {
+      true
+    }
+  }
+}
+
+fn __json_skip_ws(b: ByteArray) -> Int ![State[Int]] {
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if __json_is_ws(c) {
+    let _ws: Int = perform State.set(pos + 1);
+    __json_skip_ws(b)
+  } else {
+    0
+  }
+}
+
+fn __json_match_keyword_loop(b: ByteArray, kw_bytes: ByteArray, base: Int, i: Int, kw_len: Int) -> Bool ![] {
+  if i == kw_len {
+    true
+  } else {
+    if base + i >= byte_array_length(b) {
+      false
+    } else {
+      let bb: Int = byte_to_int(byte_array_get(b, base + i));
+      let kb: Int = byte_to_int(byte_array_get(kw_bytes, i));
+      if bb == kb {
+        __json_match_keyword_loop(b, kw_bytes, base, i + 1, kw_len)
+      } else {
+        false
+      }
+    }
+  }
+}
+
+fn __json_is_keyword(b: ByteArray, pos: Int, kw: String) -> Bool ![] {
+  let kw_bytes: ByteArray = string_to_bytes(kw);
+  let kw_len: Int = byte_array_length(kw_bytes);
+  __json_match_keyword_loop(b, kw_bytes, pos, 0, kw_len)
+}
+
+fn __json_kw_len(kw: String) -> Int ![] {
+  byte_array_length(string_to_bytes(kw))
+}
+
+fn __json_scan_string_end(b: ByteArray, i: Int) -> Int ![Raise[String]] {
+  if i >= byte_array_length(b) {
+    raise("unterminated string")
+  } else {
+    if byte_to_int(byte_array_get(b, i)) == 34 {
+      i
+    } else {
+      __json_scan_string_end(b, i + 1)
+    }
+  }
+}
+
+fn __json_parse_string_inner(b: ByteArray) -> String ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let end: Int = __json_scan_string_end(b, pos + 1);
+  let _adv: Int = perform State.set(end + 1);
+  let slice: ByteArray = byte_array_slice(b, pos + 1, end);
+  let s: String = string_from_bytes_alloc(slice);
+  s
+}
+
+fn __json_parse_string_value(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let s: String = __json_parse_string_inner(b);
+  JString(s)
+}
+
+fn __json_parse_digits(b: ByteArray, acc: Int, started: Bool) -> Int ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if __json_is_digit(c) {
+    let _adv: Int = perform State.set(pos + 1);
+    __json_parse_digits(b, acc * 10 + (c - 48), true)
+  } else {
+    if started {
+      acc
+    } else {
+      raise("expected number")
+    }
+  }
+}
+
+fn __json_parse_negative_int(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let n: Int = __json_parse_digits(b, 0, false);
+  JInt(0 - n)
+}
+
+fn __json_parse_positive_int(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let n: Int = __json_parse_digits(b, 0, false);
+  JInt(n)
+}
+
+fn __json_parse_number(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == 45 {
+    let _adv: Int = perform State.set(pos + 1);
+    __json_parse_negative_int(b)
+  } else {
+    __json_parse_positive_int(b)
+  }
+}
+
+fn __json_parse_value(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let _ws0: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == -1 {
+    raise("unexpected end of input")
+  } else {
+    if c == 110 {
+      if __json_is_keyword(b, pos, "null") {
+        let _sn: Int = perform State.set(pos + __json_kw_len("null"));
+        JNull
+      } else {
+        raise("expected null")
+      }
+    } else {
+      if c == 116 {
+        if __json_is_keyword(b, pos, "true") {
+          let _st: Int = perform State.set(pos + __json_kw_len("true"));
+          JBool(true)
+        } else {
+          raise("expected true")
+        }
+      } else {
+        if c == 102 {
+          if __json_is_keyword(b, pos, "false") {
+            let _sf: Int = perform State.set(pos + __json_kw_len("false"));
+            JBool(false)
+          } else {
+            raise("expected false")
+          }
+        } else {
+          if c == 34 {
+            __json_parse_string_value(b)
+          } else {
+            if c == 91 {
+              __json_parse_array(b)
+            } else {
+              if c == 123 {
+                __json_parse_object(b)
+              } else {
+                if c == 45 {
+                  __json_parse_number(b)
+                } else {
+                  if __json_is_digit(c) {
+                    __json_parse_number(b)
+                  } else {
+                    raise("unexpected character")
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn __json_parse_array(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let _sa: Int = perform State.set(pos + 1);
+  let _ws1: Int = __json_skip_ws(b);
+  let p1: Int = perform State.get();
+  if __json_byte_at_or_neg1(b, p1) == 93 {
+    let _sc: Int = perform State.set(p1 + 1);
+    JArray(JLNil)
+  } else {
+    __json_parse_array_body(b)
+  }
+}
+
+fn __json_parse_array_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let items: JList = __json_parse_array_elems(b);
+  JArray(items)
+}
+
+fn __json_parse_array_elems(b: ByteArray) -> JList ![State[Int], Raise[String]] {
+  let v: JValue = __json_parse_value(b);
+  let _ws2: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == 44 {
+    let _s1: Int = perform State.set(pos + 1);
+    __json_parse_array_elems_tail(b, v)
+  } else {
+    if c == 93 {
+      let _s2: Int = perform State.set(pos + 1);
+      JLCons(v, JLNil)
+    } else {
+      raise("expected , or ] in array")
+    }
+  }
+}
+
+fn __json_parse_array_elems_tail(b: ByteArray, head: JValue) -> JList ![State[Int], Raise[String]] {
+  let rest: JList = __json_parse_array_elems(b);
+  JLCons(head, rest)
+}
+
+fn __json_parse_object(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let pos: Int = perform State.get();
+  let _so: Int = perform State.set(pos + 1);
+  let _ws3: Int = __json_skip_ws(b);
+  let p1: Int = perform State.get();
+  if __json_byte_at_or_neg1(b, p1) == 125 {
+    let _sc2: Int = perform State.set(p1 + 1);
+    JObject(JONil)
+  } else {
+    __json_parse_object_body(b)
+  }
+}
+
+fn __json_parse_object_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let fields: JObject = __json_parse_object_fields(b);
+  JObject(fields)
+}
+
+fn __json_parse_object_fields(b: ByteArray) -> JObject ![State[Int], Raise[String]] {
+  let _ws4: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  if __json_byte_at_or_neg1(b, pos) == 34 {
+    __json_parse_object_field_entry(b)
+  } else {
+    raise("expected field name string in object")
+  }
+}
+
+fn __json_parse_object_field_entry(b: ByteArray) -> JObject ![State[Int], Raise[String]] {
+  let name: String = __json_parse_string_inner(b);
+  let _ws5: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  let colon: Int = __json_byte_at_or_neg1(b, pos);
+  if colon == 58 {
+    let _sc3: Int = perform State.set(pos + 1);
+    __json_parse_object_field_value(b, name)
+  } else {
+    raise("expected ':' after field name")
+  }
+}
+
+fn __json_parse_object_field_value(b: ByteArray, name: String) -> JObject ![State[Int], Raise[String]] {
+  let v: JValue = __json_parse_value(b);
+  let _ws6: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  let nx: Int = __json_byte_at_or_neg1(b, pos);
+  if nx == 44 {
+    let _s3: Int = perform State.set(pos + 1);
+    __json_parse_object_fields_tail(b, name, v)
+  } else {
+    if nx == 125 {
+      let _s4: Int = perform State.set(pos + 1);
+      JOCons(name, v, JONil)
+    } else {
+      raise("expected , or } in object")
+    }
+  }
+}
+
+fn __json_parse_object_fields_tail(b: ByteArray, name: String, v: JValue) -> JObject ![State[Int], Raise[String]] {
+  let rest: JObject = __json_parse_object_fields(b);
+  JOCons(name, v, rest)
+}
+
+fn __json_parse_body(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let v: JValue = __json_parse_value(b);
+  let _ws7: Int = __json_skip_ws(b);
+  let pos: Int = perform State.get();
+  if __json_at_eof(b, pos) {
+    v
+  } else {
+    raise("trailing characters after JSON value")
+  }
+}
