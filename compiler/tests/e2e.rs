@@ -188,41 +188,6 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
     out
 }
 
-/// TCO-4 debug — compile with `SIGIL_DUMP_IR` set so codegen prints
-/// the Cranelift IR for matching fns to stderr. Returns `compile.stderr`
-/// (which contains the IR plus any other compile diagnostics).
-/// Currently unused after the IR-dump panic test was removed; kept for
-/// future debugging without re-plumbing the env-var pass-through.
-#[allow(dead_code)]
-fn compile_with_ir_dump(source: &str, test_name: &str, dump_filter: &str) -> String {
-    let root = workspace_root();
-    let sigil_bin = sigil_binary();
-    let src_path = std::env::temp_dir().join(format!(
-        "sigil_e2e_{}_{}.sigil",
-        test_name,
-        std::process::id()
-    ));
-    std::fs::write(&src_path, source).expect("write source");
-    let bin_path =
-        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
-    let compile = Command::new(&sigil_bin)
-        .arg(&src_path)
-        .arg("-o")
-        .arg(&bin_path)
-        .env("SIGIL_DUMP_IR", dump_filter)
-        .current_dir(&root)
-        .output()
-        .expect("failed to invoke sigil compiler");
-    let _ = std::fs::remove_file(&src_path);
-    let _ = std::fs::remove_file(&bin_path);
-    assert!(
-        compile.status.success(),
-        "compile failed for {test_name}: stderr={}",
-        String::from_utf8_lossy(&compile.stderr),
-    );
-    String::from_utf8_lossy(&compile.stderr).into_owned()
-}
-
 /// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
 /// e2e tests that pin specific compile-failure E-codes.
 ///
@@ -13738,6 +13703,123 @@ fn tail_recursive_with_effect_row() {
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_with_effect_row");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review follow-up #4 — sibling for `tail_recursive_through_match`
+// that bounces between two LITERAL-pattern arms each iteration (not just
+// the catchall). The original test's `_ => count_match(n - 1)` arm fires
+// for the bulk of the iteration; literal-pattern arms (`0 => 0`,
+// `1 => count_match(0)`) only fire at the very tail. This test pins
+// `emit_pattern_test` on every iteration: the inner match scrutinizes
+// `n % 2` and selects between literal arm `0` (even) and literal arm
+// `1` (odd), each tail-calling the same fn. The outer match's literal
+// `0 => 0` is the base case.
+
+#[test]
+fn tail_recursive_through_match_literal_arms() {
+    let src = "fn ping_pong_match(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => match n % 2 {\n      \
+                     0 => ping_pong_match(n - 1),\n      \
+                     1 => ping_pong_match(n - 1),\n      \
+                     _ => 0,\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = ping_pong_match(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_through_match_literal_arms");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review MUST-FIX 2 follow-up — Cps→Cps tail recursion under
+// nested handlers. The Cps→Cps tail-call branch in
+// `lower_call_in_tail_pos` forwards the surrounding synth-cont's
+// incoming `(post_arm_k_closure, post_arm_k_fn)` pair (loaded from
+// `args_ptr+8` / `args_ptr+16`) instead of hardcoding `(null,
+// identity)`. This test composes two handlers (State + Choose) around
+// a tail-recursive Cps fn that performs effects from both rows. The
+// outer Choose handler, the inner State handler, and the recursive
+// fn all participate in the same continuation chain. Pins that
+// terminal values flow through the captured chain at unbounded depth,
+// preserving correctness when the outer continuation is non-identity.
+
+#[test]
+fn tail_recursive_cps_colored_under_nested_handlers() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               effect Choose { decide: () -> Int }\n\
+               fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_compose(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle (\n    \
+                   handle count_down_compose(10000000) with {\n      \
+                     Choose.decide(k) => k(0),\n    \
+                   }\n  \
+                 ) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tail_recursive_cps_colored_under_nested_handlers");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// PR #108 review MUST-FIX 3 — indirect-call TCO via
+// `return_call_indirect`. Two equal-arity Sync fns `bounce_a` and
+// `bounce_b` each tail-dispatch through a fn-typed let-binding to
+// the OTHER fn. The let-binding shape (`let g: (Int) -> Int ![] = b`
+// inside `bounce_a`'s tail) drives `lower_call_in_tail_pos`'s
+// indirect branch: `g`'s callee shape is `Expr::Ident` registered
+// in `local_fn_types`, the constructed indirect sig (CC=Tail,
+// `(closure_ptr, Int, terminal_out) -> Int`) equals the surrounding
+// fn's sig, so we emit `return_call_indirect`. Pre-fix (no indirect
+// TCO) the indirect call falls back to non-tail `call_indirect`,
+// leaking one C frame per dispatch — at depth 10M, both linux x86_64
+// (8 MB stack) and macos aarch64 (~8 MB) overflow. Post-fix, every
+// indirect dispatch reuses the current frame.
+
+#[test]
+fn tail_recursive_indirect_mutual_ten_million() {
+    let src = "fn bounce_a(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => {\n      \
+                     let g: (Int) -> Int ![] = bounce_b;\n      \
+                     g(n - 1)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn bounce_b(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => {\n      \
+                     let f: (Int) -> Int ![] = bounce_a;\n      \
+                     f(n - 1)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = bounce_a(10000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "tail_recursive_indirect_mutual_ten_million");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }

@@ -9695,18 +9695,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         };
         let entry = &user_fns[&f.name];
 
-        // TCO-4 debug — announce every user fn's ABI before its body
-        // is lowered. Lets us see whether count_down_cps takes the
-        // Sync body emit path (line 11647) or some Cps body path.
-        if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
-            if !filter.is_empty() && f.name.contains(&filter) {
-                eprintln!(
-                    "===== SIGIL_DUMP_IR ANNOUNCE fn `{}` (ABI={:?}, CC={:?}) =====",
-                    f.name, entry.abi, entry.signature.call_conv
-                );
-            }
-        }
-
         ctx.func.signature = entry.signature.clone();
         ctx.func.name = UserFuncName::user(0, entry.func_id.as_u32());
         {
@@ -10588,20 +10576,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     lowerer.builder.ins().return_(&[next_step]);
                     lowerer.builder.finalize();
 
-                    // TCO-4 debug — same dump as the Sync path, but
-                    // for the Cps body emit path (compound-match shape).
-                    if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
-                        if !filter.is_empty() && f.name.contains(&filter) {
-                            eprintln!(
-                                "===== SIGIL_DUMP_IR fn `{}` [Cps compound-match path] (ABI={:?}, CC={:?}) =====\n{}",
-                                f.name,
-                                entry.abi,
-                                entry.signature.call_conv,
-                                ctx.func
-                            );
-                        }
-                    }
-
                     module
                         .define_function(entry.func_id, &mut ctx)
                         .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
@@ -11469,20 +11443,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // ending the `&mut ctx.func` borrow. The module ops
                 // below safely get `&mut ctx`.
 
-                // TCO-4 debug — dump for the chained-let-yield Cps body
-                // emit path.
-                if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
-                    if !filter.is_empty() && f.name.contains(&filter) {
-                        eprintln!(
-                            "===== SIGIL_DUMP_IR fn `{}` [Cps chained-let-yield path] (ABI={:?}, CC={:?}) =====\n{}",
-                            f.name,
-                            entry.abi,
-                            entry.signature.call_conv,
-                            ctx.func
-                        );
-                    }
-                }
-
                 module
                     .define_function(entry.func_id, &mut ctx)
                     .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
@@ -11682,18 +11642,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
             }
             lowerer.builder.finalize();
-        }
-        // TCO-4 debug — dump Cranelift IR for fns matching SIGIL_DUMP_IR
-        // env var (substring match). Lets us compare IR for the leaking
-        // count_down_cps vs the passing count_down to spot what differs
-        // around the perform site / return_call epilogue.
-        if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
-            if !filter.is_empty() && f.name.contains(&filter) {
-                eprintln!(
-                    "===== SIGIL_DUMP_IR fn `{}` (ABI={:?}, CC={:?}) =====\n{}",
-                    f.name, entry.abi, entry.signature.call_conv, ctx.func
-                );
-            }
         }
         module
             .define_function(entry.func_id, &mut ctx)
@@ -13976,36 +13924,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // Final: lower tail with full env, widen,
                             // return Done.
                             //
-                            // TCO-4 follow-up — route the tail expression
-                            // through `lower_expr_in_tail_pos` so a
-                            // Cps→Cps recursive call in the tail emits a
-                            // NextStep::Call return directly (via
-                            // `lower_call_in_tail_pos`'s Cps branch)
-                            // instead of nesting `sigil_run_loop`.
-                            // `TailResult::Terminated` means the tail
-                            // already emitted the surrounding fn's
-                            // `return_(...)`; skip the Done-wrap below.
-                            let tail_result = lowerer.lower_expr_in_tail_pos(tail_expr);
-                            let tail_value = match tail_result {
-                                TailResult::Terminated => {
-                                    // Cps→Cps tail-call branch already
-                                    // emitted return_(NextStep::Call(...)).
-                                    // Done-wrap below would land in a
-                                    // dead block (Cranelift elides);
-                                    // skip cleanly.
-                                    lowerer.builder.finalize();
-                                    continue;
-                                }
-                                TailResult::Value(v) => v,
-                                TailResult::NoValue => {
-                                    // Block-with-no-tail edge case (rare
-                                    // for Final-step). Substitute zero
-                                    // of the tail's expected I64 width
-                                    // — the wrap-in-Done path tolerates
-                                    // it as the unit value.
-                                    lowerer.builder.ins().iconst(types::I64, 0)
-                                }
-                            };
+                            // PR #108 review — earlier commits (`0379896`)
+                            // added a tail-pos routing here that mirrored
+                            // the chained-let-yield Final-step fix. That
+                            // routing turned out to be unreachable: the
+                            // count_down_cps shape (the test that
+                            // motivated TCO-4 follow-up) takes the
+                            // user-fn ChainedLetBindStep path
+                            // (codegen.rs:14556+, edited at line ~15834)
+                            // — NOT this arm-side PostArmKStepRole path.
+                            // The unused edit also had a `continue` that
+                            // skipped the loop's `define_function` call,
+                            // which would have linker-broken any test
+                            // that hit it. Reverted to the original
+                            // `lower_expr` direct call. If a future
+                            // arm-side chained-let-yield body needs
+                            // Cps→Cps TCO, mirror the user-fn fix
+                            // structure (route through
+                            // `lower_expr_in_tail_pos`, handle
+                            // `TailResult::Terminated` WITHOUT skipping
+                            // the loop body's define_function call).
+                            let tail_value = lowerer.lower_expr(tail_expr);
                             let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
                             let widened_tail = if actual_tail_ty == types::I64 {
                                 tail_value
@@ -15853,7 +15792,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // (cont and gate are dead at runtime).
                                     let tail_result =
                                         lowerer.lower_expr_in_tail_pos(tail_expr.as_ref());
-                                    lowerer.emit_discharge_propagation_check();
+
+                                    // PR #108 review — gate
+                                    // `emit_discharge_propagation_check`
+                                    // on non-`Terminated`. When the tail
+                                    // already emitted `return_(...)` (the
+                                    // Cps→Cps tail-call path), the
+                                    // builder is positioned at a
+                                    // terminated block; emitting the
+                                    // check's `load` + `icmp` + `brif`
+                                    // there violates Cranelift's
+                                    // no-instructions-after-terminator
+                                    // invariant. The dead-block switch
+                                    // for the Terminated branch happens
+                                    // BELOW this point, so the check
+                                    // must skip when Terminated.
+                                    if !matches!(tail_result, TailResult::Terminated) {
+                                        lowerer.emit_discharge_propagation_check();
+                                    }
 
                                     let tail_value = match tail_result {
                                         TailResult::Value(v) => v,
@@ -18553,7 +18509,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// TCO-4 — lower a `Block` as the tail of the enclosing fn body.
     /// Statements lower normally (they're never in tail position); the
     /// tail expression goes through `lower_expr_in_tail_pos`, which
-    /// recurses through tail-preserving shapes (Block, Match, Annot)
+    /// recurses through tail-preserving shapes (Block, Match, Call)
     /// and emits `return_call` for direct user-fn calls with matching
     /// signatures. Returns `TailResult::NoValue` for stmt-only blocks.
     ///
@@ -18573,7 +18529,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// TCO-4 — lower an expression in tail position w.r.t. the
     /// enclosing fn body. Tail-preserving shapes recurse so a
     /// recursive user-fn call buried inside `match`/`if`-desugared-
-    /// to-match/`Block`/`Annot` reaches `lower_call_in_tail_pos`.
+    /// to-match/`Block` reaches `lower_call_in_tail_pos`.
     /// Everything else falls back to `lower_expr` and is wrapped as
     /// `Value` — those expressions produce a value the caller will
     /// `return_` or `jump` with.
@@ -18632,21 +18588,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///    differ across user fns of different arity, e.g. an
     ///    `f(x) -> Int` calling `g(a, b) -> Int`).
     ///
-    /// Other shapes — Cps-ABI callees, indirect calls (closure
-    /// dispatch through `ClosureRecord` / `ClosureEnvLoad`), ctor
-    /// applications, signature mismatches — fall back to
-    /// `lower_call` and wrap the result in `TailResult::Value`. The
-    /// fallback path means tail-call detection is a best-effort
-    /// optimization; missed tail calls are slow (one frame per
-    /// recursion level) but correct.
+    /// Indirect-call TCO via `return_call_indirect`. Mirrors the
+    /// indirect-call shape detection in `lower_call`'s `_` arm
+    /// (`CalleeSig::Surface(FnTypeExpr)` for `Expr::Ident` of a
+    /// fn-typed local, `CalleeSig::Resolved(FnSig)` for `Expr::Call`
+    /// or `Expr::ClosureEnvLoad`). When the constructed indirect sig
+    /// (CC=Tail, `(closure_ptr, params..., terminal_out) -> ret`)
+    /// equals the surrounding fn's sig, we emit
+    /// `return_call_indirect` instead of `call_indirect` + `return_`.
+    /// This handles the closure-recursion pattern (e.g., mutual
+    /// indirect tail-recursion through fn-typed let-bindings or
+    /// captures) at unbounded depth.
     ///
-    /// Indirect-call TCO (`return_call_indirect` for closure
-    /// dispatch) is a deferred follow-up. The diagnostic tests
-    /// added by TCO-1 are all direct calls; the four shape-coverage
-    /// tests added by TCO-4 are also direct. A future follow-up can
-    /// extend this helper to detect indirect-tail-call shapes if
-    /// real programs surface a depth-bounded indirect-recursion
-    /// pattern.
+    /// Other shapes — Cps-ABI callees (cps_signature uses the host
+    /// triple's default CC, not Tail; sig comparison fails), ctor
+    /// applications, sig-shape mismatches — fall back to `lower_call`
+    /// and wrap the result in `TailResult::Value`.
     fn lower_call_in_tail_pos(
         &mut self,
         callee: &crate::ast::Expr,
@@ -18703,36 +18660,89 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 // NextStep::Call return. The signature_match
                                 // check above implies the surrounding fn
                                 // also has cps_signature shape (4 params,
-                                // pointer return), i.e., it's also a Cps fn.
-                                // Build NextStep::Call(callee, args + (null,
-                                // identity) trailing pair) and return it.
-                                // The OUTER trampoline iterates without
-                                // nesting a fresh `sigil_run_loop` — the
-                                // pre-fix lower_call Cps direct branch would
-                                // nest one per call (~80 bytes/iter
-                                // C-stack leak; capped count_down_cps at
-                                // ~100K depth). See `[DEVIATION Task TCO-4
-                                // in-flight]` in `PLAN_C_DEVIATIONS.md` for
+                                // pointer return), i.e., it's also a Cps
+                                // fn. Build NextStep::Call(callee, args +
+                                // forwarded post_arm_k trailing pair) and
+                                // return it. The OUTER trampoline iterates
+                                // without nesting a fresh `sigil_run_loop`
+                                // — the pre-fix lower_call Cps direct
+                                // branch would nest one per call (~80
+                                // bytes/iter C-stack leak; capped
+                                // count_down_cps at ~100K depth). See
+                                // `[DEVIATION Task TCO-4 follow-up]
+                                // [CLOSED]` in `PLAN_C_DEVIATIONS.md` for
                                 // the diagnostic walk.
                                 //
-                                // The trailing pair stays (null, identity)
-                                // — same as the existing Cps direct branch.
-                                // Forwarding the surrounding fn's captured
-                                // outer (k_closure, k_fn) would preserve
-                                // continuation chains for non-trivial k,
-                                // but for v1's identity-k surrounding-handle
-                                // case (which is what `count_down_cps` from
-                                // main's `handle ... with` exercises), the
-                                // captured outer k IS (null, identity), so
-                                // (null, identity) is correct here too.
-                                // More general k-forwarding is a follow-up
-                                // when a real program surfaces the gap.
+                                // **k-forwarding** (PR #108 review-driven
+                                // fix). The recursive call's trailing pair
+                                // is the surrounding synth-cont's INCOMING
+                                // post_arm_k pair (loaded from
+                                // `args_ptr+8` / `args_ptr+16` per the
+                                // Slice A convention — see
+                                // `POST_ARM_K_CLOSURE_OFF` /
+                                // `POST_ARM_K_FN_OFF`). Forwarding instead
+                                // of hardcoding `(null, identity)` keeps
+                                // continuation semantics correct when the
+                                // surrounding chain has a non-identity
+                                // post_arm_k (a future Sigil program
+                                // composing handlers, captured-k lambdas,
+                                // or chained nested handles will surface
+                                // this — pre-fix the recursive call's
+                                // terminal value would have been silently
+                                // dropped to identity instead of routing
+                                // through the captured chain).
+                                //
+                                // **Layout assumption:** the surrounding
+                                // fn's args_ptr follows the Slice A
+                                // 3-slot layout `[arg, post_arm_k_closure,
+                                // post_arm_k_fn]` because this branch is
+                                // currently only reachable via
+                                // `lower_expr_in_tail_pos` from the
+                                // chained-let-yield Final-step site
+                                // (codegen.rs:15831 area), which hand-
+                                // emits synth-conts with that layout.
+                                // For other Cps fn bodies (user fn arity
+                                // != 1, etc.), the post_arm_k offsets
+                                // would differ; the signature_match guard
+                                // doesn't catch shape mismatches, so a
+                                // future routing change MUST verify the
+                                // surrounding fn is a Slice A synth-cont.
+                                // Today: synth-conts are the only path.
                                 let user_arg_count = args.len();
                                 let total_arg_count = user_arg_count + 2;
 
+                                // Load surrounding synth-cont's incoming
+                                // post_arm_k pair from its args_ptr (entry
+                                // block_params[1] per cps_signature).
+                                let surrounding_entry = match self.builder.func.layout.entry_block()
+                                {
+                                    Some(b) => b,
+                                    None => unreachable!(
+                                        "codegen invariant: \
+                                             lower_call_in_tail_pos's Cps→Cps branch \
+                                             invoked mid-body-emit, but the surrounding \
+                                             fn has no entry block — entry block is \
+                                             always created before lowering begins"
+                                    ),
+                                };
+                                let surrounding_args_ptr =
+                                    self.builder.func.dfg.block_params(surrounding_entry)[1];
+                                let forwarded_post_arm_k_closure = self.builder.ins().load(
+                                    self.pointer_ty,
+                                    MemFlags::trusted(),
+                                    surrounding_args_ptr,
+                                    POST_ARM_K_CLOSURE_OFF,
+                                );
+                                let forwarded_post_arm_k_fn = self.builder.ins().load(
+                                    self.pointer_ty,
+                                    MemFlags::trusted(),
+                                    surrounding_args_ptr,
+                                    POST_ARM_K_FN_OFF,
+                                );
+
                                 // Lower user args; widen + store into a
-                                // local args buffer; tack on (null,
-                                // identity) at the trailing pair slots.
+                                // local args buffer; tack on the forwarded
+                                // post_arm_k pair at the trailing slots.
                                 let slot_bytes = (total_arg_count * 8) as u32;
                                 let slot = self.builder.create_sized_stack_slot(
                                     StackSlotData::new(StackSlotKind::ExplicitSlot, slot_bytes, 3),
@@ -18757,18 +18767,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                         .ins()
                                         .stack_store(widened, slot, (i * 8) as i32);
                                 }
-                                let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
-                                let identity_k_fn = self
-                                    .builder
-                                    .ins()
-                                    .func_addr(self.pointer_ty, self.continuation_identity_ref);
                                 self.builder.ins().stack_store(
-                                    null_k_closure,
+                                    forwarded_post_arm_k_closure,
                                     slot,
                                     k_closure_offset(user_arg_count),
                                 );
                                 self.builder.ins().stack_store(
-                                    identity_k_fn,
+                                    forwarded_post_arm_k_fn,
                                     slot,
                                     k_fn_offset(user_arg_count),
                                 );
@@ -18787,6 +18792,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                     .iconst(types::I32, total_arg_count as i64);
                                 let null_call_closure =
                                     self.builder.ins().iconst(self.pointer_ty, 0);
+                                // Stackmap discipline: this `call` to
+                                // `sigil_next_step_call` is the GC safe
+                                // point for live values during the args-
+                                // copy loop below. Mirrors the existing
+                                // non-tail Cps direct branch (lower_call's
+                                // Cps path at codegen.rs:22214+) — same
+                                // placeholder push immediately after the
+                                // call inst, same MemFlags::trusted()
+                                // loads/stores against the local slot,
+                                // same ordering relative to argument
+                                // lowering. If a future change in either
+                                // branch starts emitting GC-allocating
+                                // calls between user-arg lowering and
+                                // this push, both branches must update
+                                // together.
                                 let ns_call = self.builder.ins().call(
                                     self.next_step_call_ref,
                                     &[null_call_closure, callee_addr, arg_count_v],
@@ -18832,6 +18852,102 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         }
                     }
                 }
+            }
+        }
+
+        // Indirect-call TCO via `return_call_indirect` (PR #108
+        // review-driven follow-up — closes MUST-FIX 3). The callee
+        // is a fn-typed value (let-binding, fn parameter, expression
+        // returning a closure). Build the indirect Cranelift sig the
+        // same way `lower_call`'s indirect dispatch path does
+        // (codegen.rs:23712+), compare against the surrounding fn's
+        // sig, and emit `return_call_indirect` if equal.
+        //
+        // **Soundness:** Cranelift requires (a) caller and callee CCs
+        // match and (b) the CC supports tail calls. The constructed
+        // indirect sig uses `CallConv::Tail`; the sig equality check
+        // therefore implies the surrounding fn is also Tail-CC, which
+        // is the Sync user-fn flavour (Cps fns use the host triple's
+        // default CC via `cps_signature`, so they fail the comparison
+        // and fall through to `lower_call`).
+        //
+        // **Mutually exclusive with the direct branch above.** The
+        // direct branch only fires when `callee` is `Expr::Ident(name)`
+        // with `name` in `user_fn_refs` AND not in `env`. If we land
+        // here past that branch, either `name` is shadowed by a
+        // let-binding (`local_fn_types` lookup picks it up), or the
+        // callee shape is `Expr::Call` / `Expr::ClosureEnvLoad`
+        // (handled by the resolved-sig paths below), or the direct
+        // branch's sig-match guard rejected it (in which case neither
+        // direct nor indirect TCO applies and we fall through).
+        enum IndirectSigSource {
+            Surface(Box<crate::ast::FnTypeExpr>),
+            Resolved(Box<crate::typecheck::FnSig>),
+        }
+        let sig_source: Option<IndirectSigSource> = match callee {
+            Expr::Ident(name, _) => self
+                .local_fn_types
+                .get(name)
+                .cloned()
+                .map(|fty| IndirectSigSource::Surface(Box::new(fty))),
+            Expr::Call { .. } => match self.lookup_call_callee_ty(call_span) {
+                Some(crate::typecheck::Ty::Fn(sig)) => {
+                    Some(IndirectSigSource::Resolved(sig.clone()))
+                }
+                _ => None,
+            },
+            Expr::ClosureEnvLoad { name, .. } => self
+                .captured_fn_sigs
+                .get(name)
+                .cloned()
+                .map(|sig| IndirectSigSource::Resolved(Box::new(sig))),
+            _ => None,
+        };
+
+        if let Some(sig_source) = sig_source {
+            let mut sig = Signature::new(isa::CallConv::Tail);
+            sig.params.push(AbiParam::new(self.pointer_ty));
+            let ret_ty = match &sig_source {
+                IndirectSigSource::Surface(fty) => {
+                    for p in &fty.params {
+                        sig.params.push(AbiParam::new(cranelift_ty_for_type_expr(
+                            p,
+                            self.pointer_ty,
+                        )));
+                    }
+                    cranelift_ty_for_type_expr(&fty.ret, self.pointer_ty)
+                }
+                IndirectSigSource::Resolved(s) => {
+                    for p in &s.params {
+                        sig.params
+                            .push(AbiParam::new(cranelift_ty_of_ty(p, self.pointer_ty)));
+                    }
+                    cranelift_ty_of_ty(&s.ret, self.pointer_ty)
+                }
+            };
+            sig.params.push(AbiParam::new(self.pointer_ty));
+            sig.returns.push(AbiParam::new(ret_ty));
+
+            if sig == self.builder.func.signature {
+                // Sigs match — emit `return_call_indirect`. Mirrors
+                // the closure-value lowering + code_ptr load + arg
+                // packing in `lower_call`'s indirect path.
+                let closure_value = self.lower_expr(callee);
+                let code_ptr =
+                    self.builder
+                        .ins()
+                        .load(self.pointer_ty, MemFlags::trusted(), closure_value, 8);
+                let arg_vals: Vec<Value> = args.iter().map(|a| self.lower_expr(a)).collect();
+                let terminal_out = self.terminal_out_param;
+                let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
+                all_args.push(closure_value);
+                all_args.extend(arg_vals);
+                all_args.push(terminal_out);
+                let sig_ref = self.builder.import_signature(sig);
+                self.builder
+                    .ins()
+                    .return_call_indirect(sig_ref, code_ptr, &all_args);
+                return TailResult::Terminated;
             }
         }
 
