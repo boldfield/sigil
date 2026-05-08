@@ -14183,15 +14183,24 @@ fn std_list_sort_with_custom_descending_comparator() {
 
 #[test]
 fn std_list_sort_string_alpha() {
+    // Print helper is split into a `match` arm that calls a
+    // separate `print_str_step(h, t)` fn rather than embedding
+    // the per-element block as a `Cons` arm body. The block-arm
+    // shape `Cons(h, _) => { perform IO.println(h); ... }` (with
+    // `h: String` consumed directly by the perform) trips a
+    // Sigil compiler bug — see spec example E15's same workaround.
+    // Bug reproduces on origin/main pre-MOS so this is a pre-
+    // existing latent issue, not introduced by this PR.
     let src = "import std.list\n\
                fn print_strings(xs: List[String]) -> Int ![IO] {\n  \
                  match xs {\n    \
                    Nil => 0,\n    \
-                   Cons(h, t) => {\n      \
-                     perform IO.println(h);\n      \
-                     print_strings(t)\n    \
-                   },\n  \
+                   Cons(h, t) => print_str_step(h, t),\n  \
                  }\n\
+               }\n\
+               fn print_str_step(h: String, t: List[String]) -> Int ![IO] {\n  \
+                 perform IO.println(h);\n  \
+                 print_strings(t)\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
                  let xs: List[String] = Cons(\"banana\", Cons(\"apple\", Cons(\"cherry\", Nil)));\n  \
