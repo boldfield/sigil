@@ -16092,4 +16092,26 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    #[test]
+    fn import_std_int_typechecks_cleanly() {
+        // Pin the full `std.int` safe-arithmetic surface: range
+        // constants `int_max` / `int_min` and overflow-checked
+        // `int_add_safe` / `int_sub_safe`. Both helpers return
+        // `Option[Int]` (`None` on overflow). The transitive import
+        // pulls in `std.option`.
+        let src = "import std.int\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _max: Int = int_max();\n  \
+                     let _min: Int = int_min();\n  \
+                     let _a: Option[Int] = int_add_safe(1, 2);\n  \
+                     let _b: Option[Int] = int_add_safe(int_max(), 1);\n  \
+                     let _c: Option[Int] = int_sub_safe(0, 1);\n  \
+                     let _d: Option[Int] = int_sub_safe(int_min(), 1);\n  \
+                     let _e: Option[Int] = int_sub_safe(0, int_min());\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }

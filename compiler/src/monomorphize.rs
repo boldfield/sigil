@@ -1008,12 +1008,34 @@ impl<'a> Monomorphizer<'a> {
                 //    but type-side; rewrite to the mangled ctor
                 //    name and enqueue the type for cloning.
                 // 3. Local binding — pass through unchanged.
+                //
+                // Span-keyed `call_sites` lookup is necessary but not
+                // sufficient: elaborate's `bind` (`elaborate.rs:596`)
+                // reuses the hoisted value's span for the synthetic
+                // `Ident($elab_tN)` it returns, and that span can
+                // coincide with a fn-call callee's span when the
+                // hoisted value is a `Binary` whose own span (set by
+                // the parser to `lhs.span()`) starts at the same
+                // identifier. Without a name guard, mono would
+                // mistakenly rewrite `$elab_tN` to the captured
+                // instantiation's mangled name (e.g.,
+                // `Ident($elab_t0)` → `Ident(ten)`), breaking
+                // downstream closure-convert which then turns the
+                // bare `Ident(ten)` into a `ClosureRecord(ten)` and
+                // miscompiles the program. The `name == inst.name`
+                // guard rejects the span-collision case while
+                // preserving legitimate generic-instantiation
+                // rewrites (where `name` and `inst.name` always agree
+                // — typecheck only inserts call-site entries keyed
+                // on Idents whose names match the resolved fn).
                 if let Some(inst) = self.call_sites.get(span) {
-                    let resolved = subst.resolve_instantiation(inst);
-                    if self.fn_decls.contains_key(&resolved.name) {
-                        self.enqueue_fn(resolved.name.clone(), resolved.type_args.clone());
-                        let mangled = mangle_fn(&resolved.name, &resolved.type_args);
-                        return Expr::Ident(mangled, span.clone());
+                    if name == &inst.name {
+                        let resolved = subst.resolve_instantiation(inst);
+                        if self.fn_decls.contains_key(&resolved.name) {
+                            self.enqueue_fn(resolved.name.clone(), resolved.type_args.clone());
+                            let mangled = mangle_fn(&resolved.name, &resolved.type_args);
+                            return Expr::Ident(mangled, span.clone());
+                        }
                     }
                 }
                 if let Some(inst) = self.ctor_sites.get(span) {

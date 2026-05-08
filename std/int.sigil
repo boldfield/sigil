@@ -1,0 +1,94 @@
+// sigil: 0.1
+//
+// std/int.sigil — Plan C addendum (Tier 2 follow-up).
+//
+// Safe arithmetic helpers for `Int`. Sigil's binary operators (`+`,
+// `-`) silently wrap on overflow (since `Int` is 63-bit signed,
+// in `[-2^62, 2^62 - 1]`). For programs that need to detect overflow
+// rather than wrap silently — parsers, validators, arithmetic over
+// user-supplied values — these helpers return `Option[Int]` with
+// `Some(value)` on success and `None` on overflow.
+//
+// All ops are pure (`![]`).
+//
+// ## Scope
+//
+// Ships `int_add_safe` and `int_sub_safe`. Both are pure-Sigil
+// implementations that pre-check for overflow before performing the
+// operation, so they don't need `![ArithError]` on the row.
+//
+// **Deferred to a follow-up plan with a runtime primitive:**
+// `int_mul_safe`, `int_div_safe`, `int_mod_safe`. The natural
+// pre-check pattern for multiplication uses `/` to verify the
+// product survives a round-trip; the natural pre-check for division
+// uses `/` to compute the quotient. Both trip Sigil's typecheck
+// rule that any use of `/` or `%` requires `![ArithError]` on the
+// enclosing row, regardless of runtime guards. A runtime primitive
+// `sigil_int_div_checked(a, b) -> Option[Int]` (and the multiply
+// equivalent) lifts this constraint by performing the check + op
+// in one non-aborting FFI call.
+//
+// Until that primitive ships, callers who need safe multiply or
+// divide can:
+//   - Use `Int64` (`int64_mul` / `int64_div`) under `![ArithError]`,
+//     pre-checking `b != 0` for division and bounding operand
+//     magnitudes for multiplication, and casting back to `Int`.
+//   - Wrap the operation in a `catch`-style helper at the call
+//     site, accepting the `![ArithError]` row.
+//
+// ## Range constants
+
+import std.option
+
+// `int_max()` returns `2^62 - 1`, the largest representable `Int`.
+fn int_max() -> Int ![] {
+  4611686018427387903
+}
+
+// `int_min()` returns `-2^62`, the smallest representable `Int`.
+// Note that `-int_min()` is NOT representable as an `Int` (the
+// positive-most magnitude is `int_max()`); helpers below special-
+// case `b == int_min()` so the value never appears as a negation
+// operand.
+fn int_min() -> Int ![] {
+  -4611686018427387904
+}
+
+// `int_add_safe(a, b)` returns `Some(a + b)` when no overflow,
+// `None` otherwise. O(1).
+//
+// Overflow detection: `a + b > int_max()` iff (`b > 0` and
+// `a > int_max() - b`); `a + b < int_min()` iff (`b < 0` and
+// `a < int_min() - b`). Both pre-check formulas are themselves
+// safe (the subtractions don't overflow because the operands have
+// opposite signs by the guard).
+fn int_add_safe(a: Int, b: Int) -> Option[Int] ![] {
+  if b > 0 {
+    if a > int_max() - b { None } else { Some(a + b) }
+  } else {
+    if b < 0 {
+      if a < int_min() - b { None } else { Some(a + b) }
+    } else {
+      Some(a)
+    }
+  }
+}
+
+// `int_sub_safe(a, b)` returns `Some(a - b)` when no overflow,
+// `None` otherwise. Special-cases `b == int_min()` because
+// negating `int_min()` would itself overflow, so the natural
+// `int_add_safe(a, -b)` rewrite doesn't apply.
+fn int_sub_safe(a: Int, b: Int) -> Option[Int] ![] {
+  if b == int_min() {
+    // Mathematically, a - int_min() = a + 2^62. The result is
+    // representable iff `a < 0` (so the sum lands in
+    // `[0, int_max()]`).
+    if a >= 0 {
+      None
+    } else {
+      Some(a - b)
+    }
+  } else {
+    int_add_safe(a, -b)
+  }
+}
