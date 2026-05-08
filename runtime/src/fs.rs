@@ -49,7 +49,7 @@ use crate::effect_helpers::{
     alloc_array_with_capacity, alloc_int64, alloc_string_from_str, alloc_tuple, array_set_slot_raw,
 };
 use crate::gc::string_bytes;
-use crate::handlers::{sigil_next_step_args_ptr, sigil_next_step_call, NextStep, TerminalResult};
+use crate::handlers::{write_k_dispatch_value, NextStep, TerminalResult};
 
 const FS_OK: i64 = 0;
 const FS_ERR_NOT_FOUND: i64 = 1;
@@ -132,9 +132,7 @@ pub unsafe extern "C" fn sigil_fs_exists_arm(
         None => false,
     };
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = u8::from(exists) as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, u8::from(exists) as u64)
 }
 
 /// `Fs.is_dir(path: String) -> Bool` arm fn. Op id 2.
@@ -160,9 +158,7 @@ pub unsafe extern "C" fn sigil_fs_is_dir_arm(
         None => false,
     };
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = u8::from(is_dir) as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, u8::from(is_dir) as u64)
 }
 
 /// `Fs.is_file(path: String) -> Bool` arm fn. Op id 3.
@@ -188,9 +184,7 @@ pub unsafe extern "C" fn sigil_fs_is_file_arm(
         None => false,
     };
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = u8::from(is_file) as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, u8::from(is_file) as u64)
 }
 
 // ── Metadata ──────────────────────────────────────────────────────
@@ -250,9 +244,7 @@ pub unsafe extern "C" fn sigil_fs_file_size_arm(
     };
     let tup = build_int_pointer_string_tuple(tag, size_value, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 // ── Directory ops ──────────────────────────────────────────────────
@@ -295,9 +287,7 @@ pub unsafe extern "C" fn sigil_fs_mkdir_arm(
     };
     let tup = build_int_string_tuple(tag, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 /// `Fs.read_dir(path: String) -> (Int, Array[String])` arm fn.
@@ -367,9 +357,7 @@ pub unsafe extern "C" fn sigil_fs_read_dir_arm(
     };
     let tup = build_int_pointer_string_tuple(tag, arr, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 /// `Fs.remove_dir(path: String) -> (Int, String)` arm fn. Op id 7.
@@ -408,9 +396,7 @@ pub unsafe extern "C" fn sigil_fs_remove_dir_arm(
     };
     let tup = build_int_string_tuple(tag, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 // ── File ops ───────────────────────────────────────────────────────
@@ -456,9 +442,7 @@ pub unsafe extern "C" fn sigil_fs_read_file_arm(
     };
     let tup = build_int_string_tuple(tag, value);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 /// `Fs.remove_file(path: String) -> (Int, String)` arm fn. Op id 8.
@@ -496,9 +480,7 @@ pub unsafe extern "C" fn sigil_fs_remove_file_arm(
     };
     let tup = build_int_string_tuple(tag, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 /// `Fs.write_file(path: String, data: String) -> (Int, String)` arm
@@ -542,9 +524,7 @@ pub unsafe extern "C" fn sigil_fs_write_file_arm(
     };
     let tup = build_int_string_tuple(tag, msg);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 #[cfg(test)]

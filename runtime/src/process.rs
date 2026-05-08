@@ -45,7 +45,7 @@ use std::process::Command;
 
 use crate::effect_helpers::{alloc_string_from_str, alloc_tuple};
 use crate::gc::string_bytes;
-use crate::handlers::{sigil_next_step_args_ptr, sigil_next_step_call, NextStep, TerminalResult};
+use crate::handlers::{write_k_dispatch_value, NextStep, TerminalResult};
 use sigil_header_constants::TAG_ARRAY;
 
 const PROCESS_OK: i64 = 0;
@@ -149,9 +149,7 @@ pub unsafe extern "C" fn sigil_process_run_arm(
             let empty = alloc_string_from_str("");
             let empty2 = alloc_string_from_str("");
             let tup = build_process_result_tuple(PROCESS_ERR_NOT_FOUND, 0, empty, empty2);
-            let ns = sigil_next_step_call(k_closure, k_fn, 1);
-            *sigil_next_step_args_ptr(ns) = tup as u64;
-            return ns;
+            return write_k_dispatch_value(k_closure, k_fn, tup as u64);
         }
     };
 
@@ -197,9 +195,7 @@ pub unsafe extern "C" fn sigil_process_run_arm(
     let stderr_ptr = alloc_string_from_str(&stderr_str);
     let tup = build_process_result_tuple(error_tag, exit_code, stdout_ptr, stderr_ptr);
 
-    let ns = sigil_next_step_call(k_closure, k_fn, 1);
-    *sigil_next_step_args_ptr(ns) = tup as u64;
-    ns
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
 #[cfg(test)]

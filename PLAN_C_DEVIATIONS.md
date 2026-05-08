@@ -959,7 +959,7 @@ The follow-up commit replaces the hardcoded pair with the surrounding synth-cont
 
 **Implementing commit(s).** PR #108's body rewrite + this DEVIATIONS entry.
 
-## 2026-05-08 — [DEVIATION Task MOS-4] [CLOSED] Builtin IO arms violated Slice A trailing-pair convention — synth-cont read garbage post-arm-k → SIGSEGV on natural arm-block-perform-then-literal-tail shape
+## 2026-05-08 — [DEVIATION Task MOS-4] [CLOSED] All 18 builtin runtime arm fns violated Slice A trailing-pair convention — synth-cont read garbage post-arm-k → SIGSEGV on natural arm-block-perform-then-literal-tail shape
 
 **Context.** PR #109 (Plan C addendum Stage MOS) shipped `list_sort_string` with an end-to-end test `std_list_sort_string_alpha`. The natural test shape mirrors `std_list_sort_int_three_elements_unsorted`:
 
@@ -989,9 +989,26 @@ The recursive Cps→Cps tail shape (`print_list(t)`-style) happened to survive b
 
 **Fix.** Two new helpers in `runtime/src/handlers.rs` — `write_k_dispatch_value(k_closure, k_fn, value)` and `write_k_dispatch_unit(k_closure, k_fn)` — allocate `sigil_next_step_call(k_closure, k_fn, 3)` and write `[value, null, &sigil_continuation_identity]`. The post-arm-k pair `(null, identity)` is the only legal shape for top-of-handler-stack builtins: the parent helper's incoming post-arm-k pair is `(null, identity)` for both Sync→Cps wrapper callers (lines 22735–22749) and B.3 Cps→Cps recursive callers (lines 17657+ pushes the surrounding pair onto `OUTER_POST_ARM_K_STACK` and forwards `(null, identity)` as the recursive callee's trailing pair). Identity tolerates `args_len == 3` explicitly (`sigil_continuation_identity` checks both `args_len == 1` and `args_len == 3` at its preamble); when the post-arm-k pair is `(null, identity)`, identity returns `Done(args_ptr[0])` and the trampoline routes through `OUTER_POST_ARM_K_STACK` if any chain steps pushed entries.
 
-`sigil_io_println_arm`, `sigil_io_print_arm`, and `sigil_io_read_line_arm` route through the helpers. The other runtime fns that dispatch through k pairs (`sigil_continuation_identity`'s args_len=3 branch at line 1677, `sigil_apply_body_return_arm_if_armed` at line 1468, `wrap_continuation_with_outer_post_arm_k` at line 1742) already follow the 3-slot convention; only the builtin IO arms violated it.
+**Class scope.** First-cut PR rollout fixed only the three IO arms (`sigil_io_println_arm`, `sigil_io_print_arm`, `sigil_io_read_line_arm`) and incorrectly claimed in this entry that "only the builtin IO arms violated it". PR #109 review #3 caught the audit gap: the Plan C addendum EE arm fns shipped in `runtime/src/{env,fs,process}.rs` followed the same 1-slot dispatch pattern. A grep for `sigil_next_step_call(k_closure, k_fn, 1)` returned 15 additional violations:
 
-Two runtime regression tests pin the invariant directly: `runtime::handlers::tests::write_k_dispatch_value_emits_three_slot_trailing_pair` checks the helper's NextStep shape; `runtime::handlers::tests::io_println_arm_emits_three_slot_trailing_pair` exercises `sigil_io_println_arm` end-to-end. The user-surface shape that triggered the bug ships as `compiler::tests::e2e::arm_block_perform_then_literal_tail_does_not_segv`.
+- `runtime/src/env.rs` — `sigil_env_args_arm`, `sigil_env_var_arm`, `sigil_env_vars_arm` (3 sites)
+- `runtime/src/fs.rs` — `sigil_fs_exists_arm`, `sigil_fs_is_dir_arm`, `sigil_fs_is_file_arm`, `sigil_fs_file_size_arm`, `sigil_fs_mkdir_arm`, `sigil_fs_read_dir_arm`, `sigil_fs_remove_dir_arm`, `sigil_fs_read_file_arm`, `sigil_fs_remove_file_arm`, `sigil_fs_write_file_arm` (10 sites)
+- `runtime/src/process.rs` — `sigil_process_run_arm`'s in-loop `NotFound`-on-bad-UTF-8 dispatch and final dispatch (2 sites)
+
+The bug was latent across env / fs / process because no existing e2e test exercises `perform Env.X` / `perform Fs.X` / `perform Process.X` directly inside an arm-body-with-tail shape — the existing tests use stdlib wrappers that perform the effect from a top-level fn body instead. An LLM-authored program that performs the effect from inside a `match` arm body — exactly the natural pattern for `match Fs.exists(p) { ... }` style code — would have crashed with the same SIGSEGV signature as the IO failure.
+
+Class-fix rollout: the `write_k_dispatch_*` helpers in `handlers.rs` are now `pub(crate)`. All 15 non-IO arm fns route through `write_k_dispatch_value` exactly as the IO arms do — same shape, same one-line replacement. Across the full builtin-effect surface (18 arm fns: 3 IO + 3 Env + 10 Fs + 2 Process), every k(value) dispatch is now Slice A conformant.
+
+The `ArithError` arms (`sigil_arith_error_div_by_zero_arm` at line 1950, `sigil_arith_error_mod_by_zero_arm` at line 1974) are exempt by construction: they exit the process via `std::process::exit(2)` rather than dispatching a continuation, so they never call `sigil_next_step_call`. The other runtime fns that dispatch through k pairs (`sigil_continuation_identity`'s args_len=3 branch at line 1677, `sigil_apply_body_return_arm_if_armed` at line 1468, `wrap_continuation_with_outer_post_arm_k` at line 1742) already follow the 3-slot convention.
+
+Test surface (5 layers):
+
+- **Helper unit:** `runtime::handlers::tests::write_k_dispatch_value_emits_three_slot_trailing_pair` checks the helper's NextStep shape.
+- **IO arm integration:** `runtime::handlers::tests::io_println_arm_emits_three_slot_trailing_pair` exercises `sigil_io_println_arm` end-to-end with sentinel k_pair values.
+- **IO user-surface e2e:** `compiler::tests::e2e::arm_block_perform_then_literal_tail_does_not_segv` pins `match b { true => { perform IO.println("hi"); 0 } }`.
+- **Env user-surface e2e:** `compiler::tests::e2e::arm_block_perform_then_literal_tail_env_does_not_segv` pins `perform Env.args()` inside an arm body.
+- **Fs user-surface e2e:** `compiler::tests::e2e::arm_block_perform_then_literal_tail_fs_does_not_segv` pins `perform Fs.exists("/")` inside an arm body — exercises the `Bool` (`u8::from(...)`-encoded) return shape.
+- **Process user-surface e2e:** `compiler::tests::e2e::arm_block_perform_then_literal_tail_process_does_not_segv` pins `perform Process.run("/nonexistent", argv)` inside an arm body — exercises the tuple return shape and the final dispatch path (the in-loop NotFound dispatch fires on invalid-UTF-8 cmd, which we don't want to reproduce here).
 
 **Why accepted (the PR-time scope expansion).** PR #109's plan body and design doc are explicitly about `Ordering` + `list_sort` + `Map[K, V]`. A runtime-side fix to the builtin IO arms is technically out of Stage MOS scope. The user explicitly authorised the expansion ("don't queue follow up to fix the bug, just fix the bug now") in response to the PR #109 review #2 ask, on grounds that:
 
@@ -1013,6 +1030,6 @@ fn main() -> Int ![IO] { first(true) }
 
 Output: `hi`, then signal-killed (exit 139 / SIGSEGV).
 
-**Closure path.** Closed by `runtime/src/handlers.rs`'s 3-slot-trailing-pair fix. The split-fn workaround in spec example E15's `dump_each` / `dump_each_step` shape is no longer required (the natural one-fn shape now compiles + runs cleanly); we leave E15's split-fn shape unchanged for separation-of-concerns reasons (the example is illustrative of the CLI argv pattern, not of the bug). The runtime regression tests + the e2e `arm_block_perform_then_literal_tail_does_not_segv` test pin the invariant going forward.
+**Closure path.** Closed by `runtime/src/handlers.rs`'s 3-slot-trailing-pair fix and the class extension across env / fs / process arm fns. The split-fn workaround in spec example E15's `dump_each` / `dump_each_step` shape is no longer required (the natural one-fn shape now compiles + runs cleanly); we leave E15's split-fn shape unchanged for separation-of-concerns reasons (the example is illustrative of the CLI argv pattern, not of the bug). The runtime regression tests + the four e2e `arm_block_perform_then_literal_tail_*` tests pin the invariant going forward across IO / Env / Fs / Process.
 
-**Implementing commit(s).** PR #109 commit `8d4a6dd` (workaround in `std_list_sort_string_alpha`, since reverted) → the follow-up commit that adds `write_k_dispatch_value` / `write_k_dispatch_unit` helpers, routes the three IO arms through them, adds the runtime + e2e regression tests, reverts the split-fn workaround, and adds this DEVIATIONS entry.
+**Implementing commit(s).** PR #109 commit `8d4a6dd` (workaround in `std_list_sort_string_alpha`, since reverted) → commit `213a603` (IO arm fix + helpers + runtime regression + e2e regression for IO + DEVIATIONS entry first-cut) → the follow-up commit that extends the class fix to all 15 env/fs/process arm fns, adds three more e2e regression tests covering Env / Fs / Process arm-body shapes, and rewrites the "only the builtin IO arms violated it" mis-claim above.

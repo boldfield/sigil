@@ -13891,6 +13891,89 @@ fn arm_block_perform_then_literal_tail_does_not_segv() {
     assert_eq!(stdout, "hi\n", "stderr={stderr:?}");
 }
 
+/// Companion regression for the `Env` effect — the same Slice A
+/// trailing-pair bug class affected `sigil_env_args_arm`,
+/// `sigil_env_var_arm`, and `sigil_env_vars_arm`. This test pins
+/// that `perform Env.args()` inside an arm block-body with a
+/// literal tail dispatches cleanly.
+#[test]
+fn arm_block_perform_then_literal_tail_env_does_not_segv() {
+    let src = "fn first(b: Bool) -> Int ![IO, Env] {\n  \
+                 match b {\n    \
+                   true => {\n      \
+                     let _argv: Array[String] = perform Env.args();\n      \
+                     perform IO.println(\"env ok\");\n      \
+                     0\n    \
+                   },\n    \
+                   false => 0,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO, Env] {\n  \
+                 first(true)\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_block_perform_env");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "env ok\n", "stderr={stderr:?}");
+}
+
+/// Companion regression for the `Fs` effect — the bug class
+/// affected `sigil_fs_exists_arm`, `sigil_fs_is_dir_arm`,
+/// `sigil_fs_is_file_arm`, `sigil_fs_file_size_arm`, `sigil_fs_mkdir_arm`,
+/// `sigil_fs_read_dir_arm`, `sigil_fs_remove_dir_arm`,
+/// `sigil_fs_read_file_arm`, `sigil_fs_remove_file_arm`,
+/// `sigil_fs_write_file_arm`. This test pins
+/// `perform Fs.exists` inside an arm block-body with a literal
+/// tail; the Bool return shape exercises the `u8::from(...)`
+/// encoding path.
+#[test]
+fn arm_block_perform_then_literal_tail_fs_does_not_segv() {
+    let src = "fn first(b: Bool) -> Int ![IO, Fs] {\n  \
+                 match b {\n    \
+                   true => {\n      \
+                     let _exists: Bool = perform Fs.exists(\"/\");\n      \
+                     perform IO.println(\"fs ok\");\n      \
+                     0\n    \
+                   },\n    \
+                   false => 0,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO, Fs] {\n  \
+                 first(true)\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_block_perform_fs");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "fs ok\n", "stderr={stderr:?}");
+}
+
+/// Companion regression for the `Process` effect — the bug class
+/// affected the in-loop and final dispatches in `sigil_process_run_arm`.
+/// This test pins `perform Process.run` inside an arm block-body
+/// with a literal tail. Uses an empty argv (`array_alloc(0, ...)`)
+/// so the test stays POSIX-only-free; on platforms where `/bin/echo`
+/// isn't available the spawn returns `NotFound`, but the dispatch
+/// path is exercised either way — what we're pinning is that the
+/// arm fn returns cleanly.
+#[test]
+fn arm_block_perform_then_literal_tail_process_does_not_segv() {
+    let src = "fn first(b: Bool) -> Int ![IO, Process] {\n  \
+                 match b {\n    \
+                   true => {\n      \
+                     let argv: Array[String] = array_alloc(0, \"\");\n      \
+                     let _r: (Int, Int, String, String) = perform Process.run(\"/nonexistent_bin_for_arm_body_regression\", argv);\n      \
+                     perform IO.println(\"process ok\");\n      \
+                     0\n    \
+                   },\n    \
+                   false => 0,\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO, Process] {\n  \
+                 first(true)\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "arm_block_perform_process");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "process ok\n", "stderr={stderr:?}");
+}
+
 // =====================================================================
 // Stage MOS — `Ordering`, `list_sort`, and `Map[K, V]`. Plan C addendum.
 //

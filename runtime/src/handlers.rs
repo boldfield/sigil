@@ -1900,7 +1900,11 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
 /// which `sigil_perform` populated with the original perform site's
 /// `(k_closure_ptr, k_fn_ptr)` arguments — non-null by codegen
 /// invariant.
-unsafe fn write_k_dispatch_value(k_closure: *mut u8, k_fn: *mut u8, value: u64) -> *mut NextStep {
+pub(crate) unsafe fn write_k_dispatch_value(
+    k_closure: *mut u8,
+    k_fn: *mut u8,
+    value: u64,
+) -> *mut NextStep {
     let ns = sigil_next_step_call(k_closure, k_fn, 3);
     // SAFETY: sigil_next_step_call returns a valid *mut NextStep with
     // 3 slots reserved; sigil_next_step_args_ptr returns a pointer to
@@ -1920,7 +1924,8 @@ unsafe fn write_k_dispatch_value(k_closure: *mut u8, k_fn: *mut u8, value: u64) 
 
 /// Convenience wrapper: dispatch `k(unit)` (Sigil's `Unit` is encoded
 /// as `i64 0`).
-unsafe fn write_k_dispatch_unit(k_closure: *mut u8, k_fn: *mut u8) -> *mut NextStep {
+#[allow(dead_code)]
+pub(crate) unsafe fn write_k_dispatch_unit(k_closure: *mut u8, k_fn: *mut u8) -> *mut NextStep {
     write_k_dispatch_value(k_closure, k_fn, 0)
 }
 
