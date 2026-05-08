@@ -187,6 +187,16 @@ fn __json_print_field(sb: StringBuilder, name: String, v: JValue) -> Unit ![Mem]
 
 // ===== Parser — State[Int] recursive descent =====
 
+// **CAUTION (v1):** the `Result[JValue, String]` return type is
+// the long-term contract, but malformed input currently aborts
+// the process with SIGSEGV instead of returning `Err(...)`. Every
+// `__json_parse_*` helper reads the cursor via `perform State.get()`
+// before raising, and that shape (State.get-then-raise inside a fn
+// called from `catch(run_state(...))`) trips a v1 composition
+// limitation documented in the file header and in
+// `PLAN_C_PROGRESS.md`'s Koka-test-suite entry. Validate input
+// shape before calling, or accept abort-on-malformed as the
+// failure signal until v2 lands the State+Raise composition fix.
 fn json_parse(b: ByteArray) -> Result[JValue, String] ![] {
   let result: (Result[JValue, String], Int) = run_state(0, fn () -> Result[JValue, String] ![State[Int]] => {
     catch(fn () -> JValue ![Raise[String], State[Int]] => {
