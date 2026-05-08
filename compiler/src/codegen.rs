@@ -8538,6 +8538,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_outer_post_arm_k_push: {e}"))?;
 
+    // PR #108 review follow-up — sigil_outer_post_arm_k_drop(n: u32).
+    // Emitted by `lower_call_in_tail_pos`'s Cps→Cps tail branch to
+    // balance the surrounding chain's accumulated pushes before
+    // tail-iterating without going through the normal Done-observation
+    // pop path. Without this, a tail-recursive Cps fn whose body has
+    // a chained-let-yield with N>=2 lets accumulates 1 entry per
+    // iteration, overflowing OUTER_POST_ARM_K_STACK_SIZE (32) at
+    // depth 32.
+    let mut outer_post_arm_k_drop_sig = Signature::new(isa_call_conv(&module));
+    outer_post_arm_k_drop_sig
+        .params
+        .push(AbiParam::new(types::I32)); // n
+    let outer_post_arm_k_drop = module
+        .declare_function(
+            "sigil_outer_post_arm_k_drop",
+            Linkage::Import,
+            &outer_post_arm_k_drop_sig,
+        )
+        .map_err(|e| format!("declare sigil_outer_post_arm_k_drop: {e}"))?;
+
     // sigil_next_step_discharged(value: u64) -> *mut NextStep
     //
     // Stage-6.8-followup Bug 2 fix: emitted by op arm fn bodies on the
@@ -9664,6 +9684,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         handler_frame_set_return,
         perform_func,
         outer_post_arm_k_push,
+        outer_post_arm_k_drop,
         run_loop,
         next_step_discharged,
         next_step_call,
@@ -9721,6 +9742,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
+                outer_post_arm_k_drop_ref,
                 run_loop_ref,
                 next_step_discharged_ref,
                 next_step_call_ref,
@@ -9986,6 +10008,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         stackmap: &mut stackmap,
                         env,
                         pointer_ty,
+                        chain_outer_post_arm_k_pushes: 0,
                         closure_ptr,
                         terminal_out_param: terminal_out,
                         lit_gvs,
@@ -9996,6 +10019,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_arm_ref,
                         handler_frame_set_return_ref,
                         perform_ref,
+                        outer_post_arm_k_drop_ref,
                         run_loop_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
@@ -11048,6 +11072,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     stackmap: &mut stackmap,
                     env,
                     pointer_ty,
+                    chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -11058,6 +11083,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_drop_ref,
                     run_loop_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
@@ -11480,6 +11506,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 stackmap: &mut stackmap,
                 env,
                 pointer_ty,
+                chain_outer_post_arm_k_pushes: 0,
                 closure_ptr,
                 terminal_out_param,
                 lit_gvs,
@@ -11490,6 +11517,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_drop_ref,
                 run_loop_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
@@ -12109,6 +12137,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
+                    outer_post_arm_k_drop_ref,
                     run_loop_ref,
                     next_step_discharged_ref,
                     next_step_call_ref,
@@ -12241,6 +12270,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     stackmap: &mut stackmap,
                     env,
                     pointer_ty,
+                    chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -12251,6 +12281,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_drop_ref,
                     run_loop_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
@@ -13053,6 +13084,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_return_ref,
                     perform_ref,
                     outer_post_arm_k_push_ref: _,
+                    outer_post_arm_k_drop_ref,
                     run_loop_ref,
                     next_step_discharged_ref,
                     next_step_call_ref,
@@ -13170,6 +13202,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     stackmap: &mut stackmap,
                     env,
                     pointer_ty,
+                    chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -13180,6 +13213,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     handler_frame_set_arm_ref,
                     handler_frame_set_return_ref,
                     perform_ref,
+                    outer_post_arm_k_drop_ref,
                     run_loop_ref,
                     next_step_call_ref,
                     next_step_args_ptr_ref,
@@ -13438,6 +13472,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_return_ref,
                 perform_ref,
                 outer_post_arm_k_push_ref: _,
+                outer_post_arm_k_drop_ref,
                 run_loop_ref,
                 next_step_discharged_ref,
                 next_step_call_ref,
@@ -13463,6 +13498,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 stackmap: &mut stackmap,
                 env,
                 pointer_ty,
+                chain_outer_post_arm_k_pushes: 0,
                 closure_ptr,
                 terminal_out_param: terminal_out,
                 lit_gvs,
@@ -13473,6 +13509,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 handler_frame_set_arm_ref,
                 handler_frame_set_return_ref,
                 perform_ref,
+                outer_post_arm_k_drop_ref,
                 run_loop_ref,
                 next_step_call_ref,
                 next_step_args_ptr_ref,
@@ -13840,6 +13877,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_return_ref,
                         perform_ref,
                         outer_post_arm_k_push_ref: _,
+                        outer_post_arm_k_drop_ref,
                         run_loop_ref,
                         next_step_discharged_ref,
                         next_step_call_ref,
@@ -13864,6 +13902,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         stackmap: &mut stackmap,
                         env,
                         pointer_ty,
+                        chain_outer_post_arm_k_pushes: 0,
                         closure_ptr: synth_closure_ptr,
                         terminal_out_param: terminal_out,
                         lit_gvs,
@@ -13874,6 +13913,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         handler_frame_set_arm_ref,
                         handler_frame_set_return_ref,
                         perform_ref,
+                        outer_post_arm_k_drop_ref,
                         run_loop_ref,
                         next_step_call_ref,
                         next_step_args_ptr_ref,
@@ -14660,6 +14700,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             outer_post_arm_k_push_ref,
+                            outer_post_arm_k_drop_ref,
                             run_loop_ref,
                             next_step_discharged_ref,
                             next_step_call_ref,
@@ -14685,6 +14726,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             stackmap: &mut stackmap,
                             env,
                             pointer_ty,
+                            // PR #108 review follow-up — this Lowerer
+                            // is used for BOTH Middle and Final chain
+                            // step body emit. Final's body lowers the
+                            // tail and may reach the Cps→Cps tail
+                            // branch, which needs to know how many
+                            // outer_post_arm_k pushes the chain has
+                            // accumulated by the time control reaches
+                            // it. That count is exactly
+                            // `prior_bindings.len()` (each prior chain
+                            // step is a Middle that pushed once). For
+                            // Middle steps the field is unused (Middle
+                            // doesn't reach the tail branch). Setting
+                            // it unconditionally here keeps the
+                            // construction simple.
+                            chain_outer_post_arm_k_pushes: prior_bindings.len() as u32,
                             closure_ptr,
                             terminal_out_param: terminal_out,
                             lit_gvs,
@@ -14695,6 +14751,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
+                            outer_post_arm_k_drop_ref,
                             run_loop_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
@@ -17362,6 +17419,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_return_ref,
                             perform_ref,
                             outer_post_arm_k_push_ref,
+                            outer_post_arm_k_drop_ref,
                             run_loop_ref,
                             next_step_discharged_ref,
                             next_step_call_ref,
@@ -17387,6 +17445,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             stackmap: &mut stackmap,
                             env,
                             pointer_ty,
+                            chain_outer_post_arm_k_pushes: 0,
                             closure_ptr,
                             terminal_out_param: terminal_out,
                             lit_gvs,
@@ -17397,6 +17456,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             handler_frame_set_arm_ref,
                             handler_frame_set_return_ref,
                             perform_ref,
+                            outer_post_arm_k_drop_ref,
                             run_loop_ref,
                             next_step_call_ref,
                             next_step_args_ptr_ref,
@@ -18020,6 +18080,21 @@ struct Lowerer<'a, 'b> {
     env: BTreeMap<String, Value>,
     pointer_ty: Type,
 
+    /// PR #108 review follow-up — number of `sigil_outer_post_arm_k_push`
+    /// entries the surrounding chain has accumulated by the time this
+    /// Lowerer's body emit reaches `lower_call_in_tail_pos`'s Cps→Cps
+    /// tail branch. Set to `prior_bindings.len()` (= `chain_length - 1`)
+    /// when constructing a Lowerer for the Final-step body of a chained-
+    /// let-yield synth-cont. Defaults to 0 elsewhere.
+    ///
+    /// The Cps→Cps tail branch emits a `sigil_outer_post_arm_k_drop(N)`
+    /// call before its `return_(NextStep::Call(...))` to balance these
+    /// pushes. Without this, a tail-recursive Cps fn whose body has a
+    /// chained-let-yield with N>=2 lets accumulates 1 entry per
+    /// iteration on the OUTER_POST_ARM_K_STACK and overflows at depth 32
+    /// (`OUTER_POST_ARM_K_STACK_SIZE`).
+    chain_outer_post_arm_k_pushes: u32,
+
     /// Arg-0 of the current fn's entry block: the closure record
     /// pointer under the closure calling convention (plan A2 task 32).
     /// Direct callers pass null; `ClosureRecord`-returning callees
@@ -18096,6 +18171,12 @@ struct Lowerer<'a, 'b> {
     /// it (invokes the arm fn with packed args) and returns the
     /// final `Done` value as u64.
     perform_ref: FuncRef,
+    /// PR #108 review follow-up — `sigil_outer_post_arm_k_drop`
+    /// runtime ref. Emitted by `lower_call_in_tail_pos`'s Cps→Cps
+    /// tail branch to balance the surrounding chain's accumulated
+    /// pushes before tail-iterating without going through the
+    /// normal Done-observation pop path.
+    outer_post_arm_k_drop_ref: FuncRef,
     /// Plan B Task 55 (Phase 3b) — `sigil_run_loop` runtime ref.
     /// Called by `lower_perform_to_value` to drive the CPS
     /// trampoline from the `NextStep::Call` returned by
@@ -18881,6 +18962,44 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                         ns_args_ptr,
                                         offset,
                                     );
+                                }
+
+                                // PR #108 review follow-up — balance the
+                                // surrounding chain's accumulated
+                                // `sigil_outer_post_arm_k_push` entries
+                                // before tail-iterating. Each Middle
+                                // chain step in the surrounding chain
+                                // pushes once (codegen.rs:16622 area);
+                                // the trampoline's Done-observation
+                                // pop loop matches those pushes when
+                                // the chain completes normally. A
+                                // tail-call-out (this branch's
+                                // NextStep::Call return) bypasses the
+                                // Done path, so without an explicit
+                                // drop the entries accumulate one per
+                                // recursion iteration and overflow
+                                // OUTER_POST_ARM_K_STACK_SIZE (32) at
+                                // depth 32. `chain_outer_post_arm_k_-
+                                // pushes` is set to `prior_bindings
+                                // .len()` (= chain_length - 1) when
+                                // constructing the Final-step's
+                                // Lowerer; for chain_length == 1
+                                // (single-perform shape, no Middle
+                                // step pushes) this is 0 and we skip
+                                // the call.
+                                if self.chain_outer_post_arm_k_pushes > 0 {
+                                    let drop_n = self.builder.ins().iconst(
+                                        types::I32,
+                                        self.chain_outer_post_arm_k_pushes as i64,
+                                    );
+                                    let drop_call = self
+                                        .builder
+                                        .ins()
+                                        .call(self.outer_post_arm_k_drop_ref, &[drop_n]);
+                                    self.stackmap.push_placeholder(function_code_offset(
+                                        &self.builder,
+                                        drop_call,
+                                    ));
                                 }
 
                                 // Return the NextStep — the surrounding
@@ -26350,6 +26469,12 @@ struct PerFnRefsCtx<'a> {
     /// `sigil_outer_post_arm_k_push` FuncId, called from B.2 helper
     /// Middle's emit before sigil_perform.
     outer_post_arm_k_push: cranelift_module::FuncId,
+    /// PR #108 review follow-up — `sigil_outer_post_arm_k_drop` FuncId.
+    /// Emitted by `lower_call_in_tail_pos`'s Cps→Cps tail branch to
+    /// balance the surrounding chain's accumulated pushes before
+    /// tail-iterating without going through the normal Done-observation
+    /// pop path.
+    outer_post_arm_k_drop: cranelift_module::FuncId,
     run_loop: cranelift_module::FuncId,
     /// Stage-6.8-followup Bug 2 fix — `sigil_next_step_discharged`
     /// FuncId. Op arm fn body's discard-`k` tail emit replaces
@@ -26425,6 +26550,11 @@ struct PerFnRefs {
     /// Plan B' Stage 6.7 multi-shot composition fix —
     /// `sigil_outer_post_arm_k_push` FuncRef, used by B.2 helper Middle's emit.
     outer_post_arm_k_push_ref: FuncRef,
+    /// PR #108 review follow-up — `sigil_outer_post_arm_k_drop`
+    /// FuncRef, used by `lower_call_in_tail_pos`'s Cps→Cps tail
+    /// branch to balance the surrounding chain's accumulated pushes
+    /// before tail-iterating.
+    outer_post_arm_k_drop_ref: FuncRef,
     run_loop_ref: FuncRef,
     /// Stage-6.8-followup Bug 2 fix — see `PerFnRefsCtx::next_step_discharged`.
     next_step_discharged_ref: FuncRef,
@@ -26613,6 +26743,8 @@ fn prepare_per_fn_refs(
     let perform_ref = module.declare_func_in_func(ctx.perform_func, builder.func);
     let outer_post_arm_k_push_ref =
         module.declare_func_in_func(ctx.outer_post_arm_k_push, builder.func);
+    let outer_post_arm_k_drop_ref =
+        module.declare_func_in_func(ctx.outer_post_arm_k_drop, builder.func);
     let run_loop_ref = module.declare_func_in_func(ctx.run_loop, builder.func);
     let next_step_discharged_ref =
         module.declare_func_in_func(ctx.next_step_discharged, builder.func);
@@ -26713,6 +26845,7 @@ fn prepare_per_fn_refs(
         handler_frame_set_return_ref,
         perform_ref,
         outer_post_arm_k_push_ref,
+        outer_post_arm_k_drop_ref,
         run_loop_ref,
         next_step_discharged_ref,
         next_step_call_ref,

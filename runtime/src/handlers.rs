@@ -825,6 +825,78 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
     })
 }
 
+/// Drop (without dispatching) the top `n` entries of the outer
+/// `post_arm_k` stack. Called by codegen's Cps→Cps tail-call branch
+/// (PR #108 follow-up) to balance the chain-step transition pushes
+/// (`sigil_outer_post_arm_k_push`) before tail-iterating without
+/// going through the normal Done-observation pop path.
+///
+/// **Why a drop-without-dispatch.** The trampoline's Done-observation
+/// pop loop dispatches each popped entry to continue the chain; that's
+/// the discharge mechanism for normal chain completion. A tail-call-
+/// out (NextStep::Call return from the chain's Final-step) bypasses
+/// that mechanism — the next iteration's chain re-pushes its own
+/// entries, and the previous iteration's accumulated entries are not
+/// useful (the post-completion continuation never needs to fire on
+/// the popped value because the recursion never terminates through
+/// that path). Dropping without dispatching is the matching pop
+/// discipline for the tail-call-out shape.
+///
+/// **Stale-pointer hygiene.** Mirrors `outer_post_arm_k_try_pop`'s
+/// slot-clearing — overwrite each dropped slot with nulls so a
+/// future Boehm scan of the rooted TLS range doesn't see a stale
+/// `closure_ptr` from the dropped push as a live heap reference.
+///
+/// **Underflow.** If `n` exceeds the current depth, drops only what's
+/// available (saturates at zero) and continues. Overflow is impossible
+/// (depth is monotonically non-negative). Underflow indicates a
+/// codegen bug — the caller's chain push count claim doesn't match
+/// what the runtime actually accumulated. Logged via eprintln in
+/// debug builds; no abort, since the underflow is benign at runtime
+/// (the remaining stack stays well-formed).
+///
+/// # Safety
+///
+/// Safe to call. The dropped entries' `closure_ptr` / `fn_ptr` values
+/// are heap-managed by the GC; dropping them from the stack only
+/// removes them as roots — the GC will reclaim them when no other
+/// reference remains.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_outer_post_arm_k_drop(n: u32) {
+    if n == 0 {
+        return;
+    }
+    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+        let depth = depth_cell.get();
+        let drop_count = (n as usize).min(depth);
+        if drop_count < (n as usize) {
+            // Underflow: caller asked for more than available.
+            // Don't abort — the runtime stays well-formed. Logged so
+            // a future codegen-discipline regression surfaces.
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "sigil_outer_post_arm_k_drop: requested {} but only {} available; \
+                 dropping what's available (codegen chain-push count mismatch?)",
+                n, depth
+            );
+        }
+        if drop_count == 0 {
+            return;
+        }
+        OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+            let mut stack = stack_cell.get();
+            for i in 0..drop_count {
+                stack[depth - 1 - i] = OuterPostArmKEntry {
+                    closure_ptr: ptr::null_mut(),
+                    fn_ptr: ptr::null_mut(),
+                };
+            }
+            stack_cell.set(stack);
+        });
+        depth_cell.set(depth - drop_count);
+    });
+}
+
 // ---------------------------------------------------------------------
 // HandlerFrame allocation
 // ---------------------------------------------------------------------
