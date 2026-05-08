@@ -13708,6 +13708,65 @@ fn tco4_diag_cps_colored_handler_inside_at_one_hundred_thousand() {
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
 
+// Isolation: handler in main, NO perform inside the recursive fn.
+// Tests whether the long-lived handler frame in main alone (no
+// perform interaction) causes the leak. If passes at 10M, the
+// long-lived frame ALONE is fine; the leak requires the
+// long-lived-frame × perform combination.
+
+#[test]
+fn tco4_diag_long_lived_handler_no_perform_at_ten_million() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_no_perform(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_no_perform(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_no_perform(10000000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "tco4_diag_long_lived_handler_no_perform_at_ten_million",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+// Isolation: handler installed inside the recursive fn at 1M depth
+// (the prior test was at 100K; this checks whether per-iter handler
+// push/pop scales further).
+
+#[test]
+fn tco4_diag_cps_colored_handler_inside_at_one_million() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps_handle_inside_1m(n: Int) -> Int ![] {\n  \
+                 let _: Int = handle (perform State.get()) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps_handle_inside_1m(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_down_cps_handle_inside_1m(1000000);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tco4_diag_cps_colored_handler_inside_at_one_million");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
 // Isolation: tail-recursive Sync fn with TWO intervening Cranelift
 // builtin calls per iteration. Same number of `.call(...)` sites
 // per iter as `count_down_cps`'s perform site (sigil_perform +
