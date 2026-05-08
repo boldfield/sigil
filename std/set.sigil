@@ -132,3 +132,63 @@ fn set_filter[T](s: Set[T], pred: (T) -> Bool ![]) -> Set[T] ![] {
     },
   }
 }
+
+// `set_union(a, b)` — every element in either `a` or `b`. The
+// result uses `a`'s comparator (see comparator-mixing note at
+// top of file). Implemented by folding over `b` and inserting
+// each element into `a`; insert is idempotent so duplicates are
+// coalesced naturally.
+fn set_union[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_fold(b, a, fn (acc: Set[T], x: T) -> Set[T] ![] => set_insert(acc, x))
+}
+
+// `set_intersect(a, b)` — elements in both `a` and `b`. The
+// result uses `a`'s comparator (preserved by `set_filter`).
+fn set_intersect[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_filter(a, fn (x: T) -> Bool ![] => set_contains(b, x))
+}
+
+// `set_difference(a, b)` — `a \ b`: elements in `a` but not `b`.
+// The result uses `a`'s comparator.
+fn set_difference[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_filter(a, fn (x: T) -> Bool ![] => !set_contains(b, x))
+}
+
+// `set_subset(a, b)` — true iff every element of `a` is in `b`.
+// Folds the whole set even after the answer is known; for a
+// strict-subset early-exit version, build a recursive helper
+// directly via `match` over `set_to_list(a)`.
+fn set_subset[T](a: Set[T], b: Set[T]) -> Bool ![] {
+  set_fold(a, true, fn (acc: Bool, x: T) -> Bool ![] =>
+    match acc {
+      false => false,
+      true => set_contains(b, x),
+    })
+}
+
+// `set_eq(a, b)` — true iff `a` and `b` contain the same elements
+// (under `a`'s comparator). Equivalent to `set_subset(a, b) &&
+// set_subset(b, a)`; the size-precheck short-circuits the common
+// "different sizes" case in O(1).
+fn set_eq[T](a: Set[T], b: Set[T]) -> Bool ![] {
+  if set_size(a) == set_size(b) {
+    set_subset(a, b)
+  } else {
+    false
+  }
+}
+
+// Convenience constructors — pre-wired with the matching
+// comparator from `std.ordering`. Save the user the comparator
+// argument for the common per-primitive case.
+fn set_int() -> Set[Int] ![] {
+  set_empty(int_compare)
+}
+
+fn set_string() -> Set[String] ![] {
+  set_empty(string_compare)
+}
+
+fn set_char() -> Set[Char] ![] {
+  set_empty(char_compare)
+}
