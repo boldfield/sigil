@@ -14957,6 +14957,60 @@ fn std_set_convenience_constructors_per_primitive() {
     assert_eq!(stdout, "int-yes\nstr-yes\nchr-yes\n", "stderr={stderr:?}");
 }
 
+// ===== Compiler bug regression — mono span-collision =====
+//
+// Pins the fix at `compiler/src/monomorphize.rs::rewrite_expr`
+// (`Expr::Ident` arm): the `name == &inst.name` guard prevents
+// `Ident($elab_tN)` (an elaborate-introduced ANF temp) from being
+// mis-rewritten to a captured fn instantiation when the temp's
+// span coincides with a fn-call callee's span.
+//
+// The shape that fails pre-fix:
+//   1. `import` ANY non-`BUILTIN_INJECTED` stdlib module — enough
+//      to trigger mono's `rewrite_expr` walk over user code.
+//   2. Expression of shape `<lit> <cmp> <fn_call>() <binop> <lit>`,
+//      e.g. `5 > ten() - 3`.
+//
+// The parser sets `Binary.span = lhs.span()`, so `ten() - 3` has
+// the same span as `ten()` — and elaborate's `bind` reuses that
+// span for the new `Ident($elab_t0)`. Mono's span-keyed
+// `call_sites` lookup hit the same entry and rewrote both
+// `Ident(ten)` (legitimate) and `Ident($elab_t0)` (wrong) to the
+// captured instantiation. Closure_convert then turned the bare
+// `Ident(ten)` into `ClosureRecord(ten)` (fn-as-value), and codegen
+// emitted a closure record allocation alongside the original Sub
+// — comparing against the heap pointer instead of `ten() - 3`.
+
+#[test]
+fn mono_span_collision_elab_ident_not_rewritten_to_fn() {
+    // Pre-fix: codegen emitted a closure record around `ten` and
+    // compared 5 against the heap pointer (false), routing to the
+    // else branch.
+    // Post-fix: the comparison is `5 > ten() - 3` = `5 > 7` = false,
+    // routing to the same else branch — but for the right reason.
+    // To distinguish, we use `5 < ten() - 3` (true mathematically)
+    // which the buggy code would emit as `5 < heap_ptr` (also true,
+    // but for the wrong reason). The cleaner discriminator: make
+    // the LHS larger than ten() so the comparison flips depending
+    // on whether the subtraction landed.
+    let src = "import std.option\n\
+               fn ten() -> Int ![] { 10 }\n\
+               fn main() -> Int ![IO] {\n  \
+                 if 100 > ten() - 3 {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "mono_span_collision");
+    assert_eq!(code, 0, "stderr={stderr:?}");
+    // Pre-fix: prints "no" (compares 100 against the closure record
+    // pointer, which is a heap address > 100). Post-fix: prints
+    // "yes" (compares 100 against `ten() - 3` = 7).
+    assert_eq!(stdout, "yes\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C addendum (Tier 2) — `std.int` safe arithmetic =====
 //
 // Pure-Sigil overflow-checked Int arithmetic. `int_add_safe` and
