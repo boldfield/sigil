@@ -14991,6 +14991,39 @@ fn panic_aborts_with_message_on_stderr() {
     );
 }
 
+/// `panic[A]` instantiates `A` to a sub-pointer-width type (Bool → I8).
+/// All other panic tests use A=Int / A=String, both of which lower to
+/// I64 / pointer_ty (also I64 on 64-bit) — they would not catch a
+/// regression where `lookup_call_callee_ty` returns None for a panic
+/// call and the placeholder silently widens to pointer_ty. With A=Bool
+/// the placeholder must be I8 so the surrounding lowering's downstream
+/// merge / store / branch on the (dead) value stays well-typed in the
+/// Cranelift IR. Pin via the `if` taking the Bool dead value as its
+/// condition; if the placeholder were the wrong width the verifier
+/// rejects the IR before the program ever runs.
+#[test]
+fn panic_returns_a_as_bool_typechecks() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let b: Bool = panic(\"unreachable bool\");\n  \
+                 if b {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "panic_returns_a_as_bool_typechecks");
+    assert_eq!(code, 1, "panic exits with 1; stderr={stderr:?}");
+    assert!(
+        stderr.contains("unreachable bool"),
+        "stderr should contain panic message; stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "",
+        "panic should preempt the IO.println; stdout={stdout:?}"
+    );
+}
+
 /// `panic[A]` instantiates `A` against the surrounding context.
 /// `let x: Int = panic("never"); int_to_string(x)` typechecks (A=Int)
 /// even though the let-binding never produces a real value at runtime —

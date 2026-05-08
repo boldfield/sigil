@@ -28,6 +28,15 @@ pub unsafe extern "C" fn sigil_panic(msg_ptr: *const u8) -> ! {
     let (bytes, len) = string_bytes(msg_ptr);
     let slice = std::slice::from_raw_parts(bytes, len);
 
+    // Flush stdout first so any partial line a program wrote via
+    // `IO.println` / `IO.print` reaches the user before the panic
+    // message lands on stderr. `process::exit` runs Rust's stdio
+    // cleanup via `rt::cleanup`, which handles this on supported
+    // platforms — but the explicit flush makes the ordering robust
+    // against future changes there and produces deterministic
+    // stdout-then-stderr interleaving across hosts.
+    let _ = std::io::stdout().flush();
+
     let mut err = std::io::stderr().lock();
     // Best-effort: if write fails (closed fd, etc.) the message is lost
     // but the abort is still observable via the exit status. Don't

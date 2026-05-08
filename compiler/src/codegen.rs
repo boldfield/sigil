@@ -23925,17 +23925,36 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder
                     .ins()
                     .call(self.builtins.sigil_panic_ref, &[msg]);
+                // Custom user-defined trap code (rather than
+                // `TrapCode::Unreachable`) so a post-mortem trap
+                // signature unambiguously identifies the panic-arm
+                // path if `sigil_panic` ever returns instead of
+                // exiting (link-time tampering, future LLVM/Cranelift
+                // bug, etc.). See `TRAP_PANIC_UNREACHABLE` definition.
                 self.builder
                     .ins()
                     .trap(TrapCode::unwrap_user(TRAP_PANIC_UNREACHABLE));
                 let after = self.builder.create_block();
                 self.builder.switch_to_block(after);
                 self.builder.seal_block(after);
+                // Resolved A type comes from `call_callee_tys`,
+                // populated for every `panic` call by typecheck's
+                // `is_direct_call` carve-out (`name != "panic"`).
+                // A miss here is a contract violation — emitting an
+                // arbitrary fallback width would let a sub-pointer A
+                // (Bool / Byte / Unit → I8) silently produce
+                // wrong-typed dead-code IR that the verifier rejects
+                // when a downstream merge block jumps to it.
                 let placeholder_ty = match self.lookup_call_callee_ty(call_span) {
                     Some(crate::typecheck::Ty::Fn(sig)) => {
                         cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
                     }
-                    _ => self.pointer_ty,
+                    other => unreachable!(
+                        "codegen: panic call at {call_span:?} missing \
+                         `call_callee_tys` entry — `is_direct_call` \
+                         carve-out for `panic` must populate the \
+                         side-table at typecheck (got {other:?})"
+                    ),
                 };
                 self.builder.ins().iconst(placeholder_ty, 0)
             }
