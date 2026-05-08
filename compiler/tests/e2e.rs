@@ -13711,26 +13711,30 @@ fn tail_recursive_with_effect_row() {
 // that bounces between two LITERAL-pattern arms each iteration (not just
 // the catchall). The original test's `_ => count_match(n - 1)` arm fires
 // for the bulk of the iteration; literal-pattern arms (`0 => 0`,
-// `1 => count_match(0)`) only fire at the very tail. This test pins
-// `emit_pattern_test` on every iteration: the inner match scrutinizes
-// `n % 2` and selects between literal arm `0` (even) and literal arm
-// `1` (odd), each tail-calling the same fn. The outer match's literal
-// `0 => 0` is the base case.
+// `1 => count_match(0)`) only fire at the very tail. This test exercises
+// `emit_pattern_test` on EVERY iteration via mutual recursion: `count_even`
+// and `count_odd` each scrutinize n with a literal `0 =>` base arm + a
+// catchall `_ =>` arm that tail-calls the OTHER fn with `n - 1`. The
+// alternation alone — not `n % 2` arithmetic — drives the parity switch.
+// Cleaner shape: pins multi-arm match with literal-pattern testing AND
+// mutual recursion in tail position together.
 
 #[test]
 fn tail_recursive_through_match_literal_arms() {
-    let src = "fn ping_pong_match(n: Int) -> Int ![ArithError] {\n  \
+    let src = "fn count_even(n: Int) -> Int ![] {\n  \
                  match n {\n    \
                    0 => 0,\n    \
-                   _ => match n % 2 {\n      \
-                     0 => ping_pong_match(n - 1),\n      \
-                     1 => ping_pong_match(n - 1),\n      \
-                     _ => 0,\n    \
-                   },\n  \
+                   _ => count_odd(n - 1),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO, ArithError] {\n  \
-                 let result: Int = ping_pong_match(10000000);\n  \
+               fn count_odd(n: Int) -> Int ![] {\n  \
+                 match n {\n    \
+                   0 => 1,\n    \
+                   _ => count_even(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = count_even(10000000);\n  \
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
