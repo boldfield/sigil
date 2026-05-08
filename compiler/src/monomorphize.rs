@@ -1032,10 +1032,7 @@ impl<'a> Monomorphizer<'a> {
                     if name == &inst.name {
                         let resolved = subst.resolve_instantiation(inst);
                         if self.fn_decls.contains_key(&resolved.name) {
-                            self.enqueue_fn(
-                                resolved.name.clone(),
-                                resolved.type_args.clone(),
-                            );
+                            self.enqueue_fn(resolved.name.clone(), resolved.type_args.clone());
                             let mangled = mangle_fn(&resolved.name, &resolved.type_args);
                             return Expr::Ident(mangled, span.clone());
                         }
