@@ -13975,7 +13975,37 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         PostArmKStepRole::Final { tail_expr } => {
                             // Final: lower tail with full env, widen,
                             // return Done.
-                            let tail_value = lowerer.lower_expr(tail_expr);
+                            //
+                            // TCO-4 follow-up — route the tail expression
+                            // through `lower_expr_in_tail_pos` so a
+                            // Cps→Cps recursive call in the tail emits a
+                            // NextStep::Call return directly (via
+                            // `lower_call_in_tail_pos`'s Cps branch)
+                            // instead of nesting `sigil_run_loop`.
+                            // `TailResult::Terminated` means the tail
+                            // already emitted the surrounding fn's
+                            // `return_(...)`; skip the Done-wrap below.
+                            let tail_result = lowerer.lower_expr_in_tail_pos(tail_expr);
+                            let tail_value = match tail_result {
+                                TailResult::Terminated => {
+                                    // Cps→Cps tail-call branch already
+                                    // emitted return_(NextStep::Call(...)).
+                                    // Done-wrap below would land in a
+                                    // dead block (Cranelift elides);
+                                    // skip cleanly.
+                                    lowerer.builder.finalize();
+                                    continue;
+                                }
+                                TailResult::Value(v) => v,
+                                TailResult::NoValue => {
+                                    // Block-with-no-tail edge case (rare
+                                    // for Final-step). Substitute zero
+                                    // of the tail's expected I64 width
+                                    // — the wrap-in-Done path tolerates
+                                    // it as the unit value.
+                                    lowerer.builder.ins().iconst(types::I64, 0)
+                                }
+                            };
                             let actual_tail_ty = lowerer.builder.func.dfg.value_type(tail_value);
                             let widened_tail = if actual_tail_ty == types::I64 {
                                 tail_value
@@ -18583,12 +18613,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         if let Expr::Ident(name, _) = callee {
             if self.user_fn_refs.contains_key(name) && !self.env.contains_key(name) {
-                let abi_is_sync = self
-                    .user_fns
-                    .get(name)
-                    .map(|e| matches!(e.abi, UserFnAbi::Sync))
-                    .unwrap_or(false);
-                if abi_is_sync {
+                let callee_abi = self.user_fns.get(name).map(|e| e.abi);
+                if let Some(abi) = callee_abi {
                     let func_ref = self.user_fn_refs[name];
                     let callee_sig_ref = self.builder.func.dfg.ext_funcs[func_ref].signature;
                     // Clone to release the dfg borrow before reading
@@ -18596,39 +18622,170 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let callee_sig = self.builder.func.dfg.signatures[callee_sig_ref].clone();
                     let signatures_match = callee_sig == self.builder.func.signature;
                     if signatures_match {
-                        // Mirror lower_call's Sync direct branch arg
-                        // packing: lower each arg via lower_expr (NonTail —
-                        // args are not in tail position by definition),
-                        // honoring the per-callee Continuation-arg flags
-                        // for Plan D Task 117(b) parameter-position
-                        // Continuation values.
-                        let cont_flags: Option<Vec<bool>> =
-                            self.cont_param_callees.get(name).cloned();
-                        let arg_vals: Vec<Value> = args
-                            .iter()
-                            .enumerate()
-                            .map(|(i, a)| {
-                                let is_cont_pos = cont_flags
-                                    .as_ref()
-                                    .is_some_and(|f| f.get(i).copied().unwrap_or(false));
-                                if is_cont_pos {
-                                    self.lower_continuation_arg(a)
-                                } else {
-                                    self.lower_expr(a)
+                        match abi {
+                            UserFnAbi::Sync => {
+                                // Sync→Sync TCO via Cranelift `return_call`.
+                                // Mirror lower_call's Sync direct branch arg
+                                // packing.
+                                let cont_flags: Option<Vec<bool>> =
+                                    self.cont_param_callees.get(name).cloned();
+                                let arg_vals: Vec<Value> = args
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, a)| {
+                                        let is_cont_pos = cont_flags
+                                            .as_ref()
+                                            .is_some_and(|f| f.get(i).copied().unwrap_or(false));
+                                        if is_cont_pos {
+                                            self.lower_continuation_arg(a)
+                                        } else {
+                                            self.lower_expr(a)
+                                        }
+                                    })
+                                    .collect();
+                                let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                                let terminal_out = self.terminal_out_param;
+                                let mut all_args: Vec<Value> =
+                                    Vec::with_capacity(arg_vals.len() + 2);
+                                all_args.push(null_closure);
+                                all_args.extend(arg_vals);
+                                all_args.push(terminal_out);
+                                // Emit Cranelift's tail-call IR.
+                                self.builder.ins().return_call(func_ref, &all_args);
+                                return TailResult::Terminated;
+                            }
+                            UserFnAbi::Cps => {
+                                // TCO-4 follow-up — Cps→Cps TCO via
+                                // NextStep::Call return. The signature_match
+                                // check above implies the surrounding fn
+                                // also has cps_signature shape (4 params,
+                                // pointer return), i.e., it's also a Cps fn.
+                                // Build NextStep::Call(callee, args + (null,
+                                // identity) trailing pair) and return it.
+                                // The OUTER trampoline iterates without
+                                // nesting a fresh `sigil_run_loop` — the
+                                // pre-fix lower_call Cps direct branch would
+                                // nest one per call (~80 bytes/iter
+                                // C-stack leak; capped count_down_cps at
+                                // ~100K depth). See `[DEVIATION Task TCO-4
+                                // in-flight]` in `PLAN_C_DEVIATIONS.md` for
+                                // the diagnostic walk.
+                                //
+                                // The trailing pair stays (null, identity)
+                                // — same as the existing Cps direct branch.
+                                // Forwarding the surrounding fn's captured
+                                // outer (k_closure, k_fn) would preserve
+                                // continuation chains for non-trivial k,
+                                // but for v1's identity-k surrounding-handle
+                                // case (which is what `count_down_cps` from
+                                // main's `handle ... with` exercises), the
+                                // captured outer k IS (null, identity), so
+                                // (null, identity) is correct here too.
+                                // More general k-forwarding is a follow-up
+                                // when a real program surfaces the gap.
+                                let user_arg_count = args.len();
+                                let total_arg_count = user_arg_count + 2;
+
+                                // Lower user args; widen + store into a
+                                // local args buffer; tack on (null,
+                                // identity) at the trailing pair slots.
+                                let slot_bytes = (total_arg_count * 8) as u32;
+                                let slot = self.builder.create_sized_stack_slot(
+                                    StackSlotData::new(StackSlotKind::ExplicitSlot, slot_bytes, 3),
+                                );
+                                for (i, arg_expr) in args.iter().enumerate() {
+                                    let arg_v = self.lower_expr(arg_expr);
+                                    let arg_ty = self.builder.func.dfg.value_type(arg_v);
+                                    let widened = if arg_ty == types::I64 {
+                                        arg_v
+                                    } else if arg_ty.is_int() && arg_ty.bits() < 64 {
+                                        self.builder.ins().uextend(types::I64, arg_v)
+                                    } else {
+                                        assert_eq!(
+                                            arg_ty, self.pointer_ty,
+                                            "TCO-4 follow-up Cps→Cps tail call: \
+                                             unexpected user-arg Cranelift type \
+                                             {arg_ty:?} for callee `{name}`"
+                                        );
+                                        arg_v
+                                    };
+                                    self.builder
+                                        .ins()
+                                        .stack_store(widened, slot, (i * 8) as i32);
                                 }
-                            })
-                            .collect();
-                        let null_closure = self.builder.ins().iconst(self.pointer_ty, 0);
-                        let terminal_out = self.terminal_out_param;
-                        let mut all_args: Vec<Value> = Vec::with_capacity(arg_vals.len() + 2);
-                        all_args.push(null_closure);
-                        all_args.extend(arg_vals);
-                        all_args.push(terminal_out);
-                        // Emit Cranelift's tail-call IR. `return_call`
-                        // is a terminator: no inst-results, no
-                        // subsequent emission allowed in this block.
-                        self.builder.ins().return_call(func_ref, &all_args);
-                        return TailResult::Terminated;
+                                let null_k_closure = self.builder.ins().iconst(self.pointer_ty, 0);
+                                let identity_k_fn = self
+                                    .builder
+                                    .ins()
+                                    .func_addr(self.pointer_ty, self.continuation_identity_ref);
+                                self.builder.ins().stack_store(
+                                    null_k_closure,
+                                    slot,
+                                    k_closure_offset(user_arg_count),
+                                );
+                                self.builder.ins().stack_store(
+                                    identity_k_fn,
+                                    slot,
+                                    k_fn_offset(user_arg_count),
+                                );
+
+                                // Build NextStep::Call(callee_addr,
+                                // total_arg_count). The closure_ptr field
+                                // of the NextStep is null (top-level user
+                                // fn — no captures); the args buffer is
+                                // copied into the NextStep's arena slots
+                                // by the caller convention below.
+                                let callee_addr =
+                                    self.builder.ins().func_addr(self.pointer_ty, func_ref);
+                                let arg_count_v = self
+                                    .builder
+                                    .ins()
+                                    .iconst(types::I32, total_arg_count as i64);
+                                let null_call_closure =
+                                    self.builder.ins().iconst(self.pointer_ty, 0);
+                                let ns_call = self.builder.ins().call(
+                                    self.next_step_call_ref,
+                                    &[null_call_closure, callee_addr, arg_count_v],
+                                );
+                                self.stackmap
+                                    .push_placeholder(function_code_offset(&self.builder, ns_call));
+                                let ns_ptr = self.builder.inst_results(ns_call)[0];
+
+                                // Copy our local args buffer into the
+                                // NextStep's args slot (the runtime's
+                                // contract: NextStep::Call's args_ptr is
+                                // arena-owned and the caller writes into
+                                // it via the args_ptr accessor).
+                                let argp_call = self
+                                    .builder
+                                    .ins()
+                                    .call(self.next_step_args_ptr_ref, &[ns_ptr]);
+                                let ns_args_ptr = self.builder.inst_results(argp_call)[0];
+                                let local_args_ptr =
+                                    self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
+                                for i in 0..total_arg_count {
+                                    let offset = (i * 8) as i32;
+                                    let v = self.builder.ins().load(
+                                        types::I64,
+                                        MemFlags::trusted(),
+                                        local_args_ptr,
+                                        offset,
+                                    );
+                                    self.builder.ins().store(
+                                        MemFlags::trusted(),
+                                        v,
+                                        ns_args_ptr,
+                                        offset,
+                                    );
+                                }
+
+                                // Return the NextStep — the surrounding
+                                // Cps fn's signature is `... -> *mut
+                                // NextStep`, so this is well-typed.
+                                self.builder.ins().return_(&[ns_ptr]);
+                                return TailResult::Terminated;
+                            }
+                        }
                     }
                 }
             }
