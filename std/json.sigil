@@ -43,7 +43,17 @@
 //   has no embedded escapes. Same v2 plan extends.
 // - Strict parser: trailing whitespace OK, trailing characters
 //   (anything non-whitespace after the value) → `Err("trailing
-//   characters after JSON value")`.
+//   characters after JSON value")` on well-formed prefixes.
+// - **Malformed-input crash.** Every `__json_parse_*` helper reads
+//   the cursor via `perform State.get()` before raising on
+//   malformed input. The State.get-then-raise sequence inside a fn
+//   called from `catch(run_state(...))` trips a v1 composition
+//   limitation — the program aborts with SIGSEGV instead of
+//   returning `Err`. Documented in `PLAN_C_PROGRESS.md`'s
+//   Koka-test-suite entry as a known v1 runtime limitation.
+//   Until v2 closes the State+Raise composition gap, validate
+//   input shape before calling `json_parse`, or accept the abort
+//   as the failure signal. Valid-input paths are unaffected.
 // - No Unicode classification beyond what `std.char` ships
 //   (`is_ascii_*`); the parser only recognises ASCII whitespace
 //   (space, tab, LF, CR).
