@@ -1,0 +1,67 @@
+// sigil: 0.1
+//
+// std/panic.sigil — Plan C addendum: `panic` and `assert`.
+//
+// This module is a documentation-only header. Both functions are
+// builtin-injected: their schemes live in
+// `compiler/src/typecheck.rs::register_builtin_diagnostic_schemes`
+// and their lowerings live in `compiler/src/codegen.rs`'s
+// `lower_call` arms keyed on `Expr::Ident("panic")` /
+// `Expr::Ident("assert")`. This file is listed in `BUILTIN_INJECTED`
+// so `import std.panic` is a no-op at the import resolver — the
+// names are already in scope without needing any sigil source to
+// load. The file exists so a future v2 migration to `extern fn` /
+// `opaque type` declarations has a natural home for the API.
+//
+// ## API
+//
+//   fn panic[A](msg: String) -> A ![]
+//   fn assert(cond: Bool, msg: String) -> Unit ![]
+//
+// ## `panic`
+//
+// Aborts the program. Writes `msg` to stderr followed by a single
+// newline; exits with status 1 (via `std::process::exit(1)` —
+// flushes stdio and runs Rust drop handlers; *not* `abort()` /
+// SIGABRT, which would dump core).
+//
+// `panic` returns the per-call generic `A` — the "never returns"
+// idiom Sigil already uses for `Raise.fail[A]`. The `A` is fresh-
+// instantiated at each call site and unifies with the surrounding
+// context, so `panic("oops")` typechecks anywhere any expression
+// typechecks (in a `let` RHS, a match arm, a return position, etc.).
+//
+// `panic` carries effect row `![]` — it does not perform any
+// user-handleable effect. Aborting is not catchable.
+//
+// ## `assert`
+//
+// Pure helper:
+//
+//   assert(cond, msg)  ≡  if cond { unit } else { panic(msg) }
+//
+// `assert(true, _)` is a no-op (returns Unit and falls through).
+// `assert(false, msg)` calls `panic(msg)` — same abort semantics
+// as `panic` directly.
+//
+// ## Not catchable
+//
+// `Raise[E]` is the catchable error mechanism (see `std/raise.sigil`).
+// `panic` is a hard abort: there is no `catch_panic`, no `try`, no
+// way to observe the abort from sigil code. Use `Raise[E]` when the
+// caller may want to recover; use `panic` when the program's
+// invariants have been violated and continuing would be unsafe or
+// nonsensical.
+//
+// ## v1 limits
+//
+// - No stack trace on panic. The runtime prints `msg` and exits;
+//   any caller-context information has to be encoded into `msg`
+//   itself (e.g., via `format(...)` from `std/format.sigil`). Stack
+//   traces are deferred to v2 (depends on stackmap v1 content
+//   landing first; see `spec/language.md` v1 limits table).
+// - Single message argument. No format-string variant. Use
+//   `format(...)` + `panic(...)` for formatted messages.
+// - No debug-only / release-elision of `assert`. `assert` is
+//   semantically equivalent to its `if cond { unit } else {
+//   panic(msg) }` expansion; no compiler flag erases it.
