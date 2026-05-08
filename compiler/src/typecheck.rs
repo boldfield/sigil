@@ -2814,7 +2814,10 @@ fn register_builtin_diagnostic_schemes(tc: &mut Tc) {
 /// name. Used by `check_call`'s `Expr::Ident` resolution to file-gate
 /// access to `Ref[T]` allocation / load / store.
 fn is_ref_runtime_op(name: &str) -> bool {
-    matches!(name, "sigil_ref_alloc" | "sigil_ref_deref" | "sigil_ref_set")
+    matches!(
+        name,
+        "sigil_ref_alloc" | "sigil_ref_deref" | "sigil_ref_set"
+    )
 }
 
 /// Plan State-Cell — file-path predicate identifying `std/state.sigil`.
@@ -16459,5 +16462,54 @@ mod tests {
             "program"
         );
         assert_eq!(__module_label_from_file("noslashes"), "noslashes");
+    }
+
+    // ===== Plan State-Cell — Ref[T] runtime cell ops gating =====
+
+    #[test]
+    fn sigil_ref_alloc_called_from_user_code_is_e0148() {
+        // User code (pipeline's synthetic main file) calling
+        // `sigil_ref_alloc` directly trips the file-path gate. The
+        // op is reserved for `std/state.sigil`'s cell-based State
+        // implementation; user code that wants mutation goes through
+        // `perform State.set` / `perform State.get` after running
+        // under `run_state`.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let _r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_alloc call from user code; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sigil_ref_deref_called_from_user_code_is_e0148() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     let _v: Int = sigil_ref_deref(r);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_deref call from user code; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sigil_ref_set_called_from_user_code_is_e0148() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     let _u: Unit = sigil_ref_set(r, 5);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_set call from user code; got {errs:?}"
+        );
     }
 }

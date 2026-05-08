@@ -15425,25 +15425,65 @@ fn std_json_parse_empty_array_and_object() {
     assert_eq!(stdout, "[]\n{}\n", "stderr={stderr:?}");
 }
 
-// `std_json_parse_malformed_returns_err` was authored as the
-// canonical "Err on malformed input" regression but trips a v1
-// composition limitation: a `State.get()` perform followed by
-// `raise(...)` inside a fn that's called from within
-// `catch(run_state(...))` segfaults at runtime. The same limitation
-// is documented in `PLAN_C_PROGRESS.md`'s Koka-test-suite entry
-// ("v1 runtime limitation: State+Raise composition") — discovered
-// when porting Koka's effect-handler tests. The JSON parser hits
-// the limitation on every malformed-input path because
-// `__json_parse_value` reads the cursor (State.get) before
-// raising. Valid-input paths are unaffected (covered by
-// `std_json_parse_simple_object_round_trip`,
-// `std_json_parse_negative_int`,
-// `std_json_parse_empty_array_and_object`).
-//
-// Until v2 closes the State+Raise composition gap, the malformed-
-// input behaviour is "process aborts with SIGSEGV"; user code
-// using `json_parse` should validate that input is well-formed
-// before parsing or accept the abort as the failure signal.
+// Plan State-Cell — State+Raise composition. Re-enabled now that
+// `std/state.sigil` uses a runtime-cell encoding: arm bodies
+// resume `k(arg)` directly (instead of returning a state-fn
+// closure), so foreign-discharge propagation falls through the
+// existing `lower_k_pair_call` path rather than hitting the
+// Plotkin/Sync-ABI gap. See
+// `docs/plans/2026-05-08-sigil-state-runtime-cell-design.md` for
+// the trace; `compiler/src/codegen.rs`'s "Plan State-Cell Pattern-C
+// fix" comment block at the BranchLeafFinal::Pure dispatch site
+// covers the codegen half.
+#[test]
+fn std_json_parse_malformed_returns_err() {
+    let src = "import std.json\n\
+               import std.result\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 match json_parse(string_to_bytes(\"{bad\")) {\n    \
+                   Ok(_) => perform IO.println(\"BAD: should have failed\"),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_malformed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "err\n", "stderr={stderr:?}");
+}
+
+// Plan State-Cell — minimal State+Raise composition reproducer.
+// Pre-fix this SIGSEGV'd in main's tuple destructure of run_state's
+// result (the discharged Err value flowed through state-fn's Sync
+// return typed as `(A, S)`, and main loaded offset 8 from a non-
+// tuple). Post-fix the cell encoding propagates the Raise discharge
+// cleanly: catch sees `Err("crash")`.
+#[test]
+fn state_compose_raise_propagates_err() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.state\n\
+               import std.io\n\
+               \n\
+               fn body() -> Int ![State[Int], Raise[String]] {\n  \
+                 let _v: Int = perform State.get();\n  \
+                 raise(\"crash\")\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => {\n    \
+                   let pair: (Int, Int) = run_state(0, body);\n    \
+                   match pair { (parsed, _final) => parsed }\n  \
+                 });\n  \
+                 match r {\n    \
+                   Ok(_) => perform IO.println(\"BAD: should have raised\"),\n    \
+                   Err(msg) => perform IO.println(string_concat(\"err: \", msg)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "state_compose_raise");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "err: crash\n", "stderr={stderr:?}");
+}
 
 // ===== Plan C addendum (Stage FMT) — `std.format` =====
 

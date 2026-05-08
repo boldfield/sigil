@@ -1046,6 +1046,44 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0148",
+        short: "runtime cell op called outside `std/state.sigil`",
+        long: "Plan State-Cell: `sigil_ref_alloc`, `sigil_ref_deref`, \
+               `sigil_ref_set` are runtime-internal builtins backing \
+               `std/state.sigil`'s cell-based State implementation. They \
+               allocate, read, and write a single-slot mutable heap cell \
+               (`Ref[T]`) that the State handler arms thread through \
+               `run_state` so `perform State.get` / `perform State.set` \
+               compose correctly with discharging effects like \
+               `Raise[E]`.\n\n\
+               Sigil v1 does not expose mutable cells to user code. The \
+               only observable mutation surface is the `State[S]` \
+               effect, gated by `run_state`. Any use of these three \
+               runtime ops from outside `std/state.sigil` is rejected.\n\n\
+               If you need mutable state in your code, use the State \
+               effect: `perform State.get()` reads, `perform State.set(v)` \
+               writes, and `run_state(initial, body)` runs a State-using \
+               body and produces `(result, final_state)`. Compose with \
+               other effects (Raise, IO, etc.) by listing them on the \
+               effect row.",
+        fix_example: "// Wrong (direct cell op from user code):\n\
+                      fn main() -> Int ![] {\n  \
+                        let _r: Ref[Int] = sigil_ref_alloc(0);  // E0148\n  \
+                        0\n\
+                      }\n\n\
+                      // Right (use the State effect via std.state):\n\
+                      import std.state\n\
+                      fn body() -> Int ![State[Int]] {\n  \
+                        perform State.set(5);\n  \
+                        perform State.get()\n\
+                      }\n\
+                      fn main() -> Int ![IO] {\n  \
+                        let pair: (Int, Int) = run_state(0, body);\n  \
+                        match pair { (v, _) => perform IO.println(int_to_string(v)) };\n  \
+                        0\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \

@@ -9947,8 +9947,68 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // synth-cont allocation pass will consume it (one synth-
                 // cont per index). For B.1 we only need to know whether
                 // the body matches the shape (bool), not which arms.
-                let perform_arm_indices_opt =
-                    is_compound_match_with_arm_perform_body(&f.body, &ctors);
+                // Plan State-Cell — gate B.2 (compound-match-with-arm-
+                // perform) emit on "doesn't ALSO match Pattern C
+                // *AND* none of the branched-tail arm patterns bind
+                // names". The first half closes a real bug: a Cps fn
+                // whose tail is `if cond { perform; v } else { v }`
+                // matches BOTH classifiers, and B.2 wins (checked
+                // first) but emits a per-arm synth-cont whose
+                // terminal dispatch threads via post_arm_k = identity
+                // (per the standard arm-fn k(arg) emit convention),
+                // discarding the helper's caller_k_pair. When the
+                // helper is called from another Cps fn's chain step
+                // (e.g., `body() = let a = step(); a + 1`), body's
+                // chain step 0 synth-cont never fires — step's value
+                // short-circuits to identity → Done(value), bypassing
+                // body's tail entirely. Pattern C's emit threads
+                // caller_k_pair through synth-cont closure records
+                // correctly.
+                //
+                // The second half (no pattern bindings) gates against
+                // a Pattern C limitation: branch-chain synth-cont
+                // captures don't include arm-pattern bindings (e.g.,
+                // `x` and `rest` in `Cons(x, rest) => ...`). For
+                // pattern-binding shapes, B.2 is correct — its per-arm
+                // dispatch binds the pattern fields into env before
+                // emitting the arm body. So we ONLY override B.2 with
+                // Pattern C when the branched tail's arm patterns are
+                // all pure tests (BoolLit / IntLit / wildcards) that
+                // don't bind names. The canonical case is
+                // `if cond { perform; v } else { v }` which desugars
+                // to a 2-arm BoolLit match — no bindings.
+                let pattern_c_chain_length = is_let_yield_prefix_then_branched_cps_tail_body(
+                    &f.body,
+                    &ctors,
+                    &|callee_name: &str| {
+                        is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
+                    },
+                    &|callee_name: &str| {
+                        is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
+                    },
+                );
+                // Restrict the override to chain_length=0 cases. Pattern C
+                // with chain_length>0 (let-yield prefix + branched tail)
+                // already takes precedence naturally (B.2 rejects bodies
+                // with stmts), so re-routing through it here is a no-op
+                // for those — but it ALSO causes the chain emit to
+                // double-dispatch synth-conts for parser-shape fns whose
+                // bodies have multi-yield prefixes, accumulating
+                // OUTER_POST_ARM_K entries linearly with recursion depth
+                // and overflowing the cap on programs like
+                // examples/json.sigil's recursive-descent parser.
+                // Restricting to chain_length=0 keeps the fix narrow:
+                // it covers the `if cond { perform; v } else { v }`
+                // shape (where B.2 dispatches with post_arm_k=identity
+                // discarding caller_k_pair) without disturbing the
+                // chain-length>0 paths that already work.
+                let pattern_c_should_override_b2 = matches!(pattern_c_chain_length, Some(0))
+                    && tail_has_no_arm_pattern_bindings(f.body.tail.as_ref());
+                let perform_arm_indices_opt = if pattern_c_should_override_b2 {
+                    None
+                } else {
+                    is_compound_match_with_arm_perform_body(&f.body, &ctors)
+                };
                 if let Some(perform_arm_indices) = perform_arm_indices_opt {
                     // Phase 1 — unpack user args from `args_ptr` at
                     // offsets `i*8`. Mirrors the tail-perform body's
@@ -17098,18 +17158,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             argp,
                                             0,
                                         );
-                                        // Null post_arm_k slots.
-                                        lowerer.builder.ins().store(
-                                            MemFlags::trusted(),
-                                            null_v,
-                                            argp,
-                                            8,
+                                        // Plan State-Cell — post_arm_k_pair
+                                        // = (null, identity). The
+                                        // receiving synth-cont's 3-branch
+                                        // gate discriminates
+                                        // `post_arm_k_fn == identity`.
+                                        // Writing null mis-routes
+                                        // canonical resumes through
+                                        // top_post_arm_k_dispatch_block
+                                        // which dispatches a null fn.
+                                        let identity_fn_for_post = lowerer.builder.ins().func_addr(
+                                            pointer_ty,
+                                            lowerer.continuation_identity_ref,
                                         );
                                         lowerer.builder.ins().store(
                                             MemFlags::trusted(),
                                             null_v,
                                             argp,
-                                            16,
+                                            POST_ARM_K_CLOSURE_OFF,
+                                        );
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            identity_fn_for_post,
+                                            argp,
+                                            POST_ARM_K_FN_OFF,
                                         );
                                         lowerer.builder.ins().return_(&[call_ns_ptr]);
                                     }
@@ -24038,7 +24110,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "sigil_ref_alloc" => {
                 assert_eq!(args.len(), 1, "sigil_ref_alloc builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let widened = widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_alloc");
+                let widened =
+                    widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_alloc");
                 let call = self
                     .builder
                     .ins()
@@ -28485,6 +28558,42 @@ enum BranchedCpsLeaf {
 /// Returns `Some(Vec<usize>)` listing perform-bearing arm indices on
 /// match; `None` if any arm fails the constraints.
 #[allow(dead_code)]
+/// Plan State-Cell — `true` iff the body's tail is a branched
+/// expression (`Expr::If` or `Expr::Match`) whose arm patterns bind
+/// no names. Used by the body-emit dispatch to decide whether
+/// Pattern C can replace B.2 (compound-match-with-arm-perform):
+/// Pattern C's branch-chain synth-cont captures don't include arm-
+/// pattern bindings, so the override is safe only when no bindings
+/// are present (e.g., `if cond { ... } else { ... }` desugared to a
+/// 2-arm BoolLit match).
+///
+/// `Expr::If` (the surface form, never desugared by elaborate at this
+/// commit) trivially has no bindings — its branches are blocks.
+/// `Expr::Match` arms may bind names via their patterns; the helper
+/// scans each pattern via [`collect_pattern_bindings`] and rejects
+/// any non-empty binding set.
+///
+/// `None` tail or non-branched tail returns `false` — Pattern C
+/// requires a branched tail anyway, so the dispatch always falls
+/// through to B.2 in that case.
+fn tail_has_no_arm_pattern_bindings(tail: Option<&crate::ast::Expr>) -> bool {
+    use crate::ast::Expr;
+    match tail {
+        Some(Expr::If { .. }) => true,
+        Some(Expr::Match { arms, .. }) => {
+            for arm in arms {
+                let mut bindings = std::collections::BTreeSet::new();
+                collect_pattern_bindings(&arm.pattern, &mut bindings);
+                if !bindings.is_empty() {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 fn is_compound_match_with_arm_perform_body(
     body: &crate::ast::Block,
     ctors: &std::collections::BTreeSet<String>,
