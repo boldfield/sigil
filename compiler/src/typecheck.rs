@@ -15814,4 +15814,28 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    #[test]
+    fn import_std_list_sort_typechecks_cleanly() {
+        // `list_sort` plus every per-type wrapper compiles end-to-
+        // end. Importing `std.list` should also pull in
+        // `std.ordering` transitively (the wrappers reference its
+        // comparators), so the user program does not need a
+        // second `import`.
+        let src = "import std.list\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n  \
+                     let _i: List[Int] = list_sort_int(xs);\n  \
+                     let ss: List[String] = Cons(\"b\", Cons(\"a\", Nil));\n  \
+                     let _s: List[String] = list_sort_string(ss);\n  \
+                     let cs: List[Char] = Cons('b', Cons('a', Nil));\n  \
+                     let _c: List[Char] = list_sort_char(cs);\n  \
+                     let fs: List[Float] = Cons(2.0, Cons(1.0, Nil));\n  \
+                     let _f: List[Float] = list_sort_float(fs);\n  \
+                     let _g: List[Int] = list_sort(xs, int_compare);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }

@@ -39,6 +39,13 @@
 // would lift this bound on the tail-recursive helpers; until then
 // the bound is shared across the whole module.
 
+// `list_sort` and the per-type sort wrappers below consume
+// comparators from `std.ordering`; the import threads `Ordering`
+// and the `*_compare` fns through the resolver so callers of
+// `list_sort_*` get the convenience wrappers without writing a
+// second `import` line.
+import std.ordering
+
 type List[A] = | Nil | Cons(A, List[A])
 
 // `length(xs)` returns the number of elements.
@@ -119,6 +126,118 @@ fn range(start: Int, end: Int) -> List[Int] ![] {
 // write a direct recursive `match` helper for now; the canonical
 // v2 surface lands when row-poly fn-typed params + a Unit literal
 // (or a sequencing primitive in match arm bodies) ships.
+
+// `list_sort(xs, cmp)` is a stable functional merge sort. O(n log
+// n) time, O(n) extra allocation per merge level. Returns a new
+// `List[T]`; `xs` is unchanged. The comparator `cmp` returns an
+// `Ordering` (Less / Equal / Greater) — when two elements compare
+// `Equal`, the left input's element precedes the right input's,
+// so equal-keyed elements preserve insertion order across merges.
+//
+// Implementation notes:
+// - Splitting uses the tortoise-and-hare pattern (`__split`): a
+//   slow pointer advances by 1 each step while a fast pointer
+//   advances by 2; when fast reaches the end, slow sits at the
+//   midpoint. This avoids the `n / 2` division that would force
+//   `ArithError` onto the effect row.
+// - The merge step is tail-recursive (TCO'd per Plan C Task TCO):
+//   `__merge_rev` accumulates the merged list in reverse, then
+//   `reverse` flips it back at the end. Merge stack depth is
+//   O(1) regardless of input length.
+// - The outer divide-and-conquer recursion is O(log n) deep —
+//   one frame per split level — and `__split` itself is tail-
+//   recursive. 10K-element inputs fit comfortably in an 8 MiB
+//   system stack; callers with larger inputs should sort via
+//   `MutArray[A]` (a future plan).
+fn list_sort[T](xs: List[T], cmp: (T, T) -> Ordering ![]) -> List[T] ![] {
+  match xs {
+    Nil => Nil,
+    Cons(_, t) => match t {
+      // Singleton: already sorted, return unchanged.
+      Nil => xs,
+      _ => __list_sort_split(xs, cmp),
+    },
+  }
+}
+
+fn __list_sort_split[T](xs: List[T], cmp: (T, T) -> Ordering ![]) -> List[T] ![] {
+  match __split(xs) {
+    (left, right) => {
+      let sl: List[T] = list_sort(left, cmp);
+      let sr: List[T] = list_sort(right, cmp);
+      __merge(sl, sr, cmp)
+    },
+  }
+}
+
+// Tortoise-and-hare split: returns `(front_half, back_half)` such
+// that `length(front) <= length(back) <= length(front) + 1` and
+// `front ++ back == xs`. Tail-recursive — TCO'd.
+fn __split[T](xs: List[T]) -> (List[T], List[T]) ![] {
+  __split_walk(xs, xs, Nil)
+}
+
+fn __split_walk[T](slow: List[T], fast: List[T], front_rev: List[T]) -> (List[T], List[T]) ![] {
+  match fast {
+    // fast hit end on an even-length list; slow is at midpoint.
+    Nil => (reverse(front_rev), slow),
+    Cons(_, fast_rest) => match fast_rest {
+      // fast hit end on an odd-length list; slow is at midpoint.
+      Nil => (reverse(front_rev), slow),
+      // Advance slow by 1 and fast by 2 while accumulating slow's
+      // head onto front_rev (in reverse — flipped at the leaf).
+      Cons(_, fast_rest2) => match slow {
+        // Unreachable: fast advances ahead of slow, so slow can
+        // only be Nil when xs was empty (handled by caller).
+        Nil => (reverse(front_rev), Nil),
+        Cons(sh, st) => __split_walk(st, fast_rest2, Cons(sh, front_rev)),
+      },
+    },
+  }
+}
+
+// Stable merge of two sorted lists. Picks the left input on
+// `Equal` to preserve insertion order. Tail-recursive:
+// `__merge_rev` accumulates the result in reverse, then `reverse`
+// flips it back. Both passes are TCO'd, so merge stack depth is
+// O(1) regardless of input length.
+fn __merge[T](xs: List[T], ys: List[T], cmp: (T, T) -> Ordering ![]) -> List[T] ![] {
+  reverse(__merge_rev(xs, ys, cmp, Nil))
+}
+
+fn __merge_rev[T](xs: List[T], ys: List[T], cmp: (T, T) -> Ordering ![], acc: List[T]) -> List[T] ![] {
+  match xs {
+    Nil => __reverse_acc(ys, acc),
+    Cons(xh, xt) => match ys {
+      Nil => __reverse_acc(xs, acc),
+      Cons(yh, yt) => match cmp(xh, yh) {
+        Greater => __merge_rev(xs, yt, cmp, Cons(yh, acc)),
+        // `Less` and `Equal` both consume from the left half; the
+        // `Equal` branch is what makes this sort stable.
+        _ => __merge_rev(xt, ys, cmp, Cons(xh, acc)),
+      },
+    },
+  }
+}
+
+// Convenience wrappers — saves callers the comparator threading
+// for the common per-primitive sort. Each defers to `list_sort`
+// with the matching comparator from `std.ordering`.
+fn list_sort_int(xs: List[Int]) -> List[Int] ![] {
+  list_sort(xs, int_compare)
+}
+
+fn list_sort_string(xs: List[String]) -> List[String] ![] {
+  list_sort(xs, string_compare)
+}
+
+fn list_sort_char(xs: List[Char]) -> List[Char] ![] {
+  list_sort(xs, char_compare)
+}
+
+fn list_sort_float(xs: List[Float]) -> List[Float] ![] {
+  list_sort(xs, float_compare)
+}
 
 // Internal helper: convert `Array[A]` slots `[idx, n)` into a
 // `List[A]` (head-first). Lives here rather than in `std/env.sigil`
