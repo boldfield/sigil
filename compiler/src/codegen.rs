@@ -9947,36 +9947,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // synth-cont allocation pass will consume it (one synth-
                 // cont per index). For B.1 we only need to know whether
                 // the body matches the shape (bool), not which arms.
-                // Plan State-Cell — gate B.2 (compound-match-with-arm-
-                // perform) emit on "doesn't ALSO match Pattern C
-                // *AND* none of the branched-tail arm patterns bind
-                // names". The first half closes a real bug: a Cps fn
-                // whose tail is `if cond { perform; v } else { v }`
-                // matches BOTH classifiers, and B.2 wins (checked
-                // first) but emits a per-arm synth-cont whose
-                // terminal dispatch threads via post_arm_k = identity
-                // (per the standard arm-fn k(arg) emit convention),
-                // discarding the helper's caller_k_pair. When the
-                // helper is called from another Cps fn's chain step
-                // (e.g., `body() = let a = step(); a + 1`), body's
-                // chain step 0 synth-cont never fires — step's value
-                // short-circuits to identity → Done(value), bypassing
-                // body's tail entirely. Pattern C's emit threads
-                // caller_k_pair through synth-cont closure records
-                // correctly.
-                //
-                // The second half (no pattern bindings) gates against
-                // a Pattern C limitation: branch-chain synth-cont
-                // captures don't include arm-pattern bindings (e.g.,
-                // `x` and `rest` in `Cons(x, rest) => ...`). For
-                // pattern-binding shapes, B.2 is correct — its per-arm
-                // dispatch binds the pattern fields into env before
-                // emitting the arm body. So we ONLY override B.2 with
-                // Pattern C when the branched tail's arm patterns are
-                // all pure tests (BoolLit / IntLit / wildcards) that
-                // don't bind names. The canonical case is
-                // `if cond { perform; v } else { v }` which desugars
-                // to a 2-arm BoolLit match — no bindings.
+                // Plan State-Cell — override B.2 with Pattern C when:
+                // (a) chain_length == 0 (no body-level let-yield prefix),
+                // (b) Pattern C accepts the body, and
+                // (c) the branched-tail arm patterns bind no names.
+                // B.2 discards `caller_k_pair` via post_arm_k=identity;
+                // Pattern C threads it through synth-cont closure records.
+                // Pattern bindings (e.g., `Cons(x, rest)`) keep B.2 because
+                // Pattern C's branch chain doesn't capture them. The
+                // `chain_length > 0` paths already prefer Pattern C
+                // naturally (B.2 rejects bodies with stmts); re-routing
+                // them here would push extra OUTER_POST_ARM_K entries per
+                // recursive frame and overflow the cap on deeply-recursive
+                // shapes like examples/json.sigil's parser.
                 let pattern_c_chain_length = is_let_yield_prefix_then_branched_cps_tail_body(
                     &f.body,
                     &ctors,
@@ -9987,21 +9970,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     },
                 );
-                // Restrict the override to chain_length=0 cases. Pattern C
-                // with chain_length>0 (let-yield prefix + branched tail)
-                // already takes precedence naturally (B.2 rejects bodies
-                // with stmts), so re-routing through it here is a no-op
-                // for those — but it ALSO causes the chain emit to
-                // double-dispatch synth-conts for parser-shape fns whose
-                // bodies have multi-yield prefixes, accumulating
-                // OUTER_POST_ARM_K entries linearly with recursion depth
-                // and overflowing the cap on programs like
-                // examples/json.sigil's recursive-descent parser.
-                // Restricting to chain_length=0 keeps the fix narrow:
-                // it covers the `if cond { perform; v } else { v }`
-                // shape (where B.2 dispatches with post_arm_k=identity
-                // discarding caller_k_pair) without disturbing the
-                // chain-length>0 paths that already work.
                 let pattern_c_should_override_b2 = matches!(pattern_c_chain_length, Some(0))
                     && tail_has_no_arm_pattern_bindings(f.body.tail.as_ref());
                 let perform_arm_indices_opt = if pattern_c_should_override_b2 {
@@ -28850,6 +28818,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             contains_apply_or_generic_ref(&prog),
@@ -28882,6 +28851,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             contains_apply_or_generic_ref(&prog),
@@ -28906,6 +28876,7 @@ mod tests {
                 variants: Vec::new(),
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             contains_apply_or_generic_ref(&prog),
@@ -28935,6 +28906,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !contains_apply_or_generic_ref(&prog),
@@ -28986,6 +28958,7 @@ mod tests {
                     span: span.clone(),
                 })),
             ],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !contains_apply_or_generic_ref(&prog),
@@ -29120,6 +29093,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !contains_apply_or_generic_ref(&prog),
@@ -29157,6 +29131,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !contains_apply_or_generic_ref(&prog),
@@ -29205,6 +29180,7 @@ mod tests {
                 },
                 span: span.clone(),
             }))],
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             contains_apply_or_generic_ref(&prog),
@@ -30231,6 +30207,7 @@ mod tests {
         let program = Program {
             items: vec![Item::Fn(Box::new(fn_decl))],
             file: "test.sigil".to_string(),
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         let checked = CheckedProgram {
             program,
@@ -30315,6 +30292,7 @@ mod tests {
         let program = Program {
             items: vec![Item::Fn(Box::new(fn_decl))],
             file: "test.sigil".to_string(),
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         let checked = CheckedProgram {
             program,
@@ -30604,6 +30582,7 @@ mod tests {
             let program = Program {
                 items: vec![Item::Fn(Box::new(fn_decl))],
                 file: "test.sigil".to_string(),
+                stdlib_files: std::collections::BTreeSet::new(),
             };
             let mut effects = std::collections::BTreeMap::new();
             effects.insert(

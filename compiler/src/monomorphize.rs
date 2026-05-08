@@ -2294,6 +2294,7 @@ mod tests {
         let prog = Program {
             file: "test.sigil".to_string(),
             items,
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !crate::codegen::contains_apply_or_generic_ref(&prog),
@@ -2658,6 +2659,7 @@ mod tests {
         let prog = Program {
             file: "test.sigil".to_string(),
             items,
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         assert!(
             !crate::codegen::contains_apply_or_generic_ref(&prog),

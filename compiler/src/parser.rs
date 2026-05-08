@@ -98,6 +98,7 @@ pub fn parse(file: &str, tokens: &[Token]) -> (Program, Vec<CompilerError>) {
         Program {
             items,
             file: file.to_string(),
+            stdlib_files: std::collections::BTreeSet::new(),
         },
         p.errors,
     )

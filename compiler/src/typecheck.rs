@@ -1407,6 +1407,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         next_scope_var: 0,
         current_fn_scope_var: None,
         current_fn_file: None,
+        stdlib_files: program.stdlib_files.clone(),
         current_arm_scope_id: None,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
@@ -2820,11 +2821,16 @@ fn is_ref_runtime_op(name: &str) -> bool {
     )
 }
 
-/// Plan State-Cell — file-path predicate identifying `std/state.sigil`.
-/// Both stdlib auto-discovery (yields bare `state.sigil`) and absolute
-/// paths (when the file is read off disk during tests) are accepted.
-fn file_is_std_state_sigil(file: &str) -> bool {
-    file == "state.sigil" || file.ends_with("/std/state.sigil")
+/// Plan State-Cell — file-path predicate identifying `std/state.sigil`,
+/// requiring the file string to be in the stdlib-origin set populated
+/// by `imports::resolve` at load time. The set discrimination prevents
+/// a coincidentally-named user file at the project root from bypassing
+/// the gate (review feedback on PR #117 #3): bare-name match alone is
+/// not enough because user code lexed via `pipeline::compile(input)`
+/// with `input == "state.sigil"` produces the same `span.file` as the
+/// stdlib's bundled module.
+fn file_is_std_state_sigil(file: &str, stdlib_files: &std::collections::BTreeSet<String>) -> bool {
+    file == "state.sigil" && stdlib_files.contains(file)
 }
 
 /// Plan State-Cell — three runtime ops backing `std/state.sigil`'s
@@ -3042,6 +3048,18 @@ struct Tc {
     /// same-named sibling-module fn (e.g., `map` in `std.list` vs
     /// `std.option`) resolves to ITS OWN module's scheme.
     current_fn_file: Option<String>,
+    /// Plan State-Cell — set of `span.file` strings whose source
+    /// originated from the embedded stdlib (loaded via
+    /// `imports::resolve`). Read by `check_call`'s `Expr::Ident`
+    /// resolution to gate calls to runtime-internal builtins
+    /// (`sigil_ref_alloc` / `sigil_ref_deref` / `sigil_ref_set`,
+    /// emitting E0148 from outside `std/state.sigil`). Discriminating
+    /// against the set rather than against the file string alone
+    /// prevents a user file coincidentally named `state.sigil` at
+    /// the project root from bypassing the gate. Empty for test
+    /// fixtures and pre-resolve programs (no stdlib imports loaded
+    /// → no gated callers possible).
+    stdlib_files: std::collections::BTreeSet<String>,
     /// Plan D Task 117 (continuation-surface) — current handler arm
     /// body's scope id, set during arm-body typecheck walks. When
     /// `Some(N)`, user-written `Continuation[op_ret, ret]` type
@@ -5279,7 +5297,7 @@ impl Tc {
                         let from_state_sigil = self
                             .current_fn_file
                             .as_ref()
-                            .map(|file| file_is_std_state_sigil(file))
+                            .map(|file| file_is_std_state_sigil(file, &self.stdlib_files))
                             .unwrap_or(false);
                         if !from_state_sigil {
                             self.push_error(
@@ -11661,6 +11679,7 @@ mod tests {
             next_scope_var: 0,
             current_fn_scope_var: None,
             current_fn_file: None,
+            stdlib_files: std::collections::BTreeSet::new(),
             current_arm_scope_id: None,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),

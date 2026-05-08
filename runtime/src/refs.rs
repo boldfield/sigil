@@ -39,7 +39,6 @@
 //! `Ref[T]` is therefore not exposed as a v1 user-facing type — it's an
 //! internal representation detail of `run_state`'s cell-backed encoding.
 
-use crate::counters::{self, CounterId};
 use crate::gc::sigil_alloc;
 use crate::header::{Header, TAG_REF};
 
@@ -73,7 +72,9 @@ pub extern "C" fn sigil_ref_alloc(initial: u64) -> *mut u8 {
         let value_slot: *mut u64 = obj.add(8).cast();
         value_slot.write(initial);
     }
-    counters::incr(CounterId::BoehmAllocCount);
+    // No `counters::incr(BoehmAllocCount)` here — `sigil_alloc` already
+    // increments before its Boehm GC call (gc.rs:163). A second bump
+    // here would double-count every Ref[T] allocation.
     obj
 }
 
@@ -143,7 +144,7 @@ mod tests {
 
         let _g = gc_test_lock();
         unsafe {
-            // SAFETY: `s` is a valid static byte slice; sigil_string_new copies.
+            // SAFETY: gc-heap-ptr arithmetic (static byte slice; sigil_string_new copies).
             let str_ptr = sigil_string_new(b"hello".as_ptr(), 5);
             let cell = sigil_ref_alloc(str_ptr as u64);
 

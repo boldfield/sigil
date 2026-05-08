@@ -15453,6 +15453,55 @@ fn std_json_parse_malformed_returns_err() {
     assert_eq!(stdout, "err\n", "stderr={stderr:?}");
 }
 
+// Plan State-Cell — deep-recursion State stress test. Pins the
+// invariant that `__set_then_arg` collapses the State.set arm body
+// to a single tail-`k` call so it doesn't push an
+// OUTER_POST_ARM_K_STACK entry per arm invocation. A future
+// refactor to either the helper or the arm-body emit could silently
+// reintroduce the linear-with-depth push pattern, and the failure
+// mode is "abort with `sigil_outer_post_arm_k_push: stack overflow`
+// at depth N where N depends on cap (currently 256)" — silent for
+// shallow programs, fatal for deep ones. 100 iterations comfortably
+// exceeds the prior 32-entry cap and the current 256-entry cap is
+// still untouched at completion (each State op pushes/pops within
+// the same chain step, so steady-state depth stays ~O(1) across
+// recursion).
+#[test]
+fn state_deep_recursion_does_not_overflow_outer_post_arm_k() {
+    // Recursive bump_to: increment cell from current value to N via
+    // N State.get/set pairs. With Plotkin encoding this would have
+    // been bounded by the discharge-on-each-perform mechanism; with
+    // cell encoding it's bounded by the chain machinery's
+    // push/pop discipline. If the discipline regresses, this test
+    // aborts with the OUTER_POST_ARM_K cap message.
+    let src = "import std.state\n\
+               import std.io\n\
+               \n\
+               fn bump_to(target: Int) -> Int ![State[Int]] {\n  \
+                 let cur: Int = perform State.get();\n  \
+                 if cur >= target {\n    \
+                   cur\n  \
+                 } else {\n    \
+                   let _next: Int = perform State.set(cur + 1);\n    \
+                   bump_to(target)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let pair: (Int, Int) = run_state(0, fn () -> Int ![State[Int]] => bump_to(100));\n  \
+                 match pair { (final_val, final_state) => {\n    \
+                   perform IO.println(int_to_string(final_val));\n    \
+                   perform IO.println(int_to_string(final_state));\n  \
+                 }};\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "state_deep_recursion");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Each frame does get + set; final run produces final state 100,
+    // body returns 100 (the cur it observed when cur >= target).
+    assert_eq!(stdout, "100\n100\n", "stderr={stderr:?}");
+}
+
 // Plan State-Cell — minimal State+Raise composition reproducer.
 // Pre-fix this SIGSEGV'd in main's tuple destructure of run_state's
 // result (the discharged Err value flowed through state-fn's Sync

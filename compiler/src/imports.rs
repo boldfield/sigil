@@ -119,10 +119,20 @@ pub(crate) fn resolve_with_source(
     let mut new_items: Vec<Item> = program.items.clone();
     new_items.extend(imported_items);
 
+    // `loaded` records every module that successfully loaded source
+    // from the stdlib (or test-injected) embedded tree; `loaded` keys
+    // are the bare relative paths (e.g., `state.sigil`,
+    // `iter/fold.sigil`) that `lexer::lex` was called with — i.e.,
+    // exactly the strings that `span.file` carries on stdlib-origin
+    // tokens / spans / fn decls. Plumbed through `Program::stdlib_files`
+    // so the typechecker's path-gate (E0148) can distinguish a real
+    // stdlib `state.sigil` from a coincidentally-named user file
+    // sitting at the project root.
     (
         Program {
             items: new_items,
             file: program.file,
+            stdlib_files: loaded,
         },
         errs,
     )
