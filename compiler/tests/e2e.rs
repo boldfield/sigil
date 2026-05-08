@@ -13597,6 +13597,62 @@ fn tail_recursive_cps_colored_count_down_one_million() {
     assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
 }
 
+// TCO-4 debug bisects — same shape as the 1M test but at smaller
+// depths. If 1K passes and 1M fails, there's a per-iteration leak
+// (something not unwinding under TCO); if 1K also fails, TCO isn't
+// active for the Cps-colored shape at all. Once the cause is
+// understood and fixed, these debug tests can be removed.
+
+#[test]
+fn tco4_debug_cps_colored_count_down_one_thousand() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps_1k(n: Int) -> Int ![State, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps_1k(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_cps_1k(1000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "tco4_debug_cps_colored_count_down_one_thousand");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
+#[test]
+fn tco4_debug_cps_colored_count_down_one_hundred_thousand() {
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps_100k(n: Int) -> Int ![State, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps_100k(n - 1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_cps_100k(100000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "tco4_debug_cps_colored_count_down_one_hundred_thousand",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stdout mismatch; stderr={stderr:?}");
+}
+
 // ===== TCO-4 shape-coverage regression tests ================================
 //
 // Pin the four tail-position shapes that `lower_expr_in_tail_pos`
