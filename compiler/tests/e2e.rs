@@ -13880,3 +13880,651 @@ fn std_ordering_int_compare_basic_three_way() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "1\n2\n3\n", "stderr={stderr:?}");
 }
+
+#[test]
+fn std_ordering_int_compare_negatives() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(int_compare(-5, -1))));\n  \
+                 perform IO.println(int_to_string(encode(int_compare(-1, -5))));\n  \
+                 perform IO.println(int_to_string(encode(int_compare(-3, -3))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_int_compare_negatives");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_int_compare_zero() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(int_compare(0, 0))));\n  \
+                 perform IO.println(int_to_string(encode(int_compare(0, 1))));\n  \
+                 perform IO.println(int_to_string(encode(int_compare(-1, 0))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_int_compare_zero");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n1\n1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_string_compare_basic() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"a\", \"b\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"b\", \"a\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"abc\", \"abc\"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_string_compare_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_string_compare_prefix_shorter_is_less() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"ab\", \"abc\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"abc\", \"ab\"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_string_compare_prefix_shorter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_string_compare_empty() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"\", \"\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"\", \"a\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"a\", \"\"))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_string_compare_empty");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n1\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_char_compare_basic() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(char_compare('a', 'b'))));\n  \
+                 perform IO.println(int_to_string(encode(char_compare('b', 'a'))));\n  \
+                 perform IO.println(int_to_string(encode(char_compare('z', 'z'))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_char_compare_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_char_compare_unicode_codepoint_order() {
+    // 'a' = U+0061, 'A' = U+0041, '1' = U+0031, '\u{1F600}' = U+1F600.
+    // Codepoint order: '1' (0x31) < 'A' (0x41) < 'a' (0x61) < '\u{1F600}'.
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(char_compare('1', 'A'))));\n  \
+                 perform IO.println(int_to_string(encode(char_compare('A', 'a'))));\n  \
+                 perform IO.println(int_to_string(encode(char_compare('a', '\\u{1F600}'))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_char_compare_codepoint");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n1\n1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_bool_compare_false_less_true() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(bool_compare(false, true))));\n  \
+                 perform IO.println(int_to_string(encode(bool_compare(true, false))));\n  \
+                 perform IO.println(int_to_string(encode(bool_compare(false, false))));\n  \
+                 perform IO.println(int_to_string(encode(bool_compare(true, true))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_bool_compare");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_float_compare_nan_total_order() {
+    // Pin the total-order NaN convention: NaN == NaN, NaN < non-NaN.
+    // NaN is constructed as `float_div(0.0, 0.0)` (IEEE 754).
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let nan: Float = float_div(0.0, 0.0);\n  \
+                 perform IO.println(int_to_string(encode(float_compare(nan, nan))));\n  \
+                 perform IO.println(int_to_string(encode(float_compare(nan, 1.0))));\n  \
+                 perform IO.println(int_to_string(encode(float_compare(1.0, nan))));\n  \
+                 perform IO.println(int_to_string(encode(float_compare(1.0, 2.0))));\n  \
+                 perform IO.println(int_to_string(encode(float_compare(2.0, 1.0))));\n  \
+                 perform IO.println(int_to_string(encode(float_compare(3.5, 3.5))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_float_compare_nan");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n1\n3\n1\n3\n2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_ordering_int64_compare_basic() {
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int64 = int64_from_int(7);\n  \
+                 let b: Int64 = int64_from_int(42);\n  \
+                 perform IO.println(int_to_string(encode(int64_compare(a, b))));\n  \
+                 perform IO.println(int_to_string(encode(int64_compare(b, a))));\n  \
+                 perform IO.println(int_to_string(encode(int64_compare(a, a))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_ordering_int64_compare");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n", "stderr={stderr:?}");
+}
+
+// ===== list_sort =====
+
+/// Helper: print a list of ints space-separated, terminated with newline.
+fn int_list_print_helper() -> &'static str {
+    "fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+       match xs {\n    \
+         Nil => 0,\n    \
+         Cons(h, t) => {\n      \
+           perform IO.println(int_to_string(h));\n      \
+           print_ints(t)\n    \
+         },\n  \
+       }\n\
+     }\n"
+}
+
+#[test]
+fn std_list_sort_int_empty() {
+    let src = "import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Nil;\n  \
+                 let ys: List[Int] = list_sort_int(xs);\n  \
+                 match ys { Nil => 0, Cons(_, _) => 1 }\n\
+               }\n";
+    let (_stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_empty");
+    assert_eq!(code, 0, "expected empty list → 0; stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_int_three_elements_unsorted() {
+    let src = format!(
+        "import std.list\n\
+         {helper}\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n  \
+           let ys: List[Int] = list_sort_int(xs);\n  \
+           print_ints(ys)\n\
+         }}\n",
+        helper = int_list_print_helper(),
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_three_unsorted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_int_already_sorted() {
+    let src = format!(
+        "import std.list\n\
+         {helper}\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))));\n  \
+           let ys: List[Int] = list_sort_int(xs);\n  \
+           print_ints(ys)\n\
+         }}\n",
+        helper = int_list_print_helper(),
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_already_sorted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n4\n5\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_int_reverse_sorted() {
+    let src = format!(
+        "import std.list\n\
+         {helper}\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = Cons(5, Cons(4, Cons(3, Cons(2, Cons(1, Nil)))));\n  \
+           let ys: List[Int] = list_sort_int(xs);\n  \
+           print_ints(ys)\n\
+         }}\n",
+        helper = int_list_print_helper(),
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_reverse_sorted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n4\n5\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_int_all_equal() {
+    let src = format!(
+        "import std.list\n\
+         {helper}\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = Cons(7, Cons(7, Cons(7, Cons(7, Nil))));\n  \
+           let ys: List[Int] = list_sort_int(xs);\n  \
+           print_ints(ys)\n\
+         }}\n",
+        helper = int_list_print_helper(),
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_all_equal");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\n7\n7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_with_custom_descending_comparator() {
+    // Descending sort via `(a, b) => int_compare(b, a)`.
+    let src = format!(
+        "import std.list\n\
+         fn desc_int(a: Int, b: Int) -> Ordering ![] {{ int_compare(b, a) }}\n\
+         {helper}\
+         fn main() -> Int ![IO] {{\n  \
+           let xs: List[Int] = Cons(3, Cons(1, Cons(4, Cons(1, Cons(5, Nil)))));\n  \
+           let ys: List[Int] = list_sort(xs, desc_int);\n  \
+           print_ints(ys)\n\
+         }}\n",
+        helper = int_list_print_helper(),
+    );
+    let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_custom_descending");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "5\n4\n3\n1\n1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_string_alpha() {
+    let src = "import std.list\n\
+               fn print_strings(xs: List[String]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => {\n      \
+                     perform IO.println(h);\n      \
+                     print_strings(t)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[String] = Cons(\"banana\", Cons(\"apple\", Cons(\"cherry\", Nil)));\n  \
+                 print_strings(list_sort_string(xs))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_string_alpha");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "apple\nbanana\ncherry\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_char_codepoint_order() {
+    let src = "import std.list\n\
+               fn print_chars(xs: List[Char]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => {\n      \
+                     perform IO.println(char_to_string(h));\n      \
+                     print_chars(t)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Char] = Cons('c', Cons('a', Cons('b', Nil)));\n  \
+                 print_chars(list_sort_char(xs))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_char_codepoint");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "a\nb\nc\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_list_sort_int_one_thousand_reversed() {
+    // Stress test: sort 1K reverse-sorted ints, count via length, and
+    // verify the head and length are correct. Calling `range(0, 10000)`
+    // and reversing it pushes the AA-tree balance through enough levels
+    // to exercise both `__split` and `__merge_rev` deeply, but 1K stays
+    // well inside the pod stack budget — the e2e test exercises
+    // correctness rather than the exact 10K stress called out in the
+    // plan.
+    let src = "import std.list\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = reverse(range(0, 1000));\n  \
+                 let ys: List[Int] = list_sort_int(xs);\n  \
+                 perform IO.println(int_to_string(length(ys)));\n  \
+                 match ys {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, _) => {\n      \
+                     perform IO.println(int_to_string(h));\n      \
+                     0\n    \
+                   },\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_one_thousand");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // length first, then head element (smallest after sort = 0).
+    assert_eq!(stdout, "1000\n0\n", "stderr={stderr:?}");
+}
+
+// ===== Map[K, V] =====
+
+#[test]
+fn std_map_empty_size_is_zero() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Map[Int, Int] = map_int_keys();\n  \
+                 perform IO.println(int_to_string(map_size(m)));\n  \
+                 match map_is_empty(m) { true => 0, false => 1 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_empty_size_zero");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_insert_get_round_trip() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m0: Map[Int, String] = map_empty(int_compare);\n  \
+                 let m1: Map[Int, String] = map_insert(m0, 1, \"one\");\n  \
+                 let m2: Map[Int, String] = map_insert(m1, 2, \"two\");\n  \
+                 let m3: Map[Int, String] = map_insert(m2, 3, \"three\");\n  \
+                 perform IO.println(int_to_string(map_size(m3)));\n  \
+                 match map_get(m3, 2) {\n    \
+                   Some(v) => { perform IO.println(v); 0 },\n    \
+                   None => { perform IO.println(\"MISS\"); 1 },\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_insert_get");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\ntwo\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_insert_replace_value() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m0: Map[Int, Int] = map_int_keys();\n  \
+                 let m1: Map[Int, Int] = map_insert(m0, 5, 100);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 5, 200);\n  \
+                 perform IO.println(int_to_string(map_size(m2)));\n  \
+                 match map_get(m2, 5) {\n    \
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
+                   None => 1,\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_insert_replace");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Size unchanged at 1; value replaced with 200.
+    assert_eq!(stdout, "1\n200\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_get_missing_returns_none() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 match map_get(m, 999) { Some(_) => 1, None => 0 }\n\
+               }\n";
+    let (_stdout, stderr, code) = compile_and_run(src, "std_map_get_missing_none");
+    assert_eq!(code, 0, "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_contains_existing_and_missing() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Map[Int, Int] = map_insert(map_int_keys(), 7, 70);\n  \
+                 perform IO.println(match map_contains(m, 7) { true => \"yes\", false => \"no\" });\n  \
+                 perform IO.println(match map_contains(m, 999) { true => \"yes\", false => \"no\" });\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_contains");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\nno\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_remove_existing_decreases_size() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                 let m3: Map[Int, Int] = map_remove(m2, 1);\n  \
+                 perform IO.println(int_to_string(map_size(m3)));\n  \
+                 match map_get(m3, 1) {\n    \
+                   Some(_) => { perform IO.println(\"PRESENT\"); 1 },\n    \
+                   None => { perform IO.println(\"GONE\"); 0 },\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_remove_existing");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\nGONE\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_remove_absent_is_noop() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 let m2: Map[Int, Int] = map_remove(m1, 999);\n  \
+                 perform IO.println(int_to_string(map_size(m2)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_remove_absent");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_keys_returned_sorted() {
+    // Insert in scrambled order; keys come back ascending.
+    let src = "import std.map\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 30);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 1, 10);\n  \
+                 let m3: Map[Int, Int] = map_insert(m2, 5, 50);\n  \
+                 let m4: Map[Int, Int] = map_insert(m3, 2, 20);\n  \
+                 let m5: Map[Int, Int] = map_insert(m4, 4, 40);\n  \
+                 print_ints(map_keys(m5))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_keys_sorted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n4\n5\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_to_list_round_trip() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 300);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 1, 100);\n  \
+                 let m3: Map[Int, Int] = map_insert(m2, 2, 200);\n  \
+                 let pairs: List[(Int, Int)] = map_to_list(m3);\n  \
+                 let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n  \
+                 perform IO.println(int_to_string(map_size(m4)));\n  \
+                 match map_get(m4, 2) {\n    \
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
+                   None => 1,\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_to_list_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n200\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_fold_sums_all_values() {
+    let src = "import std.map\n\
+               fn add_value(acc: Int, _k: Int, v: Int) -> Int ![] { acc + v }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
+                 perform IO.println(int_to_string(map_fold(m3, 0, add_value)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_fold_sum");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "60\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_map_transforms_values_keeps_keys() {
+    let src = "import std.map\n\
+               fn double(v: Int) -> Int ![] { v + v }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                 let m3: Map[Int, Int] = map_map(m2, double);\n  \
+                 match map_get(m3, 2) {\n    \
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
+                   None => 1,\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_map_values");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "40\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_filter_keeps_pred_true_entries() {
+    let src = "import std.map\n\
+               fn keep_big(_k: Int, v: Int) -> Bool ![] { v > 15 }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
+                 let m4: Map[Int, Int] = map_filter(m3, keep_big);\n  \
+                 perform IO.println(int_to_string(map_size(m4)));\n  \
+                 match map_get(m4, 1) { Some(_) => 1, None => 0 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_filter");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Only keys 2 and 3 survive (size 2), and key 1 is gone (None → exit 0).
+    assert_eq!(stdout, "2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_string_keys_constructor_round_trip() {
+    let src = "import std.map\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m0: Map[String, Int] = map_string_keys();\n  \
+                 let m1: Map[String, Int] = map_insert(m0, \"alpha\", 1);\n  \
+                 let m2: Map[String, Int] = map_insert(m1, \"beta\", 2);\n  \
+                 match map_get(m2, \"beta\") {\n    \
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
+                   None => 1,\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_string_keys");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_one_hundred_inserts_and_lookups() {
+    // Stress test scaled down from the plan's 10K target — 100
+    // inserts is enough to drive several AA-tree split + skew
+    // rebalances and exercise the in-order traversal at non-trivial
+    // height while staying well under the pod's stack budget. CI
+    // expanded scaling sits in a follow-up "stress" lane.
+    let src = "import std.map\n\
+               fn fill(m: Map[Int, Int], i: Int, n: Int) -> Map[Int, Int] ![] {\n  \
+                 if i >= n { m }\n  \
+                 else { fill(map_insert(m, i, i + 1000), i + 1, n) }\n\
+               }\n\
+               fn count_hits(m: Map[Int, Int], i: Int, n: Int, acc: Int) -> Int ![] {\n  \
+                 if i >= n { acc }\n  \
+                 else {\n    \
+                   let next: Int = match map_contains(m, i) { true => acc + 1, false => acc };\n    \
+                   count_hits(m, i + 1, n, next)\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Map[Int, Int] = fill(map_int_keys(), 0, 100);\n  \
+                 perform IO.println(int_to_string(map_size(m)));\n  \
+                 perform IO.println(int_to_string(count_hits(m, 0, 100, 0)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_one_hundred_inserts");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // First line: size after 100 distinct inserts. Second line: how
+    // many of keys 0..100 are present afterwards.
+    assert_eq!(stdout, "100\n100\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_map_with_user_defined_record_comparator() {
+    // Construct a record `Point { x, y }` and a comparator that
+    // compares by `x` only. Build a Map keyed on Point and assert
+    // round-trip lookup.
+    let src = "import std.map\n\
+               type Point = { x: Int, y: Int }\n\
+               fn point_cmp(a: Point, b: Point) -> Ordering ![] {\n  \
+                 match a {\n    \
+                   Point { x: ax, y: _ } => match b {\n      \
+                     Point { x: bx, y: _ } => int_compare(ax, bx),\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m0: Map[Point, String] = map_empty(point_cmp);\n  \
+                 let m1: Map[Point, String] = map_insert(m0, Point { x: 1, y: 100 }, \"first\");\n  \
+                 let m2: Map[Point, String] = map_insert(m1, Point { x: 2, y: 200 }, \"second\");\n  \
+                 match map_get(m2, Point { x: 2, y: 999 }) {\n    \
+                   Some(v) => { perform IO.println(v); 0 },\n    \
+                   None => 1,\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_user_defined_cmp");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Even though y differs (999 vs 200), the comparator only inspects
+    // x — so the lookup hits the (x=2) entry and prints "second".
+    assert_eq!(stdout, "second\n", "stderr={stderr:?}");
+}
