@@ -1252,6 +1252,56 @@ files are the authoritative API reference.
 | `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
 | `std.panic` | Doc-only header for the `panic` / `assert` builtins (see §13.2.1). Importing it is a no-op — both names are available without `import`. |
 
+#### §13.1 — Comparator-mixing in `Set` operations
+
+The binary set-theoretic operations on `std.set` — `set_union`,
+`set_intersect`, `set_difference`, `set_subset`, `set_eq` — use
+the **left operand's comparator** for the result, but the
+**right operand's comparator** for membership tests inside the
+predicate (via `set_contains(b, x)`). When `a` and `b` were
+built with the same comparator, the asymmetry is invisible. When
+the comparators differ on the same `T`, results are still
+well-defined but depend on which side performs which role.
+
+Concrete example: case-sensitive vs case-insensitive string sets.
+
+```sigil
+import std.set
+import std.ordering
+import std.string
+
+// `string_compare_ci(x, y)` would be a case-insensitive variant
+// (not shipped in v1; user-defined). For the purposes of the
+// example, treat it as comparing "foo" and "Foo" as equal.
+
+fn main() -> Int ![IO] {
+  let cs: Set[String] = set_string();                 // case-sensitive
+  let ci: Set[String] = set_empty(string_compare_ci); // case-insensitive
+  let a: Set[String] = set_insert(set_insert(cs, "foo"), "Foo");
+  let b: Set[String] = set_insert(ci, "foo");
+
+  // set_intersect(a, b): keeps every a-element that b "contains".
+  // Under b's case-insensitive comparator, b contains both "foo"
+  // and "Foo". Result: {"foo", "Foo"} ordered by a's case-sensitive
+  // comparator. Size 2.
+  perform IO.println(int_to_string(set_size(set_intersect(a, b))));
+
+  // set_subset(a, b): every a-element matches in b under b's
+  // comparator. "foo" → match. "Foo" → match (case-insensitive).
+  // Result: true, even though `a` has "more" elements under its
+  // own comparator.
+  perform IO.println(match set_subset(a, b) { true => "yes", false => "no" });
+  0
+}
+```
+
+The two-step semantics is consistent: the result's downstream
+lookups use `a`'s comparator (the result's stored comparator),
+but the construction-time membership decision used `b`'s. For
+LLM-authored code, the safe rule is **always pass sets built
+with the same comparator**; mix only when you have a specific
+reason and have walked through the asymmetry above.
+
 #### §13.2 — Builtin primitives (not in stdlib modules)
 
 These functions are available without any `import`:
