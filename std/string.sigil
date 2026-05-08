@@ -1,12 +1,17 @@
 // sigil: 0.1
 //
-// std/string.sigil — Plan C Task 68 part 1.
+// std/string.sigil — Plan C Task 68 part 1 + Plan C addendum (Tier 2
+// follow-up: `string_split` / `string_replace`).
 //
-// **Documentation only.** The `String` primitive type and its
-// operations are registered at the typechecker as builtins via
-// `register_builtin_string_schemes()`. Edits to this file have no
-// effect on compilation. `import std.string` is allowed (skip-list
-// path) but is not required.
+// The `String` primitive type and most of its operations are
+// registered at the typechecker as builtins via
+// `register_builtin_string_schemes()` — the comment block below
+// documents the full builtin surface. The `string_split` and
+// `string_replace` helpers at the bottom of this file are
+// pure-Sigil additions that ship as part of `std.string`'s loaded
+// source (the module was moved off `BUILTIN_INJECTED` to make this
+// possible — `import std.string` now both pulls in the builtin
+// surface and registers the source-level helpers).
 //
 // String operations are split into **byte-indexed** and **codepoint-
 // indexed** surfaces. Byte-indexed ops (`string_byte_at`,
@@ -23,9 +28,16 @@
 // reasons in terms of "the i-th character" or builds strings
 // codepoint-by-codepoint.
 //
-// `string_split` / `string_replace` codepoint-aware variants are
-// out of scope for this addendum — see `PLAN_C_DEVIATIONS.md` Task
-// 68 entry for the closure path.
+// `string_split` and `string_replace` ship as pure-Sigil helpers
+// at the bottom of this file (Tier 2 follow-up addendum). They
+// are codepoint-correct for valid UTF-8 input by virtue of byte-
+// level substring matching: UTF-8's self-synchronizing property
+// guarantees that no continuation byte (0x80–0xBF) can be
+// confused with a leading byte of any codepoint, so byte-level
+// substring matches always align to codepoint boundaries.
+// Behaviour on invalid UTF-8 input matches `string_index_of` /
+// `string_substring` byte semantics (the bytes are processed
+// verbatim; results may not be codepoint-aligned).
 //
 // ## Builtin operations
 //
@@ -99,3 +111,86 @@
 // (`Result` ships in `std/result.sigil`; the wrapper is left to
 // user code per the same flat-namespace concern as other byte/string
 // stdlib helpers.)
+
+// =====================================================================
+// Pure-Sigil source-level helpers (Tier 2 follow-up)
+// =====================================================================
+
+import std.list
+
+// `string_split(s, sep)` returns a list of the substrings of `s`
+// separated by `sep`. Examples:
+//
+//   string_split("a,b,c", ",")  → ["a", "b", "c"]
+//   string_split("axxb",  "xx") → ["a", "b"]
+//   string_split("",      ",")  → [""]
+//   string_split("abc",   "z")  → ["abc"]
+//   string_split("ab",    "")   → ["ab"]    // empty separator: no split
+//   string_split(",a,",   ",")  → ["", "a", ""]
+//
+// Codepoint-correct for valid UTF-8 — see file header. O(n × occurrences)
+// time; tail-recursive accumulator + final reverse so stack depth is
+// O(1) regardless of the number of separator occurrences.
+fn string_split(s: String, sep: String) -> List[String] ![] {
+  if string_length(sep) == 0 {
+    Cons(s, Nil)
+  } else {
+    __string_split_acc(s, sep, string_length(sep), Nil)
+  }
+}
+
+fn __string_split_acc(s: String, sep: String, sep_len: Int,
+                      acc: List[String]) -> List[String] ![] {
+  let idx: Int = string_index_of(s, sep);
+  if idx < 0 {
+    reverse(Cons(s, acc))
+  } else {
+    let head: String = string_substring(s, 0, idx);
+    let tail: String = string_substring(s, idx + sep_len, string_length(s));
+    __string_split_acc(tail, sep, sep_len, Cons(head, acc))
+  }
+}
+
+// `string_replace(s, find, replace)` returns `s` with every
+// occurrence of `find` replaced by `replace`. Examples:
+//
+//   string_replace("hello", "ell", "ELL")    → "hELLo"
+//   string_replace("aaa",   "a",   "bb")     → "bbbbbb"
+//   string_replace("xyz",   "q",   "Q")      → "xyz"  (no match)
+//   string_replace("abc",   "",    "X")      → "abc"  (empty find: no-op)
+//   string_replace("",      "x",   "y")      → ""     (empty input)
+//
+// Non-overlapping left-to-right replacement (matches the index
+// returned by `string_index_of`). Codepoint-correct for valid
+// UTF-8. Tail-recursive accumulator (concat-chain — see the
+// performance note below).
+//
+// **Performance.** The accumulator is a concat chain rather than
+// a `StringBuilder` because `string_replace` is declared `![]`
+// and `sb_*` ops gate on the `Mem` effect. Each
+// `string_concat(acc, head)` allocates a fresh String of size
+// `acc.len + head.len`. For an output of total length L with M
+// matches, the worst-case work is O(L²). Suitable for log lines,
+// error messages, and few-KB strings; for large-output renders
+// (replacing across a 100KB document), drive the loop manually
+// with `StringBuilder` under `![Mem]` instead.
+fn string_replace(s: String, find: String, replace: String) -> String ![] {
+  if string_length(find) == 0 {
+    s
+  } else {
+    __string_replace_acc(s, find, replace, string_length(find), "")
+  }
+}
+
+fn __string_replace_acc(s: String, find: String, replace: String,
+                        find_len: Int, acc: String) -> String ![] {
+  let idx: Int = string_index_of(s, find);
+  if idx < 0 {
+    string_concat(acc, s)
+  } else {
+    let head: String = string_substring(s, 0, idx);
+    let tail: String = string_substring(s, idx + find_len, string_length(s));
+    let new_acc: String = string_concat(acc, string_concat(head, replace));
+    __string_replace_acc(tail, find, replace, find_len, new_acc)
+  }
+}

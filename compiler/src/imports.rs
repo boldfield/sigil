@@ -64,7 +64,7 @@ const BUILTIN_INJECTED: &[&str] = &[
     "mut_array.sigil",
     "byte_array.sigil",
     "mut_byte_array.sigil",
-    "string.sigil",
+    // `string.sigil` ships real source (string_split / string_replace).
     "mem.sigil",
     "int64.sigil",
     "string_builder.sigil",
