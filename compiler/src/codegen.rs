@@ -9695,6 +9695,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         };
         let entry = &user_fns[&f.name];
 
+        // TCO-4 debug — announce every user fn's ABI before its body
+        // is lowered. Lets us see whether count_down_cps takes the
+        // Sync body emit path (line 11647) or some Cps body path.
+        if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
+            if !filter.is_empty() && f.name.contains(&filter) {
+                eprintln!(
+                    "===== SIGIL_DUMP_IR ANNOUNCE fn `{}` (ABI={:?}, CC={:?}) =====",
+                    f.name, entry.abi, entry.signature.call_conv
+                );
+            }
+        }
+
         ctx.func.signature = entry.signature.clone();
         ctx.func.name = UserFuncName::user(0, entry.func_id.as_u32());
         {
@@ -10576,6 +10588,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     lowerer.builder.ins().return_(&[next_step]);
                     lowerer.builder.finalize();
 
+                    // TCO-4 debug — same dump as the Sync path, but
+                    // for the Cps body emit path (compound-match shape).
+                    if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
+                        if !filter.is_empty() && f.name.contains(&filter) {
+                            eprintln!(
+                                "===== SIGIL_DUMP_IR fn `{}` [Cps compound-match path] (ABI={:?}, CC={:?}) =====\n{}",
+                                f.name,
+                                entry.abi,
+                                entry.signature.call_conv,
+                                ctx.func
+                            );
+                        }
+                    }
+
                     module
                         .define_function(entry.func_id, &mut ctx)
                         .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
@@ -11443,6 +11469,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // ending the `&mut ctx.func` borrow. The module ops
                 // below safely get `&mut ctx`.
 
+                // TCO-4 debug — dump for the chained-let-yield Cps body
+                // emit path.
+                if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
+                    if !filter.is_empty() && f.name.contains(&filter) {
+                        eprintln!(
+                            "===== SIGIL_DUMP_IR fn `{}` [Cps chained-let-yield path] (ABI={:?}, CC={:?}) =====\n{}",
+                            f.name,
+                            entry.abi,
+                            entry.signature.call_conv,
+                            ctx.func
+                        );
+                    }
+                }
+
                 module
                     .define_function(entry.func_id, &mut ctx)
                     .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
@@ -11452,7 +11492,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             // Seed the per-fn env with user params. Block param 0 is the
             // closure_ptr; user params follow; the trailing block param
-            // is `terminal_out: *mut TerminalResult` (Plan D Task 111b).
+            // is `terminal_out: *mut TerminalResult` (Plan D Task 111p).
             let block_params: Vec<Value> = builder.block_params(block).to_vec();
             // PR #90 R1 issue 2 — Sync ABI signature emit guarantees
             // block_params.len() == f.params.len() + 2 (closure_ptr +
