@@ -16048,4 +16048,48 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    // ===== Plan C addendum (Stage SET) — `std.set` =====
+
+    #[test]
+    fn import_std_set_typechecks_cleanly() {
+        // Pin the full `std.set` surface: constructor, lookup,
+        // insert / remove, list round-trip, fold / filter, the four
+        // set-theoretic operations, and the per-primitive convenience
+        // constructors. Imports `std.set`, which transitively pulls in
+        // `std.map`, `std.list`, `std.option`, and `std.ordering`.
+        let src = "import std.set\n\
+                   fn keep_big(x: Int) -> Bool ![] { x > 10 }\n\
+                   fn sum_elem(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let s0: Set[Int] = set_int();\n  \
+                     let _empty: Bool = set_is_empty(s0);\n  \
+                     let s1: Set[Int] = set_insert(s0, 1);\n  \
+                     let s2: Set[Int] = set_insert(s1, 2);\n  \
+                     let s3: Set[Int] = set_insert(s2, 3);\n  \
+                     let _sz: Int = set_size(s3);\n  \
+                     let _has: Bool = set_contains(s3, 2);\n  \
+                     let _xs: List[Int] = set_to_list(s3);\n  \
+                     let s4: Set[Int] = set_from_list(\n      \
+                       Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n  \
+                     let _bigs: Set[Int] = set_filter(s4, keep_big);\n  \
+                     let _total: Int = set_fold(s4, 0, sum_elem);\n  \
+                     let s5: Set[Int] = set_remove(s4, 2);\n  \
+                     let _sz5: Int = set_size(s5);\n  \
+                     let s6: Set[Int] = set_from_list(\n      \
+                       Cons(2, Cons(3, Cons(4, Nil))), int_compare);\n  \
+                     let _u: Set[Int] = set_union(s4, s6);\n  \
+                     let _i: Set[Int] = set_intersect(s4, s6);\n  \
+                     let _d: Set[Int] = set_difference(s4, s6);\n  \
+                     let _sub: Bool = set_subset(s5, s4);\n  \
+                     let _eq: Bool = set_eq(s4, s6);\n  \
+                     let _ss: Set[String] = set_string();\n  \
+                     let _ss1: Set[String] = set_insert(_ss, \"a\");\n  \
+                     let _sc: Set[Char] = set_char();\n  \
+                     let _sc1: Set[Char] = set_insert(_sc, 'a');\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }

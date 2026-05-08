@@ -1,0 +1,203 @@
+// sigil: 0.1
+//
+// std/set.sigil — Plan C addendum (Stage SET).
+//
+// `Set[T]` is a thin pure-Sigil layer over `Map[T, Unit]`.
+// Closes the deduplication / membership-testing gap. Every op
+// forwards to the corresponding `Map` op, so `Set[T]` inherits
+// the AA-tree's O(log n) lookup / insert / remove and ordered
+// iteration from `std.map`.
+//
+// All operations are persistent: every op returns a fresh
+// `Set[T]` and the input is unchanged. `set_to_list(s)` yields
+// elements sorted ascending per the comparator stored at
+// construction time.
+//
+// ## Comparator-mixing convention
+//
+// All set-theoretic operations (`set_union`, `set_intersect`,
+// `set_difference`, `set_subset`, `set_eq`) take two sets and
+// use the **left operand's comparator**. When `a` and `b` were
+// built with semantically-different comparators on the same
+// `T`, the result is well-defined (it carries `a`'s ordering)
+// but element identity follows `a`'s notion of equality. Mixing
+// comparators is supported but not idiomatic; pass sets built
+// the same way unless you have a specific reason.
+//
+// ## Scope (v1)
+//
+// Ships: `set_empty`, `set_size`, `set_is_empty`, `set_contains`,
+// `set_insert`, `set_remove`, `set_to_list`, `set_from_list`,
+// `set_fold`, `set_filter`, `set_union`, `set_intersect`,
+// `set_difference`, `set_subset`, `set_eq`, plus convenience
+// constructors `set_int`, `set_string`, `set_char`.
+//
+// Deferred (follow-up plan): `MutSet`, range queries, min / max
+// queries, `set_for_each`, range-based bulk ops.
+
+import std.map
+import std.list
+import std.option
+import std.ordering
+
+// `Set[T]` is a record wrapping `Map[T, Unit]`. The wrapper
+// exists to give Set its own surface (every helper takes / returns
+// `Set[T]`, not `Map[T, Unit]`) and to keep the Unit slot opaque to
+// callers — they think in elements, not key-value pairs.
+type Set[T] = { underlying: Map[T, Unit] }
+
+// `set_empty(cmp)` returns the empty set keyed by `cmp`.
+fn set_empty[T](cmp: (T, T) -> Ordering ![]) -> Set[T] ![] {
+  Set { underlying: map_empty(cmp) }
+}
+
+// `set_size(s)` returns the number of distinct elements. O(1).
+fn set_size[T](s: Set[T]) -> Int ![] {
+  match s {
+    Set { underlying } => map_size(underlying),
+  }
+}
+
+// `set_is_empty(s)` — true iff `set_size(s) == 0`.
+fn set_is_empty[T](s: Set[T]) -> Bool ![] {
+  match s {
+    Set { underlying } => map_is_empty(underlying),
+  }
+}
+
+// `set_contains(s, x)` — true iff `x` is in `s`. O(log n).
+fn set_contains[T](s: Set[T], x: T) -> Bool ![] {
+  match s {
+    Set { underlying } => map_contains(underlying, x),
+  }
+}
+
+// `set_insert(s, x)` returns a new set containing `x`. If `x`
+// was already present, returns a structurally-equivalent set
+// with size unchanged (idempotent). O(log n).
+fn set_insert[T](s: Set[T], x: T) -> Set[T] ![] {
+  match s {
+    Set { underlying } => Set { underlying: map_insert(underlying, x, ()) },
+  }
+}
+
+// `set_remove(s, x)` returns a new set with `x` removed. If `x`
+// was absent, returns the input unchanged. O(log n).
+fn set_remove[T](s: Set[T], x: T) -> Set[T] ![] {
+  match s {
+    Set { underlying } => Set { underlying: map_remove(underlying, x) },
+  }
+}
+
+// `set_to_list(s)` returns the elements as a sorted `List[T]`.
+fn set_to_list[T](s: Set[T]) -> List[T] ![] {
+  match s {
+    Set { underlying } => map_keys(underlying),
+  }
+}
+
+// `set_from_list(xs, cmp)` builds a set by inserting each element
+// of `xs` in order. Duplicates are coalesced (idempotent insert).
+fn set_from_list[T](xs: List[T], cmp: (T, T) -> Ordering ![]) -> Set[T] ![] {
+  __set_from_list_acc(xs, set_empty(cmp))
+}
+
+fn __set_from_list_acc[T](xs: List[T], acc: Set[T]) -> Set[T] ![] {
+  match xs {
+    Nil => acc,
+    Cons(h, t) => __set_from_list_acc(t, set_insert(acc, h)),
+  }
+}
+
+// `set_fold(s, init, f)` is a left fold over elements in
+// ascending order: `f(... f(f(init, x0), x1) ..., xN)`.
+// Delegates to `map_fold` and discards the Unit value slot;
+// avoids the redundant `set_to_list` materialization that an
+// intermediate `__set_fold_list` walker would require.
+fn set_fold[T, B](s: Set[T], init: B, f: (B, T) -> B ![]) -> B ![] {
+  match s {
+    Set { underlying } =>
+      map_fold(underlying, init, fn (acc: B, k: T, _v: Unit) -> B ![] => f(acc, k)),
+  }
+}
+
+// `set_filter(s, pred)` keeps elements where `pred(x)` is true.
+// The result preserves `s`'s comparator. Implemented atop
+// `map_filter`, ignoring the Unit value slot.
+fn set_filter[T](s: Set[T], pred: (T) -> Bool ![]) -> Set[T] ![] {
+  match s {
+    Set { underlying } => Set {
+      underlying: map_filter(underlying, fn (k: T, _v: Unit) -> Bool ![] => pred(k)),
+    },
+  }
+}
+
+// `set_union(a, b)` — every element in either `a` or `b`. The
+// result uses `a`'s comparator (see comparator-mixing note at
+// top of file). Implemented by folding over `b` and inserting
+// each element into `a`; insert is idempotent so duplicates are
+// coalesced naturally.
+fn set_union[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_fold(b, a, fn (acc: Set[T], x: T) -> Set[T] ![] => set_insert(acc, x))
+}
+
+// `set_intersect(a, b)` — elements in both `a` and `b`. The
+// result uses `a`'s comparator (preserved by `set_filter`).
+fn set_intersect[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_filter(a, fn (x: T) -> Bool ![] => set_contains(b, x))
+}
+
+// `set_difference(a, b)` — `a \ b`: elements in `a` but not `b`.
+// The result uses `a`'s comparator.
+fn set_difference[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
+  set_filter(a, fn (x: T) -> Bool ![] => !set_contains(b, x))
+}
+
+// `set_subset(a, b)` — true iff every element of `a` is in `b`.
+// Walks the materialized element list of `a` with early-exit on
+// the first miss: as soon as `set_contains(b, h)` returns false
+// the recursion bails, so worst-case work is O(k * log m) where
+// `k` is the index of the first non-member and `m = set_size(b)`,
+// vs O(n * log m) for a fold-based version that visits every
+// element. The full materialization of `set_to_list(a)` is still
+// O(n); the win is the skipped `set_contains` calls past `k`.
+fn set_subset[T](a: Set[T], b: Set[T]) -> Bool ![] {
+  __set_subset_list(set_to_list(a), b)
+}
+
+fn __set_subset_list[T](xs: List[T], b: Set[T]) -> Bool ![] {
+  match xs {
+    Nil => true,
+    Cons(h, t) => match set_contains(b, h) {
+      false => false,
+      true => __set_subset_list(t, b),
+    },
+  }
+}
+
+// `set_eq(a, b)` — true iff `a` and `b` contain the same elements
+// (under `a`'s comparator). Equivalent to `set_subset(a, b) &&
+// set_subset(b, a)`; the size-precheck short-circuits the common
+// "different sizes" case in O(1).
+fn set_eq[T](a: Set[T], b: Set[T]) -> Bool ![] {
+  if set_size(a) == set_size(b) {
+    set_subset(a, b)
+  } else {
+    false
+  }
+}
+
+// Convenience constructors — pre-wired with the matching
+// comparator from `std.ordering`. Save the user the comparator
+// argument for the common per-primitive case.
+fn set_int() -> Set[Int] ![] {
+  set_empty(int_compare)
+}
+
+fn set_string() -> Set[String] ![] {
+  set_empty(string_compare)
+}
+
+fn set_char() -> Set[Char] ![] {
+  set_empty(char_compare)
+}

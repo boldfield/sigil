@@ -1228,6 +1228,7 @@ files are the authoritative API reference.
 | `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
 | `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` is the canonical string comparator (returns `Ordering`) — the legacy Int-returning builtin was retired in this addendum. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
 | `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |
+| `std.set` | Persistent ordered `Set[T]` layered over `Map[T, Unit]` (same AA-tree O(log n) lookup / insert / remove). `set_empty(cmp)`, `set_size`, `set_is_empty`, `set_contains`, `set_insert`, `set_remove`, `set_to_list`, `set_from_list`, `set_fold`, `set_filter`. Set-theoretic operations (`set_union`, `set_intersect`, `set_difference`, `set_subset`, `set_eq`) use the **left operand's comparator** — when `a` and `b` were built with semantically-different comparators, the result is well-defined (carries `a`'s ordering) but may surprise. Convenience constructors `set_int`, `set_string`, `set_char`. Iteration order is sorted ascending. Persistent semantics match `Map`: every op returns a fresh `Set[T]`; inputs are unchanged. |
 | `std.array` | `Array[A]`, `array_alloc`, `array_get`, `array_set` (returns new), `array_length`. |
 | `std.mut_array` | `MutArray[A]` (Mem-gated). |
 | `std.byte_array` | `ByteArray`, conversion to/from `String`. |
@@ -1250,6 +1251,56 @@ files are the authoritative API reference.
 | `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> A ![]`. |
 | `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
 | `std.panic` | Doc-only header for the `panic` / `assert` builtins (see §13.2.1). Importing it is a no-op — both names are available without `import`. |
+
+#### §13.1 — Comparator-mixing in `Set` operations
+
+The binary set-theoretic operations on `std.set` — `set_union`,
+`set_intersect`, `set_difference`, `set_subset`, `set_eq` — use
+the **left operand's comparator** for the result, but the
+**right operand's comparator** for membership tests inside the
+predicate (via `set_contains(b, x)`). When `a` and `b` were
+built with the same comparator, the asymmetry is invisible. When
+the comparators differ on the same `T`, results are still
+well-defined but depend on which side performs which role.
+
+Concrete example: case-sensitive vs case-insensitive string sets.
+
+```sigil
+import std.set
+import std.ordering
+import std.string
+
+// `string_compare_ci(x, y)` would be a case-insensitive variant
+// (not shipped in v1; user-defined). For the purposes of the
+// example, treat it as comparing "foo" and "Foo" as equal.
+
+fn main() -> Int ![IO] {
+  let cs: Set[String] = set_string();                 // case-sensitive
+  let ci: Set[String] = set_empty(string_compare_ci); // case-insensitive
+  let a: Set[String] = set_insert(set_insert(cs, "foo"), "Foo");
+  let b: Set[String] = set_insert(ci, "foo");
+
+  // set_intersect(a, b): keeps every a-element that b "contains".
+  // Under b's case-insensitive comparator, b contains both "foo"
+  // and "Foo". Result: {"foo", "Foo"} ordered by a's case-sensitive
+  // comparator. Size 2.
+  perform IO.println(int_to_string(set_size(set_intersect(a, b))));
+
+  // set_subset(a, b): every a-element matches in b under b's
+  // comparator. "foo" → match. "Foo" → match (case-insensitive).
+  // Result: true, even though `a` has "more" elements under its
+  // own comparator.
+  perform IO.println(match set_subset(a, b) { true => "yes", false => "no" });
+  0
+}
+```
+
+The two-step semantics is consistent: the result's downstream
+lookups use `a`'s comparator (the result's stored comparator),
+but the construction-time membership decision used `b`'s. For
+LLM-authored code, the safe rule is **always pass sets built
+with the same comparator**; mix only when you have a specific
+reason and have walked through the asymmetry above.
 
 #### §13.2 — Builtin primitives (not in stdlib modules)
 
@@ -1320,6 +1371,7 @@ The following limits are permanent v1 design choices:
 | Recursive `mkdir -p` and recursive `rm -rf` | Future stdlib helpers layered on top of `mkdir` / `remove_dir` / `read_dir`. v1 `Fs.mkdir` / `remove_dir` are single-level. |
 | Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
 | `MutMap`, range queries on `Map` (`map_range`, prefix scans), set operations (`map_union`, `map_intersect`, `map_difference`), `map_for_each`, `map_eq` | Future map-extensions plan. v1 ships only the persistent immutable `Map[K, V]` plus the closed-row pure-helper surface (`map_get` / `map_insert` / `map_remove` / `map_keys` / `map_to_list` / `map_fold` / `map_map` / `map_filter` etc.). |
+| `MutSet`, range queries on `Set` (`set_range`, prefix scans), min / max queries (`set_min`, `set_max`), `set_for_each` | Future set-extensions plan. v1 ships only the persistent immutable `Set[T]` plus the closed-row pure-helper surface (`set_contains` / `set_insert` / `set_remove` / `set_to_list` / `set_fold` / `set_filter` / set-theoretic ops). |
 | `mut_array_sort` (in-place sort over `MutArray[A]`) | Future plan. v1 ships only the pure functional `list_sort`; an in-place sort would force `![Mem]` onto every call site, which the LLM-default surface chose to avoid. |
 | Format specifiers (`{:.2}`, `{:>10}`, `{:#x}`) — width, precision, alignment, fill, base prefix | Future format-specifiers plan. v1 ships only positional `{}` (each placeholder consumes the next `FormatArg`); width / precision / alignment / fill / base would extend the placeholder grammar and the per-`FormatArg`-variant render path. |
 | Named args (`{name}`) and positional indices (`{0}`, `{1}`) | Future format-specifiers plan. v1's `{}` is strictly positional — each placeholder consumes the next `FormatArg`. |
