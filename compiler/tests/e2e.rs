@@ -14666,6 +14666,297 @@ fn std_map_with_user_defined_record_comparator() {
     assert_eq!(stdout, "second\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C addendum (Stage SET) — `std.set` =====
+
+#[test]
+fn std_set_empty_and_size_zero() {
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: Set[Int] = set_int();\n  \
+                 perform IO.println(int_to_string(set_size(s)));\n  \
+                 match set_is_empty(s) { true => 0, false => 1 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_empty_size_zero");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_insert_round_trip() {
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s0: Set[Int] = set_empty(int_compare);\n  \
+                 let s1: Set[Int] = set_insert(s0, 1);\n  \
+                 let s2: Set[Int] = set_insert(s1, 2);\n  \
+                 let s3: Set[Int] = set_insert(s2, 3);\n  \
+                 perform IO.println(int_to_string(set_size(s3)));\n  \
+                 match set_contains(s3, 2) { true => 0, false => 1 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_insert_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_insert_duplicate_idempotent() {
+    // Inserting the same element twice leaves the set with one
+    // element — Set inherits Map's "replace value, structure
+    // unchanged" semantics for repeated keys.
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s0: Set[Int] = set_int();\n  \
+                 let s1: Set[Int] = set_insert(s0, 1);\n  \
+                 let s2: Set[Int] = set_insert(s1, 1);\n  \
+                 perform IO.println(int_to_string(set_size(s2)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_insert_duplicate");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_remove_existing_decreases_size() {
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s1: Set[Int] = set_insert(set_int(), 1);\n  \
+                 let s2: Set[Int] = set_insert(s1, 2);\n  \
+                 let s3: Set[Int] = set_remove(s2, 1);\n  \
+                 perform IO.println(int_to_string(set_size(s3)));\n  \
+                 match set_contains(s3, 1) {\n    \
+                   true => { perform IO.println(\"PRESENT\"); 1 },\n    \
+                   false => { perform IO.println(\"GONE\"); 0 },\n  \
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_remove_existing");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\nGONE\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_remove_absent_is_noop() {
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s1: Set[Int] = set_insert(set_int(), 1);\n  \
+                 let s2: Set[Int] = set_remove(s1, 999);\n  \
+                 perform IO.println(int_to_string(set_size(s2)));\n  \
+                 match set_contains(s2, 1) { true => 0, false => 1 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_remove_absent");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_contains_basic() {
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: Set[Int] = set_insert(set_int(), 7);\n  \
+                 perform IO.println(match set_contains(s, 7) { true => \"yes\", false => \"no\" });\n  \
+                 perform IO.println(match set_contains(s, 999) { true => \"yes\", false => \"no\" });\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_contains_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\nno\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_to_list_sorted() {
+    // Insert in scrambled order; to_list yields ascending.
+    let src = "import std.set\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s1: Set[Int] = set_insert(set_int(), 3);\n  \
+                 let s2: Set[Int] = set_insert(s1, 1);\n  \
+                 let s3: Set[Int] = set_insert(s2, 2);\n  \
+                 print_ints(set_to_list(s3))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_to_list_sorted");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n2\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_from_list_dedup() {
+    // `set_from_list([1, 2, 1, 3, 2], int_compare)` → size 3.
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: List[Int] = Cons(1, Cons(2, Cons(1, Cons(3, Cons(2, Nil)))));\n  \
+                 let s: Set[Int] = set_from_list(xs, int_compare);\n  \
+                 perform IO.println(int_to_string(set_size(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_from_list_dedup");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_union_basic() {
+    // {1, 2} ∪ {2, 3} → {1, 2, 3}.
+    let src = "import std.set\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Set[Int] = set_from_list(Cons(1, Cons(2, Nil)), int_compare);\n  \
+                 let b: Set[Int] = set_from_list(Cons(2, Cons(3, Nil)), int_compare);\n  \
+                 let u: Set[Int] = set_union(a, b);\n  \
+                 perform IO.println(int_to_string(set_size(u)));\n  \
+                 print_ints(set_to_list(u))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_union_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n1\n2\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_intersect_basic() {
+    // {1, 2, 3} ∩ {2, 3, 4} → {2, 3}.
+    let src = "import std.set\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Set[Int] = set_from_list(Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n  \
+                 let b: Set[Int] = set_from_list(Cons(2, Cons(3, Cons(4, Nil))), int_compare);\n  \
+                 let i: Set[Int] = set_intersect(a, b);\n  \
+                 perform IO.println(int_to_string(set_size(i)));\n  \
+                 print_ints(set_to_list(i))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_intersect_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n2\n3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_difference_basic() {
+    // {1, 2, 3} \ {2, 3} → {1}.
+    let src = "import std.set\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Set[Int] = set_from_list(Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n  \
+                 let b: Set[Int] = set_from_list(Cons(2, Cons(3, Nil)), int_compare);\n  \
+                 let d: Set[Int] = set_difference(a, b);\n  \
+                 perform IO.println(int_to_string(set_size(d)));\n  \
+                 print_ints(set_to_list(d))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_difference_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_subset_basic() {
+    // {1} ⊆ {1, 2}; {1, 4} ⊄ {1, 2}.
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Set[Int] = set_from_list(Cons(1, Nil), int_compare);\n  \
+                 let b: Set[Int] = set_from_list(Cons(1, Cons(2, Nil)), int_compare);\n  \
+                 let c: Set[Int] = set_from_list(Cons(1, Cons(4, Nil)), int_compare);\n  \
+                 perform IO.println(match set_subset(a, b) { true => \"yes\", false => \"no\" });\n  \
+                 perform IO.println(match set_subset(c, b) { true => \"yes\", false => \"no\" });\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_subset_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\nno\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_eq_basic() {
+    // {1, 2} == {2, 1} (insertion order doesn't matter); {1, 2} != {1, 2, 3}.
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Set[Int] = set_from_list(Cons(1, Cons(2, Nil)), int_compare);\n  \
+                 let b: Set[Int] = set_from_list(Cons(2, Cons(1, Nil)), int_compare);\n  \
+                 let c: Set[Int] = set_from_list(Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n  \
+                 perform IO.println(match set_eq(a, b) { true => \"yes\", false => \"no\" });\n  \
+                 perform IO.println(match set_eq(a, c) { true => \"yes\", false => \"no\" });\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_eq_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "yes\nno\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_fold_sum() {
+    let src = "import std.set\n\
+               fn add_elem(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: Set[Int] = set_from_list(Cons(1, Cons(2, Cons(3, Cons(4, Nil)))), int_compare);\n  \
+                 perform IO.println(int_to_string(set_fold(s, 0, add_elem)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_fold_sum");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "10\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_filter_keeps_subset() {
+    // `keep_big(x) -> x > 2` keeps {3, 4, 5} from {1..5}. Filter
+    // preserves the source set's comparator (via map_filter).
+    // Avoids `/` and `%` to keep the predicate's effect row at `![]`
+    // (per ArithError; see std/list.sigil's tortoise-and-hare note).
+    let src = "import std.set\n\
+               fn keep_big(x: Int) -> Bool ![] { x > 2 }\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: Set[Int] = set_from_list(\n      \
+                   Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil))))), int_compare);\n  \
+                 let bigs: Set[Int] = set_filter(s, keep_big);\n  \
+                 perform IO.println(int_to_string(set_size(bigs)));\n  \
+                 print_ints(set_to_list(bigs))\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_filter_keeps_subset");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n3\n4\n5\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_set_convenience_constructors_per_primitive() {
+    // `set_int` / `set_string` / `set_char` thread the matching
+    // comparator from `std.ordering`. This test exercises round-trip
+    // insert + contains for each primitive.
+    let src = "import std.set\n\
+               fn main() -> Int ![IO] {\n  \
+                 let si: Set[Int] = set_insert(set_int(), 42);\n  \
+                 perform IO.println(match set_contains(si, 42) { true => \"int-yes\", false => \"int-no\" });\n  \
+                 let ss: Set[String] = set_insert(set_string(), \"hello\");\n  \
+                 perform IO.println(match set_contains(ss, \"hello\") { true => \"str-yes\", false => \"str-no\" });\n  \
+                 let sc: Set[Char] = set_insert(set_char(), 'a');\n  \
+                 perform IO.println(match set_contains(sc, 'a') { true => \"chr-yes\", false => \"chr-no\" });\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_set_convenience_constructors");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "int-yes\nstr-yes\nchr-yes\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C addendum (Stage FMT) — `std.format` =====
 
 #[test]
