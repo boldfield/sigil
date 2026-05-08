@@ -8385,6 +8385,33 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_continuation_invoke: {e}"))?;
 
+    // Plan State-Cell — runtime cell ops backing `std/state.sigil`'s
+    // cell-based State implementation. Path-gated to `state.sigil`
+    // calls only at the typecheck layer; codegen lowers user calls
+    // to direct extern-C calls to these symbols.
+    // sigil_ref_alloc(initial: u64) -> *mut u8
+    let mut sigil_ref_alloc_sig = Signature::new(isa_call_conv(&module));
+    sigil_ref_alloc_sig.params.push(AbiParam::new(types::I64));
+    sigil_ref_alloc_sig.returns.push(AbiParam::new(pointer_ty));
+    let sigil_ref_alloc = module
+        .declare_function("sigil_ref_alloc", Linkage::Import, &sigil_ref_alloc_sig)
+        .map_err(|e| format!("declare sigil_ref_alloc: {e}"))?;
+    // sigil_ref_deref(cell: *mut u8) -> u64
+    let mut sigil_ref_deref_sig = Signature::new(isa_call_conv(&module));
+    sigil_ref_deref_sig.params.push(AbiParam::new(pointer_ty));
+    sigil_ref_deref_sig.returns.push(AbiParam::new(types::I64));
+    let sigil_ref_deref = module
+        .declare_function("sigil_ref_deref", Linkage::Import, &sigil_ref_deref_sig)
+        .map_err(|e| format!("declare sigil_ref_deref: {e}"))?;
+    // sigil_ref_set(cell: *mut u8, value: u64) -> u64 (Unit)
+    let mut sigil_ref_set_sig = Signature::new(isa_call_conv(&module));
+    sigil_ref_set_sig.params.push(AbiParam::new(pointer_ty));
+    sigil_ref_set_sig.params.push(AbiParam::new(types::I64));
+    sigil_ref_set_sig.returns.push(AbiParam::new(types::I64));
+    let sigil_ref_set = module
+        .declare_function("sigil_ref_set", Linkage::Import, &sigil_ref_set_sig)
+        .map_err(|e| format!("declare sigil_ref_set: {e}"))?;
+
     // Plan B Task 55 (Phase 3a) — runtime handler-frame imports.
     // Phase 3a wires the frame allocation + push/pop ABI from Task
     // 56 around every `handle` body. Arms stay null in this commit
@@ -9681,6 +9708,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             sigil_panic,
             cont_alloc,
             cont_invoke,
+            sigil_ref_alloc,
+            sigil_ref_deref,
+            sigil_ref_set,
         },
         handler_frame_new,
         handle_push,
@@ -23992,6 +24022,77 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.builder.seal_block(merge);
                 self.builder.block_params(merge)[0]
             }
+            // Plan State-Cell — runtime cell ops backing
+            // `std/state.sigil`'s cell-based State implementation. The
+            // typecheck layer (E0148) already gates these calls to
+            // `state.sigil` only; codegen emits direct extern-C calls
+            // to the runtime symbols. All three follow standard Sync
+            // ABI (no closure_ptr, no terminal_out).
+            //
+            // Argument widening: the value passed to alloc/set is
+            // widened to I64 to match the runtime ABI (the cell holds a
+            // u64 slot regardless of the Sigil source-level type T).
+            // The widening mirrors `lower_call`'s standard Sync arg
+            // shape: pointer-typed values pass through, narrower scalar
+            // types extend.
+            Expr::Ident(name, _) if name == "sigil_ref_alloc" => {
+                assert_eq!(args.len(), 1, "sigil_ref_alloc builtin arg count is not 1");
+                let v = self.lower_expr(&args[0]);
+                let widened = widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_alloc");
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.sigil_ref_alloc_ref, &[widened]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                self.builder.inst_results(call)[0]
+            }
+            Expr::Ident(name, _) if name == "sigil_ref_deref" => {
+                assert_eq!(args.len(), 1, "sigil_ref_deref builtin arg count is not 1");
+                let cell = self.lower_expr(&args[0]);
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.sigil_ref_deref_ref, &[cell]);
+                let raw_i64 = self.builder.inst_results(call)[0];
+                // Narrow the I64 result back to the source-level T's
+                // Cranelift type. T is recovered from `call_callee_tys`
+                // — the typecheck instantiation pinned T at this site.
+                let target_ty = match self.lookup_call_callee_ty(call_span) {
+                    Some(crate::typecheck::Ty::Fn(sig)) => {
+                        cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
+                    }
+                    _ => types::I64,
+                };
+                if target_ty == types::I64 {
+                    raw_i64
+                } else if target_ty.is_int() && target_ty.bits() < 64 {
+                    self.builder.ins().ireduce(target_ty, raw_i64)
+                } else {
+                    debug_assert_eq!(
+                        target_ty, self.pointer_ty,
+                        "sigil_ref_deref: unexpected target Cranelift type {target_ty:?}"
+                    );
+                    raw_i64
+                }
+            }
+            Expr::Ident(name, _) if name == "sigil_ref_set" => {
+                assert_eq!(args.len(), 2, "sigil_ref_set builtin arg count is not 2");
+                let cell = self.lower_expr(&args[0]);
+                let v = self.lower_expr(&args[1]);
+                let widened = widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_set");
+                let call = self
+                    .builder
+                    .ins()
+                    .call(self.builtins.sigil_ref_set_ref, &[cell, widened]);
+                self.stackmap
+                    .push_placeholder(function_code_offset(&self.builder, call));
+                // Result is Unit. Runtime returns I64 0; codegen
+                // produces an I8 0 sentinel for the surrounding
+                // expression value flow.
+                let _raw = self.builder.inst_results(call)[0];
+                self.builder.ins().iconst(types::I8, 0)
+            }
             Expr::ClosureRecord { code_fn_name, .. } => {
                 // Evaluate the ClosureRecord first (allocates + stores
                 // the closure on the heap) and use its pointer as the
@@ -26395,6 +26496,11 @@ struct BuiltinFuncIds {
     /// continuation held in a fn parameter).
     cont_alloc: cranelift_module::FuncId,
     cont_invoke: cranelift_module::FuncId,
+    /// Plan State-Cell — runtime cell ops backing
+    /// `std/state.sigil`'s cell-based State implementation.
+    sigil_ref_alloc: cranelift_module::FuncId,
+    sigil_ref_deref: cranelift_module::FuncId,
+    sigil_ref_set: cranelift_module::FuncId,
 }
 
 /// Per-fn FuncRefs for the builtin runtime primitives. Sibling of
@@ -26532,6 +26638,14 @@ struct BuiltinFuncRefs {
     /// emits direct calls.
     cont_alloc_ref: FuncRef,
     cont_invoke_ref: FuncRef,
+    /// Plan State-Cell — runtime cell ops backing
+    /// `std/state.sigil`'s cell-based State implementation. Path-
+    /// gated to calls from inside `state.sigil` only at the
+    /// typecheck layer (E0148); these refs are the codegen target
+    /// for the gated callsites.
+    sigil_ref_alloc_ref: FuncRef,
+    sigil_ref_deref_ref: FuncRef,
+    sigil_ref_set_ref: FuncRef,
 }
 
 /// Plan B Task 55, Phase 4e — input context for [`prepare_per_fn_refs`].
@@ -26821,6 +26935,9 @@ fn prepare_builtin_func_refs(
         sigil_panic_ref: module.declare_func_in_func(ids.sigil_panic, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
+        sigil_ref_alloc_ref: module.declare_func_in_func(ids.sigil_ref_alloc, builder.func),
+        sigil_ref_deref_ref: module.declare_func_in_func(ids.sigil_ref_deref, builder.func),
+        sigil_ref_set_ref: module.declare_func_in_func(ids.sigil_ref_set, builder.func),
     }
 }
 

@@ -200,6 +200,33 @@ pub const TAG_FLOAT: u8 = 0x0B;
 /// `TAG_INT64` boxed-scalar precedent.
 pub const TAG_CHAR: u8 = 0x0C;
 
+/// `Ref[T]` heap cell tag — single-slot mutable cell used by
+/// `std/state.sigil`'s runtime-cell-backed State implementation.
+///
+/// Layout:
+///
+/// ```text
+/// offset 0 : 8-byte header (tag = TAG_REF, count = 1, bitmap = 0b1)
+/// offset 8 : u64 value slot — holds tagged-Int / heap-pointer / Unit
+/// ```
+///
+/// Bitmap bit 0 is set: Boehm scans the value slot conservatively as a
+/// possible pointer. Tagged-Int values (low bit = 1) are tolerated by
+/// the conservative scan — non-pointer bit patterns are simply not
+/// followed. Heap pointers in the slot are followed and keep their
+/// referents alive for the lifetime of the cell.
+///
+/// **v1 access discipline.** The runtime ops `sigil_ref_alloc`,
+/// `sigil_ref_deref`, `sigil_ref_set` are the only writers/readers.
+/// User code cannot allocate `Ref[T]` directly — the typechecker
+/// gates the three ops to calls from inside `std/state.sigil` only.
+/// `Ref[T]` values therefore never escape the State implementation;
+/// they're an internal representation detail of `run_state`'s cell-
+/// backed encoding (the prior Plotkin lambda-encoding could not
+/// compose with discharging effects through the Sync ABI; see
+/// `docs/plans/2026-05-08-sigil-state-runtime-cell-design.md`).
+pub const TAG_REF: u8 = 0x0D;
+
 /// Payload-word-count field layout.
 pub const COUNT_BITS: u32 = 6;
 pub const COUNT_SHIFT: u32 = 8;
@@ -282,6 +309,7 @@ mod tests {
         assert_eq!(TAG_CONTINUATION, 0x0A);
         assert_eq!(TAG_FLOAT, 0x0B);
         assert_eq!(TAG_CHAR, 0x0C);
+        assert_eq!(TAG_REF, 0x0D);
         assert_eq!(TAG_EXTERNAL_DESCRIPTOR, 0xFF);
     }
 
