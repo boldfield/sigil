@@ -1054,10 +1054,15 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
 
 #### §12.1 — Tail-call optimization
 
-Every direct user-fn call in **tail position** is lowered to
-Cranelift's `return_call` instruction — a native tail-jump that
-deallocates the current stack frame before transferring control to
-the callee. Programs may rely on this for **unbounded recursion**.
+Every direct user-fn call in **tail position** with a Cranelift
+signature exactly matching the surrounding fn's signature is
+lowered to Cranelift's `return_call` instruction — a native
+tail-jump that deallocates the current stack frame before
+transferring control to the callee. Programs may rely on this
+for **unbounded recursion** in the shapes listed below; tail
+calls whose signatures don't match (cross-arity, cross-return-
+type) fall back to a non-tail call (one stack frame per call) and
+are depth-bounded by the host thread's stack size.
 
 A call is in tail position when it appears as:
 
@@ -1101,14 +1106,22 @@ Tail-call optimization covers:
   match-arm body emits `return_(NextStep::Call(callee, args))`
   directly. The OUTER trampoline iterates without nesting
   `sigil_run_loop` per call — stack-bounded to the same
-  unbounded depth as pure-Sync recursion.
+  unbounded depth as pure-Sync recursion. The recursive call
+  forwards the surrounding chained-let-yield's incoming
+  `(post_arm_k_closure, post_arm_k_fn)` pair as the inner call's
+  trailing pair, preserving continuation chains across nested
+  handlers; non-identity outer continuations route through the
+  captured chain rather than being silently dropped.
+- **Indirect calls** (closure dispatch through `code_ptr`) when the
+  callee is a fn-typed value (let-binding, fn parameter, or
+  expression returning a closure) whose signature matches the
+  surrounding fn's. These lower to Cranelift's
+  `return_call_indirect`. Mutual indirect tail-recursion through
+  fn-typed bindings (e.g., `a` and `b` each indirectly tail-call
+  the other through a fn-typed local) is depth-unbounded.
 
 Tail-call optimization does **not** apply to:
 
-- Indirect calls (closure dispatch through `code_ptr`). A future
-  follow-up may extend the optimization to `return_call_indirect`
-  when a closure-typed callee in tail position has a signature
-  matching the current fn.
 - Sync→Cps cross-ABI calls in tail position. The surrounding Sync
   fn returns the user's value type, not `*mut NextStep`; tail-
   jumping to a Cps callee would lose the trampoline drive that
@@ -1117,14 +1130,16 @@ Tail-call optimization does **not** apply to:
   per call), which is correct but stack-bounded.
 
 Regression tests in `compiler/tests/e2e.rs` pin the guarantee at
-depth 10,000,000 for all seven shapes (Sync self, Sync mutual,
-let-block tail, if-arm tail, match-arm tail, `Mem`-effect-row
-body, AND Cps-colored chained-let-yield with tail recursion).
+depth 10,000,000 for all covered shapes (Sync self, Sync mutual,
+let-block tail, if-arm tail, match-arm tail with literal-pattern
+arms, `Mem`-effect-row body, Cps-colored chained-let-yield with
+tail recursion, Cps→Cps under nested non-identity-k handler, and
+indirect-call mutual tail-recursion through fn-typed bindings).
 See `done/2026-05-07-01-sigil-tco-verify.md` for the
-diagnostic-first plan and `[DEVIATION Task TCO-4 in-flight]` in
-`PLAN_C_DEVIATIONS.md` for the architectural walk through both
-TCO mechanisms (Sync `return_call` and Cps→Cps `NextStep::Call`
-return).
+diagnostic-first plan and the `[DEVIATION Task TCO-4 ...]`
+entries in `PLAN_C_DEVIATIONS.md` for the architectural walk
+through all three TCO mechanisms (Sync `return_call`, Cps→Cps
+`NextStep::Call` return, and indirect-call `return_call_indirect`).
 
 ### §13 — Stdlib reference
 
