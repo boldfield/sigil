@@ -14665,3 +14665,301 @@ fn std_map_with_user_defined_record_comparator() {
     // x — so the lookup hits the (x=2) entry and prints "second".
     assert_eq!(stdout, "second\n", "stderr={stderr:?}");
 }
+
+// ===== Plan C addendum (Stage FMT) — `std.format` =====
+
+#[test]
+fn std_format_no_placeholders() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"hello\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_no_placeholders");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_single_int() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format_int(\"x = {}\", 42));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_single_int");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "x = 42\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_single_string() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format_string(\"name: {}\", \"alice\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_single_string");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "name: alice\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_two_args_mixed() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format2(\"{}: {}\", AString(\"count\"), AInt(7)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_two_args_mixed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "count: 7\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_general_list_form() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = format(\"a={}, b={}\",\n    \
+                   Cons(AInt(1), Cons(AInt(2), Nil)));\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_general_list_form");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "a=1, b=2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_escape_braces() {
+    // `{{x}}` → literal `{x}` — neither pair consumes an arg.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"{{x}}\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_escape_braces");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "{x}\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_too_few_args_emits_marker() {
+    // Two `{}` placeholders, only one arg → second slot prints
+    // the literal marker `{?}`. No runtime crash.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"{} and {}\",\n    \
+                   Cons(AInt(1), Nil)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_too_few_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1 and {?}\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_too_many_args_silently_drops() {
+    // One `{}` placeholder, two args → trailing arg is silently
+    // ignored. The template controls the output.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"{}\",\n    \
+                   Cons(AInt(1), Cons(AInt(2), Nil))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_too_many_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "1\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_each_type_one_per_variant() {
+    // One placeholder per FormatArg variant; each prints with the
+    // matching `_to_string` conversion.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format1(\"{}\", AInt(42)));\n  \
+                 perform IO.println(format1(\"{}\", AInt64(int64_from_int(99))));\n  \
+                 perform IO.println(format1(\"{}\", AFloat(2.5)));\n  \
+                 perform IO.println(format1(\"{}\", AString(\"ok\")));\n  \
+                 perform IO.println(format1(\"{}\", ABool(true)));\n  \
+                 perform IO.println(format1(\"{}\", AChar('Z')));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_each_type");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n99\n2.5\nok\ntrue\nZ\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_bool_true_false() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format_bool(\"ok = {}\", true));\n  \
+                 perform IO.println(format_bool(\"ok = {}\", false));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_bool_true_false");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok = true\nok = false\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_char_codepoint() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format_char(\"first letter = {}\", 'A'));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_char_codepoint");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "first letter = A\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_float_basic() {
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format_float(\"pi = {}\", 3.14));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_float_basic");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "pi = 3.14\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_long_template_multiple_placeholders() {
+    // Long template (>100 bytes) with mixed escapes and several
+    // placeholders. Pins the run-flushing path: the walker must
+    // emit each verbatim run in one substring, not one byte at a
+    // time, and must thread args correctly across arbitrary
+    // intervening literal content.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = format4(\n    \
+                   \"req {{id={}}}: status={} latency={}ms note=\\\"{}\\\"\",\n    \
+                   AInt(101), AString(\"OK\"), AInt(42),\n    \
+                   AString(\"hello\"));\n  \
+                 perform IO.println(s);\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_long_template");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "req {id=101}: status=OK latency=42ms note=\"hello\"\n",
+        "stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn std_format_unbalanced_close_brace_is_literal() {
+    // A lone `}` (not part of `}}`) is forgiving — emits a
+    // literal `}` and continues. Pins the close-brace fallback
+    // path that the design doc calls out.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"a}b\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_unbalanced_close_brace");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "a}b\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_invalid_open_brace_emits_question_marker() {
+    // `{` followed by a non-`{`/non-`}` byte emits `{?` and
+    // advances one. Pins the invalid-placeholder fallback.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"a{xb\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_invalid_open_brace");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "a{?xb\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_multibyte_utf8_passes_through_intact() {
+    // The walker scans byte-by-byte but flushes verbatim runs as
+    // substrings, so multi-byte UTF-8 sequences (here `é` =
+    // 0xC3 0xA9, three-byte CJK ideograph, four-byte emoji) pass
+    // through unsplit.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format1(\"café-{}\", AInt(1)));\n  \
+                 perform IO.println(format1(\"日本語 {}\", AString(\"x\")));\n  \
+                 perform IO.println(format1(\"🦀 = {}\", AString(\"crab\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_multibyte_utf8");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "café-1\n日本語 x\n🦀 = crab\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_empty_template_returns_empty_string() {
+    // Pins the walker's `i >= len` base case for an empty
+    // template. `format("", Nil)` short-circuits to an empty
+    // verbatim flush.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = format(\"\", Nil);\n  \
+                 perform IO.println(s);\n  \
+                 perform IO.println(int_to_string(string_length(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_empty_template");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "\n0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_adjacent_placeholders_no_separator() {
+    // Two `{}` placeholders with nothing between them. Pins the
+    // empty-run-flush path (the second placeholder has
+    // `run_start == i` when entering the open-brace handler).
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"{}{}\",\n    \
+                   Cons(AInt(1), Cons(AInt(2), Nil))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_adjacent_placeholders");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_trailing_open_brace_at_eof_emits_marker() {
+    // `{` at end-of-template — the `i + 1 < len` guard fails so
+    // there is no peek byte. Walker emits `{?` and advances past
+    // the `{`. Pins the EOF branch of the open-brace handler.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"x = {\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_trailing_open_brace_eof");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "x = {?\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_trailing_close_brace_at_eof_is_literal() {
+    // `}` at end-of-template — the `i + 1 < len` guard fails so
+    // there is no peek byte. Forgiving fallback emits a literal
+    // `}` and advances past it. Pins the EOF branch of the
+    // close-brace handler.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"done }\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_trailing_close_brace_eof");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "done }\n", "stderr={stderr:?}");
+}

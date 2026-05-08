@@ -21,7 +21,7 @@ linear reading.
 
 ---
 
-## Worked examples (E1–E14)
+## Worked examples (E1–E17)
 
 ### E1 — Hello, world
 
@@ -500,6 +500,31 @@ threaded through `map_char_keys`) every lookup is O(log n) without
 the caller threading an equality predicate. `map_to_list` returns
 the entries sorted ascending by key, so the output is deterministic
 across runs.
+
+### E17 — Format-string log-line builder
+
+```sigil
+import std.io
+import std.format
+
+fn log_line(level: String, request_id: Int, message: String) -> String ![] {
+  format3("[{}] req={} msg={}", AString(level), AInt(request_id), AString(message))
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(log_line("INFO", 42, "ok"));
+  perform IO.println(log_line("WARN", 43, "slow query"));
+  0
+}
+```
+
+`format(template, args)` walks `template` and substitutes each `{}`
+placeholder with the next `FormatArg` from `args`. `{{` and `}}`
+escape to literal braces; mismatched arity is forgiving (unfilled
+`{}` emits the literal marker `{?}`, extra args drop). The arity
+helpers `format1`...`format8` build the args list mechanically; the
+per-type wrappers (`format_int`, `format_string`, ...) save the
+constructor ceremony for the common single-arg case. See §13.
 
 ---
 
@@ -1212,6 +1237,7 @@ files are the authoritative API reference.
 | `std.float` | Boxed `Float` (IEEE 754 f64): arithmetic (`float_add`/`sub`/`mul`/`div`/`neg`), comparison (`float_eq`/`lt`/`le`/`gt`/`ge`; NaN≠NaN), math (`float_abs`/`floor`/`ceil`/`sqrt`), conversion (`float_from_int`/`float_to_int`/`float_to_string`/`string_to_float_validate`/`string_to_float_parse`). `float_to_string` always includes `.0` for whole numbers; `inf`/`NaN` unchanged. |
 | `std.int64` | Boxed `Int64` with arithmetic, comparison, conversion, stringify. |
 | `std.string_builder` | `StringBuilder` rope (Mem-gated). |
+| `std.format` | Format-string output. `FormatArg = \| AInt \| AInt64 \| AFloat \| AString \| ABool \| AChar`. General entry `format(template, args: List[FormatArg]) -> String ![]`; arity helpers `format1`..`format8` build the args list mechanically; per-type wrappers (`format_int`, `format_int64`, `format_string`, `format_float`, `format_bool`, `format_char`) save the `AInt(...)` ceremony for single-arg cases. Template syntax: `{}` is a positional placeholder, `{{` / `}}` escape literal braces. Mismatched arity is forgiving (unfilled `{}` emits the literal marker `{?}`, extra args drop). The walker is mutually tail-recursive (TCO'd per §12.1), so stack depth is O(1) regardless of template length. The accumulator is a concat chain (`format` is `![]`, so `StringBuilder` is unavailable — `sb_*` ops gate on `Mem`); each concat allocates a fresh String, so total work is O(L²) in output length L. Suitable for short-to-medium strings (log lines, error messages, ≤ a few KB); for large outputs (rendering a 100 KB document via repeated `format`) prefer `StringBuilder` directly under `![Mem]`. No format specifiers, named args, or positional indices in v1 — see §14.1. |
 | `std.pair` | `fst[A, B]`, `snd[A, B]` accessors for binary tuples `(A, B)`. |
 | `std.io` | `IO` effect: `print`, `println`, `read_line`. (File ops moved to `std.fs`.) |
 | `std.env` | `Env` effect: `env_args() -> List[String]`, `env_var(name) -> Option[String]`, `env_vars() -> List[(String, String)]`. The effect-prefixed naming matches `random_int` / `clock_now` and avoids shadowing the very common parameter name `args`. |
@@ -1268,6 +1294,9 @@ The following limits are permanent v1 design choices:
 | Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
 | `MutMap`, range queries on `Map` (`map_range`, prefix scans), set operations (`map_union`, `map_intersect`, `map_difference`), `map_for_each`, `map_eq` | Future map-extensions plan. v1 ships only the persistent immutable `Map[K, V]` plus the closed-row pure-helper surface (`map_get` / `map_insert` / `map_remove` / `map_keys` / `map_to_list` / `map_fold` / `map_map` / `map_filter` etc.). |
 | `mut_array_sort` (in-place sort over `MutArray[A]`) | Future plan. v1 ships only the pure functional `list_sort`; an in-place sort would force `![Mem]` onto every call site, which the LLM-default surface chose to avoid. |
+| Format specifiers (`{:.2}`, `{:>10}`, `{:#x}`) — width, precision, alignment, fill, base prefix | Future format-specifiers plan. v1 ships only positional `{}` (each placeholder consumes the next `FormatArg`); width / precision / alignment / fill / base would extend the placeholder grammar and the per-`FormatArg`-variant render path. |
+| Named args (`{name}`) and positional indices (`{0}`, `{1}`) | Future format-specifiers plan. v1's `{}` is strictly positional — each placeholder consumes the next `FormatArg`. |
+| Compiler-level f-string syntax (`f"x = {x}"`) | Future plan. v1 ships only the runtime `format` family in `std.format`; a compile-time f-string surface would lower to `format` calls but requires lexer + parser changes. |
 
 ### §15 — Build and run
 

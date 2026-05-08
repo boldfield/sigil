@@ -15946,4 +15946,49 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    // ===== Plan C addendum (Stage FMT) — `std.format` =====
+
+    #[test]
+    fn import_std_format_typechecks_cleanly() {
+        // Pin the full `std.format` surface: `FormatArg` constructors,
+        // `format` general entry, `format1`..`format8` arity helpers,
+        // and every per-type single-arg wrapper.
+        let src = "import std.format\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let _a: String = format(\"plain\", Nil);\n  \
+                     let _b: String = format(\"x={}\",\n      \
+                       Cons(AInt(1), Nil));\n  \
+                     let _c: String = format1(\"x={}\", AInt(1));\n  \
+                     let _d: String = format2(\"{}: {}\", AString(\"k\"), AInt(7));\n  \
+                     let _e: String = format3(\"{}/{}/{}\",\n      \
+                       AInt(1), AInt(2), AInt(3));\n  \
+                     let _f: String = format4(\"{} {} {} {}\",\n      \
+                       AInt(1), AInt(2), AInt(3), AInt(4));\n  \
+                     let _g: String = format5(\"{} {} {} {} {}\",\n      \
+                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5));\n  \
+                     let _h: String = format6(\"{} {} {} {} {} {}\",\n      \
+                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5), AInt(6));\n  \
+                     let _i: String = format7(\"{} {} {} {} {} {} {}\",\n      \
+                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n      \
+                       AInt(6), AInt(7));\n  \
+                     let _j: String = format8(\"{} {} {} {} {} {} {} {}\",\n      \
+                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n      \
+                       AInt(6), AInt(7), AInt(8));\n  \
+                     let _k: String = format_int(\"x={}\", 42);\n  \
+                     let _l: String = format_int64(\"x={}\",\n      \
+                       int64_from_int(42));\n  \
+                     let _m: String = format_string(\"name={}\", \"alice\");\n  \
+                     let _n: String = format_float(\"pi={}\", 3.14);\n  \
+                     let _o: String = format_bool(\"ok={}\", true);\n  \
+                     let _p: String = format_char(\"c={}\", 'A');\n  \
+                     let _q: String = format(\"{}: {} = {}\",\n      \
+                       Cons(AString(\"k\"),\n      \
+                       Cons(AInt(1),\n      \
+                       Cons(AString(\"v\"), Nil))));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }
