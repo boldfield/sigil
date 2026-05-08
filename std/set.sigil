@@ -155,15 +155,25 @@ fn set_difference[T](a: Set[T], b: Set[T]) -> Set[T] ![] {
 }
 
 // `set_subset(a, b)` — true iff every element of `a` is in `b`.
-// Folds the whole set even after the answer is known; for a
-// strict-subset early-exit version, build a recursive helper
-// directly via `match` over `set_to_list(a)`.
+// Walks the materialized element list of `a` with early-exit on
+// the first miss: as soon as `set_contains(b, h)` returns false
+// the recursion bails, so worst-case work is O(k * log m) where
+// `k` is the index of the first non-member and `m = set_size(b)`,
+// vs O(n * log m) for a fold-based version that visits every
+// element. The full materialization of `set_to_list(a)` is still
+// O(n); the win is the skipped `set_contains` calls past `k`.
 fn set_subset[T](a: Set[T], b: Set[T]) -> Bool ![] {
-  set_fold(a, true, fn (acc: Bool, x: T) -> Bool ![] =>
-    match acc {
+  __set_subset_list(set_to_list(a), b)
+}
+
+fn __set_subset_list[T](xs: List[T], b: Set[T]) -> Bool ![] {
+  match xs {
+    Nil => true,
+    Cons(h, t) => match set_contains(b, h) {
       false => false,
-      true => set_contains(b, x),
-    })
+      true => __set_subset_list(t, b),
+    },
+  }
 }
 
 // `set_eq(a, b)` — true iff `a` and `b` contain the same elements
