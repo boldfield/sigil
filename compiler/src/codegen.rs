@@ -11643,6 +11643,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             lowerer.builder.finalize();
         }
+        // TCO-4 debug — dump Cranelift IR for fns matching SIGIL_DUMP_IR
+        // env var (substring match). Lets us compare IR for the leaking
+        // count_down_cps vs the passing count_down to spot what differs
+        // around the perform site / return_call epilogue.
+        if let Ok(filter) = std::env::var("SIGIL_DUMP_IR") {
+            if !filter.is_empty() && f.name.contains(&filter) {
+                eprintln!(
+                    "===== SIGIL_DUMP_IR fn `{}` (ABI={:?}, CC={:?}) =====\n{}",
+                    f.name, entry.abi, entry.signature.call_conv, ctx.func
+                );
+            }
+        }
         module
             .define_function(entry.func_id, &mut ctx)
             .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
