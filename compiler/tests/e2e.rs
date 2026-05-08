@@ -7154,18 +7154,24 @@ fn std_string_substring_extracts_bytes() {
     assert_eq!(stdout, "3456\n", "stderr={stderr:?}");
 }
 
-/// `string_compare` returns -1 / 0 / 1 lex-order.
+/// `string_compare` (from `std.ordering`) returns `Ordering` —
+/// `Less` / `Equal` / `Greater`. The legacy Int-returning builtin
+/// was retired in Plan C addendum Stage MOS.
 #[test]
 fn std_string_compare_lt_eq_gt() {
-    let src = "fn main() -> Int ![IO] {\n  \
-                 perform IO.println(int_to_string(string_compare(\"a\", \"b\")));\n  \
-                 perform IO.println(int_to_string(string_compare(\"b\", \"a\")));\n  \
-                 perform IO.println(int_to_string(string_compare(\"a\", \"a\")));\n  \
+    let src = "import std.ordering\n\
+               fn encode(o: Ordering) -> Int ![] {\n  \
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"a\", \"b\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"b\", \"a\"))));\n  \
+                 perform IO.println(int_to_string(encode(string_compare(\"a\", \"a\"))));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_string_compare");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "-1\n1\n0\n", "stderr={stderr:?}");
+    assert_eq!(stdout, "1\n3\n2\n", "stderr={stderr:?}");
 }
 
 /// `string_starts_with` / `_ends_with` / `_contains` — boolean
@@ -14218,31 +14224,39 @@ fn std_list_sort_char_codepoint_order() {
 }
 
 #[test]
-fn std_list_sort_int_one_thousand_reversed() {
-    // Stress test: sort 1K reverse-sorted ints, count via length, and
-    // verify the head and length are correct. Calling `range(0, 10000)`
-    // and reversing it pushes the AA-tree balance through enough levels
-    // to exercise both `__split` and `__merge_rev` deeply, but 1K stays
-    // well inside the pod stack budget — the e2e test exercises
-    // correctness rather than the exact 10K stress called out in the
-    // plan.
+fn std_list_sort_int_ten_thousand_reversed() {
+    // Plan-spec stress: sort 10K reverse-sorted ints. Catches
+    // O(n^2) regressions in merge sort — at N=10000 a quadratic
+    // sort runs ~100M ops vs ~130K for n log n, which becomes a
+    // visible wall-clock difference in CI. Asserts length round-
+    // trip, head (smallest = 0), and last (largest = 9999).
     let src = "import std.list\n\
+               fn last(xs: List[Int]) -> Int ![] {\n  \
+                 match xs {\n    \
+                   Nil => -1,\n    \
+                   Cons(h, t) => match t {\n      \
+                     Nil => h,\n      \
+                     _ => last(t),\n    \
+                   },\n  \
+                 }\n\
+               }\n\
                fn main() -> Int ![IO] {\n  \
-                 let xs: List[Int] = reverse(range(0, 1000));\n  \
+                 let xs: List[Int] = reverse(range(0, 10000));\n  \
                  let ys: List[Int] = list_sort_int(xs);\n  \
                  perform IO.println(int_to_string(length(ys)));\n  \
                  match ys {\n    \
                    Nil => 0,\n    \
                    Cons(h, _) => {\n      \
                      perform IO.println(int_to_string(h));\n      \
+                     perform IO.println(int_to_string(last(ys)));\n      \
                      0\n    \
                    },\n  \
                  }\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_one_thousand");
+    let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_ten_thousand");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // length first, then head element (smallest after sort = 0).
-    assert_eq!(stdout, "1000\n0\n", "stderr={stderr:?}");
+    // length, head (= 0), last (= 9999).
+    assert_eq!(stdout, "10000\n0\n9999\n", "stderr={stderr:?}");
 }
 
 // ===== Map[K, V] =====
@@ -14468,12 +14482,14 @@ fn std_map_string_keys_constructor_round_trip() {
 }
 
 #[test]
-fn std_map_one_hundred_inserts_and_lookups() {
-    // Stress test scaled down from the plan's 10K target — 100
-    // inserts is enough to drive several AA-tree split + skew
-    // rebalances and exercise the in-order traversal at non-trivial
-    // height while staying well under the pod's stack budget. CI
-    // expanded scaling sits in a follow-up "stress" lane.
+fn std_map_ten_thousand_inserts_then_lookups() {
+    // Plan-spec stress: 10K distinct inserts followed by 10K
+    // lookups. Catches O(n) per-op regressions in the AA-tree
+    // walks (insert / contains both need to stay O(log n)). At
+    // N=10000 a linear walk is ~50M ops per phase vs ~130K for
+    // O(log n) — slow enough to surface in CI wall-clock if a
+    // regression slips in. Assertion verifies size after fill
+    // and hit-count over the same key range.
     let src = "import std.map\n\
                fn fill(m: Map[Int, Int], i: Int, n: Int) -> Map[Int, Int] ![] {\n  \
                  if i >= n { m }\n  \
@@ -14487,16 +14503,16 @@ fn std_map_one_hundred_inserts_and_lookups() {
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
-                 let m: Map[Int, Int] = fill(map_int_keys(), 0, 100);\n  \
+                 let m: Map[Int, Int] = fill(map_int_keys(), 0, 10000);\n  \
                  perform IO.println(int_to_string(map_size(m)));\n  \
-                 perform IO.println(int_to_string(count_hits(m, 0, 100, 0)));\n  \
+                 perform IO.println(int_to_string(count_hits(m, 0, 10000, 0)));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_map_one_hundred_inserts");
+    let (stdout, stderr, code) = compile_and_run(src, "std_map_ten_thousand_inserts");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // First line: size after 100 distinct inserts. Second line: how
-    // many of keys 0..100 are present afterwards.
-    assert_eq!(stdout, "100\n100\n", "stderr={stderr:?}");
+    // First line: size after 10K distinct inserts. Second line:
+    // how many of keys 0..10000 are present afterwards.
+    assert_eq!(stdout, "10000\n10000\n", "stderr={stderr:?}");
 }
 
 #[test]

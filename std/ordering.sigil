@@ -33,15 +33,16 @@
 // (`!float_eq(x, x)` is `true` iff `x` is NaN); no new runtime
 // primitive is required.
 //
-// ## Shadowing of the builtin `string_compare`
+// ## `string_compare` is the canonical string comparator
 //
-// Sigil ships a builtin `string_compare(String, String) -> Int`
-// (returning -1 / 0 / +1) that predates this module. `import
-// std.ordering` shadows that builtin with this module's
-// `Ordering`-returning version (per the typechecker's "user fns
-// override builtins" rule). Programs that need the integer form
-// either skip this import or wrap the Ordering result via
-// `match`.
+// Earlier Sigil versions shipped a builtin `string_compare(String,
+// String) -> Int` returning -1 / 0 / +1. Plan C addendum Stage MOS
+// retired that builtin in favour of this module's
+// `Ordering`-returning version, so the names match the rest of
+// the per-type comparators (`int_compare`, `char_compare`,
+// `float_compare`, `bool_compare`, `int64_compare`). Callers that
+// want a numeric form can convert via
+// `match string_compare(a, b) { Less => -1, Equal => 0, Greater => 1 }`.
 
 type Ordering = | Less | Equal | Greater
 
@@ -57,17 +58,15 @@ fn int_compare(a: Int, b: Int) -> Ordering ![] {
 // of two `String`s. Pure-sigil byte walk via `string_byte_at` /
 // `string_length` and `byte_to_int` to widen `Byte` to `Int`.
 //
-// Implementation note: this fn shadows the builtin
-// `string_compare(String, String) -> Int` for any program that
-// imports `std.ordering`. The byte walk is independent of the
-// builtin so the shadow does not introduce recursion.
+// Lengths are computed once at the entry point and threaded
+// through the recursive helper — `string_length` is O(1) on the
+// String header but recomputing it per byte still costs a pair of
+// header reads on every iteration. Threading is cleaner.
 fn string_compare(a: String, b: String) -> Ordering ![] {
-  __string_compare_at(a, b, 0)
+  __string_compare_at(a, b, string_length(a), string_length(b), 0)
 }
 
-fn __string_compare_at(a: String, b: String, i: Int) -> Ordering ![] {
-  let la: Int = string_length(a);
-  let lb: Int = string_length(b);
+fn __string_compare_at(a: String, b: String, la: Int, lb: Int, i: Int) -> Ordering ![] {
   match (i < la, i < lb) {
     (false, false) => Equal,
     (false, true) => Less,
@@ -79,7 +78,7 @@ fn __string_compare_at(a: String, b: String, i: Int) -> Ordering ![] {
       let ba: Int = byte_to_int(string_byte_at(a, i));
       let bb: Int = byte_to_int(string_byte_at(b, i));
       if ba < bb { Less }
-      else { if ba == bb { __string_compare_at(a, b, i + 1) } else { Greater } }
+      else { if ba == bb { __string_compare_at(a, b, la, lb, i + 1) } else { Greater } }
     },
   }
 }

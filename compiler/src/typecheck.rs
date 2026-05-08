@@ -2576,7 +2576,6 @@ fn register_builtin_string_builder_schemes(tc: &mut Tc) {
 /// - `string_concat(String, String) -> String ![]`
 /// - `string_substring(String, Int, Int) -> String ![]`
 /// - `string_byte_at(String, Int) -> Byte ![]`
-/// - `string_compare(String, String) -> Int ![]`
 /// - `string_starts_with(String, String) -> Bool ![]`
 /// - `string_ends_with(String, String) -> Bool ![]`
 /// - `string_contains(String, String) -> Bool ![]`
@@ -2609,10 +2608,13 @@ fn register_builtin_string_schemes(tc: &mut Tc) {
         "string_byte_at".to_string(),
         make_scheme(vec![Ty::String, Ty::Int], Ty::Byte),
     );
-    tc.fn_schemes.insert(
-        "string_compare".to_string(),
-        make_scheme(vec![Ty::String, Ty::String], Ty::Int),
-    );
+    // `string_compare` was previously a builtin returning `Int` (-1 /
+    // 0 / +1). It is now provided by `std/ordering.sigil` returning
+    // the `Ordering` sum type (Plan C addendum Stage MOS). The builtin
+    // is gone; callers must `import std.ordering` to reach the new
+    // surface, which matches the per-type-comparator naming
+    // convention shared with `int_compare` / `char_compare` /
+    // `float_compare` / `int64_compare` / `bool_compare`.
     tc.fn_schemes.insert(
         "string_starts_with".to_string(),
         make_scheme(vec![Ty::String, Ty::String], Ty::Bool),
@@ -14721,14 +14723,34 @@ mod tests {
     }
 
     #[test]
-    fn string_compare_returns_int_typechecks() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let c: Int = string_compare(\"a\", \"b\");\n  \
-                     perform IO.println(int_to_string(c));\n  \
-                     0\n\
+    fn string_compare_returns_ordering_typechecks() {
+        // The legacy Int-returning `string_compare` builtin was
+        // retired in Plan C addendum Stage MOS; the canonical
+        // `string_compare` lives in `std.ordering` and returns
+        // `Ordering`.
+        let src = "import std.ordering\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let o: Ordering = string_compare(\"a\", \"b\");\n  \
+                     match o { Less => 0, Equal => 1, Greater => 2 }\n\
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn string_compare_without_import_is_unknown_ident() {
+        // Without `import std.ordering`, calling `string_compare`
+        // is an unknown-ident error — the builtin Int-returning
+        // version was removed in Plan C addendum Stage MOS.
+        let src = "fn main() -> Int ![] {\n  \
+                     let _o: Ordering = string_compare(\"a\", \"b\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !errs.is_empty(),
+            "expected unknown-ident / unknown-type errors; got clean"
+        );
     }
 
     #[test]
