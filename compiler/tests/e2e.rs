@@ -13719,7 +13719,7 @@ fn tail_recursive_with_effect_row() {
 
 #[test]
 fn tail_recursive_through_match_literal_arms() {
-    let src = "fn ping_pong_match(n: Int) -> Int ![] {\n  \
+    let src = "fn ping_pong_match(n: Int) -> Int ![ArithError] {\n  \
                  match n {\n    \
                    0 => 0,\n    \
                    _ => match n % 2 {\n      \
@@ -13729,7 +13729,7 @@ fn tail_recursive_through_match_literal_arms() {
                    },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
+               fn main() -> Int ![IO, ArithError] {\n  \
                  let result: Int = ping_pong_match(10000000);\n  \
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
