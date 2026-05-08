@@ -52,12 +52,22 @@
 //
 // ## Stack-depth bound
 //
-// The walker is recursive; Sigil v1 does not guarantee tail-call
-// optimisation. Each recursive call advances at least one byte, so
-// stack depth is O(template_byte_length). For typical templates
-// (≤ a few thousand bytes) this stays well within the default
-// system stack budget. Same bound as `std/list.sigil`'s recursive
-// helpers.
+// The walker is mutually tail-recursive: `__fmt_walk` →
+// `__fmt_open_brace` / `__fmt_close_brace` → `__fmt_walk`. Per
+// Sigil's TCO guarantee (§12.1), all three helpers share an exact
+// signature so every recursive call lowers to `return_call` —
+// stack depth is O(1) regardless of template length, and templates
+// of arbitrary size are safe.
+//
+// Wall-clock cost is the only constraint that scales with input.
+// The accumulator is a concat chain (`format` is `![]`, so
+// `StringBuilder` is unavailable — `sb_*` ops gate on `Mem`); each
+// `string_concat(acc, head)` allocates a fresh String of size
+// `acc.len + head.len`. For a template producing total output
+// length L, the worst-case work is O(L²). For typical LLM-authored
+// strings (log lines, error messages, ≤ a few KB) this is fine;
+// for large outputs (rendering a 100 KB document via repeated
+// `format`) prefer using `StringBuilder` directly under `![Mem]`.
 //
 // ## Forwarder layer
 //
@@ -135,13 +145,23 @@ fn __fmt_walk(template: String, len: Int, run_start: Int, i: Int,
   }
 }
 
+// Flush a pending verbatim run into `acc` if one exists. The
+// `run_start < i` guard skips spurious empty-substring concats on
+// adjacent specials (e.g. `{}{}`); without it, every special byte
+// would allocate one extra empty `String` plus a fresh
+// `acc`-identical concat result.
+fn __fmt_flush_run(template: String, run_start: Int, i: Int, acc: String) -> String ![] {
+  if run_start < i {
+    string_concat(acc, string_substring(template, run_start, i))
+  } else { acc }
+}
+
 // Handle `{` at position `i`: peek the next byte and dispatch on
 // `{{` (literal `{`), `{}` (consume arg), or anything else /
 // end-of-template (invalid-placeholder marker `{?`).
 fn __fmt_open_brace(template: String, len: Int, run_start: Int, i: Int,
                     args: List[FormatArg], acc: String) -> String ![] {
-  let head: String = string_substring(template, run_start, i);
-  let acc2: String = string_concat(acc, head);
+  let acc2: String = __fmt_flush_run(template, run_start, i, acc);
   if i + 1 < len {
     let nb: Int = byte_to_int(string_byte_at(template, i + 1));
     if nb == 123 {
@@ -161,23 +181,20 @@ fn __fmt_open_brace(template: String, len: Int, run_start: Int, i: Int,
   }
 }
 
-// Handle `}` at position `i`: peek the next byte and dispatch on
-// `}}` (literal `}`) or anything else (forgiving — emit a literal
-// `}` and advance one byte).
+// Handle `}` at position `i`: peek the next byte and decide on
+// `}}` (escape — advance 2) vs anything else / end-of-template
+// (forgiving — emit a literal `}` and advance 1). The two
+// non-`}}` cases share the same emit + advance shape, so the
+// peek collapses to a single advance computation.
 fn __fmt_close_brace(template: String, len: Int, run_start: Int, i: Int,
                      args: List[FormatArg], acc: String) -> String ![] {
-  let head: String = string_substring(template, run_start, i);
-  let acc2: String = string_concat(acc, head);
-  if i + 1 < len {
+  let acc2: String = __fmt_flush_run(template, run_start, i, acc);
+  let acc3: String = string_concat(acc2, "}");
+  let advance: Int = if i + 1 < len {
     let nb: Int = byte_to_int(string_byte_at(template, i + 1));
-    if nb == 125 {
-      __fmt_walk(template, len, i + 2, i + 2, args, string_concat(acc2, "}"))
-    } else {
-      __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "}"))
-    }
-  } else {
-    __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "}"))
-  }
+    if nb == 125 { 2 } else { 1 }
+  } else { 1 };
+  __fmt_walk(template, len, i + advance, i + advance, args, acc3)
 }
 
 // `format1(t, a)` ... `format8(t, a, ..., h)` are mechanical

@@ -14899,3 +14899,67 @@ fn std_format_multibyte_utf8_passes_through_intact() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "café-1\n日本語 x\n🦀 = crab\n", "stderr={stderr:?}");
 }
+
+#[test]
+fn std_format_empty_template_returns_empty_string() {
+    // Pins the walker's `i >= len` base case for an empty
+    // template. `format("", Nil)` short-circuits to an empty
+    // verbatim flush.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = format(\"\", Nil);\n  \
+                 perform IO.println(s);\n  \
+                 perform IO.println(int_to_string(string_length(s)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_empty_template");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "\n0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_adjacent_placeholders_no_separator() {
+    // Two `{}` placeholders with nothing between them. Pins the
+    // empty-run-flush path (the second placeholder has
+    // `run_start == i` when entering the open-brace handler).
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"{}{}\",\n    \
+                   Cons(AInt(1), Cons(AInt(2), Nil))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_adjacent_placeholders");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "12\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_trailing_open_brace_at_eof_emits_marker() {
+    // `{` at end-of-template — the `i + 1 < len` guard fails so
+    // there is no peek byte. Walker emits `{?` and advances past
+    // the `{`. Pins the EOF branch of the open-brace handler.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"x = {\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_trailing_open_brace_eof");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "x = {?\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_format_trailing_close_brace_at_eof_is_literal() {
+    // `}` at end-of-template — the `i + 1 < len` guard fails so
+    // there is no peek byte. Forgiving fallback emits a literal
+    // `}` and advances past it. Pins the EOF branch of the
+    // close-brace handler.
+    let src = "import std.format\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(format(\"done }\", Nil));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_format_trailing_close_brace_eof");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "done }\n", "stderr={stderr:?}");
+}
