@@ -18711,50 +18711,49 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 let user_arg_count = args.len();
                                 let total_arg_count = user_arg_count + 2;
 
-                                // PR #108 re-review #9 — defensive
-                                // debug_assert against a future routing
-                                // change that exposes this branch to a
-                                // non-synth-cont surrounding fn. The
-                                // `signature_match` guard above already
-                                // implies the surrounding sig has
-                                // cps_signature shape (sig equality is
-                                // transitive through callee_sig ==
-                                // surrounding_sig), but the args_ptr
-                                // LAYOUT (1 user arg + 2 trailing
-                                // post_arm_k slots) is a structural
-                                // invariant from the chained-let-yield
-                                // Final-step emit site — NOT observable
-                                // from the sig alone. Today's only
-                                // reachable path emits 1 user arg +
-                                // 2-trailing-pair synth-conts, so
-                                // assert that as the user-arg-count
-                                // invariant matches: this branch's
-                                // `args.len() == 1` (one user arg). A
-                                // routing change exposing higher-arity
-                                // Cps fns to this branch would trip
-                                // this assert in debug builds before
-                                // shipping the silent-load-from-wrong-
-                                // offset bug.
-                                debug_assert_eq!(
-                                    user_arg_count, 1,
-                                    "Cps→Cps tail branch reached with \
-                                     user_arg_count={} (expected 1 — \
-                                     synth-cont arity invariant). The \
-                                     args_ptr+POST_ARM_K_*_OFF loads \
-                                     below assume the Slice A 3-slot \
-                                     layout `[arg, post_arm_k_closure, \
-                                     post_arm_k_fn]`. A routing change \
-                                     made this branch reachable from a \
-                                     non-synth-cont Cps fn — verify the \
-                                     surrounding fn's args_ptr layout \
-                                     and update the offset constants \
-                                     before disabling this assert.",
-                                    user_arg_count,
-                                );
-
                                 // Load surrounding synth-cont's incoming
                                 // post_arm_k pair from its args_ptr (entry
                                 // block_params[1] per cps_signature).
+                                //
+                                // PR #108 re-review #9 — note on the
+                                // arity invariant. An earlier revision
+                                // attempted `debug_assert_eq!(user_arg
+                                // _count, 1)` here, but `user_arg_count`
+                                // is the CALLEE's arity — sudoku's
+                                // `solve(grid, row, col, n)` recurses
+                                // with 4 callee args and trips that
+                                // assert. The assert was checking the
+                                // wrong variable.
+                                //
+                                // The structurally correct invariant is
+                                // on the SURROUNDING synth-cont's
+                                // args_ptr layout (1 user arg + 2
+                                // trailing post_arm_k slots), not the
+                                // callee's. cps_signature is shape-
+                                // identical (4 params: closure, args_ptr,
+                                // args_len, terminal_out) regardless of
+                                // user arity, so neither the Cranelift
+                                // sig nor `args.len()` lets us assert
+                                // the surrounding's user-arg count
+                                // here. The structural invariant is
+                                // upheld by reachability: the only path
+                                // that lands here is the chained-let-
+                                // yield Final-step (codegen.rs:15834
+                                // area), and synth-conts always emit
+                                // with the 1-user-arg layout. A future
+                                // routing change exposing this branch
+                                // to non-synth-cont surroundings would
+                                // need to plumb the surrounding's
+                                // user-arg count into the Lowerer
+                                // before any assert is meaningful.
+                                //
+                                // The k-forwarding code below IS correct
+                                // for any callee arity: the LOAD reads
+                                // the surrounding synth-cont's fixed
+                                // args_ptr+8/+16, and the STORE uses
+                                // `k_closure_offset(user_arg_count)` /
+                                // `k_fn_offset(user_arg_count)` which
+                                // adapt to the callee's arity.
                                 let surrounding_entry = match self.builder.func.layout.entry_block()
                                 {
                                     Some(b) => b,

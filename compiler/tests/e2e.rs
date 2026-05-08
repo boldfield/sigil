@@ -13777,8 +13777,8 @@ fn tail_recursive_cps_colored_under_nested_handlers() {
     let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
                effect Choose { decide: () -> Int }\n\
                fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n  \
-                 let _: Int = perform State.get();\n  \
-                 let _: Int = perform Choose.decide();\n  \
+                 let _s: Int = perform State.get();\n  \
+                 let _c: Int = perform Choose.decide();\n  \
                  match n {\n    \
                    0 => 0,\n    \
                    _ => count_down_compose(n - 1),\n  \
