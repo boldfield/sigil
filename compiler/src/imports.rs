@@ -64,14 +64,7 @@ const BUILTIN_INJECTED: &[&str] = &[
     "mut_array.sigil",
     "byte_array.sigil",
     "mut_byte_array.sigil",
-    // `string.sigil` was previously listed here as a doc-only entry,
-    // but the Tier 2 follow-up addendum (`string_split` /
-    // `string_replace` source-level helpers) added real Sigil source
-    // that must be parsed at import time. The String primitive ops
-    // it documents (`string_length`, `string_concat`, etc.) are
-    // still registered as builtin schemes by
-    // `register_builtin_string_schemes()`; the source helpers are
-    // additive on top.
+    // `string.sigil` ships real source (string_split / string_replace).
     "mem.sigil",
     "int64.sigil",
     "string_builder.sigil",
