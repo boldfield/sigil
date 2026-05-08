@@ -12391,7 +12391,9 @@ fn tail_perform_state_get_after_set() {
 
 /// State+Raise composition: catch inside run_state.
 /// Raise fires, state set before raise survives in final state.
-/// This is the minimal reproduction of the v1 composition limitation.
+/// (The catch-OUTSIDE-run_state shape was the prior v1 limitation;
+/// closed by Plan State-Cell — see `state_compose_raise_propagates_err`
+/// for that direction's regression test.)
 #[test]
 fn state_raise_composition_catch_inside_run_state() {
     let src = "import std.state\n\
