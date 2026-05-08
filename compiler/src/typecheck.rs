@@ -15838,4 +15838,48 @@ mod tests {
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
+
+    #[test]
+    fn import_std_map_typechecks_cleanly() {
+        // Pin the full Map surface (constructor + lookup + insert +
+        // remove + iteration + transformations + convenience
+        // constructors). Imports `std.map`, which transitively pulls
+        // in `std.option` (for Option), `std.list` (for List), and
+        // `std.ordering` (for the per-type comparators).
+        let src = "import std.map\n\
+                   fn double(n: Int) -> Int ![] { n + n }\n\
+                   fn keep_big(_k: Int, v: Int) -> Bool ![] {\n  \
+                     v > 15\n\
+                   }\n\
+                   fn sum_values(acc: Int, _k: Int, v: Int) -> Int ![] {\n  \
+                     acc + v\n\
+                   }\n\
+                   fn main() -> Int ![IO] {\n  \
+                     let m0: Map[Int, Int] = map_int_keys();\n  \
+                     let _empty: Bool = map_is_empty(m0);\n  \
+                     let m1: Map[Int, Int] = map_insert(m0, 1, 10);\n  \
+                     let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
+                     let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
+                     let _sz: Int = map_size(m3);\n  \
+                     let _hit: Option[Int] = map_get(m3, 2);\n  \
+                     let _has: Bool = map_contains(m3, 2);\n  \
+                     let _ks: List[Int] = map_keys(m3);\n  \
+                     let _vs: List[Int] = map_values(m3);\n  \
+                     let pairs: List[(Int, Int)] = map_to_list(m3);\n  \
+                     let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n  \
+                     let _doubled: Map[Int, Int] = map_map(m4, double);\n  \
+                     let _bigs: Map[Int, Int] = map_filter(m4, keep_big);\n  \
+                     let total: Int = map_fold(m4, 0, sum_values);\n  \
+                     let m5: Map[Int, Int] = map_remove(m4, 2);\n  \
+                     let _sz2: Int = map_size(m5);\n  \
+                     let m6: Map[String, Int] = map_string_keys();\n  \
+                     let _m6b: Map[String, Int] = map_insert(m6, \"a\", 1);\n  \
+                     let m7: Map[Char, Int] = map_char_keys();\n  \
+                     let _m7b: Map[Char, Int] = map_insert(m7, 'a', 1);\n  \
+                     perform IO.println(int_to_string(total));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
 }
