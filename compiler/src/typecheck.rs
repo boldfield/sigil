@@ -1400,6 +1400,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         match_scrut_tys: BTreeMap::new(),
         call_callee_tys: BTreeMap::new(),
         fn_schemes: BTreeMap::new(),
+        bare_name_origins: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
         next_scope_id: 0,
@@ -1559,6 +1560,19 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             let qualified_key = format!("{}::{}", f.span.file, f.name);
             tc.fn_schemes.insert(qualified_key, scheme.clone());
             tc.fn_schemes.insert(f.name.clone(), scheme);
+            // Plan C addendum (Tier 1) — bare-name ambiguity tracking.
+            // Append the source file to this name's origin list, deduping
+            // intra-file re-registrations (which shouldn't happen for
+            // top-level fns but the dedup keeps the list correctness-by-
+            // construction). The list is read at call-site resolution
+            // in `check_call`'s `Expr::Ident` callee lookup; if 2+
+            // distinct source files registered the same bare name, the
+            // bare-name lookup is ambiguous and emits E0147.
+            let origin = f.span.file.clone();
+            let origins = tc.bare_name_origins.entry(f.name.clone()).or_default();
+            if !origins.contains(&origin) {
+                origins.push(origin);
+            }
         }
     }
     // E0112 sweep: any TypeExpr in an FnDecl signature that does not
@@ -2844,6 +2858,18 @@ struct Tc {
     /// path (e.g., during the recursive-fn pre-pass when the fn is
     /// being checked itself).
     fn_schemes: BTreeMap<String, Scheme>,
+    /// Plan C addendum (Tier 1) — bare-name ambiguity tracking.
+    /// Maps a bare fn name (e.g., `"map"`) to the list of source-file
+    /// paths that registered a fn under that name. When a call site
+    /// resolves a bare name and finds 2+ source files defining it,
+    /// the call is ambiguous (silent-wrong-dispatch class) and
+    /// `check_call`'s callee resolution emits E0147 naming the
+    /// conflicting modules. Built up by the user-fn pre-pass at
+    /// `register_fn_scheme_with_origin`. Builtins (registered in
+    /// compiler code via `register_builtin_*_schemes`) do NOT
+    /// participate — they're always in scope without imports and
+    /// never conflict with each other.
+    bare_name_origins: BTreeMap<String, Vec<String>>,
     /// Type-variable id supply — one counter per `Tc` lifetime.
     /// Allocated via `fresh_ty_var`; freed when the substitution
     /// resolves them. Codegen-entry walker in task 48 asserts no
@@ -5095,13 +5121,42 @@ impl Tc {
                 // Plan D Task 117 (b) Phase 4 — try the file-qualified
                 // key first so a fn body's recursive call to a same-
                 // named sibling-module fn resolves to its own module's
-                // scheme. Falls back to the bare name (last-wins
-                // across modules; user-facing default).
-                let scheme_opt = self
+                // scheme. Falls back to the bare name (Plan C Tier 1
+                // addendum: ambiguous bare-name lookups now emit E0147
+                // instead of silently picking last-registered).
+                let file_qualified_hit = self
                     .current_fn_file
                     .as_ref()
-                    .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned())
-                    .or_else(|| self.fn_schemes.get(name).cloned());
+                    .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned());
+                let scheme_opt = file_qualified_hit.or_else(|| {
+                    // Bare-name fallback path. Check ambiguity BEFORE
+                    // returning the last-wins entry: if 2+ source
+                    // files registered the same bare name, the lookup
+                    // is silent-wrong-dispatch territory.
+                    if let Some(origins) = self.bare_name_origins.get(name) {
+                        if origins.len() > 1 {
+                            let mut modules: Vec<String> = origins
+                                .iter()
+                                .map(|p| __module_label_from_file(p))
+                                .collect();
+                            modules.sort();
+                            modules.dedup();
+                            self.push_error(
+                                "E0147",
+                                span.clone(),
+                                format!(
+                                    "ambiguous bare name `{name}` — defined in {}. \
+                                     Multiple imported modules export `{name}`; \
+                                     remove all but one of these imports, or rename \
+                                     the user fn to avoid the collision (qualified-call \
+                                     syntax `module.fn(...)` is a future v2 surface).",
+                                    modules.join(", ")
+                                ),
+                            );
+                        }
+                    }
+                    self.fn_schemes.get(name).cloned()
+                });
                 if let Some(scheme) = scheme_opt {
                     let (ty, fresh_ids) = self.instantiate_with_vars(&scheme);
                     // Plan B task 49 — capture every top-level-fn use
@@ -8965,6 +9020,29 @@ fn saturating_add(a: usize, b: usize) -> usize {
     a.saturating_add(b).min(2)
 }
 
+/// Plan C addendum (Tier 1) — turn a source file path into a
+/// user-facing module label for the E0147 ambiguous-bare-name
+/// diagnostic. Stdlib modules embedded by `include_dir!` arrive
+/// with a relative path like `list.sigil` (basename only —
+/// `imports::path_to_module` strips the `std/` head). A user
+/// program file arrives as an absolute path like
+/// `/path/to/program.sigil`. Heuristic:
+///   - If the path has NO `/` separators (i.e., it's just a
+///     basename) and ends with `.sigil`, treat it as a stdlib
+///     module → `std.<basename-without-.sigil>`.
+///   - Otherwise return the basename without the `.sigil`
+///     extension (user file).
+#[allow(non_snake_case)]
+fn __module_label_from_file(path: &str) -> String {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let stem = basename.trim_end_matches(".sigil");
+    if !path.contains('/') && path.ends_with(".sigil") {
+        format!("std.{}", stem)
+    } else {
+        stem.to_string()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -11438,6 +11516,7 @@ mod tests {
             match_scrut_tys: BTreeMap::new(),
             call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
+            bare_name_origins: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
             next_scope_id: 0,
@@ -16167,5 +16246,83 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    // ===== Plan C addendum (Tier 1) — bare-name ambiguity =====
+
+    #[test]
+    fn bare_name_collision_across_imports_is_e0147() {
+        // `std.list::map` and `std.option::map` both define `map`.
+        // Importing both and calling bare `map(xs, f)` is silent-
+        // wrong-dispatch territory — the compiler now emits E0147
+        // naming the conflicting modules instead of silently picking
+        // the last-registered scheme.
+        let src = "import std.list\n\
+                   import std.option\n\
+                   fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
+                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0147"),
+            "expected E0147 on ambiguous bare `map`; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_name_single_import_is_unambiguous_no_e0147() {
+        // Importing only `std.list` keeps `map` unambiguous (only
+        // one source registers it). No E0147 should fire.
+        let src = "import std.list\n\
+                   fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
+                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0147"),
+            "did not expect E0147 with a single import; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_name_intra_module_recursive_call_is_unambiguous_no_e0147() {
+        // Inside `std.list`, `map` calls itself recursively. The
+        // file-qualified key path (current_fn_file == "list.sigil")
+        // resolves first, so the bare-name fallback never fires —
+        // no E0147 even though `map` is also registered in
+        // `std.option` / `std.result` (which `std.list` doesn't
+        // import). The existing stdlib loads cleanly under the
+        // ambiguity check; this test pins that as a regression
+        // guard.
+        let src = "import std.list\n\
+                   import std.option\n\
+                   import std.result\n\
+                   fn main() -> Int ![IO] {\n  \
+                     // No bare `map` call here — exercises only the\n  \
+                     // import-resolution path. Existing stdlib should\n  \
+                     // still typecheck cleanly under the new check.\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    #[test]
+    fn module_label_from_file_handles_stdlib_and_user_paths() {
+        assert_eq!(__module_label_from_file("list.sigil"), "std.list");
+        assert_eq!(__module_label_from_file("option.sigil"), "std.option");
+        assert_eq!(
+            __module_label_from_file("/Users/dev/sigil/std/list.sigil"),
+            "list"
+        );
+        assert_eq!(
+            __module_label_from_file("/path/to/program.sigil"),
+            "program"
+        );
+        assert_eq!(__module_label_from_file("noslashes"), "noslashes");
     }
 }

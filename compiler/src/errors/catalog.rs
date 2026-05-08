@@ -1011,6 +1011,41 @@ pub const CATALOG: &[ErrorEntry] = &[
                       type Cont = | Foo",
     },
     ErrorEntry {
+        code: "E0147",
+        short: "ambiguous bare name — multiple imported modules export it",
+        long: "Plan C addendum (Tier 1): when a user file imports two \
+               or more stdlib modules that each define a top-level \
+               function with the same bare name (e.g., `import std.list; \
+               import std.option;` — both export `map`), bare-name \
+               function calls (`map(xs, f)`) are silent-wrong-dispatch \
+               territory: the compiler resolves to whichever module \
+               registered the name most recently, which depends on \
+               import order and transitive load order.\n\n\
+               The fix is to remove all but one of the conflicting \
+               imports, or rename the call sites to avoid the bare \
+               name. Until v2 ships qualified-call syntax \
+               (`std.list.map(xs, f)`), there is no in-language \
+               disambiguation surface.\n\n\
+               Builtins (registered by the compiler — `int_to_string`, \
+               `string_concat`, etc.) do not participate in this check; \
+               only user-fn-from-stdlib registrations contribute to \
+               the ambiguity tracking.",
+        fix_example: "// Wrong (both modules define `map`):\n\
+                      import std.list\n\
+                      import std.option\n\
+                      fn main() -> Int ![] {\n  \
+                        let _ys: List[Int] = map(Cons(1, Nil), fn (x: Int) -> Int ![] => x);\n  \
+                        // E0147: ambiguous bare name `map`\n  \
+                        0\n\
+                      }\n\n\
+                      // Right (drop the unused import):\n\
+                      import std.list\n\
+                      fn main() -> Int ![] {\n  \
+                        let _ys: List[Int] = map(Cons(1, Nil), fn (x: Int) -> Int ![] => x);\n  \
+                        0\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \
