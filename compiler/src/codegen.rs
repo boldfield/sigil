@@ -15828,8 +15828,52 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // discharge from the surrounding
                                     // handle's tag check).
                                     lowerer.emit_terminal_out_reset_to_done();
-                                    let tail_value = lowerer.lower_expr(tail_expr.as_ref());
+                                    // TCO-4 follow-up — route through
+                                    // `lower_expr_in_tail_pos` so a Match
+                                    // tail with a recursive Cps→Cps arm
+                                    // body emits NextStep::Call return
+                                    // (via `lower_call_in_tail_pos`'s
+                                    // Cps→Cps branch) instead of the
+                                    // existing Cps direct-call branch
+                                    // (which nests sigil_run_loop per
+                                    // call, ~80 bytes/iter C-stack leak;
+                                    // capped count_down_cps at ~100K
+                                    // depth pre-fix). For Match-tails
+                                    // where at least one arm flows a
+                                    // value to cont, lower_match_in_tail_pos
+                                    // returns Value(cont_param) and the
+                                    // existing wrap+gate path runs
+                                    // as before. The recursive arm body
+                                    // emits return_(NextStep::Call) at
+                                    // arm-body block; cont stays reachable
+                                    // from the base-case arm only — so
+                                    // for n=0 the gate fires and returns
+                                    // Done(0), for n>0 the recursive
+                                    // arm returns NextStep::Call directly
+                                    // (cont and gate are dead at runtime).
+                                    let tail_result =
+                                        lowerer.lower_expr_in_tail_pos(tail_expr.as_ref());
                                     lowerer.emit_discharge_propagation_check();
+
+                                    let tail_value = match tail_result {
+                                        TailResult::Value(v) => v,
+                                        TailResult::NoValue => {
+                                            lowerer.builder.ins().iconst(types::I64, 0)
+                                        }
+                                        TailResult::Terminated => {
+                                            // All arms emitted return_
+                                            // (rare). Switch to a fresh
+                                            // dead block so the gate
+                                            // emit below has a current
+                                            // block to land in; the gate
+                                            // becomes dead code (Cranelift
+                                            // optimizer elides).
+                                            let dead = lowerer.builder.create_block();
+                                            lowerer.builder.switch_to_block(dead);
+                                            lowerer.builder.seal_block(dead);
+                                            lowerer.builder.ins().iconst(types::I64, 0)
+                                        }
+                                    };
 
                                     let widened = if *tail_ty == types::I64 {
                                         tail_value
