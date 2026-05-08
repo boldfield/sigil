@@ -14957,6 +14957,135 @@ fn std_set_convenience_constructors_per_primitive() {
     assert_eq!(stdout, "int-yes\nstr-yes\nchr-yes\n", "stderr={stderr:?}");
 }
 
+// ===== Plan C addendum (Tier 2) — `std.int` safe arithmetic =====
+//
+// Pure-Sigil overflow-checked Int arithmetic. `int_add_safe` and
+// `int_sub_safe` return `Option[Int]` — `Some(value)` on success,
+// `None` on overflow. See `std/int.sigil` for scope notes (mul/div
+// deferred pending a runtime primitive).
+
+#[test]
+fn std_int_max_min_round_trip() {
+    let src = "import std.int\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(int_max()));\n  \
+                 perform IO.println(int_to_string(int_min()));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_max_min_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "4611686018427387903\n-4611686018427387904\n",
+        "stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn std_int_add_safe_returns_some_when_no_overflow() {
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_add_safe(1, 2) {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_add_safe_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_int_add_safe_returns_none_on_positive_overflow() {
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_add_safe(int_max(), 1) {\n    \
+                   Some(_) => perform IO.println(\"BAD: should overflow\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_add_safe_pos_overflow");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "none\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_int_add_safe_returns_none_on_negative_overflow() {
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_add_safe(int_min(), -1) {\n    \
+                   Some(_) => perform IO.println(\"BAD\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_add_safe_neg_overflow");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "none\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_int_sub_safe_returns_some_when_no_overflow() {
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_sub_safe(5, 3) {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_sub_safe_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "2\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_int_sub_safe_underflow_is_none() {
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_sub_safe(int_min(), 1) {\n    \
+                   Some(_) => perform IO.println(\"BAD\"),\n    \
+                   None => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_sub_safe_underflow");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "none\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_int_sub_safe_at_int_min_special_case() {
+    // `b == int_min()` is the special-case branch — `-int_min()`
+    // would overflow, so the natural `int_add_safe(a, -b)` rewrite
+    // doesn't apply. Test both `a >= 0 → None` and `a < 0 → Some`.
+    let src = "import std.int\n\
+               import std.option\n\
+               fn main() -> Int ![IO] {\n  \
+                 match int_sub_safe(0, int_min()) {\n    \
+                   Some(_) => perform IO.println(\"BAD: 0 - MIN should overflow\"),\n    \
+                   None => perform IO.println(\"zero-none\"),\n  \
+                 };\n  \
+                 match int_sub_safe(-1, int_min()) {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None => perform IO.println(\"BAD\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_int_sub_safe_at_min");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "zero-none\n4611686018427387903\n",
+        "stderr={stderr:?}"
+    );
+}
+
 // ===== Plan C addendum (Stage FMT) — `std.format` =====
 
 #[test]

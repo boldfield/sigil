@@ -161,6 +161,9 @@ Tracks Plan C's execution against `boldfield/designs/in-progress/2026-04-21-sigi
 
     **Deferred to follow-up plan** (per the design doc's scope guardrails): `MutSet`, range queries (`set_range`, prefix scans), min / max queries (`set_min`, `set_max`), `set_for_each` per-element side-effect helper, range-based bulk ops. v1 ships only the persistent immutable `Set[T]` plus the closed-row pure-helper surface.
 
+- Task INT-SAFE (Plan C addendum, Tier 2 follow-up) — `std.int` safe arithmetic (`int_add_safe`, `int_sub_safe`).
+  - status: **done-pending-ci** ([plan-c-tier-2-safe-arith branch]). `std/int.sigil` ships as a real-Sigil module (auto-discovered via `include_dir!`). Surface: `int_max() = 2^62 - 1`, `int_min() = -2^62` range constants; `int_add_safe(a, b)` / `int_sub_safe(a, b)` returning `Option[Int]` — `Some(value)` on success, `None` on overflow. Both helpers pre-check for overflow before performing the op (using `int_max() - b` / `int_min() - b` shape) so the body declares `![]` cleanly. `int_sub_safe` special-cases `b == int_min()` because negating `int_min()` would overflow; the natural `int_add_safe(a, -b)` rewrite doesn't apply there. **Deferred to a follow-up plan with a runtime primitive:** `int_mul_safe`, `int_div_safe`, `int_mod_safe`. The natural pre-check pattern uses `/` (multiplication overflow detection via round-trip; division for divisor validation), and Sigil's typecheck rule that any use of `/` or `%` requires `![ArithError]` on the row applies regardless of guards. A runtime primitive `sigil_int_div_checked(a, b) -> Option[Int]` (and the multiply equivalent) lifts that constraint by performing check + op in one non-aborting FFI call. 1 typecheck unit test (`import_std_int_typechecks_cleanly`) + 7 e2e behavioural tests pin the surface.
+
 ## Stage 8 — Demo programs
 
 **Goal:** Three non-trivial programs compile and run end-to-end.
