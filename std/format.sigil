@@ -1,0 +1,251 @@
+// sigil: 0.1
+//
+// std/format.sigil — Plan C addendum (Stage FMT).
+//
+// `format(template, args)` walks a template string and substitutes
+// `{}` placeholders with stringified `FormatArg` values. Closes the
+// recurring `string_concat`-chain noise for multi-piece string
+// construction.
+//
+// All ops are pure (`![]`). No new runtime FFI primitives — the
+// implementation rides on the existing `string_byte_at`,
+// `string_length`, `string_substring`, `string_concat`,
+// `byte_to_int`, and the per-primitive `_to_string` helpers.
+//
+// ## Surface
+//
+// Entry points:
+//   - `format(template: String, args: List[FormatArg]) -> String ![]`
+//   - `format1(template, a) ... format8(template, a, ..., h)`
+//   - per-type helpers: `format_int`, `format_int64`, `format_string`,
+//     `format_float`, `format_bool`, `format_char`
+//
+// Template syntax (positional only — no specifiers, no named args,
+// no positional indices):
+//   - `{}`  — placeholder; consumes the next FormatArg from `args`.
+//   - `{{`  — literal `{`.
+//   - `}}`  — literal `}`.
+//   - all other characters appear verbatim.
+//
+// ## Mismatched-arity policy (forgiving)
+//
+// - **Too few args**: a `{}` with no remaining arg emits the literal
+//   marker `"{?}"` and continues. Easier for an LLM to debug from
+//   the output than a runtime crash.
+// - **Too many args**: extra args are silently ignored. The template
+//   controls the output.
+// - **Trailing `{` with no follow byte**: emits `"{?"` (treated as
+//   an invalid placeholder).
+// - **Unbalanced `}` not followed by `}`**: emits a literal `}`.
+//
+// ## Byte-level walk safety
+//
+// The walker scans the template byte-by-byte. Special characters
+// (`{` = 0x7B, `}` = 0x7D) are ASCII codepoints, which by UTF-8
+// rules cannot appear inside a multi-byte sequence's continuation
+// bytes (those have the high bit set, 0x80..0xBF). The walker emits
+// non-special bytes by extending a "verbatim run" `[run_start, i)`
+// and flushing it via `string_substring` only when a special byte
+// is encountered (or at end-of-template). Substrings therefore
+// always slice on UTF-8 boundaries — multi-byte sequences pass
+// through intact.
+//
+// ## Stack-depth bound
+//
+// The walker is recursive; Sigil v1 does not guarantee tail-call
+// optimisation. Each recursive call advances at least one byte, so
+// stack depth is O(template_byte_length). For typical templates
+// (≤ a few thousand bytes) this stays well within the default
+// system stack budget. Same bound as `std/list.sigil`'s recursive
+// helpers.
+//
+// ## Forwarder layer
+//
+// `format1` ... `format8` are mechanical 1-line forwarders that
+// build the `List[FormatArg]` for the user. They cap at arity 8;
+// callers needing more pass a `List[FormatArg]` to the general
+// `format` directly.
+//
+// Per-type wrappers (`format_int`, `format_string`, ...) save the
+// `AInt(...)` / `AString(...)` ceremony for the common single-arg
+// case. This is the form LLMs reach for ~80% of the time in
+// practice.
+
+import std.list
+import std.option
+import std.string
+
+// `FormatArg` is the sum of every primitive type the formatter
+// can stringify. Constructors mirror the Sigil v1 primitive set:
+// `Int`, `Int64`, `Float`, `String`, `Bool`, `Char`.
+type FormatArg =
+  | AInt(Int)
+  | AInt64(Int64)
+  | AFloat(Float)
+  | AString(String)
+  | ABool(Bool)
+  | AChar(Char)
+
+// `__arg_to_string(a)` lowers a `FormatArg` to its String form.
+// `AString(s)` returns `s` directly (no allocation). All other
+// variants delegate to the matching primitive `_to_string` helper.
+fn __arg_to_string(a: FormatArg) -> String ![] {
+  match a {
+    AInt(n) => int_to_string(n),
+    AInt64(n) => int64_to_string(n),
+    AFloat(f) => float_to_string(f),
+    AString(s) => s,
+    ABool(b) => if b { "true" } else { "false" },
+    AChar(c) => char_to_string(c),
+  }
+}
+
+// `format(template, args)` — see file header for surface and
+// arity-mismatch behaviour.
+fn format(template: String, args: List[FormatArg]) -> String ![] {
+  __fmt_walk(template, string_length(template), 0, 0, args, "")
+}
+
+// `__fmt_walk` is the byte-level state machine over `template`.
+//
+// Threaded state:
+//   - `len`        — `string_length(template)`, hoisted out of the
+//                    loop so each recursive call avoids the header
+//                    re-read.
+//   - `run_start`  — start index of the next pending verbatim run.
+//   - `i`          — current byte index.
+//   - `args`       — remaining `FormatArg` values.
+//   - `acc`        — output accumulator (concat-chain; `format` is
+//                    pure, so `StringBuilder` is unavailable —
+//                    `sb_*` ops gate on the `Mem` effect).
+//
+// On a special byte, the walker first flushes
+// `string_substring(template, run_start, i)` into `acc`, then
+// handles the special, then resumes scanning with `run_start`
+// updated past the consumed bytes.
+fn __fmt_walk(template: String, len: Int, run_start: Int, i: Int,
+              args: List[FormatArg], acc: String) -> String ![] {
+  if i >= len {
+    string_concat(acc, string_substring(template, run_start, len))
+  } else {
+    let b: Int = byte_to_int(string_byte_at(template, i));
+    if b == 123 { __fmt_open_brace(template, len, run_start, i, args, acc) }
+    else { if b == 125 { __fmt_close_brace(template, len, run_start, i, args, acc) }
+           else { __fmt_walk(template, len, run_start, i + 1, args, acc) } }
+  }
+}
+
+// Handle `{` at position `i`: peek the next byte and dispatch on
+// `{{` (literal `{`), `{}` (consume arg), or anything else /
+// end-of-template (invalid-placeholder marker `{?`).
+fn __fmt_open_brace(template: String, len: Int, run_start: Int, i: Int,
+                    args: List[FormatArg], acc: String) -> String ![] {
+  let head: String = string_substring(template, run_start, i);
+  let acc2: String = string_concat(acc, head);
+  if i + 1 < len {
+    let nb: Int = byte_to_int(string_byte_at(template, i + 1));
+    if nb == 123 {
+      __fmt_walk(template, len, i + 2, i + 2, args, string_concat(acc2, "{"))
+    } else { if nb == 125 {
+      match args {
+        Nil => __fmt_walk(template, len, i + 2, i + 2, Nil,
+                          string_concat(acc2, "{?}")),
+        Cons(a, rest) => __fmt_walk(template, len, i + 2, i + 2, rest,
+                                    string_concat(acc2, __arg_to_string(a))),
+      }
+    } else {
+      __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "{?"))
+    } }
+  } else {
+    __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "{?"))
+  }
+}
+
+// Handle `}` at position `i`: peek the next byte and dispatch on
+// `}}` (literal `}`) or anything else (forgiving — emit a literal
+// `}` and advance one byte).
+fn __fmt_close_brace(template: String, len: Int, run_start: Int, i: Int,
+                     args: List[FormatArg], acc: String) -> String ![] {
+  let head: String = string_substring(template, run_start, i);
+  let acc2: String = string_concat(acc, head);
+  if i + 1 < len {
+    let nb: Int = byte_to_int(string_byte_at(template, i + 1));
+    if nb == 125 {
+      __fmt_walk(template, len, i + 2, i + 2, args, string_concat(acc2, "}"))
+    } else {
+      __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "}"))
+    }
+  } else {
+    __fmt_walk(template, len, i + 1, i + 1, args, string_concat(acc2, "}"))
+  }
+}
+
+// `format1(t, a)` ... `format8(t, a, ..., h)` are mechanical
+// forwarders. Each builds the `List[FormatArg]` and delegates to
+// `format`. Callers needing more than 8 args pass the list to
+// `format` directly.
+fn format1(template: String, a: FormatArg) -> String ![] {
+  format(template, Cons(a, Nil))
+}
+
+fn format2(template: String, a: FormatArg, b: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Nil)))
+}
+
+fn format3(template: String, a: FormatArg, b: FormatArg, c: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Cons(c, Nil))))
+}
+
+fn format4(template: String, a: FormatArg, b: FormatArg, c: FormatArg,
+           d: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Cons(c, Cons(d, Nil)))))
+}
+
+fn format5(template: String, a: FormatArg, b: FormatArg, c: FormatArg,
+           d: FormatArg, e: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Cons(c, Cons(d, Cons(e, Nil))))))
+}
+
+fn format6(template: String, a: FormatArg, b: FormatArg, c: FormatArg,
+           d: FormatArg, e: FormatArg, f: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Cons(c, Cons(d, Cons(e, Cons(f, Nil)))))))
+}
+
+fn format7(template: String, a: FormatArg, b: FormatArg, c: FormatArg,
+           d: FormatArg, e: FormatArg, f: FormatArg, g: FormatArg) -> String ![] {
+  format(template, Cons(a, Cons(b, Cons(c, Cons(d, Cons(e, Cons(f, Cons(g, Nil))))))))
+}
+
+fn format8(template: String, a: FormatArg, b: FormatArg, c: FormatArg,
+           d: FormatArg, e: FormatArg, f: FormatArg, g: FormatArg,
+           h: FormatArg) -> String ![] {
+  format(template,
+         Cons(a, Cons(b, Cons(c, Cons(d, Cons(e, Cons(f, Cons(g, Cons(h, Nil)))))))))
+}
+
+// Per-type single-arg wrappers. Each saves the `AInt(...)` /
+// `AString(...)` ceremony at the call site for the common
+// "interpolate one value" pattern.
+fn format_int(template: String, n: Int) -> String ![] {
+  format1(template, AInt(n))
+}
+
+fn format_int64(template: String, n: Int64) -> String ![] {
+  format1(template, AInt64(n))
+}
+
+fn format_string(template: String, s: String) -> String ![] {
+  format1(template, AString(s))
+}
+
+fn format_float(template: String, f: Float) -> String ![] {
+  format1(template, AFloat(f))
+}
+
+fn format_bool(template: String, b: Bool) -> String ![] {
+  format1(template, ABool(b))
+}
+
+fn format_char(template: String, c: Char) -> String ![] {
+  format1(template, AChar(c))
+}
