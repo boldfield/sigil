@@ -17700,8 +17700,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             entry.abi
         );
         // Build the shim's signature on demand (matches the one
-        // declared at user_fns insertion time).
-        let mut shim_sig = Signature::new(isa_call_conv(&module));
+        // declared at user_fns insertion time — see the shim_sig
+        // construction in the user-fns declaration loop).
+        // TCO-4 — `CallConv::Tail` to match the declared sig (and
+        // match the indirect-closure-call sig); a CC mismatch
+        // between declare and define corrupts the runtime ABI
+        // (manifested as `sigil_run_loop: out pointer must be
+        // 8-byte aligned` panics on macOS aarch64).
+        let mut shim_sig = Signature::new(isa::CallConv::Tail);
         shim_sig.params.push(AbiParam::new(pointer_ty));
         // entry.param_tys[0] is closure_ptr; user params start at [1].
         // For Cps fns we used cps_signature so param_tys is
