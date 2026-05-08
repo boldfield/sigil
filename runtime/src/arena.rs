@@ -486,12 +486,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "abort tests are not directly observable from cargo test; \
-                run with `cargo test -- --ignored` and confirm SIGABRT manually"]
-    fn arena_overflow_aborts() {
-        // Force a tiny capacity so the next alloc cannot fit.
-        force_capacity_for_test(1); // 8 bytes capacity
-        let _ = unsafe { sigil_arena_alloc(8) }; // fills it
-        let _ = unsafe { sigil_arena_alloc(8) }; // should abort
+    fn arena_overflow_aborts() -> Result<(), Box<dyn std::error::Error>> {
+        // Plan State-Cell — was previously `#[ignore]`'d ("abort tests
+        // are not directly observable from cargo test"). Self-execed
+        // subprocess approach: re-run this test binary with
+        // `SIGIL_TEST_ARENA_OVERFLOW_CHILD=1`; the child takes the
+        // child branch, calls the abort path, dies via `process::abort`,
+        // and the parent's `Command::output` reports a non-zero exit
+        // status that the assert below pins. The fn returns
+        // `Result<(), Box<dyn Error>>` so fallible setup steps can
+        // route through `?` instead of `expect()` (the workspace
+        // clippy config disallows `expect`/`unwrap` to keep error
+        // paths explicit). Same pattern absorbs future abort-path
+        // tests without re-introducing `#[ignore]`.
+        if std::env::var_os("SIGIL_TEST_ARENA_OVERFLOW_CHILD").is_some() {
+            // Child mode: trigger the abort path. The child subprocess
+            // will die via `process::abort` here; control never
+            // returns to the test harness.
+            force_capacity_for_test(1); // 8 bytes capacity
+            let _ = unsafe { sigil_arena_alloc(8) }; // fills it
+            let _ = unsafe { sigil_arena_alloc(8) }; // aborts
+            unreachable!("arena overflow path should have aborted");
+        }
+        let exe = std::env::current_exe()?;
+        let output = std::process::Command::new(&exe)
+            .args([
+                "arena::tests::arena_overflow_aborts",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("SIGIL_TEST_ARENA_OVERFLOW_CHILD", "1")
+            .output()?;
+        assert!(
+            !output.status.success(),
+            "child subprocess succeeded; expected SIGABRT from arena overflow. \
+             stdout={:?} stderr={:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("arena overflow"),
+            "expected `arena overflow` abort message; got stderr: {stderr}"
+        );
+        Ok(())
     }
 }

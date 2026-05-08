@@ -135,32 +135,40 @@ value (single-shot in v1; multi-shot supported for the static-N
 let-chain shape per [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md)
 Tasks 71–73).
 
-Stateful computation with `State` + multi-effect rows:
+Stateful computation with `State[S]` + multi-effect rows:
 
 ```sigil
 import std.state
 
-fn counter() -> Int ![State] {
+fn counter() -> Int ![State[Int]] {
   let _: Int = perform State.set(10);
   let v: Int = perform State.get();
   v + 1
 }
 
 fn main() -> Int ![IO] {
-  let result: Int = run_state(5, counter);
-  perform IO.println(int_to_string(result));   // prints 11
+  let pair: (Int, Int) = run_state(5, counter);
+  match pair { (result, _final_state) =>
+    perform IO.println(int_to_string(result));   // prints 11
+  };
   0
 }
 ```
 
-`run_state(initial, body)` is a higher-order discharger that threads
-the state through the body's `perform State.get/set` sites. Other
-effects in the row (here `IO`) are unaffected.
+`run_state[A, S](initial, body) -> (A, S)` is a higher-order
+discharger that threads the state through the body's
+`perform State.get/set` sites and returns the body's value paired
+with the final state. Other effects in the row (here `IO`) are
+unaffected. State composes with `Raise[E]` in either nesting order
+(`catch(run_state(...))` or `run_state(catch(...))`); the cell-backed
+encoding propagates foreign discharges cleanly through the existing
+CPS infrastructure.
 
 See [`examples/interpreter.sigil`](examples/interpreter.sigil) for a
 tree-walking interpreter using `Raise` + `catch`, and
 [`examples/json.sigil`](examples/json.sigil) for a JSON pretty-printer
-using the `StringBuilder` rope under `Mem`.
++ recursive-descent parser using `State[Int]` cursor + `Raise[String]`
+short-circuit, discharged via `run_state` + `catch`.
 
 ## What sigil deliberately is not
 
@@ -262,17 +270,18 @@ Task 73's `Choose` dischargers and the Sudoku demo:
 | Gap | Behavior today | Closure point |
 |-----|----------------|---------------|
 | First-class continuations (`k` as a value, captured into a closure, passed to a helper) | Rejected with "first-class continuations are deferred to v2" diagnostic in `compiler/src/codegen.rs::arm_body_walk`. Single-shot and static-N let-chain multi-shot handler arms work; arbitrary-arity / fold-callback / nested-match k-call shapes do not. Blocks `std/choose.sigil`'s `all_choices` / `first_choice` dischargers and the Sudoku demo. | v2 future architectural slice |
-| Wrapper-fn-frame composition for discharge-with-lambda | `examples/state.sigil`'s inline-perform shape works; wrapping `perform State.get/set` in a helper fn breaks the discharge-with-lambda continuation chain (the wrapper's frame doesn't re-thread state). Pinned by `#[ignore]`'d e2e test `std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix`. | v2 (same architectural slice) |
-| Type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`) | Parser rejects type-parameterized effect references in rows; v1 ships concrete-typed effects (`Raise` over `String`, `State` over `Int`). | v2 (parser surface lift) |
-| Tuple type / `Pair[A, B]` stdlib | No tuples; `run_state` returns just `A` (not `(A, S)`). User code threads final state via the body return value. | v2 stdlib expansion |
+| Multi-shot State (`run_state` with re-entered `k`) | The current cell-backed `run_state` is correct under single-shot resume only; a custom multi-shot State handler that re-enters `k` would see cell mutations from the first invocation aliased into the second. The `resumes: many` annotation on `effect State` permits user-defined multi-shot State handlers, but the canonical `run_state` never invokes `k` twice — the practical surface in v1 is single-shot. | v2 (snapshotting layer atop the cell encoding) |
 
 Each row's "Closure point" links to the corresponding `[DEVIATION
 Task NN]` entry in `PLAN_C_DEVIATIONS.md` for the technical
-detail. The cluster of v2 architectural lifts (first-class
-continuations, wrapper-fn-frame composition for discharge-with-
-lambda, conditional-k handler-arm tails) is the path that unlocks
-`std.choose`'s dischargers and the Sudoku demo (Task 81); scoping
-is a future-work decision.
+detail. The remaining v2 architectural lift is **first-class
+continuations** — `k` as a value, captured into a closure, passed
+to a helper. That's the path that unlocks `std.choose`'s
+dischargers and the Sudoku demo (Task 81); scoping is a
+future-work decision. Wrapper-fn-frame composition,
+type-parameterized effect rows (`![Raise[E]]`, `![State[S]]`),
+tuples (`(A, B)`), and the State+Raise composition gap have all
+landed in Plan C / D / State-Cell follow-ups.
 
 Authoritative sources:
 - [`PLAN_C_PROGRESS.md`](PLAN_C_PROGRESS.md) — current task status.

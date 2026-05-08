@@ -75,6 +75,7 @@ pub mod mem;
 pub mod panic;
 pub mod process;
 pub mod random;
+pub mod refs;
 pub mod stackmap;
 pub mod string;
 pub mod string_builder;

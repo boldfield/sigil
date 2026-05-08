@@ -1407,6 +1407,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         next_scope_var: 0,
         current_fn_scope_var: None,
         current_fn_file: None,
+        stdlib_files: program.stdlib_files.clone(),
         current_arm_scope_id: None,
         subst: Subst::new(),
         current_generic_subst: BTreeMap::new(),
@@ -1456,6 +1457,10 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     register_builtin_int_bitwise_schemes(&mut tc);
     // Plan C addendum (panic / assert) — diagnostic builtins.
     register_builtin_diagnostic_schemes(&mut tc);
+    // Plan State-Cell — Ref[T] runtime cell ops. Gated by file-path
+    // to `std/state.sigil` only at call-site resolution. See
+    // `register_builtin_ref_schemes` for the surface.
+    register_builtin_ref_schemes(&mut tc);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -2090,6 +2095,23 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
             name: "StringBuilder".to_string(),
             name_span: span.clone(),
             generic_params: Vec::new(),
+            variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Plan State-Cell — Ref[T] is opaque, generic. Single-slot
+        // mutable runtime cell. Constructed via `sigil_ref_alloc`,
+        // accessed via `sigil_ref_deref` / `sigil_ref_set`. The
+        // three ops are gated by file-path to `std/state.sigil`
+        // only — Ref[T] is internal scaffolding for the cell-backed
+        // State implementation, not a user-facing type. (See
+        // `docs/plans/2026-05-08-sigil-state-runtime-cell-design.md`.)
+        TypeDecl {
+            name: "Ref".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![GenericParam {
+                name: "T".to_string(),
+                span: span.clone(),
+            }],
             variants: Vec::new(),
             span,
         },
@@ -2789,6 +2811,98 @@ fn register_builtin_diagnostic_schemes(tc: &mut Tc) {
     );
 }
 
+/// Plan State-Cell — predicate matching the three runtime cell ops by
+/// name. Used by `check_call`'s `Expr::Ident` resolution to file-gate
+/// access to `Ref[T]` allocation / load / store.
+fn is_ref_runtime_op(name: &str) -> bool {
+    matches!(
+        name,
+        "sigil_ref_alloc" | "sigil_ref_deref" | "sigil_ref_set"
+    )
+}
+
+/// Plan State-Cell — file-path predicate identifying `std/state.sigil`,
+/// requiring the file string to be in the stdlib-origin set populated
+/// by `imports::resolve` at load time. The set discrimination prevents
+/// a coincidentally-named user file at the project root from bypassing
+/// the gate (review feedback on PR #117 #3): bare-name match alone is
+/// not enough because user code lexed via `pipeline::compile(input)`
+/// with `input == "state.sigil"` produces the same `span.file` as the
+/// stdlib's bundled module.
+fn file_is_std_state_sigil(file: &str, stdlib_files: &std::collections::BTreeSet<String>) -> bool {
+    file == "state.sigil" && stdlib_files.contains(file)
+}
+
+/// Plan State-Cell — three runtime ops backing `std/state.sigil`'s
+/// cell-based State implementation. The schemes are universal in `T`
+/// (`forall T. ...`) so they unify against whatever the cell is
+/// parameterised on. Effect row is `![]` deliberately: `Ref[T]` cannot
+/// escape `std/state.sigil` (path-gated at call-site resolution), so
+/// the user-observable side-effect is the State effect on
+/// `perform State.get/set`, not a Mut-on-Ref effect that would need a
+/// separate row.
+///
+/// Operations:
+/// - `sigil_ref_alloc[T](T) -> Ref[T] ![]`
+/// - `sigil_ref_deref[T](Ref[T]) -> T ![]`
+/// - `sigil_ref_set[T](Ref[T], T) -> Unit ![]`
+fn register_builtin_ref_schemes(tc: &mut Tc) {
+    {
+        let t = tc.fresh_ty_var();
+        let ref_t = Ty::User("Ref".to_string(), vec![Ty::Var(t)]);
+        tc.fn_schemes.insert(
+            "sigil_ref_alloc".to_string(),
+            Scheme {
+                type_vars: vec![t],
+                row_vars: Vec::new(),
+                scope_vars: Vec::new(),
+                body: Ty::Fn(Box::new(FnSig {
+                    params: vec![Ty::Var(t)],
+                    ret: ref_t,
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                })),
+            },
+        );
+    }
+    {
+        let t = tc.fresh_ty_var();
+        let ref_t = Ty::User("Ref".to_string(), vec![Ty::Var(t)]);
+        tc.fn_schemes.insert(
+            "sigil_ref_deref".to_string(),
+            Scheme {
+                type_vars: vec![t],
+                row_vars: Vec::new(),
+                scope_vars: Vec::new(),
+                body: Ty::Fn(Box::new(FnSig {
+                    params: vec![ref_t],
+                    ret: Ty::Var(t),
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                })),
+            },
+        );
+    }
+    {
+        let t = tc.fresh_ty_var();
+        let ref_t = Ty::User("Ref".to_string(), vec![Ty::Var(t)]);
+        tc.fn_schemes.insert(
+            "sigil_ref_set".to_string(),
+            Scheme {
+                type_vars: vec![t],
+                row_vars: Vec::new(),
+                scope_vars: Vec::new(),
+                body: Ty::Fn(Box::new(FnSig {
+                    params: vec![ref_t, Ty::Var(t)],
+                    ret: Ty::Unit,
+                    effects: Vec::new(),
+                    effect_row_var: None,
+                })),
+            },
+        );
+    }
+}
+
 struct Tc {
     errors: Vec<CompilerError>,
     string_literals: Vec<(Span, String)>,
@@ -2934,6 +3048,18 @@ struct Tc {
     /// same-named sibling-module fn (e.g., `map` in `std.list` vs
     /// `std.option`) resolves to ITS OWN module's scheme.
     current_fn_file: Option<String>,
+    /// Plan State-Cell — set of `span.file` strings whose source
+    /// originated from the embedded stdlib (loaded via
+    /// `imports::resolve`). Read by `check_call`'s `Expr::Ident`
+    /// resolution to gate calls to runtime-internal builtins
+    /// (`sigil_ref_alloc` / `sigil_ref_deref` / `sigil_ref_set`,
+    /// emitting E0148 from outside `std/state.sigil`). Discriminating
+    /// against the set rather than against the file string alone
+    /// prevents a user file coincidentally named `state.sigil` at
+    /// the project root from bypassing the gate. Empty for test
+    /// fixtures and pre-resolve programs (no stdlib imports loaded
+    /// → no gated callers possible).
+    stdlib_files: std::collections::BTreeSet<String>,
     /// Plan D Task 117 (continuation-surface) — current handler arm
     /// body's scope id, set during arm-body typecheck walks. When
     /// `Some(N)`, user-written `Continuation[op_ret, ret]` type
@@ -5158,6 +5284,36 @@ impl Tc {
                     self.fn_schemes.get(name).cloned()
                 });
                 if let Some(scheme) = scheme_opt {
+                    // Plan State-Cell — gate the three runtime cell
+                    // ops to calls from inside `std/state.sigil` only.
+                    // `Ref[T]` is internal scaffolding for the cell-
+                    // based State implementation; user code must not
+                    // touch the runtime ops directly. Failure mode
+                    // we're preventing: a user holding a `Ref[T]`
+                    // bypasses the State effect's gating, breaking the
+                    // "all observable mutation goes through effects"
+                    // invariant.
+                    if is_ref_runtime_op(name) {
+                        let from_state_sigil = self
+                            .current_fn_file
+                            .as_ref()
+                            .map(|file| file_is_std_state_sigil(file, &self.stdlib_files))
+                            .unwrap_or(false);
+                        if !from_state_sigil {
+                            self.push_error(
+                                "E0148",
+                                span.clone(),
+                                format!(
+                                    "`{name}` is a runtime-internal builtin and may only be \
+                                     called from `std/state.sigil`. v1 does not expose mutable \
+                                     cells (`Ref[T]`) to user code; observable state goes through \
+                                     the `State` effect via `run_state` / `perform State.get` / \
+                                     `perform State.set`."
+                                ),
+                            );
+                            return None;
+                        }
+                    }
                     let (ty, fresh_ids) = self.instantiate_with_vars(&scheme);
                     // Plan B task 49 — capture every top-level-fn use
                     // site (callee in a Call, or value-position Ident
@@ -11523,6 +11679,7 @@ mod tests {
             next_scope_var: 0,
             current_fn_scope_var: None,
             current_fn_file: None,
+            stdlib_files: std::collections::BTreeSet::new(),
             current_arm_scope_id: None,
             subst: Subst::new(),
             current_generic_subst: BTreeMap::new(),
@@ -16324,5 +16481,54 @@ mod tests {
             "program"
         );
         assert_eq!(__module_label_from_file("noslashes"), "noslashes");
+    }
+
+    // ===== Plan State-Cell — Ref[T] runtime cell ops gating =====
+
+    #[test]
+    fn sigil_ref_alloc_called_from_user_code_is_e0148() {
+        // User code (pipeline's synthetic main file) calling
+        // `sigil_ref_alloc` directly trips the file-path gate. The
+        // op is reserved for `std/state.sigil`'s cell-based State
+        // implementation; user code that wants mutation goes through
+        // `perform State.set` / `perform State.get` after running
+        // under `run_state`.
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let _r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_alloc call from user code; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sigil_ref_deref_called_from_user_code_is_e0148() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     let _v: Int = sigil_ref_deref(r);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_deref call from user code; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn sigil_ref_set_called_from_user_code_is_e0148() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
+                     let _u: Unit = sigil_ref_set(r, 5);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0148"),
+            "expected E0148 on direct sigil_ref_set call from user code; got {errs:?}"
+        );
     }
 }

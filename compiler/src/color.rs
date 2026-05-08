@@ -1202,6 +1202,7 @@ mod tests {
         let program = Program {
             items,
             file: "test.sigil".to_string(),
+            stdlib_files: std::collections::BTreeSet::new(),
         };
         let checked = CheckedProgram {
             program,

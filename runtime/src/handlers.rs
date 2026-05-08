@@ -341,7 +341,23 @@ pub(crate) fn unregister_handler_stack_root_for_calling_thread(
 // treats them as non-pointer-like or as pointers to non-heap regions,
 // either way they're benign.
 
-const OUTER_POST_ARM_K_STACK_SIZE: usize = 32;
+// Plan State-Cell — bumped from 32 to 256. Cell-based State arms
+// resume `k(arg)` (rather than discharging with a state-fn closure
+// like Plotkin's encoding), so State's run_loop stays alive across
+// State.get/set operations. Each chain Middle step pushes one
+// OUTER_POST_ARM_K entry on perform; in deeply-recursive State-using
+// fns (e.g., a recursive-descent JSON parser doing `let pos =
+// perform State.get(); ... let _ = perform State.set(pos+N); ...`
+// inside each recursive frame), pushes accumulate linearly with
+// recursion depth and the prior cap of 32 overflowed on real
+// programs. The Plotkin encoding worked under cap=32 because each
+// State op terminated State's run_loop, draining the entries
+// pushed during that loop's lifetime. Cell-based encoding can't
+// terminate the run_loop without re-introducing the Sync-ABI gap
+// the cell encoding fixes (foreign-discharge propagation through
+// fn returns), so the resolution is the larger cap. v2 may revisit
+// with a growable VecDeque or a chunked overflow region.
+const OUTER_POST_ARM_K_STACK_SIZE: usize = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone)]

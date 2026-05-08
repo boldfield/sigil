@@ -11,6 +11,16 @@ use crate::errors::Span;
 pub struct Program {
     pub items: Vec<Item>,
     pub file: String,
+    /// Set of `span.file` strings that originated from the embedded
+    /// stdlib (loaded via `imports::resolve` from `stdlib_embed::STD`).
+    /// Populated by [`crate::imports::resolve`]; empty by default
+    /// (test fixtures and pre-resolve programs). Read by the
+    /// typechecker's path-gate for runtime-internal builtins (E0148):
+    /// a fn whose `current_fn_file` is in this set AND matches a
+    /// recognised stdlib name (e.g., `state.sigil`) is permitted to
+    /// call gated ops; user code with a coincidentally-matching file
+    /// name is rejected because its file string isn't in the set.
+    pub stdlib_files: std::collections::BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -258,10 +258,19 @@ fn main() -> Int ![IO] {
 (initial, body)` discharges the `State[S]` effect by threading
 `initial` through every `perform State.get/set` site in `body`'s call
 tree, returning `(A, S)` — the body's result paired with the final
-state. The discharger is a higher-order function defined in pure Sigil
-(see [`std/state.sigil`](../std/state.sigil)). Both type parameters
-are inferred from the call site (e.g. `run_state(5, comp)` instantiates
-`A = Int`, `S = Int`).
+state. The discharger is defined in pure Sigil over a runtime cell
+primitive (see [`std/state.sigil`](../std/state.sigil)). Both type
+parameters are inferred from the call site (e.g. `run_state(5, comp)`
+instantiates `A = Int`, `S = Int`).
+
+`State[S]` composes with `Raise[E]` in either nesting order:
+`catch(run_state(...))` and `run_state(catch(...))` both work. A
+foreign `raise` inside a `run_state` body propagates through the
+State handle as `Discharge(effect=Raise, value=Err)`, reaching the
+enclosing `catch` cleanly — the State arm bodies resume `k(...)`
+directly (rather than returning a state-fn closure), so the foreign
+discharge passes through the existing CPS infrastructure without the
+Sync-ABI gap that would otherwise mask the discharge tag.
 
 ### E10 — Multi-effect rows
 
@@ -1248,7 +1257,7 @@ files are the authoritative API reference.
 | `std.random` | `Random` effect + `run_pseudo_random` (process-global xorshift64) + `run_seeded_random` (deterministic xorshift64 from an `Int64` seed). **Not cryptographically secure.** |
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos) + `run_frozen_clock` (fixed `Int64` timestamp for test determinism). |
 | `std.raise` | `Raise[E]` effect (generic over error type) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-polymorphic residual). |
-| `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> A ![]`. |
+| `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> (A, S) ![]`. Backed by a runtime mutable cell (`Ref[S]`) — `run_state` allocates a cell on entry, threads State arms' `get` / `set` resumes through it, and reads the final state out at exit. The cell-backed encoding composes cleanly with `Raise[E]` in either nesting order; the prior Plotkin lambda-encoding had a Sync-ABI gap that surfaced as SIGSEGV on `catch(run_state(... raise ...))`. `Ref[T]` is internal scaffolding: the typechecker rejects calls to `sigil_ref_alloc` / `sigil_ref_deref` / `sigil_ref_set` from outside `std/state.sigil` (E0148). |
 | `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
 | `std.panic` | Doc-only header for the `panic` / `assert` builtins (see §13.2.1). Importing it is a no-op — both names are available without `import`. |
 
