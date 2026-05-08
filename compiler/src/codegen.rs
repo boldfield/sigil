@@ -1740,9 +1740,8 @@ fn expr_unsupported_handle(
                     cont_param_callees,
                 ) {
                     return Some(format!(
-                        "`handle` expression at {:?} has arm `{}.{}` body that {} \
-                         (Plan B Task 55, in progress)",
-                        span, arm.effect, arm.op, msg
+                        "`handle` arm `{}.{}` body: {msg}",
+                        arm.effect, arm.op
                     ));
                 }
             }
@@ -1768,11 +1767,7 @@ fn expr_unsupported_handle(
                     cont_param_callees,
                     /* tail = */ false,
                 ) {
-                    return Some(format!(
-                        "`handle` expression at {:?} has `return({})` body that {} \
-                         (Plan B Task 55, Phase 4g)",
-                        span, ra.binding, msg
-                    ));
+                    return Some(format!("`handle` `return({})` body: {msg}", ra.binding));
                 }
             }
             // Recurse into the body itself so a nested handle inside
@@ -1902,13 +1897,16 @@ fn arm_body_unsupported_construct(
             .unwrap_or(false);
         if !is_multi_shot {
             return Some(format!(
-                "Slice C: arm body invokes `{}` multiple times (multi-shot pattern: \
-                 `let r1 = {}(...); let r2 = {}(...); ...`) but effect `{}` is \
-                 declared `resumes: one` (default). Declare `effect {} resumes: \
-                 many {{ ... }}` to opt in to multi-shot semantics; otherwise \
-                 the typecheck E0220 linearity gate already rejects this shape \
-                 at typecheck time",
-                arm.k_name, arm.k_name, arm.k_name, arm.effect, arm.effect
+                "arm body invokes `{k}` multiple times (`let r1 = {k}(...); \
+                 let r2 = {k}(...); ...`), but effect `{eff}` is single-shot \
+                 (the default — no `resumes: many` declared). Either:\n  \
+                 • Add `resumes: many` to the effect declaration (`effect {eff} \
+                 resumes: many {{ ... }}`) to opt in to multi-shot resumes, or\n  \
+                 • Invoke `{k}` exactly once in the arm body. Single-shot is the \
+                 right choice for exception-style and state-style effects; \
+                 multi-shot is for enumeration / backtracking shapes.",
+                k = arm.k_name,
+                eff = arm.effect
             ));
         }
         // Per-arg purity check.
@@ -2259,24 +2257,31 @@ fn arm_body_walk(
                 if callee_name == k_name {
                     if !tail {
                         return Some(format!(
-                            "uses continuation `{k_name}` in non-tail position \
-                             outside the supported shapes. Sigil v1 supports \
-                             non-tail `{k_name}(arg)` in two specific arm-body \
-                             shapes: (a) `{{ let r: Ty = {k_name}(arg); pure_tail }}` \
-                             (single-let lambda-lift); (b) `{{ let r1: T1 = \
-                             {k_name}(arg1); let r2: T2 = {k_name}(arg2); pure_tail }}` \
-                             for `resumes: many` effects (multi-shot). Other \
-                             non-tail `{k_name}` shapes (3+ invocations, \
-                             Binary-of-`{k_name}`-calls, computed conditional \
-                             {k_name}-use) require future captures-bearing \
-                             extensions and are not yet supported"
+                            "continuation `{k_name}` is used in a non-tail position \
+                             that v1 does not support. Supported shapes:\n  \
+                             • `{k_name}(arg)` as the arm body's tail expression — \
+                             single-shot resume (any effect).\n  \
+                             • `{{ let r: T = {k_name}(arg); pure_tail }}` — bind \
+                             the resume value, then a pure tail. Single-shot.\n  \
+                             • `{{ let r1: T = {k_name}(arg1); let r2: T = \
+                             {k_name}(arg2); pure_tail }}` — multi-shot. Requires \
+                             `resumes: many` on the effect declaration.\n\
+                             For 3+ invocations, `{k_name}` inside a binary expression \
+                             (like `{k_name}(a) + {k_name}(b)`), or `{k_name}` inside a \
+                             conditional, hand-unroll into the multi-shot let-chain \
+                             shape — bind each call to its own `let`, then combine in \
+                             the pure tail. Runtime-N enumeration (one `{k_name}` per \
+                             list element) requires first-class continuations and is \
+                             deferred to v2; for now hand-unroll for known small N or \
+                             restructure to use Raise / State / IO."
                         ));
                     }
                     if args.len() != 1 {
                         return Some(format!(
-                            "calls continuation `{k_name}` with {arity} arg(s); \
-                             continuation arity is fixed at 1 (the perform's \
-                             return value)",
+                            "continuation `{k_name}` is called with {arity} argument(s) \
+                             but always takes exactly 1 (the resume value — the type-\
+                             checked `op_ret` of the effect operation). Pass a single \
+                             argument matching the operation's return type.",
                             arity = args.len()
                         ));
                     }
@@ -6197,9 +6202,15 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
         Expr::Ident(name, _) => {
             if name == k_name {
                 return Some(format!(
-                    "Slice B: post-`k` tail of arm body references continuation \
-                     `{k_name}` — multi-shot / further-non-tail uses require Slice C \
-                     (heap-reified continuation)"
+                    "the pure tail after `let r: T = {k_name}(arg);` references \
+                     continuation `{k_name}` — `{k_name}` is dynamic-extent and may \
+                     not be reified after its single resume. To call `{k_name}` more \
+                     than once, switch to the multi-shot let-chain shape \
+                     (`let r1 = {k_name}(...); let r2 = {k_name}(...); pure_tail`) \
+                     and add `resumes: many` to the effect declaration. To return \
+                     `{k_name}` itself or pass it elsewhere, see E0145 (continuation \
+                     escape barrier) — these shapes need first-class continuations \
+                     (deferred to v2)."
                 ));
             }
             // Accept names known at the walker site (binding, extras,
@@ -6227,11 +6238,15 @@ fn arm_body_post_arm_k_tail_free_vars_ok(
                 None
             } else {
                 Some(format!(
-                    "Slice B: post-`k` tail of arm body references `{name}`, which is \
-                     neither the let-binding (`{binding_name}`) nor a global; op-arg / \
-                     outer-scope captures into the post-arm-k synth fn require a future \
-                     captures-bearing extension of Slice B (parallel to PR #26's `a5ee4c6` \
-                     captures-bearing slice for the helper synth-cont)"
+                    "the pure tail after `let {binding_name}: T = {k_name}(arg);` \
+                     references `{name}`, which isn't the let-binding `{binding_name}`, \
+                     a global, or an op-arg of this arm. The pure tail can only \
+                     reference: (a) the let-binding from the resume, (b) op-args \
+                     declared on this arm, (c) other top-level fn / type names. \
+                     If `{name}` is captured from an enclosing scope, lift it into \
+                     an op-arg or a top-level fn / let — outer-scope captures \
+                     through the resume boundary aren't supported in v1.",
+                    k_name = k_name
                 ))
             }
         }
@@ -31795,8 +31810,8 @@ mod tests {
             "diagnostic mentions the offending name: {diag}"
         );
         assert!(
-            diag.contains("captures-bearing extension"),
-            "diagnostic points at captures-bearing extension: {diag}"
+            diag.contains("op-args") || diag.contains("captured from an enclosing scope"),
+            "diagnostic explains the captures-bearing limitation: {diag}"
         );
     }
 
@@ -31817,9 +31832,15 @@ mod tests {
             None,
         )
         .expect("rejected");
+        // The diagnostic should explain that `k` is dynamic-extent and
+        // cannot be reified after its single resume; the LLM-friendly
+        // version drops the internal "Slice B/C" framing in favour of
+        // pointing at the multi-shot let-chain alternative.
         assert!(
-            diag.contains("Slice C"),
-            "diagnostic points at Slice C: {diag}"
+            diag.contains("dynamic-extent")
+                || diag.contains("multi-shot let-chain")
+                || diag.contains("first-class continuations"),
+            "diagnostic explains the k-reference rejection in user terms: {diag}"
         );
     }
 
