@@ -27263,8 +27263,8 @@ fn normalize_tail_perform_body(
     })
 }
 
-/// Plan A Phase 2 — Stmt::Perform → Stmt::Let normalization for the
-/// chained-let-yield body classifier.
+/// Plan A Phase 2 — Stmt::Perform → Stmt::Let + `$elab_t*` substitution
+/// normalization for the chained-let-yield body classifier.
 ///
 /// Background: pre-Plan-A, helpers whose body had a mid-body
 /// `Stmt::Perform` (a perform whose result is discarded by source
@@ -27278,28 +27278,80 @@ fn normalize_tail_perform_body(
 /// See `compiler/docs/multi-shot-tail-anomaly.md` for the full
 /// diagnosis.
 ///
-/// This rewrite normalizes `Stmt::Perform(p)` to `Stmt::Let { name:
-/// "__perform_unit_<idx>", ty: <op return type>, value: Expr::Perform
-/// (p) }`. The synthesized binding is unused (no later code references
-/// it); its sole purpose is to fit the chained-let-yield classifier's
-/// "every stmt is Stmt::Let" shape so the body classifies as Cps ABI
-/// and gets per-resume helper synth-cont chain emission.
+/// This rewrite does two things in one pass:
 ///
-/// Returns `Some(rewritten)` if any rewrite happened; `None` if the
-/// body has no `Stmt::Perform` to rewrite (passes through untouched).
-/// The synthetic binding name uses a `__perform_unit_` prefix; sigil
-/// identifiers can start with `_` so the prefix can't collide with
-/// user names (the parser's identifier rule accepts `_` as the lead
-/// character, but no user-facing convention uses `__perform_unit_`).
+/// 1. **Stmt::Perform → Stmt::Let**: rewrites mid-body `Stmt::Perform(p)`
+///    to `Stmt::Let { name: "__perform_unit_<idx>", ty: <op return type>,
+///    value: Expr::Perform(p) }`. The synthesized binding is unused; its
+///    sole purpose is to fit the chained-let-yield classifier's "every
+///    stmt is Stmt::Let" shape.
+///
+/// 2. **`$elab_t*` substitution**: the elaborator (compiler/src/elaborate.rs)
+///    ANF-lifts non-trivial Binary/Unary operands into `let $elab_tN: T =
+///    <expr>;` bindings, breaking up `int_to_string(a*10+b)` into a
+///    chain of pure-trailing-lets. These lets sit BETWEEN yields in
+///    chains where the original source had impure perform args
+///    (e.g., `perform IO.println(int_to_string(a*10+b))`). The
+///    `seen_pure_after_yield` gate in the classifier rejects yields
+///    that come after pure-trailing-lets, so the chain doesn't classify.
+///
+///    Substitution unwinds the elaborator's lifting: each `$elab_t*`
+///    let is dropped from the body and its value is substituted into
+///    every `Ident($elab_t*)` reference in subsequent stmts and the
+///    tail. The elaborator's invariant guarantees `$elab_t*` names are
+///    fresh, monotonic, and referenced exactly once at the immediate
+///    use site (Binary/Unary operand position), so substitution is
+///    a clean inverse with no duplication of evaluation. After
+///    substitution the chain becomes purely yield-then-yield with
+///    inline impure-non-yielding args, which the relaxed classifier
+///    args check (`!expr_contains_perform`) accepts.
+///
+/// Returns `Some(rewritten)` if any rewrite or substitution happened;
+/// `None` if the body is already in chained-let-yield-compatible shape
+/// (no `Stmt::Perform`, no `$elab_t*` lets).
 fn rewrite_perform_stmts_as_lets(
     body: &crate::ast::Block,
     effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
 ) -> Option<crate::ast::Block> {
-    use crate::ast::{Block, LetStmt, Stmt};
+    use crate::ast::{Block, Expr, LetStmt, Stmt};
     let mut changed = false;
+    let mut subst: std::collections::BTreeMap<String, Expr> =
+        std::collections::BTreeMap::new();
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(body.stmts.len());
     for (idx, stmt) in body.stmts.iter().enumerate() {
         match stmt {
+            Stmt::Let(l) if l.name.starts_with("$elab_t") => {
+                // Elaborator-lifted ANF intermediate. Inline its value
+                // into subsequent uses. The value itself may reference
+                // earlier `$elab_t*` names, so substitute through `subst`
+                // as we record this binding. (Order of insertion equals
+                // source order; the elaborator emits `$elab_tN` in
+                // monotonic numbering, so all references in this let's
+                // RHS resolve against the partial map built so far.)
+                let resolved = substitute_idents_in_expr(&l.value, &subst);
+                subst.insert(l.name.clone(), resolved);
+                changed = true;
+            }
+            Stmt::Let(l) => {
+                let resolved_value = substitute_idents_in_expr(&l.value, &subst);
+                let value_changed = !subst.is_empty();
+                new_stmts.push(Stmt::Let(LetStmt {
+                    name: l.name.clone(),
+                    ty: l.ty.clone(),
+                    value: resolved_value,
+                    span: l.span.clone(),
+                }));
+                if value_changed {
+                    changed = true;
+                }
+            }
+            Stmt::Expr(e) => {
+                let resolved = substitute_idents_in_expr(e, &subst);
+                if !subst.is_empty() {
+                    changed = true;
+                }
+                new_stmts.push(Stmt::Expr(resolved));
+            }
             Stmt::Perform(p) => {
                 // Look up the op's return type. Typecheck (E0042 /
                 // E0043) ensures effect + op are registered, so a
@@ -27316,26 +27368,187 @@ fn rewrite_perform_stmts_as_lets(
                     },
                     None => return None,
                 };
+                let resolved_args: Vec<Expr> = p
+                    .args
+                    .iter()
+                    .map(|a| substitute_idents_in_expr(a, &subst))
+                    .collect();
                 let synth_name = format!("__perform_unit_{idx}");
                 new_stmts.push(Stmt::Let(LetStmt {
                     name: synth_name,
                     ty: return_te,
-                    value: crate::ast::Expr::Perform(p.clone()),
+                    value: Expr::Perform(crate::ast::PerformExpr {
+                        effect: p.effect.clone(),
+                        op: p.op.clone(),
+                        args: resolved_args,
+                        span: p.span.clone(),
+                    }),
                     span: p.span.clone(),
                 }));
                 changed = true;
             }
-            other => new_stmts.push(other.clone()),
         }
     }
+    let new_tail = body
+        .tail
+        .as_ref()
+        .map(|t| substitute_idents_in_expr(t, &subst));
     if !changed {
         return None;
     }
     Some(Block {
         stmts: new_stmts,
-        tail: body.tail.clone(),
+        tail: new_tail,
         span: body.span.clone(),
     })
+}
+
+/// Plan A Phase 2 — substitute `Ident(name)` → `subst[name]` recursively
+/// through an expression. Used to inline elaborator-lifted `$elab_t*`
+/// bindings back into their use sites; substitution is sound because
+/// each `$elab_t*` name is referenced exactly once at the immediate
+/// use site (Binary/Unary operand position).
+fn substitute_idents_in_expr(
+    e: &crate::ast::Expr,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+) -> crate::ast::Expr {
+    use crate::ast::Expr;
+    if subst.is_empty() {
+        return e.clone();
+    }
+    match e {
+        Expr::Ident(name, _span) => {
+            if let Some(replacement) = subst.get(name) {
+                replacement.clone()
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(substitute_idents_in_expr(lhs, subst)),
+            rhs: Box::new(substitute_idents_in_expr(rhs, subst)),
+            span: span.clone(),
+        },
+        Expr::Unary { op, operand, span } => Expr::Unary {
+            op: *op,
+            operand: Box::new(substitute_idents_in_expr(operand, subst)),
+            span: span.clone(),
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: Box::new(substitute_idents_in_expr(callee, subst)),
+            args: args
+                .iter()
+                .map(|a| substitute_idents_in_expr(a, subst))
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Perform(p) => Expr::Perform(crate::ast::PerformExpr {
+            effect: p.effect.clone(),
+            op: p.op.clone(),
+            args: p
+                .args
+                .iter()
+                .map(|a| substitute_idents_in_expr(a, subst))
+                .collect(),
+            span: p.span.clone(),
+        }),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => Expr::If {
+            cond: Box::new(substitute_idents_in_expr(cond, subst)),
+            then_block: Box::new(substitute_idents_in_block(then_block, subst)),
+            else_block: Box::new(substitute_idents_in_block(else_block, subst)),
+            span: span.clone(),
+        },
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: Box::new(substitute_idents_in_expr(scrutinee, subst)),
+            arms: arms
+                .iter()
+                .map(|a| crate::ast::MatchArm {
+                    pattern: a.pattern.clone(),
+                    body: substitute_idents_in_expr(&a.body, subst),
+                    span: a.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Block(b) => Expr::Block(Box::new(substitute_idents_in_block(b, subst))),
+        Expr::RecordLit { name, fields, span } => Expr::RecordLit {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|f| crate::ast::RecordFieldLit {
+                    name: f.name.clone(),
+                    value: substitute_idents_in_expr(&f.value, subst),
+                    span: f.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Tuple { elems, span } => Expr::Tuple {
+            elems: elems
+                .iter()
+                .map(|e| substitute_idents_in_expr(e, subst))
+                .collect(),
+            span: span.clone(),
+        },
+        // Variants with no Ident-bearing children pass through.
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. }
+        | Expr::Lambda { .. }
+        | Expr::Handle { .. } => e.clone(),
+    }
+}
+
+fn substitute_idents_in_block(
+    b: &crate::ast::Block,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+) -> crate::ast::Block {
+    use crate::ast::Stmt;
+    crate::ast::Block {
+        stmts: b
+            .stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Let(l) => Stmt::Let(crate::ast::LetStmt {
+                    name: l.name.clone(),
+                    ty: l.ty.clone(),
+                    value: substitute_idents_in_expr(&l.value, subst),
+                    span: l.span.clone(),
+                }),
+                Stmt::Expr(e) => Stmt::Expr(substitute_idents_in_expr(e, subst)),
+                Stmt::Perform(p) => Stmt::Perform(crate::ast::PerformExpr {
+                    effect: p.effect.clone(),
+                    op: p.op.clone(),
+                    args: p
+                        .args
+                        .iter()
+                        .map(|a| substitute_idents_in_expr(a, subst))
+                        .collect(),
+                    span: p.span.clone(),
+                }),
+            })
+            .collect(),
+        tail: b
+            .tail
+            .as_ref()
+            .map(|t| substitute_idents_in_expr(t, subst)),
+        span: b.span.clone(),
+    }
 }
 
 /// The classifier is conservative — false negatives are acceptable
