@@ -1120,6 +1120,31 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0221",
+        short: "multi-shot body tail is a Cps-call",
+        long: "The body's tail expression is a call to a Cps-colored \
+               function. In v1, this shape silently miscompiles when \
+               the body has two or more performs — only the first \
+               resume's effects fire.\n\n\
+               Inline the helper's logic into the body's branched \
+               tail instead.",
+        fix_example: "// Broken (E0221):\n\
+                      fn pairs() -> Int ![Choose, IO] {\n\
+                        let a: Int = perform Choose.pick(1, 6);\n\
+                        let b: Int = perform Choose.pick(1, 6);\n\
+                        report(a, b)   // E0221: Cps-call-as-tail\n\
+                      }\n\n\
+                      // Working (inline the helper):\n\
+                      fn pairs() -> Int ![Choose, IO] {\n\
+                        let a: Int = perform Choose.pick(1, 6);\n\
+                        let b: Int = perform Choose.pick(1, 6);\n\
+                        match a + b == 7 {\n\
+                          true => { perform IO.println(int_to_string(a * 10 + b)); 0 },\n\
+                          false => 0,\n\
+                        }\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0401",
         short: "runtime arithmetic abort",
         long: "A division or modulo operation was performed with a zero \
