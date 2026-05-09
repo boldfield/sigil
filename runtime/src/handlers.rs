@@ -91,23 +91,11 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use sigil_abi::effect::{NEXT_STEP_TAG_CALL, NEXT_STEP_TAG_DISCHARGED, NEXT_STEP_TAG_DONE};
 
 use crate::counters::{self, CounterId};
 use crate::header::{Header, TAG_CLOSURE};
-
-static TRACE_FLAG: AtomicU8 = AtomicU8::new(2); // 2 = unchecked
-pub fn trace_enabled() -> bool {
-    let v = TRACE_FLAG.load(Ordering::Relaxed);
-    if v != 2 {
-        return v == 1;
-    }
-    let enabled = std::env::var("SIGIL_TRACE").is_ok();
-    TRACE_FLAG.store(if enabled { 1 } else { 0 }, Ordering::Relaxed);
-    enabled
-}
 
 /// CPS-color calling convention (see module-level docs). Plan D Task
 /// 111c added the trailing `terminal_out: *mut TerminalResult` arg so
@@ -387,7 +375,6 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
-    static RUN_LOOP_NESTING: Cell<usize> = const { Cell::new(0) };
 
     /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
     /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
@@ -2324,11 +2311,6 @@ pub unsafe extern "C" fn sigil_perform(
                 .add(args_len as usize)
                 .write(actual_k_closure as u64);
             ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
-            if trace_enabled() {
-                let user_args: Vec<u64> = (0..args_len as usize).map(|i| *args_ptr.add(i)).collect();
-                let opak_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-                eprintln!("[TRACE perform] eid={effect_id} oid={op_id} user_args={user_args:?} crossed={crossed} opak={opak_depth}");
-            }
             return ns;
         }
         frame = (*frame).prev;
@@ -2430,13 +2412,6 @@ pub unsafe extern "C" fn sigil_run_loop(
         out
     );
     let mut current = initial_step;
-    let rl_depth = RUN_LOOP_NESTING.with(|c| { let d = c.get(); c.set(d + 1); d });
-    if trace_enabled() {
-        let init_tag = (*initial_step).tag;
-        let init_val = (*initial_step).value;
-        let opak_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-        eprintln!("[TRACE run_loop_enter] rl={rl_depth} tag={init_tag} value={init_val:#x} opak={opak_depth}");
-    }
     // Plotkin fix — install this run_loop's entry depth into the
     // single TLS `RUN_LOOP_ENTRY_DEPTH` Cell so
     // `wrap_continuation_with_outer_post_arm_k` can determine which
@@ -2491,10 +2466,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // site can correctly skip return arm dispatch on the
                 // R-typed discharge value.
                 if tag == NEXT_STEP_TAG_DISCHARGED {
-                    if trace_enabled() {
-                        let opak_now = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-                        eprintln!("[TRACE run_loop] DISCHARGED terminal: rl={rl_depth} value={v:#x} opak={opak_now} entry_opak={outer_post_arm_k_entry_depth}");
-                    }
                     // Plan D Task 111d — caller-owned `TerminalResult`
                     // slot is the sole terminal channel. Codegen
                     // always passes a non-null pointer (main shim
@@ -2549,7 +2520,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
                     crate::arena::sigil_arena_reset();
                     run_loop_entry_depth_set(prior_run_loop_entry_depth);
-                    RUN_LOOP_NESTING.with(|c| c.set(c.get().saturating_sub(1)));
                     return v;
                 }
                 // Plan B' Stage 6.7 multi-shot composition fix: before
@@ -2585,9 +2555,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
                 if current_depth > outer_post_arm_k_entry_depth {
                     if let Some(entry) = outer_post_arm_k_try_pop() {
-                        if trace_enabled() {
-                            eprintln!("[TRACE run_loop] DONE routing via outer_post_arm_k: rl={rl_depth} value={v:#x} depth={current_depth}->{} entry_opak={outer_post_arm_k_entry_depth}", current_depth - 1);
-                        }
                         // Reset the arena before allocating the new Call.
                         crate::arena::sigil_arena_reset();
                         // Build Call(popped_closure, popped_fn_ptr,
@@ -2642,11 +2609,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // unit tests that drive `sigil_run_loop` directly
                 // with `ptr::null_mut()` to test dispatch shape
                 // without observing the terminal channel.
-                if trace_enabled() {
-                    let tag_name = if tag == NEXT_STEP_TAG_DONE { "DONE" } else { "DISCHARGED" };
-                    let opak_now = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-                    eprintln!("[TRACE run_loop] terminal {tag_name}: rl={rl_depth} value={v:#x} opak={opak_now} entry_opak={outer_post_arm_k_entry_depth}");
-                }
                 if !out.is_null() {
                     ptr::write(
                         out,
@@ -2661,7 +2623,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
                 run_loop_entry_depth_set(prior_run_loop_entry_depth);
-                RUN_LOOP_NESTING.with(|c| c.set(c.get().saturating_sub(1)));
                 return v;
             }
             NEXT_STEP_TAG_CALL => {
@@ -2695,18 +2656,6 @@ pub unsafe extern "C" fn sigil_run_loop(
                 // — that's the contract codegen relies on.
                 crate::arena::sigil_arena_reset();
 
-                if trace_enabled() {
-                    let opak_now = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-                    if arg_count >= 3 {
-                        eprintln!("[TRACE call] rl={rl_depth} fn={fn_ptr:p} closure={closure_ptr:p} argc={arg_count} args[0]={:#x} args[1]={:#x} args[2]={:#x} opak={opak_now}",
-                            args_buf[0], args_buf[1], args_buf[2]);
-                    } else if arg_count > 0 {
-                        eprintln!("[TRACE call] rl={rl_depth} fn={fn_ptr:p} closure={closure_ptr:p} argc={arg_count} args[0]={:#x} opak={opak_now}",
-                            args_buf[0]);
-                    } else {
-                        eprintln!("[TRACE call] rl={rl_depth} fn={fn_ptr:p} closure={closure_ptr:p} argc=0 opak={opak_now}");
-                    }
-                }
                 // SAFETY: fn_ptr came from a NextStep::Call constructed
                 // by `sigil_next_step_call` and thus reflects a CPS-color
                 // fn pointer per the documented calling convention.

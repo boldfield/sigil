@@ -3492,12 +3492,26 @@ fn collect_branch_chain_allocs(
         Vec<SynthContCapture>,
     )> = Vec::new();
 
-    seed_branch_work(tail_expr, ctors, is_supported, ctor_index, type_layouts, &mut work);
+    seed_branch_work(
+        tail_expr,
+        ctors,
+        is_supported,
+        ctor_index,
+        type_layouts,
+        &mut work,
+    );
 
     while let Some((stmts, tail, leaf_kind, arm_bindings)) = work.pop() {
         match leaf_kind {
             BranchedCpsLeaf::Nested => {
-                seed_branch_work(tail, ctors, is_supported, ctor_index, type_layouts, &mut work);
+                seed_branch_work(
+                    tail,
+                    ctors,
+                    is_supported,
+                    ctor_index,
+                    type_layouts,
+                    &mut work,
+                );
             }
             BranchedCpsLeaf::PerformChain => {
                 // Extract yields and inner tail from this branch body.
@@ -3716,10 +3730,26 @@ fn seed_branch_work<'a>(
                     return;
                 }
             }
-            seed_branch_work_sum_type(tail, arms, ctors, is_supported, ctor_index, type_layouts, work);
+            seed_branch_work_sum_type(
+                tail,
+                arms,
+                ctors,
+                is_supported,
+                ctor_index,
+                type_layouts,
+                work,
+            );
         }
         Expr::Match { arms, .. } if arms.len() >= 2 => {
-            seed_branch_work_sum_type(tail, arms, ctors, is_supported, ctor_index, type_layouts, work);
+            seed_branch_work_sum_type(
+                tail,
+                arms,
+                ctors,
+                is_supported,
+                ctor_index,
+                type_layouts,
+                work,
+            );
         }
         _ => {}
     }
@@ -3740,14 +3770,13 @@ fn seed_branch_work_sum_type<'a>(
     )>,
 ) {
     use crate::ast::Expr;
-    let extract_arm =
-        |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
-            if let Expr::Block(b) = body {
-                Some((b.stmts.as_slice(), b.tail.as_ref()?))
-            } else {
-                Some((&[], body))
-            }
-        };
+    let extract_arm = |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
+        if let Expr::Block(b) = body {
+            Some((b.stmts.as_slice(), b.tail.as_ref()?))
+        } else {
+            Some((&[], body))
+        }
+    };
     let mut all_ok = true;
     let mut arm_data: Vec<(
         &'a [crate::ast::Stmt],
@@ -5124,17 +5153,22 @@ fn collect_pattern_binding_captures(
                             for (i, sub) in pats.iter().enumerate() {
                                 let sub_ty = variant.field_tys.get(i);
                                 out.extend(collect_pattern_binding_captures(
-                                    sub, ctor_index, type_layouts, sub_ty,
+                                    sub,
+                                    ctor_index,
+                                    type_layouts,
+                                    sub_ty,
                                 ));
                             }
                         }
                         CtorPatternFields::Record(pat_fields) => {
                             for f in pat_fields {
-                                let idx =
-                                    variant.field_names.iter().position(|n| n == &f.name);
+                                let idx = variant.field_names.iter().position(|n| n == &f.name);
                                 let sub_ty = idx.and_then(|i| variant.field_tys.get(i));
                                 out.extend(collect_pattern_binding_captures(
-                                    &f.pattern, ctor_index, type_layouts, sub_ty,
+                                    &f.pattern,
+                                    ctor_index,
+                                    type_layouts,
+                                    sub_ty,
                                 ));
                             }
                         }
@@ -5145,7 +5179,10 @@ fn collect_pattern_binding_captures(
         Pattern::Tuple(pats, _) => {
             for sub in pats {
                 out.extend(collect_pattern_binding_captures(
-                    sub, ctor_index, type_layouts, None,
+                    sub,
+                    ctor_index,
+                    type_layouts,
+                    None,
                 ));
             }
         }
@@ -10259,7 +10296,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         chain_outer_post_arm_k_pushes: 0,
                         closure_ptr,
                         terminal_out_param: terminal_out,
-                        user_fn_abi: UserFnAbi::Cps,
+
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -11359,7 +11396,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-                    user_fn_abi: UserFnAbi::Cps,
+
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -11794,7 +11831,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 chain_outer_post_arm_k_pushes: 0,
                 closure_ptr,
                 terminal_out_param,
-                user_fn_abi: UserFnAbi::Sync,
+
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -12559,7 +12596,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-                    user_fn_abi: UserFnAbi::Cps,
+
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -13492,7 +13529,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-                    user_fn_abi: UserFnAbi::Cps,
+
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -13789,7 +13826,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 chain_outer_post_arm_k_pushes: 0,
                 closure_ptr,
                 terminal_out_param: terminal_out,
-                user_fn_abi: UserFnAbi::Sync,
+
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -14194,7 +14231,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         chain_outer_post_arm_k_pushes: 0,
                         closure_ptr: synth_closure_ptr,
                         terminal_out_param: terminal_out,
-                        user_fn_abi: UserFnAbi::Cps,
+
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -15033,7 +15070,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_outer_post_arm_k_pushes: prior_bindings.len() as u32,
                             closure_ptr,
                             terminal_out_param: terminal_out,
-                            user_fn_abi: UserFnAbi::Cps,
+
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -15258,27 +15295,46 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // PerformChain emit lowers non-Perform stmts via
                                 // lower_expr, which creates nested run_loops for
                                 // CPS calls — producing pointer-shaped garbage
-                                // instead of values. The classifier's is_supported
-                                // check can miss CPS calls when the callee isn't
-                                // "supported" (self-recursive fns whose own
-                                // classification fails).
+                                // instead of values.
+                                //
+                                // Scope: this gate only matches direct
+                                // Stmt::Let { value: Expr::Call { callee:
+                                // Expr::Ident(name) } }. It does NOT catch
+                                // CPS calls through closure-bound variables,
+                                // calls in non-let positions, or leaf-position
+                                // calls (those are handled by the classifier's
+                                // is_supported check). This is sufficient
+                                // because rewrite_perform_stmts_as_lets
+                                // normalizes arm bodies into Let stmts with
+                                // direct Call/Perform RHS before classification.
                                 let pattern_c_dispatch = match pattern_c_dispatch {
                                     Some(PatternCDispatch::SumType { ref arms, .. }) => {
-                                        let has_cps_call_in_perform_chain = arms.iter().any(|arm| {
-                                            if arm.kind != BranchedCpsLeaf::PerformChain {
-                                                return false;
-                                            }
-                                            arm.stmts.iter().any(|stmt| {
-                                                if let crate::ast::Stmt::Let(l) = stmt {
-                                                    if let crate::ast::Expr::Call { callee, .. } = &l.value {
-                                                        if let crate::ast::Expr::Ident(name, _) = callee.as_ref() {
-                                                            return cc.colored.needs_cps_transform(name);
+                                        let has_cps_call_in_perform_chain =
+                                            arms.iter().any(|arm| {
+                                                if arm.kind != BranchedCpsLeaf::PerformChain {
+                                                    return false;
+                                                }
+                                                arm.stmts.iter().any(|stmt| {
+                                                    if let crate::ast::Stmt::Let(l) = stmt {
+                                                        if let crate::ast::Expr::Call {
+                                                            callee,
+                                                            ..
+                                                        } = &l.value
+                                                        {
+                                                            if let crate::ast::Expr::Ident(
+                                                                name,
+                                                                _,
+                                                            ) = callee.as_ref()
+                                                            {
+                                                                return cc
+                                                                    .colored
+                                                                    .needs_cps_transform(name);
+                                                            }
                                                         }
                                                     }
-                                                }
-                                                false
-                                            })
-                                        });
+                                                    false
+                                                })
+                                            });
                                         if has_cps_call_in_perform_chain {
                                             None
                                         } else {
@@ -15308,10 +15364,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             else_kind,
                                         } => {
                                             let cond_v = lowerer.lower_expr(cond);
-                                            let then_block_cl =
-                                                lowerer.builder.create_block();
-                                            let else_block_cl =
-                                                lowerer.builder.create_block();
+                                            let then_block_cl = lowerer.builder.create_block();
+                                            let else_block_cl = lowerer.builder.create_block();
                                             lowerer.builder.ins().brif(
                                                 cond_v,
                                                 then_block_cl,
@@ -15349,20 +15403,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     scrut_ty.as_ref(),
                                                 );
                                                 if is_catchall {
-                                                    let body_block =
-                                                        lowerer.builder.create_block();
+                                                    let body_block = lowerer.builder.create_block();
                                                     let mut bindings: Vec<(String, Value)> =
                                                         Vec::new();
                                                     if let crate::ast::Pattern::Var(name, _) =
                                                         arm_info.pattern
                                                     {
-                                                        bindings
-                                                            .push((name.clone(), scrut_v));
+                                                        bindings.push((name.clone(), scrut_v));
                                                     }
-                                                    lowerer
-                                                        .builder
-                                                        .ins()
-                                                        .jump(body_block, &[]);
+                                                    lowerer.builder.ins().jump(body_block, &[]);
                                                     work.push((
                                                         body_block,
                                                         arm_info.stmts,
@@ -15373,12 +15422,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     chain_terminated = true;
                                                     break;
                                                 }
-                                                let body_block =
-                                                    lowerer.builder.create_block();
-                                                let next_block =
-                                                    lowerer.builder.create_block();
-                                                let mut bindings: Vec<(String, Value)> =
-                                                    Vec::new();
+                                                let body_block = lowerer.builder.create_block();
+                                                let next_block = lowerer.builder.create_block();
+                                                let mut bindings: Vec<(String, Value)> = Vec::new();
                                                 lowerer.emit_pattern_test(
                                                     arm_info.pattern,
                                                     scrut_v,
@@ -15386,10 +15432,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     next_block,
                                                     &mut bindings,
                                                 );
-                                                lowerer
-                                                    .builder
-                                                    .ins()
-                                                    .jump(body_block, &[]);
+                                                lowerer.builder.ins().jump(body_block, &[]);
                                                 work.push((
                                                     body_block,
                                                     arm_info.stmts,
@@ -15401,11 +15444,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 lowerer.builder.seal_block(next_block);
                                             }
                                             if !chain_terminated {
-                                                lowerer.builder.ins().trap(
-                                                    TrapCode::unwrap_user(
-                                                        TRAP_NONEXHAUSTIVE_MATCH,
-                                                    ),
-                                                );
+                                                lowerer.builder.ins().trap(TrapCode::unwrap_user(
+                                                    TRAP_NONEXHAUSTIVE_MATCH,
+                                                ));
                                             }
                                             work.reverse();
                                         }
@@ -15506,12 +15547,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     then_kind: n_then_kind,
                                                     else_kind: n_else_kind,
                                                 }) => {
-                                                    let n_cond_v =
-                                                        lowerer.lower_expr(n_cond);
-                                                    let n_then_blk =
-                                                        lowerer.builder.create_block();
-                                                    let n_else_blk =
-                                                        lowerer.builder.create_block();
+                                                    let n_cond_v = lowerer.lower_expr(n_cond);
+                                                    let n_then_blk = lowerer.builder.create_block();
+                                                    let n_else_blk = lowerer.builder.create_block();
                                                     lowerer.builder.ins().brif(
                                                         n_cond_v,
                                                         n_then_blk,
@@ -15534,19 +15572,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         vec![],
                                                     ));
                                                 }
-                                                Some(PatternCDispatch::SumType { .. }) => {
-                                                    unreachable!(
-                                                        "Nested leaf with SumType dispatch \
-                                                         not yet supported"
-                                                    );
-                                                }
-                                                None => {
-                                                    unreachable!(
-                                                        "Plan C Task 81: classifier accepted \
-                                                         Nested leaf but \
-                                                         detect_pattern_c_dispatch \
-                                                         returned None at emit time"
-                                                    );
+                                                Some(PatternCDispatch::SumType { .. }) | None => {
+                                                    // Nested sum-type or
+                                                    // classifier/emit disagreement:
+                                                    // fall through to standard-tail.
+                                                    // This can't happen under current
+                                                    // classification (Nested only
+                                                    // wraps If / Match-on-Bool), but
+                                                    // guarding against future
+                                                    // classifier extensions.
+                                                    break;
                                                 }
                                             }
                                             continue;
@@ -17880,7 +17915,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_outer_post_arm_k_pushes: 0,
                             closure_ptr,
                             terminal_out_param: terminal_out,
-                            user_fn_abi: UserFnAbi::Cps,
+
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -18560,17 +18595,6 @@ struct Lowerer<'a, 'b> {
     terminal_out_param: Value,
 
     /// Lambda-of-state Plan B preview — the enclosing function's ABI.
-    /// Reserved for the follow-on plan that extends Pattern C dispatch
-    /// to handle sum-type Match tails: per-ABI codegen decisions at
-    /// `lower_perform_to_value` and `lower_call`'s CPS branch will
-    /// gate discharge propagation on `user_fn_abi == Cps` (Sync fns
-    /// can't return `NextStep::Discharged`). Threaded through every
-    /// Lowerer construction site at this commit; consumer wires up
-    /// in the follow-on plan. See `LAMBDA_OF_STATE_DEVIATIONS.md` for
-    /// the full re-scope rationale.
-    #[allow(dead_code)]
-    user_fn_abi: UserFnAbi,
-
     /// Per-string-literal `(span, GV, byte-length)` tuples declared at
     /// fn-entry time. Span-keyed so closure-conversion reordering of
     /// the walk (hoisted `$lambda_N` bodies carry the string literals
@@ -29469,9 +29493,7 @@ fn detect_pattern_c_dispatch<'a>(
                             ctors,
                             is_supported,
                         )?;
-                        if !leaf_is_cps_eligible(then_kind)
-                            && !leaf_is_cps_eligible(else_kind)
-                        {
+                        if !leaf_is_cps_eligible(then_kind) && !leaf_is_cps_eligible(else_kind) {
                             return None;
                         }
                         let (then_stmts, then_leaf) = extract_leaf(&then_arm.body)?;
@@ -29493,10 +29515,8 @@ fn detect_pattern_c_dispatch<'a>(
                 return None;
             }
             let has_ctor_pattern = arms.iter().any(|arm| {
-                matches!(
-                    &arm.pattern,
-                    Pattern::Ctor { .. }
-                ) || (matches!(&arm.pattern, Pattern::Var(name, _) if ctors.contains(name)))
+                matches!(&arm.pattern, Pattern::Ctor { .. })
+                    || (matches!(&arm.pattern, Pattern::Var(name, _) if ctors.contains(name)))
             });
             if !has_ctor_pattern {
                 return None;
@@ -29504,11 +29524,7 @@ fn detect_pattern_c_dispatch<'a>(
             let mut arm_infos = Vec::with_capacity(arms.len());
             let mut any_cps_eligible = false;
             for arm in arms {
-                let kind = classify_branched_cps_tail_branch_expr(
-                    &arm.body,
-                    ctors,
-                    is_supported,
-                );
+                let kind = classify_branched_cps_tail_branch_expr(&arm.body, ctors, is_supported);
                 match kind {
                     Some(k) => {
                         if leaf_is_cps_eligible(k) {

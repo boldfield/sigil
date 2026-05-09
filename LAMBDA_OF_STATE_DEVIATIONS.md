@@ -50,8 +50,8 @@ emitted traces at `lower_k_pair_call` would have required a compiler
 rebuild cycle targeting a path that turned out not to be the offending
 step.
 
-**Implementing commit(s):** (uncommitted diagnostic instrumentation; will
-be removed before Phase 2 final commit)
+**Implementing commit(s):** Diagnostic instrumentation added in Phase 1,
+removed in the Phase 2 review-iteration commit per this commitment.
 
 ## 2026-05-09 — [DEVIATION Phase 2] Fix scope is architectural, not point-fix; plan task underspecified
 
@@ -153,28 +153,20 @@ post-hoc check at the perform site can recover the captured continuation
 extend Pattern C dispatch to keep the perform site on the chain
 machinery's real-continuation path for sum-type Match.
 
-**Implementing commit(s):** Investigation surfaced the architectural
-scope; full implementation deferred. The `user_fn_abi` field
-infrastructure (9 Lowerer construction sites + 1 struct field) committed
-first as a no-op foundation for future per-ABI codegen decisions. The
-plan moves to `failed/` with this deviation as the authoritative scope
-re-estimation; a follow-on plan should be queued with the four-layer
-machinery extension (classifier → dispatch → work-stack → branch chain)
-broken into independently testable seams.
+**Implementing commit(s):** Investigation in the initial session surfaced
+the architectural scope. The four-layer fix (classifier → seed →
+work-stack dispatch → branch chain captures) shipped in the follow-on
+session as commit 3810f52 + review-iteration commits. The `user_fn_abi`
+field infrastructure was removed during review (the fix didn't need
+per-ABI gating; the CPS-call safety gate at the dispatch call site
+solved the problem at the right level).
 
-**Note on P19's documented oracle.** The design doc claims P19's
-expected output is `5`, but tracing the program semantics (lambda-of-
-state with `return(v) => fn(_s) => v` and `count_elements`'s `Nil => 0`
-base case ignoring final state) gives `0`: `runner(initial)` =
-`(fn(s) => k(s)(s))(0)` unwinds through the deep-handler chain to
-`return arm closure` applied to state, returning the body's terminal
-value (`0`), not the final state. The working baseline test
-`pattern_c_in_branch_perform_state_threading_returns_42` works because
-its `comp` ends with `let v = perform S.get(); v` — explicitly reading
-final state. P19's `count_elements` never reads state, so its program
-semantics produce `0`. The bug is observable via `pattern_c_use_x`
-(prints pointer-shaped integers + crashes "handler stack empty"), which
-is the more precise acceptance gate. The follow-on plan should restate
-P19's expected output as `0` (or rewrite `count_elements` to read final
-state via `Nil => perform State.get()`) to align expected with semantic
-ground truth.
+**Note on P19's documented oracle.** The literal P19 prompt uses
+`return(v) => fn(_s) => v` — returning the body's terminal value, not
+the final state. With `count_elements`'s `Nil => 0` base case, this
+produces `0`. The e2e test `lambda_of_state_literal_p19_body_value_-
+returns_0` verifies this semantically correct output. A separate test
+(`lambda_of_state_sum_type_state_threading_returns_5`) uses the
+modified handler `return(v) => fn(s) => s` which returns final state
+`5` — this exercises the SumType dispatch's state-threading correctness
+but is not the literal P19 shape.
