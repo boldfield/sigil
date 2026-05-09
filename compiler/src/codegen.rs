@@ -27344,9 +27344,49 @@ fn rewrite_perform_stmts_as_lets(
     body: &crate::ast::Block,
     effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
 ) -> Option<crate::ast::Block> {
+    let (rewritten, changed) =
+        rewrite_block_with_subst(body, &std::collections::BTreeMap::new(), effects);
+    if changed {
+        Some(rewritten)
+    } else {
+        None
+    }
+}
+
+/// Plan A Phase 2 — recursive variant of [`rewrite_perform_stmts_as_lets`].
+/// Walks a `Block` AND every nested Block reachable through If/Match/
+/// Block subexpressions, applying the same `Stmt::Perform → Stmt::Let`
+/// + `$elab_t*` substitution pass to each.
+///
+/// Each nested Block inherits the outer scope's substitution map (the
+/// elaborator emits `$elab_t*` names fresh + monotonic, so outer-scope
+/// elab let values can be applied to inner expressions without
+/// shadowing concerns). The inner Block extends a *clone* of the
+/// inherited map with its own `$elab_t*` lets — local additions don't
+/// leak back out to the outer scope.
+///
+/// Returns `(new_block, changed)`. `changed` is `true` iff anything
+/// in the resulting block (or any nested block) differs from the input.
+/// The caller `rewrite_perform_stmts_as_lets` lifts that into the
+/// `Option<Block>` API the existing call sites consume.
+///
+/// The recursion matters for the body classifier's branch leaf check
+/// (`classify_branched_cps_tail_branch`): without this, branches like
+/// `{ Stmt::Perform(IO.println); IntLit(0) }` stay un-normalized and
+/// the classifier rejects them; with the recursion, each branch's
+/// `Stmt::Perform` becomes a `Stmt::Let { __perform_unit_<idx>: <ret>
+/// = perform ... }`, which the branch classifier accepts as
+/// `BranchedCpsLeaf::PerformChain`. This is what makes the literal P20
+/// shape (let-yield-prefix + If-tail with perform-bearing branch) pass
+/// classification without needing AST hoisting.
+fn rewrite_block_with_subst(
+    body: &crate::ast::Block,
+    inherited_subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> (crate::ast::Block, bool) {
     use crate::ast::{Block, Expr, LetStmt, Stmt};
     let mut changed = false;
-    let mut subst: std::collections::BTreeMap<String, Expr> = std::collections::BTreeMap::new();
+    let mut subst: std::collections::BTreeMap<String, Expr> = inherited_subst.clone();
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(body.stmts.len());
     for (idx, stmt) in body.stmts.iter().enumerate() {
         match stmt {
@@ -27405,26 +27445,26 @@ fn rewrite_perform_stmts_as_lets(
                         l.name, refs
                     );
                 }
-                let resolved = substitute_idents_in_expr(&l.value, &subst);
+                let (resolved, _) = rewrite_expr_propagating(&l.value, &subst, effects);
                 subst.insert(l.name.clone(), resolved);
                 changed = true;
             }
             Stmt::Let(l) => {
-                let resolved_value = substitute_idents_in_expr(&l.value, &subst);
-                let value_changed = !subst.is_empty();
+                let (resolved_value, expr_changed) =
+                    rewrite_expr_propagating(&l.value, &subst, effects);
+                if expr_changed {
+                    changed = true;
+                }
                 new_stmts.push(Stmt::Let(LetStmt {
                     name: l.name.clone(),
                     ty: l.ty.clone(),
                     value: resolved_value,
                     span: l.span.clone(),
                 }));
-                if value_changed {
-                    changed = true;
-                }
             }
             Stmt::Expr(e) => {
-                let resolved = substitute_idents_in_expr(e, &subst);
-                if !subst.is_empty() {
+                let (resolved, expr_changed) = rewrite_expr_propagating(e, &subst, effects);
+                if expr_changed {
                     changed = true;
                 }
                 new_stmts.push(Stmt::Expr(resolved));
@@ -27433,22 +27473,24 @@ fn rewrite_perform_stmts_as_lets(
                 // Look up the op's return type. Typecheck (E0042 /
                 // E0043) ensures effect + op are registered, so a
                 // missing entry here is a typecheck-invariant violation;
-                // surface it as None (the body falls back to its
-                // existing un-normalized handling) rather than
-                // panicking — the classifier path is conservative,
-                // and a defensive None preserves the invariant that
-                // false negatives are acceptable.
-                let return_te = match effects.get(&p.effect) {
-                    Some(eff) => match eff.ops.iter().find(|o| o.name == p.op) {
-                        Some(op_decl) => op_decl.return_type.clone(),
-                        None => return None,
-                    },
-                    None => return None,
+                // bail with `(body.clone(), false)` so the caller treats
+                // this as "no rewrite happened" and falls back to the
+                // existing un-normalized handling.
+                let return_te = match effects
+                    .get(&p.effect)
+                    .and_then(|eff| eff.ops.iter().find(|o| o.name == p.op))
+                    .map(|op_decl| op_decl.return_type.clone())
+                {
+                    Some(te) => te,
+                    None => return (body.clone(), false),
                 };
                 let resolved_args: Vec<Expr> = p
                     .args
                     .iter()
-                    .map(|a| substitute_idents_in_expr(a, &subst))
+                    .map(|a| {
+                        let (rewritten, _) = rewrite_expr_propagating(a, &subst, effects);
+                        rewritten
+                    })
                     .collect();
                 let synth_name = format!("__perform_unit_{idx}");
                 new_stmts.push(Stmt::Let(LetStmt {
@@ -27466,18 +27508,280 @@ fn rewrite_perform_stmts_as_lets(
             }
         }
     }
-    let new_tail = body
-        .tail
-        .as_ref()
-        .map(|t| substitute_idents_in_expr(t, &subst));
-    if !changed {
-        return None;
-    }
-    Some(Block {
+    let new_tail = body.tail.as_ref().map(|t| {
+        let (rewritten, expr_changed) = rewrite_expr_propagating(t, &subst, effects);
+        if expr_changed {
+            changed = true;
+        }
+        rewritten
+    });
+    let new_block = Block {
         stmts: new_stmts,
         tail: new_tail,
         span: body.span.clone(),
-    })
+    };
+    (new_block, changed)
+}
+
+/// Plan A Phase 2 — apply `Ident → subst[name]` substitution AND
+/// recursively descend into nested Blocks for their own normalization
+/// (`Stmt::Perform → Stmt::Let`, `$elab_t*` substitution). Returns
+/// `(new_expr, changed)` where `changed` is `true` iff anything was
+/// substituted or any nested Block had a structural rewrite.
+///
+/// Each nested Block inherits the outer scope's substitution map (the
+/// elaborator's monotonic-fresh-name discipline guarantees no
+/// shadowing collision when an outer-scope `$elab_t*` value is applied
+/// to inner expressions). The inner Block extends a clone of the
+/// inherited map with its own local elab lets via `rewrite_block_with_-
+/// subst`.
+fn rewrite_expr_propagating(
+    e: &crate::ast::Expr,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> (crate::ast::Expr, bool) {
+    use crate::ast::Expr;
+    match e {
+        Expr::Ident(name, _) => {
+            if let Some(replacement) = subst.get(name) {
+                (replacement.clone(), true)
+            } else {
+                (e.clone(), false)
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => {
+            let (new_lhs, c1) = rewrite_expr_propagating(lhs, subst, effects);
+            let (new_rhs, c2) = rewrite_expr_propagating(rhs, subst, effects);
+            (
+                Expr::Binary {
+                    op: *op,
+                    lhs: Box::new(new_lhs),
+                    rhs: Box::new(new_rhs),
+                    span: span.clone(),
+                },
+                c1 || c2,
+            )
+        }
+        Expr::Unary { op, operand, span } => {
+            let (new_operand, c) = rewrite_expr_propagating(operand, subst, effects);
+            (
+                Expr::Unary {
+                    op: *op,
+                    operand: Box::new(new_operand),
+                    span: span.clone(),
+                },
+                c,
+            )
+        }
+        Expr::Call { callee, args, span } => {
+            let (new_callee, c0) = rewrite_expr_propagating(callee, subst, effects);
+            let mut any_changed = c0;
+            let new_args: Vec<Expr> = args
+                .iter()
+                .map(|a| {
+                    let (new_a, c) = rewrite_expr_propagating(a, subst, effects);
+                    any_changed = any_changed || c;
+                    new_a
+                })
+                .collect();
+            (
+                Expr::Call {
+                    callee: Box::new(new_callee),
+                    args: new_args,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Perform(p) => {
+            let mut any_changed = false;
+            let new_args: Vec<Expr> = p
+                .args
+                .iter()
+                .map(|a| {
+                    let (new_a, c) = rewrite_expr_propagating(a, subst, effects);
+                    any_changed = any_changed || c;
+                    new_a
+                })
+                .collect();
+            (
+                Expr::Perform(crate::ast::PerformExpr {
+                    effect: p.effect.clone(),
+                    op: p.op.clone(),
+                    args: new_args,
+                    span: p.span.clone(),
+                }),
+                any_changed,
+            )
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => {
+            let (new_cond, c0) = rewrite_expr_propagating(cond, subst, effects);
+            let (new_then, c1) = rewrite_block_with_subst(then_block, subst, effects);
+            let (new_else, c2) = rewrite_block_with_subst(else_block, subst, effects);
+            (
+                Expr::If {
+                    cond: Box::new(new_cond),
+                    then_block: Box::new(new_then),
+                    else_block: Box::new(new_else),
+                    span: span.clone(),
+                },
+                c0 || c1 || c2,
+            )
+        }
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => {
+            let (new_scrut, c0) = rewrite_expr_propagating(scrutinee, subst, effects);
+            let mut any_changed = c0;
+            let new_arms: Vec<crate::ast::MatchArm> = arms
+                .iter()
+                .map(|a| {
+                    let (new_body, c) = rewrite_expr_propagating(&a.body, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::MatchArm {
+                        pattern: a.pattern.clone(),
+                        body: new_body,
+                        span: a.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::Match {
+                    scrutinee: Box::new(new_scrut),
+                    arms: new_arms,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Block(b) => {
+            let (rewritten, c) = rewrite_block_with_subst(b, subst, effects);
+            (Expr::Block(Box::new(rewritten)), c)
+        }
+        Expr::RecordLit { name, fields, span } => {
+            let mut any_changed = false;
+            let new_fields: Vec<crate::ast::RecordFieldLit> = fields
+                .iter()
+                .map(|f| {
+                    let (nv, c) = rewrite_expr_propagating(&f.value, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::RecordFieldLit {
+                        name: f.name.clone(),
+                        value: nv,
+                        span: f.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::RecordLit {
+                    name: name.clone(),
+                    fields: new_fields,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Tuple { elems, span } => {
+            let mut any_changed = false;
+            let new_elems: Vec<Expr> = elems
+                .iter()
+                .map(|el| {
+                    let (ne, c) = rewrite_expr_propagating(el, subst, effects);
+                    any_changed = any_changed || c;
+                    ne
+                })
+                .collect();
+            (
+                Expr::Tuple {
+                    elems: new_elems,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Lambda {
+            params,
+            return_type,
+            effects: lam_effects,
+            effect_row_var,
+            body,
+            span,
+        } => {
+            let (new_body, c) = rewrite_expr_propagating(body, subst, effects);
+            (
+                Expr::Lambda {
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    effects: lam_effects.clone(),
+                    effect_row_var: effect_row_var.clone(),
+                    body: Box::new(new_body),
+                    span: span.clone(),
+                },
+                c,
+            )
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            span,
+        } => {
+            let (new_body, c0) = rewrite_expr_propagating(body, subst, effects);
+            let mut any_changed = c0;
+            let new_return_arm = return_arm.as_ref().map(|ra| {
+                let (nb, c) = rewrite_expr_propagating(&ra.body, subst, effects);
+                any_changed = any_changed || c;
+                Box::new(crate::ast::HandleReturnArm {
+                    binding: ra.binding.clone(),
+                    binding_span: ra.binding_span.clone(),
+                    body: nb,
+                    span: ra.span.clone(),
+                })
+            });
+            let new_op_arms: Vec<crate::ast::HandleOpArm> = op_arms
+                .iter()
+                .map(|arm| {
+                    let (nb, c) = rewrite_expr_propagating(&arm.body, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::HandleOpArm {
+                        effect: arm.effect.clone(),
+                        effect_span: arm.effect_span.clone(),
+                        op: arm.op.clone(),
+                        op_span: arm.op_span.clone(),
+                        params: arm.params.clone(),
+                        k_name: arm.k_name.clone(),
+                        k_span: arm.k_span.clone(),
+                        body: nb,
+                        span: arm.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::Handle {
+                    body: Box::new(new_body),
+                    return_arm: new_return_arm,
+                    op_arms: new_op_arms,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. } => (e.clone(), false),
+    }
 }
 
 /// Plan A Phase 2 — substitute `Ident(name)` → `subst[name]` recursively
@@ -27485,6 +27789,7 @@ fn rewrite_perform_stmts_as_lets(
 /// bindings back into their use sites; substitution is sound because
 /// each `$elab_t*` name is referenced exactly once at the immediate
 /// use site (Binary/Unary operand position).
+#[allow(dead_code)]
 fn substitute_idents_in_expr(
     e: &crate::ast::Expr,
     subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
