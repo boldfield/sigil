@@ -16170,44 +16170,45 @@ fn multi_shot_three_resumes_distinct_io() {
     );
 }
 
-/// Plan A — pilot prompt P20 shape (Choose pair enumeration). Two
-/// distinct multi-shot effects (`OuterC` / `InnerC`) enumerate all
-/// 4 ordered pairs over the resume sets `{1, 6} × {2, 5}`, printing
-/// `a*10 + b` for each. Pre-Plan-A `pair`'s body post-perform IO
-/// (printing) collapsed to one (or zero) executions; post-Plan-A each
-/// (a, b) combination prints independently.
+/// Plan A — pilot prompt P20 LITERAL (Choose pair enumeration).
+/// Single multi-shot `Choose.pick` effect; `pairs()` performs twice
+/// (a, b) and conditionally prints `a*10+b` when `a + b == 7`. The
+/// handler arm enumerates `k(v)` for v ∈ [1, 6], so the multi-shot
+/// resumption produces all 36 (a, b) combinations; only the six
+/// satisfying `a + b == 7` print. Oracle `16\n25\n34\n43\n52\n61\n`
+/// matches `spec/validation-prompts.md` §P20.
 ///
-/// Reduced from the literal P20 prompt's 6×6 enumeration with sum-to-7
-/// filter: the literal shape places the IO inside an If's then-branch
-/// (a perform-in-tail-branch) which falls outside Plan A's
-/// chained-let-yield body classifier. The 2×2 enumeration with two
-/// distinct effects exercises the same multi-shot per-resume body
-/// execution Plan A targets, with a body shape that classifies as
-/// Cps ABI.
+/// Pre-PR-#119-review-#4 the literal shape's body classified outside
+/// Plan A's coverage (the body's tail is an If with a perform-bearing
+/// then-branch — `classify_branched_cps_tail_branch` rejected
+/// Block-with-Stmt::Perform leaves). The recursive Phase 2 rewriter
+/// extension (`rewrite_block_with_subst` recursing through nested
+/// Blocks reachable via If/Match/Block subexpressions) normalizes the
+/// branch-Block's `Stmt::Perform` to `Stmt::Let` so the branch
+/// classifier accepts as `BranchedCpsLeaf::PerformChain`, putting the
+/// body on the let-yield-prefix-branched-cps-tail emit path.
 #[test]
 fn multi_shot_choose_pair_enumeration() {
-    let src = "effect OuterC resumes: many { pick: (Int) -> Int }\n\
-               effect InnerC resumes: many { pick: (Int) -> Int }\n\
-               fn pair() -> Int ![OuterC, InnerC, IO] {\n  \
-                 let a: Int = perform OuterC.pick(0);\n  \
-                 let b: Int = perform InnerC.pick(0);\n  \
-                 perform IO.println(int_to_string(a * 10 + b));\n  \
-                 0\n\
-               }\n\
-               fn run_inner() -> Int ![OuterC, IO] {\n  \
-                 handle pair() with {\n    \
-                   InnerC.pick(_seed, k) => {\n      \
-                     let r1: Int = k(2);\n      \
-                     let r2: Int = k(5);\n      \
-                     0\n    \
-                   },\n  \
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 if a + b == 7 {\n    \
+                   perform IO.println(int_to_string(a * 10 + b));\n    \
+                   0\n  \
+                 } else {\n    \
+                   0\n  \
                  }\n\
                }\n\
                fn main() -> Int ![IO] {\n  \
-                 let _r: Int = handle run_inner() with {\n    \
-                   OuterC.pick(_seed, k) => {\n      \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
                      let r1: Int = k(1);\n      \
-                     let r2: Int = k(6);\n      \
+                     let r2: Int = k(2);\n      \
+                     let r3: Int = k(3);\n      \
+                     let r4: Int = k(4);\n      \
+                     let r5: Int = k(5);\n      \
+                     let r6: Int = k(6);\n      \
                      0\n    \
                    },\n  \
                  };\n  \
@@ -16216,10 +16217,11 @@ fn multi_shot_choose_pair_enumeration() {
     let (stdout, stderr, code) = compile_and_run(src, "multi_shot_choose_pair_enumeration");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
-        stdout, "12\n15\n62\n65\n",
-        "Plan A: pair enumeration over OuterC × InnerC = {{1, 6}} × {{2, 5}}. \
-         For each outer resume a, inner resumes 2 then 5; pair prints a*10+b. \
-         a=1: prints 12, 15. a=6: prints 62, 65. stderr={stderr:?}"
+        stdout, "16\n25\n34\n43\n52\n61\n",
+        "Plan A literal P20: pairs() multi-shot enumeration over (a, b) \
+         in [1..6]^2 with sum-to-7 filter. Each Cons of (a, b) prints \
+         a*10+b iff a + b == 7. Oracle from spec/validation-prompts.md \
+         §P20. stderr={stderr:?}"
     );
 }
 
