@@ -193,6 +193,10 @@ pub unsafe extern "C" fn sigil_continuation_invoke(
     args.add(2).write(identity_addr as u64);
     let body_val = sigil_run_loop(ns, terminal_out);
 
+    if crate::handlers::trace_enabled() {
+        eprintln!("[TRACE cont_invoke] arg={arg:#x} body_val={body_val:#x}");
+    }
+
     // Phase 2: wrap via return arm if present AND the body's
     // run completed normally (DONE). On DISCHARGE the terminal
     // value is already the handle's R-typed value (an inner arm
@@ -222,6 +226,10 @@ pub unsafe extern "C" fn sigil_continuation_invoke(
         args2.add(2).write(identity_addr as u64);
         sigil_run_loop(ns2, terminal_out)
     };
+
+    if crate::handlers::trace_enabled() {
+        eprintln!("[TRACE cont_invoke] wrapped={wrapped:#x} (return_fn_null={})", return_fn.is_null());
+    }
 
     // Phase 3: restore outer_post_arm_k depth — drain anything that
     // leaked from the captured continuation's internal pushes.
