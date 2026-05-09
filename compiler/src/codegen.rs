@@ -3477,23 +3477,27 @@ fn collect_branch_chain_allocs(
     pointer_ty: Type,
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
+    ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &std::collections::BTreeMap<String, crate::layout::TypeLayout>,
     synth_cont_sig: &cranelift::codegen::ir::Signature,
     module: &mut ObjectModule,
     cps_continuation_synth: &mut Vec<CpsContinuationSynth>,
 ) -> Result<Vec<BranchChainAlloc>, String> {
     let mut allocs: Vec<BranchChainAlloc> = Vec::new();
 
-    // DFS work-stack mirroring the emit's traversal order.
-    // Each entry: (block stmts, block tail, leaf kind).
-    let mut work: Vec<(&[crate::ast::Stmt], &crate::ast::Expr, BranchedCpsLeaf)> = Vec::new();
+    let mut work: Vec<(
+        &[crate::ast::Stmt],
+        &crate::ast::Expr,
+        BranchedCpsLeaf,
+        Vec<SynthContCapture>,
+    )> = Vec::new();
 
-    // Seed from the tail expression's top-level branches.
-    seed_branch_work(tail_expr, ctors, is_supported, &mut work);
+    seed_branch_work(tail_expr, ctors, is_supported, ctor_index, type_layouts, &mut work);
 
-    while let Some((stmts, tail, leaf_kind)) = work.pop() {
+    while let Some((stmts, tail, leaf_kind, arm_bindings)) = work.pop() {
         match leaf_kind {
             BranchedCpsLeaf::Nested => {
-                seed_branch_work(tail, ctors, is_supported, &mut work);
+                seed_branch_work(tail, ctors, is_supported, ctor_index, type_layouts, &mut work);
             }
             BranchedCpsLeaf::PerformChain => {
                 // Extract yields and inner tail from this branch body.
@@ -3540,9 +3544,6 @@ fn collect_branch_chain_allocs(
                     }
                 }
 
-                // Conservative captures: all body captures + all
-                // body chain bindings + body-level tail-prefix-lets
-                // (all available in the body chain's last step env).
                 let mut branch_captures: Vec<SynthContCapture> = body_captures.to_vec();
                 for (i, name) in body_binding_names.iter().enumerate() {
                     branch_captures.push(SynthContCapture {
@@ -3555,6 +3556,9 @@ fn collect_branch_chain_allocs(
                         name: tpl.name.clone(),
                         kind: tpl.kind,
                     });
+                }
+                for ab in &arm_bindings {
+                    branch_captures.push(ab.clone());
                 }
 
                 let branch_yield_count = branch_steps.len();
@@ -3637,17 +3641,20 @@ fn collect_branch_chain_allocs(
 }
 
 /// Seed the DFS work-stack for branch-chain collection from a
-/// branched tail expression (If or Bool-Match). Pushes entries
-/// in reverse order so the first branch is popped first (matching
-/// the emit's work-stack discipline).
+/// branched tail expression (If, Bool-Match, or sum-type Match).
+/// Pushes entries in reverse order so the first branch is popped
+/// first (matching the emit's work-stack discipline).
 fn seed_branch_work<'a>(
     tail: &'a crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
+    ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &std::collections::BTreeMap<String, crate::layout::TypeLayout>,
     work: &mut Vec<(
         &'a [crate::ast::Stmt],
         &'a crate::ast::Expr,
         BranchedCpsLeaf,
+        Vec<SynthContCapture>,
     )>,
 ) {
     use crate::ast::{Expr, Pattern};
@@ -3660,12 +3667,11 @@ fn seed_branch_work<'a>(
             let then_kind = classify_branched_cps_tail_branch(then_block, ctors, is_supported);
             let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_supported);
             if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
-                // Push else first, then then — so then is popped first.
                 if let Some(et) = else_block.tail.as_ref() {
-                    work.push((else_block.stmts.as_slice(), et, ek));
+                    work.push((else_block.stmts.as_slice(), et, ek, vec![]));
                 }
                 if let Some(tt) = then_block.tail.as_ref() {
-                    work.push((then_block.stmts.as_slice(), tt, tk));
+                    work.push((then_block.stmts.as_slice(), tt, tk, vec![]));
                 }
             }
         }
@@ -3701,16 +3707,77 @@ fn seed_branch_work<'a>(
                         classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported);
                     if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
                         if let Some((es, et)) = extract_arm(&else_arm.body) {
-                            work.push((es, et, ek));
+                            work.push((es, et, ek, vec![]));
                         }
                         if let Some((ts, tt)) = extract_arm(&then_arm.body) {
-                            work.push((ts, tt, tk));
+                            work.push((ts, tt, tk, vec![]));
                         }
                     }
+                    return;
                 }
             }
+            seed_branch_work_sum_type(tail, arms, ctors, is_supported, ctor_index, type_layouts, work);
+        }
+        Expr::Match { arms, .. } if arms.len() >= 2 => {
+            seed_branch_work_sum_type(tail, arms, ctors, is_supported, ctor_index, type_layouts, work);
         }
         _ => {}
+    }
+}
+
+fn seed_branch_work_sum_type<'a>(
+    _tail: &'a crate::ast::Expr,
+    arms: &'a [crate::ast::MatchArm],
+    ctors: &std::collections::BTreeSet<String>,
+    is_supported: &impl Fn(&str) -> bool,
+    ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &std::collections::BTreeMap<String, crate::layout::TypeLayout>,
+    work: &mut Vec<(
+        &'a [crate::ast::Stmt],
+        &'a crate::ast::Expr,
+        BranchedCpsLeaf,
+        Vec<SynthContCapture>,
+    )>,
+) {
+    use crate::ast::Expr;
+    let extract_arm =
+        |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
+            if let Expr::Block(b) = body {
+                Some((b.stmts.as_slice(), b.tail.as_ref()?))
+            } else {
+                Some((&[], body))
+            }
+        };
+    let mut all_ok = true;
+    let mut arm_data: Vec<(
+        &'a [crate::ast::Stmt],
+        &'a crate::ast::Expr,
+        BranchedCpsLeaf,
+        Vec<SynthContCapture>,
+    )> = Vec::with_capacity(arms.len());
+    for arm in arms {
+        let kind = match classify_branched_cps_tail_branch_expr(&arm.body, ctors, is_supported) {
+            Some(k) => k,
+            None => {
+                all_ok = false;
+                break;
+            }
+        };
+        let (stmts, leaf) = match extract_arm(&arm.body) {
+            Some(pair) => pair,
+            None => {
+                all_ok = false;
+                break;
+            }
+        };
+        let arm_bindings =
+            collect_pattern_binding_captures(&arm.pattern, ctor_index, type_layouts, None);
+        arm_data.push((stmts, leaf, kind, arm_bindings));
+    }
+    if all_ok && !arm_data.is_empty() {
+        for item in arm_data.into_iter().rev() {
+            work.push(item);
+        }
     }
 }
 
@@ -3803,6 +3870,21 @@ fn slot_kind_for_type_expr_post_mono(te: &crate::ast::TypeExpr) -> EnvSlotKind {
         // Plan D Task 113 — tuple values are heap-allocated records
         // with one slot per element; treat as User pointer slot.
         crate::ast::TypeExpr::Tuple { .. } => EnvSlotKind::User,
+    }
+}
+
+fn slot_kind_for_ty(ty: &crate::typecheck::Ty) -> EnvSlotKind {
+    use crate::typecheck::Ty;
+    match ty {
+        Ty::Int => EnvSlotKind::Int,
+        Ty::Bool => EnvSlotKind::Bool,
+        Ty::Char => EnvSlotKind::Char,
+        Ty::Byte => EnvSlotKind::Byte,
+        Ty::Unit => EnvSlotKind::Unit,
+        Ty::String => EnvSlotKind::String,
+        Ty::Fn(_) => EnvSlotKind::Closure,
+        Ty::User(_, _) | Ty::Tuple(_) => EnvSlotKind::User,
+        Ty::Continuation(_) | Ty::Var(_) => EnvSlotKind::User,
     }
 }
 
@@ -5000,6 +5082,75 @@ fn collect_pattern_bindings(p: &crate::ast::Pattern, out: &mut std::collections:
             }
         },
     }
+}
+
+fn collect_pattern_binding_captures(
+    pat: &crate::ast::Pattern,
+    ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &std::collections::BTreeMap<String, crate::layout::TypeLayout>,
+    field_ty: Option<&crate::typecheck::Ty>,
+) -> Vec<SynthContCapture> {
+    use crate::ast::{CtorPatternFields, Pattern};
+    let mut out = Vec::new();
+    match pat {
+        Pattern::Wildcard(_)
+        | Pattern::IntLit(..)
+        | Pattern::BoolLit(..)
+        | Pattern::CharLit(..) => {}
+        Pattern::Var(name, _) => {
+            if let Some((type_name, variant_idx)) = ctor_index.get(name) {
+                if let Some(layout) = type_layouts.get(type_name) {
+                    if layout.variants[*variant_idx].field_count() == 0 {
+                        return out;
+                    }
+                }
+            }
+            let kind = match field_ty {
+                Some(ty) => slot_kind_for_ty(ty),
+                None => EnvSlotKind::User,
+            };
+            out.push(SynthContCapture {
+                name: name.clone(),
+                kind,
+            });
+        }
+        Pattern::Ctor { name, fields, .. } => {
+            if let Some((type_name, variant_idx)) = ctor_index.get(name) {
+                if let Some(layout) = type_layouts.get(type_name) {
+                    let variant = &layout.variants[*variant_idx];
+                    match fields {
+                        CtorPatternFields::Unit => {}
+                        CtorPatternFields::Positional(pats) => {
+                            for (i, sub) in pats.iter().enumerate() {
+                                let sub_ty = variant.field_tys.get(i);
+                                out.extend(collect_pattern_binding_captures(
+                                    sub, ctor_index, type_layouts, sub_ty,
+                                ));
+                            }
+                        }
+                        CtorPatternFields::Record(pat_fields) => {
+                            for f in pat_fields {
+                                let idx =
+                                    variant.field_names.iter().position(|n| n == &f.name);
+                                let sub_ty = idx.and_then(|i| variant.field_tys.get(i));
+                                out.extend(collect_pattern_binding_captures(
+                                    &f.pattern, ctor_index, type_layouts, sub_ty,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Pattern::Tuple(pats, _) => {
+            for sub in pats {
+                out.extend(collect_pattern_binding_captures(
+                    sub, ctor_index, type_layouts, None,
+                ));
+            }
+        }
+    }
+    out
 }
 
 fn walk_collect_captures_block(
@@ -9402,6 +9553,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             &|n: &str| {
                                 is_supported_cps_user_fn(n, &fns_by_name, &cc.colored, &ctors)
                             },
+                            &ctor_index,
+                            &type_layouts,
                             &synth_cont_sig,
                             &mut module,
                             &mut cps_continuation_synth,
@@ -15100,62 +15253,176 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     &ctors,
                                     &supported_lookup,
                                 );
+                                // Reject SumType dispatch if any PerformChain arm
+                                // has Call stmts to CPS-colored functions. The
+                                // PerformChain emit lowers non-Perform stmts via
+                                // lower_expr, which creates nested run_loops for
+                                // CPS calls — producing pointer-shaped garbage
+                                // instead of values. The classifier's is_supported
+                                // check can miss CPS calls when the callee isn't
+                                // "supported" (self-recursive fns whose own
+                                // classification fails).
+                                let pattern_c_dispatch = match pattern_c_dispatch {
+                                    Some(PatternCDispatch::SumType { ref arms, .. }) => {
+                                        let has_cps_call_in_perform_chain = arms.iter().any(|arm| {
+                                            if arm.kind != BranchedCpsLeaf::PerformChain {
+                                                return false;
+                                            }
+                                            arm.stmts.iter().any(|stmt| {
+                                                if let crate::ast::Stmt::Let(l) = stmt {
+                                                    if let crate::ast::Expr::Call { callee, .. } = &l.value {
+                                                        if let crate::ast::Expr::Ident(name, _) = callee.as_ref() {
+                                                            return cc.colored.needs_cps_transform(name);
+                                                        }
+                                                    }
+                                                }
+                                                false
+                                            })
+                                        });
+                                        if has_cps_call_in_perform_chain {
+                                            None
+                                        } else {
+                                            pattern_c_dispatch
+                                        }
+                                    }
+                                    other => other,
+                                };
 
-                                if let Some((
-                                    cond,
-                                    then_stmts,
-                                    then_leaf,
-                                    else_stmts,
-                                    else_leaf,
-                                    then_kind,
-                                    else_kind,
-                                )) = pattern_c_dispatch
-                                {
-                                    // Pattern C path: emit per-branch
-                                    // routing. Pure leaves jump to
-                                    // `gate_entry_block`; Cps-call
-                                    // leaves emit `NextStep::Call` and
-                                    // `return_` directly.
-                                    let cond_v = lowerer.lower_expr(cond);
-                                    let then_block_cl = lowerer.builder.create_block();
-                                    let else_block_cl = lowerer.builder.create_block();
-                                    lowerer.builder.ins().brif(
-                                        cond_v,
-                                        then_block_cl,
-                                        &[],
-                                        else_block_cl,
-                                        &[],
-                                    );
-
-                                    // Plan C Task 81 — work-stack
-                                    // dispatch over branched-cps tail.
-                                    // Each item carries:
-                                    //   - the dispatch block to switch to
-                                    //   - the arm-body's pure-let stmts
-                                    //     (lowered before the leaf)
-                                    //   - the leaf expression
-                                    //   - the leaf kind
-                                    // Nested leaves re-enter the loop
-                                    // by pushing 2 sub-branches.
-                                    // Termination: each iteration either
-                                    // emits a leaf (return_/jump
-                                    // terminates the block) or pushes 2
-                                    // strictly-smaller sub-trees.
+                                if let Some(dispatch) = pattern_c_dispatch {
                                     let mut branch_chain_cursor: usize = 0;
                                     let mut work: Vec<(
                                         cranelift::codegen::ir::Block,
                                         &[crate::ast::Stmt],
                                         &crate::ast::Expr,
                                         BranchedCpsLeaf,
-                                    )> = vec![
-                                        (else_block_cl, else_stmts, else_leaf, else_kind),
-                                        (then_block_cl, then_stmts, then_leaf, then_kind),
-                                    ];
-                                    while let Some((block_cl, leaf_stmts, block_tail, leaf_kind)) =
-                                        work.pop()
+                                        Vec<(String, Value)>,
+                                    )> = Vec::new();
+                                    match dispatch {
+                                        PatternCDispatch::Binary {
+                                            cond,
+                                            then_stmts,
+                                            then_leaf,
+                                            else_stmts,
+                                            else_leaf,
+                                            then_kind,
+                                            else_kind,
+                                        } => {
+                                            let cond_v = lowerer.lower_expr(cond);
+                                            let then_block_cl =
+                                                lowerer.builder.create_block();
+                                            let else_block_cl =
+                                                lowerer.builder.create_block();
+                                            lowerer.builder.ins().brif(
+                                                cond_v,
+                                                then_block_cl,
+                                                &[],
+                                                else_block_cl,
+                                                &[],
+                                            );
+                                            work.push((
+                                                else_block_cl,
+                                                else_stmts,
+                                                else_leaf,
+                                                else_kind,
+                                                vec![],
+                                            ));
+                                            work.push((
+                                                then_block_cl,
+                                                then_stmts,
+                                                then_leaf,
+                                                then_kind,
+                                                vec![],
+                                            ));
+                                        }
+                                        PatternCDispatch::SumType {
+                                            scrutinee,
+                                            match_span,
+                                            arms: sum_arms,
+                                        } => {
+                                            let scrut_v = lowerer.lower_expr(scrutinee);
+                                            let scrut_ty =
+                                                lowerer.lookup_match_scrut_ty(&match_span);
+                                            let mut chain_terminated = false;
+                                            for arm_info in &sum_arms {
+                                                let is_catchall = lowerer.is_catchall_pattern(
+                                                    arm_info.pattern,
+                                                    scrut_ty.as_ref(),
+                                                );
+                                                if is_catchall {
+                                                    let body_block =
+                                                        lowerer.builder.create_block();
+                                                    let mut bindings: Vec<(String, Value)> =
+                                                        Vec::new();
+                                                    if let crate::ast::Pattern::Var(name, _) =
+                                                        arm_info.pattern
+                                                    {
+                                                        bindings
+                                                            .push((name.clone(), scrut_v));
+                                                    }
+                                                    lowerer
+                                                        .builder
+                                                        .ins()
+                                                        .jump(body_block, &[]);
+                                                    work.push((
+                                                        body_block,
+                                                        arm_info.stmts,
+                                                        arm_info.leaf,
+                                                        arm_info.kind,
+                                                        bindings,
+                                                    ));
+                                                    chain_terminated = true;
+                                                    break;
+                                                }
+                                                let body_block =
+                                                    lowerer.builder.create_block();
+                                                let next_block =
+                                                    lowerer.builder.create_block();
+                                                let mut bindings: Vec<(String, Value)> =
+                                                    Vec::new();
+                                                lowerer.emit_pattern_test(
+                                                    arm_info.pattern,
+                                                    scrut_v,
+                                                    scrut_ty.as_ref(),
+                                                    next_block,
+                                                    &mut bindings,
+                                                );
+                                                lowerer
+                                                    .builder
+                                                    .ins()
+                                                    .jump(body_block, &[]);
+                                                work.push((
+                                                    body_block,
+                                                    arm_info.stmts,
+                                                    arm_info.leaf,
+                                                    arm_info.kind,
+                                                    bindings,
+                                                ));
+                                                lowerer.builder.switch_to_block(next_block);
+                                                lowerer.builder.seal_block(next_block);
+                                            }
+                                            if !chain_terminated {
+                                                lowerer.builder.ins().trap(
+                                                    TrapCode::unwrap_user(
+                                                        TRAP_NONEXHAUSTIVE_MATCH,
+                                                    ),
+                                                );
+                                            }
+                                            work.reverse();
+                                        }
+                                    }
+                                    while let Some((
+                                        block_cl,
+                                        leaf_stmts,
+                                        block_tail,
+                                        leaf_kind,
+                                        arm_bindings,
+                                    )) = work.pop()
                                     {
                                         lowerer.builder.switch_to_block(block_cl);
                                         lowerer.builder.seal_block(block_cl);
+                                        for (bind_name, bind_val) in &arm_bindings {
+                                            lowerer.env.insert(bind_name.clone(), *bind_val);
+                                        }
                                         // Plan C Task 81 — lower arm-
                                         // body pure-let stmts BEFORE
                                         // dispatching the leaf. Skip
@@ -15229,44 +15496,59 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 &ctors,
                                                 &supported_lookup,
                                             );
-                                            let (
-                                                n_cond,
-                                                n_then_stmts,
-                                                n_then_leaf,
-                                                n_else_stmts,
-                                                n_else_leaf,
-                                                n_then_kind,
-                                                n_else_kind,
-                                            ) = match nested {
-                                                Some(t) => t,
-                                                None => unreachable!(
-                                                    "Plan C Task 81: classifier accepted \
-                                                     Nested leaf but detect_pattern_c_dispatch \
-                                                     returned None at emit time"
-                                                ),
-                                            };
-                                            let n_cond_v = lowerer.lower_expr(n_cond);
-                                            let n_then_blk = lowerer.builder.create_block();
-                                            let n_else_blk = lowerer.builder.create_block();
-                                            lowerer.builder.ins().brif(
-                                                n_cond_v,
-                                                n_then_blk,
-                                                &[],
-                                                n_else_blk,
-                                                &[],
-                                            );
-                                            work.push((
-                                                n_else_blk,
-                                                n_else_stmts,
-                                                n_else_leaf,
-                                                n_else_kind,
-                                            ));
-                                            work.push((
-                                                n_then_blk,
-                                                n_then_stmts,
-                                                n_then_leaf,
-                                                n_then_kind,
-                                            ));
+                                            match nested {
+                                                Some(PatternCDispatch::Binary {
+                                                    cond: n_cond,
+                                                    then_stmts: n_then_stmts,
+                                                    then_leaf: n_then_leaf,
+                                                    else_stmts: n_else_stmts,
+                                                    else_leaf: n_else_leaf,
+                                                    then_kind: n_then_kind,
+                                                    else_kind: n_else_kind,
+                                                }) => {
+                                                    let n_cond_v =
+                                                        lowerer.lower_expr(n_cond);
+                                                    let n_then_blk =
+                                                        lowerer.builder.create_block();
+                                                    let n_else_blk =
+                                                        lowerer.builder.create_block();
+                                                    lowerer.builder.ins().brif(
+                                                        n_cond_v,
+                                                        n_then_blk,
+                                                        &[],
+                                                        n_else_blk,
+                                                        &[],
+                                                    );
+                                                    work.push((
+                                                        n_else_blk,
+                                                        n_else_stmts,
+                                                        n_else_leaf,
+                                                        n_else_kind,
+                                                        vec![],
+                                                    ));
+                                                    work.push((
+                                                        n_then_blk,
+                                                        n_then_stmts,
+                                                        n_then_leaf,
+                                                        n_then_kind,
+                                                        vec![],
+                                                    ));
+                                                }
+                                                Some(PatternCDispatch::SumType { .. }) => {
+                                                    unreachable!(
+                                                        "Nested leaf with SumType dispatch \
+                                                         not yet supported"
+                                                    );
+                                                }
+                                                None => {
+                                                    unreachable!(
+                                                        "Plan C Task 81: classifier accepted \
+                                                         Nested leaf but \
+                                                         detect_pattern_c_dispatch \
+                                                         returned None at emit time"
+                                                    );
+                                                }
+                                            }
                                             continue;
                                         }
                                         match leaf_kind {
@@ -29113,23 +29395,11 @@ fn leaf_is_cps_eligible(k: BranchedCpsLeaf) -> bool {
 /// `then_leaf` / `else_leaf` are the branch leaf expressions (block
 /// tail OR bare arm body expression).
 ///
-/// Arbitrary Match shapes (sum-type patterns, etc.) return `None` —
-/// supporting them would require richer per-arm dispatch (mirror PR #81's
-/// `lower_match_arms_to_next_step`); deferred.
-#[allow(clippy::type_complexity)]
 fn detect_pattern_c_dispatch<'a>(
     tail: &'a crate::ast::Expr,
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
-) -> Option<(
-    &'a crate::ast::Expr,
-    &'a [crate::ast::Stmt],
-    &'a crate::ast::Expr,
-    &'a [crate::ast::Stmt],
-    &'a crate::ast::Expr,
-    BranchedCpsLeaf,
-    BranchedCpsLeaf,
-)> {
+) -> Option<PatternCDispatch<'a>> {
     use crate::ast::{Expr, Pattern};
     match tail {
         Expr::If {
@@ -29147,53 +29417,21 @@ fn detect_pattern_c_dispatch<'a>(
             }
             let then_leaf = then_block.tail.as_ref()?;
             let else_leaf = else_block.tail.as_ref()?;
-            Some((
-                cond.as_ref(),
-                then_block.stmts.as_slice(),
+            Some(PatternCDispatch::Binary {
+                cond: cond.as_ref(),
+                then_stmts: then_block.stmts.as_slice(),
                 then_leaf,
-                else_block.stmts.as_slice(),
+                else_stmts: else_block.stmts.as_slice(),
                 else_leaf,
                 then_kind,
                 else_kind,
-            ))
+            })
         }
         Expr::Match {
-            scrutinee, arms, ..
+            scrutinee,
+            arms,
+            span,
         } => {
-            // If-desugar shape: exactly 2 arms with BoolLit patterns.
-            if arms.len() != 2 {
-                return None;
-            }
-            let extract_bool = |p: &Pattern| -> Option<bool> {
-                if let Pattern::BoolLit(b, _) = p {
-                    Some(*b)
-                } else {
-                    None
-                }
-            };
-            let arm0_b = extract_bool(&arms[0].pattern)?;
-            let arm1_b = extract_bool(&arms[1].pattern)?;
-            if arm0_b == arm1_b {
-                return None;
-            }
-            let (then_arm, else_arm) = if arm0_b {
-                (&arms[0], &arms[1])
-            } else {
-                (&arms[1], &arms[0])
-            };
-            let then_kind =
-                classify_branched_cps_tail_branch_expr(&then_arm.body, ctors, is_supported)?;
-            let else_kind =
-                classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported)?;
-            if !leaf_is_cps_eligible(then_kind) && !leaf_is_cps_eligible(else_kind) {
-                return None;
-            }
-            // Plan C Task 81 — extract both arm-body stmts AND leaf.
-            // Bare Expr arm bodies → empty stmts. Block arm bodies →
-            // stmts + tail (must be Some). The work-stack emit lowers
-            // the stmts (each must be Stmt::Let with pure RHS, per
-            // classify_branched_cps_tail_branch's gate) before the
-            // leaf-emit dispatch.
             let extract_leaf = |body: &'a Expr| -> Option<(&'a [crate::ast::Stmt], &'a Expr)> {
                 if let Expr::Block(b) = body {
                     let t = b.tail.as_ref()?;
@@ -29202,17 +29440,104 @@ fn detect_pattern_c_dispatch<'a>(
                     Some((&[], body))
                 }
             };
-            let (then_stmts, then_leaf) = extract_leaf(&then_arm.body)?;
-            let (else_stmts, else_leaf) = extract_leaf(&else_arm.body)?;
-            Some((
-                scrutinee.as_ref(),
-                then_stmts,
-                then_leaf,
-                else_stmts,
-                else_leaf,
-                then_kind,
-                else_kind,
-            ))
+            // Try BoolLit (if-desugar) shape first.
+            if arms.len() == 2 {
+                let extract_bool = |p: &Pattern| -> Option<bool> {
+                    if let Pattern::BoolLit(b, _) = p {
+                        Some(*b)
+                    } else {
+                        None
+                    }
+                };
+                if let (Some(a0), Some(a1)) = (
+                    extract_bool(&arms[0].pattern),
+                    extract_bool(&arms[1].pattern),
+                ) {
+                    if a0 != a1 {
+                        let (then_arm, else_arm) = if a0 {
+                            (&arms[0], &arms[1])
+                        } else {
+                            (&arms[1], &arms[0])
+                        };
+                        let then_kind = classify_branched_cps_tail_branch_expr(
+                            &then_arm.body,
+                            ctors,
+                            is_supported,
+                        )?;
+                        let else_kind = classify_branched_cps_tail_branch_expr(
+                            &else_arm.body,
+                            ctors,
+                            is_supported,
+                        )?;
+                        if !leaf_is_cps_eligible(then_kind)
+                            && !leaf_is_cps_eligible(else_kind)
+                        {
+                            return None;
+                        }
+                        let (then_stmts, then_leaf) = extract_leaf(&then_arm.body)?;
+                        let (else_stmts, else_leaf) = extract_leaf(&else_arm.body)?;
+                        return Some(PatternCDispatch::Binary {
+                            cond: scrutinee.as_ref(),
+                            then_stmts,
+                            then_leaf,
+                            else_stmts,
+                            else_leaf,
+                            then_kind,
+                            else_kind,
+                        });
+                    }
+                }
+            }
+            // Sum-type Match: N arms with ctor/wildcard/var patterns.
+            if arms.len() < 2 {
+                return None;
+            }
+            let has_ctor_pattern = arms.iter().any(|arm| {
+                matches!(
+                    &arm.pattern,
+                    Pattern::Ctor { .. }
+                ) || (matches!(&arm.pattern, Pattern::Var(name, _) if ctors.contains(name)))
+            });
+            if !has_ctor_pattern {
+                return None;
+            }
+            let mut arm_infos = Vec::with_capacity(arms.len());
+            let mut any_cps_eligible = false;
+            for arm in arms {
+                let kind = classify_branched_cps_tail_branch_expr(
+                    &arm.body,
+                    ctors,
+                    is_supported,
+                );
+                match kind {
+                    Some(k) => {
+                        if leaf_is_cps_eligible(k) {
+                            any_cps_eligible = true;
+                        }
+                        let (stmts, leaf) = match extract_leaf(&arm.body) {
+                            Some(pair) => pair,
+                            None => return None,
+                        };
+                        arm_infos.push(SumTypeArmDispatch {
+                            pattern: &arm.pattern,
+                            stmts,
+                            leaf,
+                            kind: k,
+                        });
+                    }
+                    None => {
+                        return None;
+                    }
+                }
+            }
+            if !any_cps_eligible {
+                return None;
+            }
+            Some(PatternCDispatch::SumType {
+                scrutinee: scrutinee.as_ref(),
+                match_span: span.clone(),
+                arms: arm_infos,
+            })
         }
         _ => None,
     }
@@ -29259,6 +29584,12 @@ fn classify_branched_cps_tail_branch(
             Stmt::Let(l) => {
                 if matches!(&l.value, Expr::Perform(_)) {
                     has_branch_perform = true;
+                } else if let Expr::Call { callee, .. } = &l.value {
+                    if let Expr::Ident(name, _) = callee.as_ref() {
+                        if is_supported(name) {
+                            return None;
+                        }
+                    }
                 }
             }
             _ => return None,
@@ -29325,6 +29656,30 @@ enum BranchedCpsLeaf {
     /// (Perform / CallCps) in the branch body. At pre-pass time,
     /// one synth-cont per yield is allocated for the branch chain.
     PerformChain,
+}
+
+struct SumTypeArmDispatch<'a> {
+    pattern: &'a crate::ast::Pattern,
+    stmts: &'a [crate::ast::Stmt],
+    leaf: &'a crate::ast::Expr,
+    kind: BranchedCpsLeaf,
+}
+
+enum PatternCDispatch<'a> {
+    Binary {
+        cond: &'a crate::ast::Expr,
+        then_stmts: &'a [crate::ast::Stmt],
+        then_leaf: &'a crate::ast::Expr,
+        else_stmts: &'a [crate::ast::Stmt],
+        else_leaf: &'a crate::ast::Expr,
+        then_kind: BranchedCpsLeaf,
+        else_kind: BranchedCpsLeaf,
+    },
+    SumType {
+        scrutinee: &'a crate::ast::Expr,
+        match_span: crate::errors::Span,
+        arms: Vec<SumTypeArmDispatch<'a>>,
+    },
 }
 
 /// Plan B Task 78.5 G4 (Phase A — shape detector only) — does this fn
