@@ -9437,16 +9437,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     {
                                         if cc.colored.needs_cps_transform(callee_name) {
                                             let performs_multi_shot = f.effects.iter().any(|er| {
-                                                checked
-                                                    .program
-                                                    .items
-                                                    .iter()
-                                                    .any(|item| match item {
+                                                checked.program.items.iter().any(
+                                                    |item| match item {
                                                         crate::ast::Item::Effect(e) => {
                                                             e.name == er.name && e.resumes_many
                                                         }
                                                         _ => false,
-                                                    })
+                                                    },
+                                                )
                                             });
                                             if performs_multi_shot {
                                                 let span = tail.span();
@@ -9458,10 +9456,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                      Inline the helper's logic into the body's \
                                                      branched tail instead. \
                                                      Run `sigil explain E0221` for details.",
-                                                    span.file,
-                                                    span.line,
-                                                    span.column,
-                                                    callee_name,
+                                                    span.file, span.line, span.column, callee_name,
                                                 ));
                                             }
                                         }

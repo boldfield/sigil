@@ -16664,8 +16664,7 @@ fn inline_branched_tail_in_multi_shot_compiles_and_runs() {
                  };\n  \
                  total\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "inline_branched_tail_multi_shot");
+    let (stdout, stderr, code) = compile_and_run(src, "inline_branched_tail_multi_shot");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "16\n25\n34\n43\n52\n61\n",
@@ -16697,8 +16696,7 @@ fn pure_tail_in_multi_shot_compiles_unchanged() {
                  perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "pure_tail_multi_shot");
+    let (stdout, stderr, code) = compile_and_run(src, "pure_tail_multi_shot");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "198\n",
@@ -16731,8 +16729,7 @@ fn single_shot_cps_call_as_tail_compiles_unchanged() {
                  perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "single_shot_cps_tail");
+    let (stdout, stderr, code) = compile_and_run(src, "single_shot_cps_tail");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "15\n30\n",
@@ -16768,8 +16765,7 @@ fn multi_shot_one_perform_cps_call_as_tail_compiles_unchanged() {
                  perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "multi_shot_one_perform_cps_tail");
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_one_perform_cps_tail");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "1\n2\n3\n12\n",
