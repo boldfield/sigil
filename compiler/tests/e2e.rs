@@ -16390,3 +16390,170 @@ fn multi_shot_post_perform_tail_nonunit_discard_perform() {
          700000 + 11000 = 711000. stderr={stderr:?}"
     );
 }
+
+// ===== Plan B preview — Lambda-of-state runtime correctness =====
+
+/// P19 literal: Plotkin-style lambda-of-state handler with sum-type
+/// match (IntList). count_elements recurses through a 5-element list,
+/// incrementing state at each Cons. The handler's return arm returns
+/// final state (`s`), so the output is 5.
+#[test]
+fn lambda_of_state_p19_sum_type_match_returns_5() {
+    let src = "import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               fn count_elements(xs: IntList) -> Int ![State, IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(_, rest) => {\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     count_elements(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn run_state(initial: Int, comp: () -> Int ![State, IO]) -> Int ![IO] {\n  \
+                 let runner: (Int) -> Int ![IO] = handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![IO] => s,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![IO] => k(s)(s),\n    \
+                   State.set(s2, k) => fn (_s: Int) -> Int ![IO] => k(s2)(s2),\n  \
+                 };\n  \
+                 runner(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(10, Cons(20, Cons(30, Cons(40, Cons(50, Nil)))));\n  \
+                 let final_count: Int = run_state(0, fn () -> Int ![State, IO] => count_elements(xs));\n  \
+                 perform IO.println(int_to_string(final_count));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "lambda_of_state_p19_sum_type_match");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "5\n",
+        "P19 lambda-of-state: count_elements over a 5-element IntList \
+         with Plotkin-style run_state (return arm returns final state s). \
+         Wrong output means SumType Pattern C dispatch or lambda-of-state \
+         handler arm threading is broken. stderr={stderr:?}"
+    );
+}
+
+/// Existing pattern_c_in_branch_perform_state_threading_returns_42 shape
+/// must still pass — confirms no regression in the Binary dispatch path
+/// (if/else branches, not sum-type match).
+#[test]
+fn lambda_of_state_binary_dispatch_unchanged() {
+    let src = "import std.io\n\
+               \n\
+               effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
+                 set: (Int) -> Int,\n\
+               }\n\
+               \n\
+               fn helper(n: Int) -> Int ![S] {\n  \
+                 let _x: Int = perform S.get();\n  \
+                 if n == 0 {\n    \
+                   let _s0: Int = perform S.set(42);\n    \
+                   99\n  \
+                 } else {\n    \
+                   let _s1: Int = perform S.set(n);\n    \
+                   helper(n - 1)\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               fn comp() -> Int ![S] {\n  \
+                 let _y: Int = helper(3);\n  \
+                 let v: Int = perform S.get();\n  \
+                 v\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "lambda_of_state_binary_dispatch");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\n",
+        "Binary dispatch (if/else) lambda-of-state: helper(3) recurses \
+         with S.set in each branch, base case sets 42, comp reads via \
+         S.get. Regression means the SumType extension broke existing \
+         Binary Pattern C dispatch. stderr={stderr:?}"
+    );
+}
+
+/// Sum-type match with CPS calls in arm stmts must fall through to
+/// standard-tail path (not SumType dispatch). The g5 eval pattern:
+/// DivE arm has recursive CPS calls to eval before performs. Uses
+/// polymorphic run_state_poly, Raise/catch from the original g5 test.
+#[test]
+fn lambda_of_state_sum_type_with_cps_calls_falls_through() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
+               \n\
+               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
+                 match e {\n    \
+                   IntE(i) => i,\n    \
+                   DivE(e1, e2) => {\n      \
+                     let x: Int = eval(e1);\n      \
+                     let y: Int = eval(e2);\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     perform IO.println(\"tick\");\n      \
+                     if y == 0 {\n        \
+                       let _r: Int = raise(\"divide by zero\");\n        \
+                       _r\n      \
+                     } else {\n        \
+                       x / y\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO, ArithError] {\n  \
+                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "lambda_of_state_sum_type_cps_calls");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "Sum-type match with CPS calls (eval) in DivE arm must fall \
+         through to standard-tail (not SumType dispatch). DivE(DivE(16,2),3): \
+         two DivE arms each print tick, handler return(v)=>fn(s)=>v \
+         returns 16/2/3=2. Wrong output means SumType dispatch was \
+         incorrectly applied to arms with CPS calls. stderr={stderr:?}"
+    );
+}

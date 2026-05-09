@@ -1131,6 +1131,48 @@ First-class continuations enable passing `k` to helper functions
 `all_choices` in `std.choose`). Dynamic-extent enforcement ensures
 a continuation cannot be invoked after its handler frame has exited.
 
+**Lambda-of-state (Plotkin-style) handler encoding.** Handler arms
+can return closures that capture `k` without calling it immediately.
+The canonical state-threading encoding uses this to thread a state
+parameter through the continuation:
+
+```sigil
+effect State resumes: many { get: () -> Int, set: (Int) -> Int }
+type IntList = | Nil | Cons(Int, IntList)
+
+fn count_elements(xs: IntList) -> Int ![State] {
+  match xs {
+    Nil => 0,
+    Cons(_, rest) => {
+      let cur: Int = perform State.get();
+      let _: Int = perform State.set(cur + 1);
+      count_elements(rest)
+    },
+  }
+}
+
+fn run_state(initial: Int, comp: () -> Int ![State]) -> Int ![] {
+  let runner: (Int) -> Int ![] = handle comp() with {
+    return(v) => fn (s: Int) -> Int ![] => s,
+    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
+    State.set(s2, k) => fn (_s: Int) -> Int ![] => k(s2)(s2),
+  };
+  runner(initial)
+}
+```
+
+Each handler arm returns `fn (s: Int) -> ...` — a closure that
+receives the current state and threads it through `k`. The `get` arm
+passes `s` as both the resume value and the next state; the `set` arm
+replaces the state with `s2`. The `return` arm discards the body's
+terminal value and returns the final state. `run_state(0, comp)`
+applies the resulting state-threaded closure to the initial state `0`.
+
+This encoding works with sum-type match bodies (`count_elements`
+above) where the pattern dispatch contains multiple perform sites per
+arm. The runtime composes the arm-body continuations through the
+handler's state-threading closures at each perform site.
+
 ### §9 — `Mem` and mutation
 
 `Mem` is the builtin marker effect that gates all in-place
