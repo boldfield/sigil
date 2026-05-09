@@ -16047,3 +16047,208 @@ fn assert_in_function_validation_fails() {
     );
     assert_eq!(stdout, "", "stdout={stdout:?}");
 }
+
+// ---------------------------------------------------------------------
+// Plan A — multi-shot post-perform-tail correctness
+// ---------------------------------------------------------------------
+//
+// These tests pin the per-resume execution semantics of the body's
+// post-perform tail under multi-shot (`resumes: many`) effects. The
+// helper body shape `let x = perform Choose; perform IO.println(...);
+// pure_tail` previously fell back to Sync ABI because the chained-let-
+// yield classifier didn't accept mid-body `Stmt::Perform` or non-pure
+// perform args; Sync ABI multi-shot uses `sigil_continuation_identity`
+// as `k_fn`, collapsing per-resume body execution to zero. Plan A
+// Phase 2 fixes this by AST-rewriting `Stmt::Perform` to `Stmt::Let`
+// and relaxing the perform-args purity check to `!expr_contains_perform`.
+//
+// See `compiler/docs/multi-shot-tail-anomaly.md` for the diagnosis.
+
+/// Plan A — Background-section reproducer. Per-resume body execution
+/// fires the body's IO println once per `k(arg_i)` with `x = arg_i`,
+/// then the arm's combine fires once with `r_i = body_pure_tail(arg_i)
+/// = arg_i * 1000`. Pre-Plan-A this produced `711\n711000\n` (single
+/// IO with `x = 711` = arm's combine evaluated with `r_i := arg_i`,
+/// then arm combine pure-tail also produces 711000). Post-Plan-A the
+/// per-resume IO ordering matches the spec §8.3 semantics.
+#[test]
+fn multi_shot_post_perform_tail_io_per_resume() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_io_per_resume");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: per-resume body execution. k(7) → body fires with x=7, prints \"7\", \
+         returns 7*1000=7000; k(11) → body fires with x=11, prints \"11\", returns \
+         11*1000=11000; arm combine 7000*100 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — body has TWO post-perform observable effects in sequence.
+/// Both nested IO performs must fire per resume. Pre-Plan-A both
+/// would either fire once (collapsed) or with wrong x value; post-Plan-A
+/// each resume independently runs the full post-perform tail.
+#[test]
+fn multi_shot_post_perform_tail_nested_perform_per_resume() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 perform IO.println(\"got\");\n  \
+                 x * 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(2);\n      \
+                     let r2: Int = k(3);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_nested_perform_per_resume");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\ngot\n3\ngot\n500\n",
+        "Plan A: per-resume body execution with two nested performs. \
+         k(2) → prints \"2\", \"got\", returns 200. \
+         k(3) → prints \"3\", \"got\", returns 300. \
+         Arm combine 200 + 300 = 500. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — N=3 chain with distinct per-resume IO. Verifies ordering
+/// (resume 1 IO, resume 2 IO, resume 3 IO, then the arm's combine)
+/// and that each resume sees its own arg.
+#[test]
+fn multi_shot_three_resumes_distinct_io() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(0) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     let r3: Int = k(13);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_three_resumes_distinct_io");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n13\n31\n",
+        "Plan A: 3-resume chain. k(7) prints 7, returns 7. k(11) prints 11, returns 11. \
+         k(13) prints 13, returns 13. Sum = 31. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — pilot prompt P20 shape (Choose pair enumeration). Two
+/// distinct multi-shot effects (`OuterC` / `InnerC`) enumerate all
+/// 4 ordered pairs over the resume sets `{1, 6} × {2, 5}`, printing
+/// `a*10 + b` for each. Pre-Plan-A `pair`'s body post-perform IO
+/// (printing) collapsed to one (or zero) executions; post-Plan-A each
+/// (a, b) combination prints independently.
+///
+/// Reduced from the literal P20 prompt's 6×6 enumeration with sum-to-7
+/// filter: the literal shape places the IO inside an If's then-branch
+/// (a perform-in-tail-branch) which falls outside Plan A's
+/// chained-let-yield body classifier. The 2×2 enumeration with two
+/// distinct effects exercises the same multi-shot per-resume body
+/// execution Plan A targets, with a body shape that classifies as
+/// Cps ABI.
+#[test]
+fn multi_shot_choose_pair_enumeration() {
+    let src = "effect OuterC resumes: many { pick: (Int) -> Int }\n\
+               effect InnerC resumes: many { pick: (Int) -> Int }\n\
+               fn pair() -> Int ![OuterC, InnerC, IO] {\n  \
+                 let a: Int = perform OuterC.pick(0);\n  \
+                 let b: Int = perform InnerC.pick(0);\n  \
+                 perform IO.println(int_to_string(a * 10 + b));\n  \
+                 0\n\
+               }\n\
+               fn run_inner() -> Int ![OuterC, IO] {\n  \
+                 handle pair() with {\n    \
+                   InnerC.pick(_seed, k) => {\n      \
+                     let r1: Int = k(2);\n      \
+                     let r2: Int = k(5);\n      \
+                     0\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle run_inner() with {\n    \
+                   OuterC.pick(_seed, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(6);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_choose_pair_enumeration");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "12\n15\n62\n65\n",
+        "Plan A: pair enumeration over OuterC × InnerC = {{1, 6}} × {{2, 5}}. \
+         For each outer resume a, inner resumes 2 then 5; pair prints a*10+b. \
+         a=1: prints 12, 15. a=6: prints 62, 65. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — pure-tail body remains correct (was already accepted by
+/// the pre-Plan-A chained-let-yield classifier; this test pins it
+/// against any future regression to the classifier or emit pass).
+/// Mirrors `examples/choose_demo.sigil` shape.
+#[test]
+fn multi_shot_pure_tail_unchanged() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(arg + 10);\n      \
+                     let r2: Int = k(arg + 20);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_pure_tail_unchanged");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "Plan A no-regression: pure-tail body. helper(5) → arm with arg=5; \
+         k(15)→15, k(25)→25; sum=40. stderr={stderr:?}"
+    );
+}
