@@ -9429,6 +9429,42 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_body, &ctors, &lookup, &lookup,
                         )
                     });
+                    if let Some(cl) = chain_length {
+                        if cl >= 2 {
+                            if let Some(tail) = &chain_body.tail {
+                                if let crate::ast::Expr::Call { callee, .. } = tail {
+                                    if let crate::ast::Expr::Ident(callee_name, _) = callee.as_ref()
+                                    {
+                                        if cc.colored.needs_cps_transform(callee_name) {
+                                            let performs_multi_shot = f.effects.iter().any(|er| {
+                                                checked.program.items.iter().any(
+                                                    |item| match item {
+                                                        crate::ast::Item::Effect(e) => {
+                                                            e.name == er.name && e.resumes_many
+                                                        }
+                                                        _ => false,
+                                                    },
+                                                )
+                                            });
+                                            if performs_multi_shot {
+                                                let span = tail.span();
+                                                return Err(format!(
+                                                    "[E0221] {}:{}:{}: multi-shot body's \
+                                                     post-perform tail is a Cps-call to `{}`. \
+                                                     In v1 this shape silently miscompiles — \
+                                                     only the first resume's effects fire. \
+                                                     Inline the helper's logic into the body's \
+                                                     branched tail instead. \
+                                                     Run `sigil explain E0221` for details.",
+                                                    span.file, span.line, span.column, callee_name,
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(chain_length) = chain_length {
                         let arm_body = chain_body;
                         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);

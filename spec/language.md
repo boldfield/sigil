@@ -1101,8 +1101,9 @@ when the `if`/`match` IS the `tail_expr`. The shapes that do
   Cps-colored function (e.g., `let a = perform p; let b = perform p; helper(a, b)`
   where `helper` itself performs IO): the Cps-call-as-tail breaks
   per-resume execution and only the first resume's effects fire.
-  Inline the helper's logic as a branched `tail_expr` instead of
-  hoisting branched performs into a separate Cps helper.
+  **The compiler rejects this shape with E0221.** Inline the
+  helper's logic as a branched `tail_expr` instead of hoisting
+  branched performs into a separate Cps helper.
 
 These restrictions lift in a follow-on plan.
 
@@ -1244,6 +1245,7 @@ Common codes:
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
+| E0221 | multi-shot body's post-perform tail is a Cps-call (§8.3) |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
 

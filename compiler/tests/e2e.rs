@@ -16597,3 +16597,180 @@ fn lambda_of_state_sum_type_with_cps_calls_falls_through() {
          incorrectly applied to arms with CPS calls. stderr={stderr:?}"
     );
 }
+
+// ===== E0221 — Cps-call-as-tail rejection in multi-shot bodies =====
+
+/// Multi-shot body with 2 performs + CPS-call-as-tail → E0221.
+#[test]
+fn cps_call_as_tail_in_multi_shot_rejected_with_e0221() {
+    let src = "import std.io\n\
+               \n\
+               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               \n\
+               fn report(a: Int, b: Int) -> Int ![IO] {\n  \
+                 match a + b == 7 {\n    \
+                   true => { perform IO.println(int_to_string(a * 10 + b)); 0 },\n    \
+                   false => 0,\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 report(a, b)\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1); let r2: Int = k(2); let r3: Int = k(3);\n      \
+                     let r4: Int = k(4); let r5: Int = k(5); let r6: Int = k(6);\n      \
+                     r1 + r2 + r3 + r4 + r5 + r6\n    \
+                   },\n  \
+                 };\n  \
+                 total\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "E0221",
+        &["report"],
+        "cps_call_as_tail_multi_shot_e0221",
+    );
+}
+
+/// Inline branched tail in multi-shot body compiles and runs correctly.
+#[test]
+fn inline_branched_tail_in_multi_shot_compiles_and_runs() {
+    let src = "import std.io\n\
+               \n\
+               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               \n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 match a + b == 7 {\n    \
+                   true => { perform IO.println(int_to_string(a * 10 + b)); 0 },\n    \
+                   false => 0,\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1); let r2: Int = k(2); let r3: Int = k(3);\n      \
+                     let r4: Int = k(4); let r5: Int = k(5); let r6: Int = k(6);\n      \
+                     r1 + r2 + r3 + r4 + r5 + r6\n    \
+                   },\n  \
+                 };\n  \
+                 total\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "inline_branched_tail_multi_shot");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "16\n25\n34\n43\n52\n61\n",
+        "Inline branched tail produces all 6 pairs summing to 7. \
+         stderr={stderr:?}"
+    );
+}
+
+/// Pure tail in multi-shot body compiles unchanged (no E0221).
+#[test]
+fn pure_tail_in_multi_shot_compiles_unchanged() {
+    let src = "import std.io\n\
+               \n\
+               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               \n\
+               fn body() -> Int ![Choose] {\n  \
+                 let a: Int = perform Choose.pick(1, 3);\n  \
+                 let b: Int = perform Choose.pick(1, 3);\n  \
+                 a * 10 + b\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle body() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1); let r2: Int = k(2); let r3: Int = k(3);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "pure_tail_multi_shot");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "198\n",
+        "Pure tail (a*10+b) in multi-shot body compiles unchanged. \
+         Sum of all a*10+b for a,b in 1..3 = 198. stderr={stderr:?}"
+    );
+}
+
+/// Single-shot body with CPS-call-as-tail compiles unchanged (no E0221).
+#[test]
+fn single_shot_cps_call_as_tail_compiles_unchanged() {
+    let src = "import std.io\n\
+               \n\
+               effect Once { do_thing: (Int) -> Int }\n\
+               \n\
+               fn helper(x: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 2\n\
+               }\n\
+               \n\
+               fn body() -> Int ![Once, IO] {\n  \
+                 let a: Int = perform Once.do_thing(5);\n  \
+                 helper(a)\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle body() with {\n    \
+                   Once.do_thing(n, k) => k(n + 10),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "single_shot_cps_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "15\n30\n",
+        "Single-shot CPS-call-as-tail compiles and runs correctly. \
+         helper(15) prints 15 returns 30. stderr={stderr:?}"
+    );
+}
+
+/// Multi-shot body with 1 perform + CPS-call-as-tail compiles unchanged.
+#[test]
+fn multi_shot_one_perform_cps_call_as_tail_compiles_unchanged() {
+    let src = "import std.io\n\
+               \n\
+               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               \n\
+               fn helper(x: Int) -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 2\n\
+               }\n\
+               \n\
+               fn body() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 3);\n  \
+                 helper(a)\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle body() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1); let r2: Int = k(2); let r3: Int = k(3);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_one_perform_cps_tail");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "1\n2\n3\n12\n",
+        "Multi-shot with 1 perform + CPS-call-as-tail works correctly. \
+         3 resumes print 1,2,3; helper returns x*2; sum=2+4+6=12. \
+         stderr={stderr:?}"
+    );
+}
