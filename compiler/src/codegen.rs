@@ -10703,6 +10703,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
+                // Plan A Phase 2 — extract body_first_step from the same
+                // rewritten body shape that ABI selection (line ~9020) and
+                // chain-step materialization (line ~9228) saw. Without
+                // this re-rewrite, the helper body emit reads `f.body`
+                // (un-rewritten); when the elaborator hoisted Binary /
+                // Unary operands into `$elab_t*` lets, the body's first
+                // stmt is a `$elab_t*` let whose value is a non-Perform /
+                // non-Call expression — the match arms below `unreachable
+                // !()` on it. The ABI classifier saw the inlined form and
+                // accepted; the emit saw the un-inlined form and panicked.
+                // Re-running the same composed rewrite here is idempotent
+                // and pure (the helper takes `&Block` and `&effects`,
+                // returns `Option<Block>` with substitution applied).
+                // Reproducer: helper with `perform Choose.choose(seed +
+                // factor * factor)` triggers the elaborator's BinOp
+                // hoisting; pre-this-fix, codegen panicked at the
+                // unreachable arm a few lines below.
+                let perform_norm_emit = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+                let body_after_perform_norm_emit = perform_norm_emit.as_ref().unwrap_or(&f.body);
+                let chain_normalized_emit =
+                    normalize_tail_perform_body(body_after_perform_norm_emit, &f.return_type);
+                let body_for_emit = chain_normalized_emit
+                    .as_ref()
+                    .unwrap_or(body_after_perform_norm_emit);
                 // Detection-before-dispatch ordering guard. The existing
                 // None-synth-cont arm `unreachable!()`'s on body tails
                 // that aren't `Some(Expr::Perform)` (e.g., compound
@@ -10714,7 +10738,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // into a debug-build crash with a pointer at the
                 // precedent.
                 debug_assert!(
-                    matches!(f.body.tail, Some(crate::ast::Expr::Perform(_)))
+                    matches!(body_for_emit.tail, Some(crate::ast::Expr::Perform(_)))
                         || synth_cont_idx_opt.is_some(),
                     "compute_user_fn_abi: a fn body without a tail-perform AND without a synth-cont \
                      reached the existing dispatch path. New body shapes (e.g. compound match) MUST \
@@ -10742,7 +10766,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // which would silently misbehave if any code path
                 // between Phase 4 and Phase 6 inspected the
                 // would-be-Perform's effect/op fields.
-                let is_zero_chain = synth_cont_idx_opt.is_some() && f.body.stmts.is_empty();
+                let is_zero_chain = synth_cont_idx_opt.is_some() && body_for_emit.stmts.is_empty();
                 let (body_first_step, synth_cont_func_id_opt): (
                     Option<ChainedNextStep>,
                     Option<cranelift_module::FuncId>,
@@ -10750,7 +10774,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let synth_cont_func_id = cps_continuation_synth[idx].func_id;
                     (None, Some(synth_cont_func_id))
                 } else if let Some(idx) = synth_cont_idx_opt {
-                    let step = match &f.body.stmts[0] {
+                    // Plan A Phase 2 — Stmt::Perform / Stmt::Expr cases
+                    // remain unreachable post-rewrite (rewrite_perform_-
+                    // stmts_as_lets converts every Stmt::Perform to
+                    // Stmt::Let; Stmt::Expr never matched the chained-let-
+                    // yield classifier). Stmt::Let arms cover the chain-
+                    // step shapes the classifier accepts.
+                    let step = match &body_for_emit.stmts[0] {
                         crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
                         crate::ast::Stmt::Let(l) => match &l.value {
                             crate::ast::Expr::Perform(p) => ChainedNextStep::Perform(p.clone()),
@@ -10770,7 +10800,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             _ => unreachable!(
                                 "is_simple_chained_let_yield_then_pure_tail_body \
                                      classifier guarantees Let value is Expr::Perform or \
-                                     Expr::Call (Plan D Task 112)"
+                                     Expr::Call (Plan D Task 112). Plan A Phase 2: the \
+                                     `body_for_emit` re-runs the same rewrite the pre-pass \
+                                     applied (rewrite_perform_stmts_as_lets +/- normalize_-
+                                     tail_perform_body), so any divergence here means the \
+                                     classifier accepted a body the rewrite couldn't \
+                                     normalize — a pre-pass invariant violation."
                             ),
                         },
                         _ => unreachable!(
@@ -10783,7 +10818,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let synth_cont_func_id = cps_continuation_synth[idx].func_id;
                     (Some(step), Some(synth_cont_func_id))
                 } else {
-                    let p = match &f.body.tail {
+                    let p = match &body_for_emit.tail {
                         Some(crate::ast::Expr::Perform(p)) => p.clone(),
                         _ => unreachable!(
                             "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
@@ -27323,6 +27358,53 @@ fn rewrite_perform_stmts_as_lets(
                 // source order; the elaborator emits `$elab_tN` in
                 // monotonic numbering, so all references in this let's
                 // RHS resolve against the partial map built so far.)
+                //
+                // Plan A Phase 2 (PR #119 review #5) — debug-only
+                // invariant check. The elaborator's contract for
+                // Binary/Unary operand hoisting is "fresh + monotonic
+                // + referenced exactly once at the immediate use site".
+                // `substitute_idents_in_expr` ASSUMES that contract:
+                // it inlines the value into every reference without
+                // memoizing. If a future elaborator change widens
+                // hoisting to call args (or any multi-reference shape),
+                // substitution will silently duplicate-evaluate the
+                // hoisted expression. For impure-but-non-yielding
+                // calls the args-purity relaxation now permits in
+                // perform args (`int_to_string(x*10+b)` etc.),
+                // duplicate evaluation is a correctness bug —
+                // double-allocation, double-observable-effects.
+                //
+                // The check counts `Ident($elab_tN)` occurrences in
+                // the rest of the original body (stmts[idx+1..] +
+                // tail). The expected count is exactly 1: each
+                // elaborator-lifted intermediate appears at exactly
+                // one use site by construction. A non-1 count means
+                // the elaborator's invariant changed; the rewriter
+                // must be re-audited before substitution can stay
+                // sound.
+                #[cfg(debug_assertions)]
+                {
+                    let mut refs: usize = 0;
+                    for s in &body.stmts[idx + 1..] {
+                        refs += count_ident_refs_in_stmt(s, &l.name);
+                    }
+                    if let Some(t) = body.tail.as_ref() {
+                        refs += count_ident_refs_in_expr(t, &l.name);
+                    }
+                    debug_assert_eq!(
+                        refs, 1,
+                        "Plan A Phase 2 substitution invariant: elaborator-lifted \
+                         binding `{}` is referenced {} times in the rest of fn body; \
+                         substitute_idents_in_expr assumes exactly 1 (the elaborator's \
+                         single-reference contract for Binary/Unary operand hoisting). \
+                         If the elaborator was extended to hoist a multi-reference \
+                         shape (e.g., call args, match scrutinees, repeated subexpressions), \
+                         the rewriter's eager-inline substitution will silently duplicate-\
+                         evaluate. Re-audit `rewrite_perform_stmts_as_lets` before \
+                         relaxing this assertion.",
+                        l.name, refs
+                    );
+                }
                 let resolved = substitute_idents_in_expr(&l.value, &subst);
                 subst.insert(l.name.clone(), resolved);
                 changed = true;
@@ -27541,6 +27623,109 @@ fn substitute_idents_in_block(
         tail: b.tail.as_ref().map(|t| substitute_idents_in_expr(t, subst)),
         span: b.span.clone(),
     }
+}
+
+/// Plan A Phase 2 (PR #119 review #5) — debug-only invariant check
+/// helper. Counts `Expr::Ident(name)` occurrences in an expression tree.
+/// Used by `rewrite_perform_stmts_as_lets` to verify the elaborator's
+/// single-reference contract for `$elab_t*` lifted intermediates.
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_expr(e: &crate::ast::Expr, name: &str) -> usize {
+    use crate::ast::Expr;
+    match e {
+        Expr::Ident(n, _) => {
+            if n == name {
+                1
+            } else {
+                0
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            count_ident_refs_in_expr(lhs, name) + count_ident_refs_in_expr(rhs, name)
+        }
+        Expr::Unary { operand, .. } => count_ident_refs_in_expr(operand, name),
+        Expr::Call { callee, args, .. } => {
+            count_ident_refs_in_expr(callee, name)
+                + args
+                    .iter()
+                    .map(|a| count_ident_refs_in_expr(a, name))
+                    .sum::<usize>()
+        }
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .map(|a| count_ident_refs_in_expr(a, name))
+            .sum(),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            count_ident_refs_in_expr(cond, name)
+                + count_ident_refs_in_block(then_block, name)
+                + count_ident_refs_in_block(else_block, name)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            count_ident_refs_in_expr(scrutinee, name)
+                + arms
+                    .iter()
+                    .map(|a| count_ident_refs_in_expr(&a.body, name))
+                    .sum::<usize>()
+        }
+        Expr::Block(b) => count_ident_refs_in_block(b, name),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .map(|f| count_ident_refs_in_expr(&f.value, name))
+            .sum(),
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .map(|e| count_ident_refs_in_expr(e, name))
+            .sum(),
+        // Variants that don't carry user-named Ident references (or
+        // are post-CC nodes that shouldn't appear pre-codegen-rewrite).
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. }
+        | Expr::Lambda { .. }
+        | Expr::Handle { .. } => 0,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_stmt(s: &crate::ast::Stmt, name: &str) -> usize {
+    use crate::ast::Stmt;
+    match s {
+        Stmt::Let(l) => count_ident_refs_in_expr(&l.value, name),
+        Stmt::Expr(e) => count_ident_refs_in_expr(e, name),
+        Stmt::Perform(p) => p
+            .args
+            .iter()
+            .map(|a| count_ident_refs_in_expr(a, name))
+            .sum(),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_block(b: &crate::ast::Block, name: &str) -> usize {
+    let stmts_refs: usize = b
+        .stmts
+        .iter()
+        .map(|s| count_ident_refs_in_stmt(s, name))
+        .sum();
+    let tail_refs = b
+        .tail
+        .as_ref()
+        .map(|t| count_ident_refs_in_expr(t, name))
+        .unwrap_or(0);
+    stmts_refs + tail_refs
 }
 
 /// The classifier is conservative — false negatives are acceptable

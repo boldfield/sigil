@@ -16253,3 +16253,138 @@ fn multi_shot_pure_tail_unchanged() {
          k(15)→15, k(25)→25; sum=40. stderr={stderr:?}"
     );
 }
+
+/// Plan A (PR #119 review #2a) — non-trivial Binary in perform args.
+/// Pre-fix this triggered a codegen panic at the chained-let-yield
+/// body-emit's `body_first_step` extraction (`unreachable!()` at the
+/// `Stmt::Let` Binary-value match arm) because the body emit walked
+/// `f.body` un-rewritten while ABI selection saw the elaborator-
+/// inlined form. The Phase 2 re-rewrite fix at the body emit site
+/// closes the gap; this test pins it.
+#[test]
+fn multi_shot_post_perform_tail_nontrivial_perform_args() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int, factor: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed + factor * factor);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5, 3) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_nontrivial_perform_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: helper's perform-arg expression `seed + factor * factor` \
+         elaborator-hoists into a `$elab_t*` chain; the Phase 2 rewriter inlines \
+         them back so the chained-let-yield classifier accepts. Per-resume \
+         body execution prints arg_i and returns arg_i*1000; arm combine \
+         700000 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
+
+/// Plan A (PR #119 review #2b) — Cps user fn call inside perform args.
+/// The args-purity relaxation (`expr_is_pure → !expr_contains_perform`)
+/// permits Calls in args; the chain step's Middle synth-cont's emit
+/// lowers them via `lowerer.lower_expr`, which routes Cps user fn calls
+/// through `lower_call`'s existing Sync→Cps interop wrapper. This test
+/// exercises that path.
+#[test]
+fn multi_shot_post_perform_tail_cps_call_in_args() {
+    let src = "effect Tag { mark: () -> Int }\n\
+               fn marked_id(x: Int) -> Int ![Tag] {\n  \
+                 let _t: Int = perform Tag.mark();\n  \
+                 x\n\
+               }\n\
+               effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, Tag, IO] {\n  \
+                 let x: Int = perform Choose.choose(marked_id(seed));\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 100\n\
+               }\n\
+               fn run_tag(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Tag.mark(k) => k(1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_tag(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_cps_call_in_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n1800\n",
+        "Plan A: `marked_id(seed)` is a Cps user fn call inside the multi-shot \
+         perform's args; routes through Sync→Cps interop synchronously. The \
+         args eval ONCE at the perform site (not per resume) — Tag.mark() \
+         fires once with seed=5. Per-resume body execution: x=7 prints 7 \
+         and returns 700; x=11 prints 11 and returns 1100; arm combine \
+         r1+r2 = 1800. stderr={stderr:?}"
+    );
+}
+
+/// Plan A (PR #119 review #2c) — mid-body discard `Stmt::Perform` whose
+/// op has a non-Unit return type. The Phase 2 rewriter's
+/// `rewrite_perform_stmts_as_lets` synthesizes a let with the op's
+/// actual return type (looked up via the effects registry), not a
+/// hardcoded Unit. This test exercises a Stmt::Perform of an `Int`-
+/// returning op (`Counter.tick`) whose result is discarded by source
+/// semantics.
+#[test]
+fn multi_shot_post_perform_tail_nonunit_discard_perform() {
+    let src = "effect Counter { tick: () -> Int }\n\
+               effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, Counter, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform Counter.tick();\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn run_counter(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Counter.tick(k) => k(99),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_counter(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_nonunit_discard_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: `perform Counter.tick()` is a discard-Stmt::Perform with \
+         non-Unit return type (Int). The rewriter synthesizes \
+         `let __perform_unit_<idx>: Int = perform Counter.tick()` rather \
+         than hardcoding Unit. Per-resume body execution: x=7 prints 7 \
+         and returns 7000; x=11 prints 11 and returns 11000; arm combine \
+         700000 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
