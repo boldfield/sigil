@@ -1073,18 +1073,38 @@ per-resume IO ordering specified here is what the caller observes.
 **Eligible body shapes for v1.** The compiler classifies the helper
 fn's body into one of several supported Cps-ABI shapes that
 implement per-resume execution. The chained-let-yield shape covers
-`let x_0 = perform p_0; ...; let x_N = perform p_N; pure_tail` and
+`let x_0 = perform p_0; ...; let x_N = perform p_N; tail_expr` and
 its mid-body-discard variant `let x_0 = perform p_0; perform p_1;
-…; pure_tail` (mid-body `Stmt::Perform` is normalized to a discarded
+…; tail_expr` (mid-body `Stmt::Perform` is normalized to a discarded
 let by the codegen pass; the compiler also inlines elaborator-lifted
 ANF intermediates so impure-but-non-yielding perform args like
-`int_to_string(x*10+b)` don't prevent classification). Body shapes
-outside this surface (e.g., post-perform tail with a perform inside
-an `if`/`match` arm) currently fall back to a non-Cps lowering that
-does not implement per-resume execution; programs in those shapes
-should refactor the post-perform tail into a Cps-classifiable form
-(typically by hoisting branched performs into a separate Cps
-helper). This restriction lifts in a follow-on plan.
+`int_to_string(x*10+b)` don't prevent classification).
+
+`tail_expr` is the block's final expression (no trailing `;`). It
+may be:
+
+- A pure expression (literal, arithmetic, identifier, etc.).
+- An `if`/`else` whose branches each return values of the body's
+  return type. Either or both branches may perform their own effects.
+- A `match` whose arms each return values of the body's return
+  type. Any arm may perform its own effects.
+
+Per-resume execution is preserved through the branched expression
+when the `if`/`match` IS the `tail_expr`. The shapes that do
+**not** currently work:
+
+- **Branched perform as a statement** followed by a separate
+  `tail_expr` (e.g., `let a = perform p; match cond { true => perform q, false => () }; 0`).
+  The match must be the tail, not a statement before the tail.
+  Rewrite as `let a = perform p; match cond { true => { perform q; 0 }, false => 0 }`.
+- **Cps-call-as-tail** — a `tail_expr` that's a call to a separate
+  Cps-colored function (e.g., `let a = perform p; let b = perform p; helper(a, b)`
+  where `helper` itself performs IO): the Cps-call-as-tail breaks
+  per-resume execution and only the first resume's effects fire.
+  Inline the helper's logic as a branched `tail_expr` instead of
+  hoisting branched performs into a separate Cps helper.
+
+These restrictions lift in a follow-on plan.
 
 **Conditional k-call.** Handler arm bodies may use `if`/`else` and
 `match` to conditionally invoke `k`:

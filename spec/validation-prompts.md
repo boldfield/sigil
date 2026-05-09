@@ -403,12 +403,13 @@ Int }` and a cons-list type `type IntList = | Nil | Cons(Int,
 IntList)`. Define `fn count_elements(xs: IntList) -> Int ![State, IO]`
 that walks the list and increments the State counter once per `Cons`
 cell via `let cur: Int = perform State.get(); let _: Int = perform
-State.set(cur + 1); count_elements(rest)`, returning `0` at the
-`Nil` base case. Define a higher-order helper `fn run_state(
-initial: Int, comp: () -> Int ![State, IO]) -> Int ![IO]` that
-discharges State by maintaining the threaded counter through
-handler arms returning lambdas-of-state (the canonical Koka/Effekt
-shape: `State.get(k) => fn(s) { k(s)(s) }`, `State.set(s', k) =>
+State.set(cur + 1); count_elements(rest)`, returning the final
+threaded count via `perform State.get()` at the `Nil` base case.
+Define a higher-order helper `fn run_state(initial: Int, comp:
+() -> Int ![State, IO]) -> Int ![IO]` that discharges State by
+maintaining the threaded counter through handler arms returning
+lambdas-of-state (the canonical Koka/Effekt shape:
+`State.get(k) => fn(s) { k(s)(s) }`, `State.set(s', k) =>
 fn(_) { k(())(s') }`, `return(v) => fn(_) { v }`, applied to
 `initial`). In `main`, build a 5-element `IntList` (e.g., `Cons(10,
 Cons(20, Cons(30, Cons(40, Cons(50, Nil)))))`), `let final_count:
