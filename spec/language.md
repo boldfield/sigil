@@ -1078,13 +1078,20 @@ its mid-body-discard variant `let x_0 = perform p_0; perform p_1;
 …; pure_tail` (mid-body `Stmt::Perform` is normalized to a discarded
 let by the codegen pass; the compiler also inlines elaborator-lifted
 ANF intermediates so impure-but-non-yielding perform args like
-`int_to_string(x*10+b)` don't prevent classification). Body shapes
-outside this surface (e.g., post-perform tail with a perform inside
-an `if`/`match` arm) currently fall back to a non-Cps lowering that
-does not implement per-resume execution; programs in those shapes
-should refactor the post-perform tail into a Cps-classifiable form
-(typically by hoisting branched performs into a separate Cps
-helper). This restriction lifts in a follow-on plan.
+`int_to_string(x*10+b)` don't prevent classification). Body shapes outside this surface (e.g., post-perform tail with a
+perform inside an `if`/`match` arm) currently fall back to a non-Cps
+lowering that does not implement per-resume execution; programs in
+those shapes should refactor the post-perform tail into a
+Cps-classifiable form. This restriction lifts in a follow-on plan.
+
+The shape that does **not** currently work is a post-perform tail
+that is a call to a separate Cps-colored function (e.g., `let a =
+perform p; let b = perform p; helper(a, b)` where `helper` itself
+performs IO): the resulting Cps-call-as-tail breaks per-resume
+execution and only the first resume's effects fire. **The compiler
+rejects this shape with E0221.** Inline the helper's logic into the
+body's branched tail instead of hoisting branched performs into a
+separate Cps helper. This restriction lifts in a follow-on plan.
 
 **Conditional k-call.** Handler arm bodies may use `if`/`else` and
 `match` to conditionally invoke `k`:
@@ -1224,6 +1231,7 @@ Common codes:
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
+| E0221 | multi-shot body's post-perform tail is a Cps-call (§8.3) |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
 
