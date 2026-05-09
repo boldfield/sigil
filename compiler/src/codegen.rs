@@ -9014,8 +9014,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let normalized_body = normalize_tail_perform_body(&f.body, &f.return_type);
-            let body_for_abi = normalized_body.as_ref().unwrap_or(&f.body);
+            // Plan A Phase 2 — rewrite `Stmt::Perform(p)` to `Stmt::Let
+            // { name: synthesized, ty: <op return>, value: perform p }`
+            // BEFORE the existing tail-perform normalization. Composing
+            // both normalizations lets the chained-let-yield classifier
+            // accept body shapes with mid-body discard performs (which
+            // previously fell to Sync ABI and silently miscompiled
+            // multi-shot — see compiler/docs/multi-shot-tail-anomaly.md).
+            let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+            let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+            let normalized_body =
+                normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
+            let body_for_abi = normalized_body
+                .as_ref()
+                .unwrap_or(body_after_perform_norm);
             let abi =
                 compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
@@ -9211,8 +9223,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
                 } else {
-                    let chain_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
-                    let chain_body = chain_normalized.as_ref().unwrap_or(&f.body);
+                    // Plan A Phase 2 — same Stmt::Perform → Stmt::Let
+                    // rewrite as the ABI selection above; both passes
+                    // must see identical body shapes for the classifier
+                    // and emit to materialize the same chain.
+                    let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+                    let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+                    let chain_normalized =
+                        normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
+                    let chain_body = chain_normalized
+                        .as_ref()
+                        .unwrap_or(body_after_perform_norm);
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
@@ -27242,6 +27263,81 @@ fn normalize_tail_perform_body(
     })
 }
 
+/// Plan A Phase 2 — Stmt::Perform → Stmt::Let normalization for the
+/// chained-let-yield body classifier.
+///
+/// Background: pre-Plan-A, helpers whose body had a mid-body
+/// `Stmt::Perform` (a perform whose result is discarded by source
+/// semantics) failed the chained-let-yield classifier
+/// ([`is_simple_chained_let_yield_then_pure_tail_body`]) on its
+/// "every stmt is `Stmt::Let`" gate, falling back to `UserFnAbi
+/// ::Sync`. Sync ABI multi-shot is structurally broken because
+/// `lower_perform_to_value` passes `k_fn = sigil_continuation_-
+/// identity`, collapsing per-resume body execution (each k(arg_i)
+/// dispatches identity, so r_i = arg_i instead of body_tail(arg_i)).
+/// See `compiler/docs/multi-shot-tail-anomaly.md` for the full
+/// diagnosis.
+///
+/// This rewrite normalizes `Stmt::Perform(p)` to `Stmt::Let { name:
+/// "__perform_unit_<idx>", ty: <op return type>, value: Expr::Perform
+/// (p) }`. The synthesized binding is unused (no later code references
+/// it); its sole purpose is to fit the chained-let-yield classifier's
+/// "every stmt is Stmt::Let" shape so the body classifies as Cps ABI
+/// and gets per-resume helper synth-cont chain emission.
+///
+/// Returns `Some(rewritten)` if any rewrite happened; `None` if the
+/// body has no `Stmt::Perform` to rewrite (passes through untouched).
+/// The synthetic binding name uses a `__perform_unit_` prefix; sigil
+/// identifiers can start with `_` so the prefix can't collide with
+/// user names (the parser's identifier rule accepts `_` as the lead
+/// character, but no user-facing convention uses `__perform_unit_`).
+fn rewrite_perform_stmts_as_lets(
+    body: &crate::ast::Block,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> Option<crate::ast::Block> {
+    use crate::ast::{Block, LetStmt, Stmt};
+    let mut changed = false;
+    let mut new_stmts: Vec<Stmt> = Vec::with_capacity(body.stmts.len());
+    for (idx, stmt) in body.stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Perform(p) => {
+                // Look up the op's return type. Typecheck (E0042 /
+                // E0043) ensures effect + op are registered, so a
+                // missing entry here is a typecheck-invariant violation;
+                // surface it as None (the body falls back to its
+                // existing un-normalized handling) rather than
+                // panicking — the classifier path is conservative,
+                // and a defensive None preserves the invariant that
+                // false negatives are acceptable.
+                let return_te = match effects.get(&p.effect) {
+                    Some(eff) => match eff.ops.iter().find(|o| o.name == p.op) {
+                        Some(op_decl) => op_decl.return_type.clone(),
+                        None => return None,
+                    },
+                    None => return None,
+                };
+                let synth_name = format!("__perform_unit_{idx}");
+                new_stmts.push(Stmt::Let(LetStmt {
+                    name: synth_name,
+                    ty: return_te,
+                    value: crate::ast::Expr::Perform(p.clone()),
+                    span: p.span.clone(),
+                }));
+                changed = true;
+            }
+            other => new_stmts.push(other.clone()),
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some(Block {
+        stmts: new_stmts,
+        tail: body.tail.clone(),
+        span: body.span.clone(),
+    })
+}
+
 /// The classifier is conservative — false negatives are acceptable
 /// (force the body through the existing native-ABI path), false
 /// positives are not (would cause codegen to emit incomplete
@@ -27846,7 +27942,27 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
                 if seen_pure_after_yield {
                     return None;
                 }
-                if !p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+                // Plan A Phase 2 — accept perform args that are
+                // non-yielding rather than the stricter `expr_is_pure`
+                // gate. The Middle synth-cont's emit lowers
+                // `next_arg_expr` via `lowerer.lower_expr`, which
+                // handles arbitrary non-yielding expressions
+                // (builtins, Sync user fn calls, BinOps over them) at
+                // the chain-step body site. The previous `expr_is_pure`
+                // gate rejected `int_to_string(x)` etc. (non-ctor
+                // calls aren't pure under the constructor-only purity
+                // rule), forcing helpers like `let _u = perform IO
+                // .println(int_to_string(x))` to fall back to Sync
+                // ABI where multi-shot is structurally broken.
+                //
+                // `expr_contains_perform` permits non-yielding Calls
+                // and rejects nested performs / Lambdas / Handles
+                // (lambdas conservatively classify as containing
+                // perform; see `expr_contains_perform`). Cps user fn
+                // calls in args route through `lower_call`'s existing
+                // Sync→Cps interop, identical to pre-Plan-A
+                // behaviour for those calls.
+                if p.args.iter().any(expr_contains_perform) {
                     return None;
                 }
                 yield_count += 1;
@@ -29623,10 +29739,14 @@ mod tests {
     }
 
     #[test]
-    fn chained_classifier_rejects_impure_perform_args() {
-        // A perform whose args aren't pure (e.g., a nested call)
-        // disqualifies — the synth-cont machinery can't lower
-        // yield-able args.
+    fn chained_classifier_accepts_non_yielding_call_perform_args() {
+        // Plan A Phase 2 — perform args with non-yielding Calls
+        // (builtins, Sync user fns) are accepted. The Middle synth-cont
+        // emit lowers them via `lowerer.lower_expr` at chain-step time.
+        // Pre-Plan-A this case rejected via the stricter `expr_is_pure`
+        // gate, forcing helpers like `let _u = perform IO.println(int_to_string(x))`
+        // to fall back to Sync ABI where multi-shot is structurally
+        // broken.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -29637,12 +29757,54 @@ mod tests {
                 value: Expr::Perform(PerformExpr {
                     effect: "Raise".to_string(),
                     op: "fail".to_string(),
-                    // Args contain a Call — not pure.
+                    // Args contain a Call — non-yielding (no nested
+                    // perform). The classifier permits it; the emit
+                    // pass lowers via `lowerer.lower_expr`.
                     args: vec![Expr::Call {
                         callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
                         args: Vec::new(),
                         span: span.clone(),
                     }],
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new(),
+                &|_| false,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_rejects_perform_in_perform_args() {
+        // Plan A Phase 2 — yielding args (perform inside perform args)
+        // remain rejected. The chain-step emit can't lower a yield-
+        // bearing arg expression — it would need to issue a nested
+        // perform mid-step, which the chain machinery doesn't support.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    // Args contain a nested perform — yielding.
+                    args: vec![Expr::Perform(PerformExpr {
+                        effect: "State".to_string(),
+                        op: "get".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    })],
                     span: span.clone(),
                 }),
                 span: span.clone(),
