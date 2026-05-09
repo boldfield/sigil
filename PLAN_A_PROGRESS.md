@@ -82,10 +82,15 @@ position (no if/match in the tail). Oracle `12\n15\n62\n65\n`. This
 demonstrates Plan A's per-resume body execution under nested multi-
 shot handlers with the body shape Plan A's fix supports.
 
-**Verdict:** Plan A's fix is necessary but not sufficient for the
-literal LLM-written P20. The reduced 2x2 e2e test pins the
-mechanism Plan A targets; the literal P20 needs a follow-on plan
-extending the classifier to if/match-tail-with-perform-branches.
+**Update (2026-05-09 review iteration #2):** the literal P20 prompt's
+shape now classifies and runs correctly. The Phase 2 rewriter
+extension (recursive normalization through nested `Block`s reachable
+via `Expr::If` / `Expr::Match` / `Expr::Block` / `Expr::Lambda` /
+`Expr::Handle` subexpressions) lets `classify_branched_cps_tail_branch`
+accept perform-bearing branches via `BranchedCpsLeaf::PerformChain`.
+The `multi_shot_choose_pair_enumeration` e2e test was updated to use
+the literal P20 shape; output matches the documented oracle
+`16\n25\n34\n43\n52\n61\n` exit 0.
 
 ### P19 (State threading via lambda-of-state)
 
@@ -138,13 +143,51 @@ separate machinery (lifting the dynamic-extent restriction so
 continuations can be reified into a lambda return value, per the
 plan's cluster note that Plan B handles this).
 
-**Verdict:** Plan A doesn't make P19 produce `5\n` even with the
-`resumes: many` patch. The design doc's claim that "Plan A with
-resumes: many patch" suffices is inconsistent with what Plan A's
-diagnosis surfaced (the bug is at ABI selection for helpers; arm-
-body lambdas are a separate issue). The runtime gap remains until
-Plan B's first-class continuation work, OR until a separate plan
-extends arm-body classification to lambdas-returning-from-arm.
+**Update (2026-05-09 review iteration #2):** empirical investigation
+confirmed P19's runtime issue is **pre-existing on `main`** (commit
+`32b4356`, the head of `main` at PR #119 open) and **independent of
+Plan A's helper-body classifier extension**. Steps:
+
+1. Stashed the Plan A branch's work, checked out `main`, rebuilt with
+   `cargo build --release --bin sigil`, ran the same P19 source. Output:
+   `0`. Same as on the Plan A branch.
+2. Wrote `pattern_c_use_x.sigil`: a verbatim copy of the existing
+   passing test `pattern_c_in_branch_perform_state_threading_returns_42`
+   with one line added — `perform IO.println(int_to_string(_x))`
+   inside `helper`. Compiled + ran on `main` (no Plan A). Output:
+   pointer-shaped values like `4310626240` followed by
+   `sigil_perform: unhandled effect_id 1 (op_id 1); handler stack empty`,
+   exit 134.
+
+The pattern_c test "passes" only because `_x` (the `perform S.get()`
+value inside `helper`) is bound but never observed. The lambda-of-state
+encoding's runtime mechanism does NOT correctly deliver the perform's
+resume value when observed — the value bound is the arm's lambda
+closure pointer, not the threaded state Int. This is a runtime-level
+gap in v1's lambda-of-state semantics that exists on `main` and is
+unrelated to multi-shot helper-body classification.
+
+Specifically, the runtime path (`lower_k_pair_call` at codegen.rs:21957
++ `sigil_continuation_invoke` at runtime/continuation.rs:174) handles
+the captured-`k` dispatch convention for lifted lambdas correctly for
+the FINAL perform site (where the body has no further yields after the
+perform — that's pattern_c's `let v = perform S.get(); v`); for
+perform sites with more yields after them (P19's `let cur = perform
+State.get(); ...; State.set(cur+1); count_elements(rest)`), the
+delivered value is the next arm's lambda closure rather than the
+state Int. The `(s)` application chain in `k(s)(s)` doesn't compose
+correctly when the body's continuation hits a subsequent perform
+before completing.
+
+**Verdict (revised, 2026-05-09 #2):** Plan A doesn't make P19 produce
+`5` because the issue isn't multi-shot helper-body classification —
+it's lambda-of-state runtime semantics for non-terminal perform sites.
+The design doc's claim "Plan A's bug fix surfaces here" was based on
+a misreading of where the runtime gap lies; empirical verification on
+`main` shows the same `0` output regardless of Plan A's classifier
+extension. Fixing P19 properly is genuinely Plan B's "first-class
+continuation surface" + lambda-of-state runtime work — a substantial
+runtime + codegen redesign (1000+ LOC estimate, multiple subsystems).
 
 P19 with prompt rewrite to cell-backed encoding (`run_state` allocates
 a `Ref[Int]` and threads via arms that return Int) is what
@@ -159,9 +202,10 @@ suite — that path is unaffected by Plan A.
 
 | Prompt | Plan A outcome | Plan A's design-doc expectation | Match? |
 |--------|---------------|--------------------------------|--------|
-| P20 literal | empty stdout | `16\n25\n34\n43\n52\n61\n` | NO — body shape outside Plan A |
-| P20 reduced (2x2) | `12\n15\n62\n65\n` | (n/a — not the literal prompt) | YES, demonstrates mechanism |
-| P19 with `resumes: many` patch | `0\n` | `5\n` | NO — arm-body lambda outside Plan A |
+| P20 literal (pre-#119-review-#4) | empty stdout | `16\n25\n34\n43\n52\n61\n` | NO — branch classifier rejected perform-bearing branches |
+| P20 literal (post-#119-review-#4) | `16\n25\n34\n43\n52\n61\n` | `16\n25\n34\n43\n52\n61\n` | YES |
+| P19 with `resumes: many` patch (Plan A branch) | `0\n` | `5\n` | NO — lambda-of-state runtime gap (pre-existing on `main`) |
+| P19 with `resumes: many` patch (`main`, pre-Plan-A) | `0\n` | (n/a) | Same as Plan A branch — confirms Plan A doesn't regress and doesn't address |
 
 ## Recommendation
 
