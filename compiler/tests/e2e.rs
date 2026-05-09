@@ -16090,8 +16090,7 @@ fn multi_shot_post_perform_tail_io_per_resume() {
                  perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "multi_shot_post_perform_tail_io_per_resume");
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_post_perform_tail_io_per_resume");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "7\n11\n711000\n",
@@ -16125,8 +16124,10 @@ fn multi_shot_post_perform_tail_nested_perform_per_resume() {
                  perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "multi_shot_post_perform_tail_nested_perform_per_resume");
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "multi_shot_post_perform_tail_nested_perform_per_resume",
+    );
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "2\ngot\n3\ngot\n500\n",

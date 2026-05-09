@@ -9025,9 +9025,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
             let normalized_body =
                 normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
-            let body_for_abi = normalized_body
-                .as_ref()
-                .unwrap_or(body_after_perform_norm);
+            let body_for_abi = normalized_body.as_ref().unwrap_or(body_after_perform_norm);
             let abi =
                 compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
@@ -9231,9 +9229,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
                     let chain_normalized =
                         normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
-                    let chain_body = chain_normalized
-                        .as_ref()
-                        .unwrap_or(body_after_perform_norm);
+                    let chain_body = chain_normalized.as_ref().unwrap_or(body_after_perform_norm);
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
@@ -27315,8 +27311,7 @@ fn rewrite_perform_stmts_as_lets(
 ) -> Option<crate::ast::Block> {
     use crate::ast::{Block, Expr, LetStmt, Stmt};
     let mut changed = false;
-    let mut subst: std::collections::BTreeMap<String, Expr> =
-        std::collections::BTreeMap::new();
+    let mut subst: std::collections::BTreeMap<String, Expr> = std::collections::BTreeMap::new();
     let mut new_stmts: Vec<Stmt> = Vec::with_capacity(body.stmts.len());
     for (idx, stmt) in body.stmts.iter().enumerate() {
         match stmt {
@@ -27543,10 +27538,7 @@ fn substitute_idents_in_block(
                 }),
             })
             .collect(),
-        tail: b
-            .tail
-            .as_ref()
-            .map(|t| substitute_idents_in_expr(t, subst)),
+        tail: b.tail.as_ref().map(|t| substitute_idents_in_expr(t, subst)),
         span: b.span.clone(),
     }
 }
