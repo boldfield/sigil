@@ -1012,6 +1012,80 @@ Effect.op(arg, k) => {
 N is fixed at compile time; runtime-N variations use first-class
 continuations (see §8.5).
 
+**Per-resume execution semantics.** Each `k(arg_i)` invocation runs
+the body's post-perform tail **independently** with the let-binding
+of the perform site bound to `arg_i`. Observable side effects in the
+body's post-perform tail fire **in resume order**, once per `k(arg_i)`
+call. The pure return value produced by the body's tail under
+substitution `let-binding := arg_i` is bound to `r_i`. After all N
+resumes complete, the arm's `combine(r_1, …, r_N)` runs once with
+the per-resume `r_i` values in scope.
+
+That is: for a body of shape `let x: T = perform E.op(); rest_using_x`,
+each `k(arg_i)` is observationally equivalent to running `rest_using_x`
+with `x = arg_i`. If `rest_using_x` performs further effects, those
+effects fire per resume in their original source order.
+
+##### Worked example — per-resume IO ordering
+
+```sigil
+effect Choose resumes: many { choose: (Int) -> Int }
+
+fn helper(seed: Int) -> Int ![Choose, IO] {
+  let x: Int = perform Choose.choose(seed);
+  perform IO.println(int_to_string(x));   -- post-perform observable
+  x * 1000
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = handle helper(5) with {
+    Choose.choose(arg, k) => {
+      let r1: Int = k(7);
+      let r2: Int = k(11);
+      r1 * 100 + r2
+    },
+  };
+  perform IO.println(int_to_string(total));
+  0
+}
+```
+
+Stdout:
+
+```
+7
+11
+711000
+```
+
+Trace: `k(7)` runs the body's post-perform tail with `x = 7` —
+prints `7`, returns `7 * 1000 = 7000` so `r1 = 7000`. `k(11)` runs
+the same tail with `x = 11` — prints `11`, returns `11 * 1000 =
+11000` so `r2 = 11000`. The arm's combine `r1 * 100 + r2 = 700000 +
+11000 = 711000` runs once. The outer `IO.println(int_to_string(total))`
+prints `711000`.
+
+This shape generalizes to any `resumes: many` effect. `std.choose`'s
+`all_choices` (see §13) is layered on top of this primitive — when
+the bodies passed to `all_choices` contain side effects, the
+per-resume IO ordering specified here is what the caller observes.
+
+**Eligible body shapes for v1.** The compiler classifies the helper
+fn's body into one of several supported Cps-ABI shapes that
+implement per-resume execution. The chained-let-yield shape covers
+`let x_0 = perform p_0; ...; let x_N = perform p_N; pure_tail` and
+its mid-body-discard variant `let x_0 = perform p_0; perform p_1;
+…; pure_tail` (mid-body `Stmt::Perform` is normalized to a discarded
+let by the codegen pass; the compiler also inlines elaborator-lifted
+ANF intermediates so impure-but-non-yielding perform args like
+`int_to_string(x*10+b)` don't prevent classification). Body shapes
+outside this surface (e.g., post-perform tail with a perform inside
+an `if`/`match` arm) currently fall back to a non-Cps lowering that
+does not implement per-resume execution; programs in those shapes
+should refactor the post-perform tail into a Cps-classifiable form
+(typically by hoisting branched performs into a separate Cps
+helper). This restriction lifts in a follow-on plan.
+
 **Conditional k-call.** Handler arm bodies may use `if`/`else` and
 `match` to conditionally invoke `k`:
 
@@ -1258,7 +1332,7 @@ files are the authoritative API reference.
 | `std.clock` | `Clock` effect + `run_os_clock` (wall-clock nanos) + `run_frozen_clock` (fixed `Int64` timestamp for test determinism). |
 | `std.raise` | `Raise[E]` effect (generic over error type) + `raise[A, E](e: E) -> A ![Raise[E]]` + `catch[A, E](body) -> Result[A, E] ![| e]` (row-polymorphic residual). |
 | `std.state` | `State[S]` effect (generic over state type) + `run_state[A, S](initial, body) -> (A, S) ![]`. Backed by a runtime mutable cell (`Ref[S]`) — `run_state` allocates a cell on entry, threads State arms' `get` / `set` resumes through it, and reads the final state out at exit. The cell-backed encoding composes cleanly with `Raise[E]` in either nesting order; the prior Plotkin lambda-encoding had a Sync-ABI gap that surfaced as SIGSEGV on `catch(run_state(... raise ...))`. `Ref[T]` is internal scaffolding: the typechecker rejects calls to `sigil_ref_alloc` / `sigil_ref_deref` / `sigil_ref_set` from outside `std/state.sigil` (E0148). |
-| `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. |
+| `std.choose` | `Choose resumes: many` effect + `all_choices[A](body) -> List[A]` (enumerate all branches) + `first_choice[A](body) -> Option[A]` (find first non-failing branch). Both use first-class continuations for runtime-N enumeration. Per §8.3 per-resume semantics: when `body` performs observable effects (e.g., IO) after a `Choose.choose` perform, those effects fire once per branch in resume order. |
 | `std.panic` | Doc-only header for the `panic` / `assert` builtins (see §13.2.1). Importing it is a no-op — both names are available without `import`. |
 
 #### §13.1 — Comparator-mixing in `Set` operations
