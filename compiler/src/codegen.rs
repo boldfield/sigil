@@ -9014,8 +9014,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // field; this commit consumes it for signature selection.
             // The transitional `#[allow(dead_code)]` on
             // `UserFnEntry::abi` is removed at the same time.
-            let normalized_body = normalize_tail_perform_body(&f.body, &f.return_type);
-            let body_for_abi = normalized_body.as_ref().unwrap_or(&f.body);
+            // Plan A Phase 2 — rewrite `Stmt::Perform(p)` to `Stmt::Let
+            // { name: synthesized, ty: <op return>, value: perform p }`
+            // BEFORE the existing tail-perform normalization. Composing
+            // both normalizations lets the chained-let-yield classifier
+            // accept body shapes with mid-body discard performs (which
+            // previously fell to Sync ABI and silently miscompiled
+            // multi-shot — see compiler/docs/multi-shot-tail-anomaly.md).
+            let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+            let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+            let normalized_body =
+                normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
+            let body_for_abi = normalized_body.as_ref().unwrap_or(body_after_perform_norm);
             let abi =
                 compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
             let (sig, param_tys, ret_ty) = match abi {
@@ -9211,8 +9221,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     });
                     cps_continuation_synth_indices.insert(f.name.clone(), synth_cont_idx);
                 } else {
-                    let chain_normalized = normalize_tail_perform_body(&f.body, &f.return_type);
-                    let chain_body = chain_normalized.as_ref().unwrap_or(&f.body);
+                    // Plan A Phase 2 — same Stmt::Perform → Stmt::Let
+                    // rewrite as the ABI selection above; both passes
+                    // must see identical body shapes for the classifier
+                    // and emit to materialize the same chain.
+                    let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+                    let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+                    let chain_normalized =
+                        normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
+                    let chain_body = chain_normalized.as_ref().unwrap_or(body_after_perform_norm);
                     let lookup = |callee_name: &str| {
                         is_supported_cps_user_fn(callee_name, &fns_by_name, &cc.colored, &ctors)
                     };
@@ -10686,6 +10703,30 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
+                // Plan A Phase 2 — extract body_first_step from the same
+                // rewritten body shape that ABI selection (line ~9020) and
+                // chain-step materialization (line ~9228) saw. Without
+                // this re-rewrite, the helper body emit reads `f.body`
+                // (un-rewritten); when the elaborator hoisted Binary /
+                // Unary operands into `$elab_t*` lets, the body's first
+                // stmt is a `$elab_t*` let whose value is a non-Perform /
+                // non-Call expression — the match arms below `unreachable
+                // !()` on it. The ABI classifier saw the inlined form and
+                // accepted; the emit saw the un-inlined form and panicked.
+                // Re-running the same composed rewrite here is idempotent
+                // and pure (the helper takes `&Block` and `&effects`,
+                // returns `Option<Block>` with substitution applied).
+                // Reproducer: helper with `perform Choose.choose(seed +
+                // factor * factor)` triggers the elaborator's BinOp
+                // hoisting; pre-this-fix, codegen panicked at the
+                // unreachable arm a few lines below.
+                let perform_norm_emit = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
+                let body_after_perform_norm_emit = perform_norm_emit.as_ref().unwrap_or(&f.body);
+                let chain_normalized_emit =
+                    normalize_tail_perform_body(body_after_perform_norm_emit, &f.return_type);
+                let body_for_emit = chain_normalized_emit
+                    .as_ref()
+                    .unwrap_or(body_after_perform_norm_emit);
                 // Detection-before-dispatch ordering guard. The existing
                 // None-synth-cont arm `unreachable!()`'s on body tails
                 // that aren't `Some(Expr::Perform)` (e.g., compound
@@ -10697,7 +10738,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // into a debug-build crash with a pointer at the
                 // precedent.
                 debug_assert!(
-                    matches!(f.body.tail, Some(crate::ast::Expr::Perform(_)))
+                    matches!(body_for_emit.tail, Some(crate::ast::Expr::Perform(_)))
                         || synth_cont_idx_opt.is_some(),
                     "compute_user_fn_abi: a fn body without a tail-perform AND without a synth-cont \
                      reached the existing dispatch path. New body shapes (e.g. compound match) MUST \
@@ -10725,7 +10766,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // which would silently misbehave if any code path
                 // between Phase 4 and Phase 6 inspected the
                 // would-be-Perform's effect/op fields.
-                let is_zero_chain = synth_cont_idx_opt.is_some() && f.body.stmts.is_empty();
+                let is_zero_chain = synth_cont_idx_opt.is_some() && body_for_emit.stmts.is_empty();
                 let (body_first_step, synth_cont_func_id_opt): (
                     Option<ChainedNextStep>,
                     Option<cranelift_module::FuncId>,
@@ -10733,7 +10774,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let synth_cont_func_id = cps_continuation_synth[idx].func_id;
                     (None, Some(synth_cont_func_id))
                 } else if let Some(idx) = synth_cont_idx_opt {
-                    let step = match &f.body.stmts[0] {
+                    // Plan A Phase 2 — Stmt::Perform / Stmt::Expr cases
+                    // remain unreachable post-rewrite (rewrite_perform_-
+                    // stmts_as_lets converts every Stmt::Perform to
+                    // Stmt::Let; Stmt::Expr never matched the chained-let-
+                    // yield classifier). Stmt::Let arms cover the chain-
+                    // step shapes the classifier accepts.
+                    let step = match &body_for_emit.stmts[0] {
                         crate::ast::Stmt::Perform(p) => ChainedNextStep::Perform(p.clone()),
                         crate::ast::Stmt::Let(l) => match &l.value {
                             crate::ast::Expr::Perform(p) => ChainedNextStep::Perform(p.clone()),
@@ -10753,7 +10800,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             _ => unreachable!(
                                 "is_simple_chained_let_yield_then_pure_tail_body \
                                      classifier guarantees Let value is Expr::Perform or \
-                                     Expr::Call (Plan D Task 112)"
+                                     Expr::Call (Plan D Task 112). Plan A Phase 2: the \
+                                     `body_for_emit` re-runs the same rewrite the pre-pass \
+                                     applied (rewrite_perform_stmts_as_lets +/- normalize_-
+                                     tail_perform_body), so any divergence here means the \
+                                     classifier accepted a body the rewrite couldn't \
+                                     normalize — a pre-pass invariant violation."
                             ),
                         },
                         _ => unreachable!(
@@ -10766,7 +10818,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let synth_cont_func_id = cps_continuation_synth[idx].func_id;
                     (Some(step), Some(synth_cont_func_id))
                 } else {
-                    let p = match &f.body.tail {
+                    let p = match &body_for_emit.tail {
                         Some(crate::ast::Expr::Perform(p)) => p.clone(),
                         _ => unreachable!(
                             "codegen Phase 4e: CPS-ABI fn `{}` body is not a \
@@ -27242,6 +27294,745 @@ fn normalize_tail_perform_body(
     })
 }
 
+/// Plan A Phase 2 — Stmt::Perform → Stmt::Let + `$elab_t*` substitution
+/// normalization for the chained-let-yield body classifier.
+///
+/// Background: pre-Plan-A, helpers whose body had a mid-body
+/// `Stmt::Perform` (a perform whose result is discarded by source
+/// semantics) failed the chained-let-yield classifier
+/// ([`is_simple_chained_let_yield_then_pure_tail_body`]) on its
+/// "every stmt is `Stmt::Let`" gate, falling back to `UserFnAbi
+/// ::Sync`. Sync ABI multi-shot is structurally broken because
+/// `lower_perform_to_value` passes `k_fn = sigil_continuation_-
+/// identity`, collapsing per-resume body execution (each k(arg_i)
+/// dispatches identity, so r_i = arg_i instead of body_tail(arg_i)).
+/// See `compiler/docs/multi-shot-tail-anomaly.md` for the full
+/// diagnosis.
+///
+/// This rewrite does two things in one pass:
+///
+/// 1. **Stmt::Perform → Stmt::Let**: rewrites mid-body `Stmt::Perform(p)`
+///    to `Stmt::Let { name: "__perform_unit_<idx>", ty: <op return type>,
+///    value: Expr::Perform(p) }`. The synthesized binding is unused; its
+///    sole purpose is to fit the chained-let-yield classifier's "every
+///    stmt is Stmt::Let" shape.
+///
+/// 2. **`$elab_t*` substitution**: the elaborator (compiler/src/elaborate.rs)
+///    ANF-lifts non-trivial Binary/Unary operands into `let $elab_tN: T =
+///    <expr>;` bindings, breaking up `int_to_string(a*10+b)` into a
+///    chain of pure-trailing-lets. These lets sit BETWEEN yields in
+///    chains where the original source had impure perform args
+///    (e.g., `perform IO.println(int_to_string(a*10+b))`). The
+///    `seen_pure_after_yield` gate in the classifier rejects yields
+///    that come after pure-trailing-lets, so the chain doesn't classify.
+///
+///    Substitution unwinds the elaborator's lifting: each `$elab_t*`
+///    let is dropped from the body and its value is substituted into
+///    every `Ident($elab_t*)` reference in subsequent stmts and the
+///    tail. The elaborator's invariant guarantees `$elab_t*` names are
+///    fresh, monotonic, and referenced exactly once at the immediate
+///    use site (Binary/Unary operand position), so substitution is
+///    a clean inverse with no duplication of evaluation. After
+///    substitution the chain becomes purely yield-then-yield with
+///    inline impure-non-yielding args, which the relaxed classifier
+///    args check (`!expr_contains_perform`) accepts.
+///
+/// Returns `Some(rewritten)` if any rewrite or substitution happened;
+/// `None` if the body is already in chained-let-yield-compatible shape
+/// (no `Stmt::Perform`, no `$elab_t*` lets).
+fn rewrite_perform_stmts_as_lets(
+    body: &crate::ast::Block,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> Option<crate::ast::Block> {
+    let (rewritten, changed) =
+        rewrite_block_with_subst(body, &std::collections::BTreeMap::new(), effects);
+    if changed {
+        Some(rewritten)
+    } else {
+        None
+    }
+}
+
+/// Plan A Phase 2 — recursive variant of [`rewrite_perform_stmts_as_lets`].
+/// Walks a `Block` AND every nested Block reachable through If/Match/
+/// Block subexpressions, applying the same `Stmt::Perform → Stmt::Let`
+/// + `$elab_t*` substitution pass to each.
+///
+/// Each nested Block inherits the outer scope's substitution map (the
+/// elaborator emits `$elab_t*` names fresh + monotonic, so outer-scope
+/// elab let values can be applied to inner expressions without
+/// shadowing concerns). The inner Block extends a *clone* of the
+/// inherited map with its own `$elab_t*` lets — local additions don't
+/// leak back out to the outer scope.
+///
+/// Returns `(new_block, changed)`. `changed` is `true` iff anything
+/// in the resulting block (or any nested block) differs from the input.
+/// The caller `rewrite_perform_stmts_as_lets` lifts that into the
+/// `Option<Block>` API the existing call sites consume.
+///
+/// The recursion matters for the body classifier's branch leaf check
+/// (`classify_branched_cps_tail_branch`): without this, branches like
+/// `{ Stmt::Perform(IO.println); IntLit(0) }` stay un-normalized and
+/// the classifier rejects them; with the recursion, each branch's
+/// `Stmt::Perform` becomes a `Stmt::Let { __perform_unit_<idx>: <ret>
+/// = perform ... }`, which the branch classifier accepts as
+/// `BranchedCpsLeaf::PerformChain`. This is what makes the literal P20
+/// shape (let-yield-prefix + If-tail with perform-bearing branch) pass
+/// classification without needing AST hoisting.
+fn rewrite_block_with_subst(
+    body: &crate::ast::Block,
+    inherited_subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> (crate::ast::Block, bool) {
+    use crate::ast::{Block, Expr, LetStmt, Stmt};
+    let mut changed = false;
+    let mut subst: std::collections::BTreeMap<String, Expr> = inherited_subst.clone();
+    let mut new_stmts: Vec<Stmt> = Vec::with_capacity(body.stmts.len());
+    for (idx, stmt) in body.stmts.iter().enumerate() {
+        match stmt {
+            Stmt::Let(l) if l.name.starts_with("$elab_t") => {
+                // Elaborator-lifted ANF intermediate. Inline its value
+                // into subsequent uses. The value itself may reference
+                // earlier `$elab_t*` names, so substitute through `subst`
+                // as we record this binding. (Order of insertion equals
+                // source order; the elaborator emits `$elab_tN` in
+                // monotonic numbering, so all references in this let's
+                // RHS resolve against the partial map built so far.)
+                //
+                // Plan A Phase 2 (PR #119 review #5) — debug-only
+                // invariant check. The elaborator's contract for
+                // Binary/Unary operand hoisting is "fresh + monotonic
+                // + referenced exactly once at the immediate use site".
+                // `substitute_idents_in_expr` ASSUMES that contract:
+                // it inlines the value into every reference without
+                // memoizing. If a future elaborator change widens
+                // hoisting to call args (or any multi-reference shape),
+                // substitution will silently duplicate-evaluate the
+                // hoisted expression. For impure-but-non-yielding
+                // calls the args-purity relaxation now permits in
+                // perform args (`int_to_string(x*10+b)` etc.),
+                // duplicate evaluation is a correctness bug —
+                // double-allocation, double-observable-effects.
+                //
+                // The check counts `Ident($elab_tN)` occurrences in
+                // the rest of the original body (stmts[idx+1..] +
+                // tail). The expected count is exactly 1: each
+                // elaborator-lifted intermediate appears at exactly
+                // one use site by construction. A non-1 count means
+                // the elaborator's invariant changed; the rewriter
+                // must be re-audited before substitution can stay
+                // sound.
+                #[cfg(debug_assertions)]
+                {
+                    let mut refs: usize = 0;
+                    for s in &body.stmts[idx + 1..] {
+                        refs += count_ident_refs_in_stmt(s, &l.name);
+                    }
+                    if let Some(t) = body.tail.as_ref() {
+                        refs += count_ident_refs_in_expr(t, &l.name);
+                    }
+                    debug_assert_eq!(
+                        refs, 1,
+                        "Plan A Phase 2 substitution invariant: elaborator-lifted \
+                         binding `{}` is referenced {} times in the rest of fn body; \
+                         substitute_idents_in_expr assumes exactly 1 (the elaborator's \
+                         single-reference contract for Binary/Unary operand hoisting). \
+                         If the elaborator was extended to hoist a multi-reference \
+                         shape (e.g., call args, match scrutinees, repeated subexpressions), \
+                         the rewriter's eager-inline substitution will silently duplicate-\
+                         evaluate. Re-audit `rewrite_perform_stmts_as_lets` before \
+                         relaxing this assertion.",
+                        l.name, refs
+                    );
+                }
+                let (resolved, _) = rewrite_expr_propagating(&l.value, &subst, effects);
+                subst.insert(l.name.clone(), resolved);
+                changed = true;
+            }
+            Stmt::Let(l) => {
+                let (resolved_value, expr_changed) =
+                    rewrite_expr_propagating(&l.value, &subst, effects);
+                if expr_changed {
+                    changed = true;
+                }
+                new_stmts.push(Stmt::Let(LetStmt {
+                    name: l.name.clone(),
+                    ty: l.ty.clone(),
+                    value: resolved_value,
+                    span: l.span.clone(),
+                }));
+            }
+            Stmt::Expr(e) => {
+                let (resolved, expr_changed) = rewrite_expr_propagating(e, &subst, effects);
+                if expr_changed {
+                    changed = true;
+                }
+                new_stmts.push(Stmt::Expr(resolved));
+            }
+            Stmt::Perform(p) => {
+                // Look up the op's return type. Typecheck (E0042 /
+                // E0043) ensures effect + op are registered, so a
+                // missing entry here is a typecheck-invariant violation;
+                // bail with `(body.clone(), false)` so the caller treats
+                // this as "no rewrite happened" and falls back to the
+                // existing un-normalized handling.
+                let return_te = match effects
+                    .get(&p.effect)
+                    .and_then(|eff| eff.ops.iter().find(|o| o.name == p.op))
+                    .map(|op_decl| op_decl.return_type.clone())
+                {
+                    Some(te) => te,
+                    None => return (body.clone(), false),
+                };
+                let resolved_args: Vec<Expr> = p
+                    .args
+                    .iter()
+                    .map(|a| {
+                        let (rewritten, _) = rewrite_expr_propagating(a, &subst, effects);
+                        rewritten
+                    })
+                    .collect();
+                let synth_name = format!("__perform_unit_{idx}");
+                new_stmts.push(Stmt::Let(LetStmt {
+                    name: synth_name,
+                    ty: return_te,
+                    value: Expr::Perform(crate::ast::PerformExpr {
+                        effect: p.effect.clone(),
+                        op: p.op.clone(),
+                        args: resolved_args,
+                        span: p.span.clone(),
+                    }),
+                    span: p.span.clone(),
+                }));
+                changed = true;
+            }
+        }
+    }
+    let new_tail = body.tail.as_ref().map(|t| {
+        let (rewritten, expr_changed) = rewrite_expr_propagating(t, &subst, effects);
+        if expr_changed {
+            changed = true;
+        }
+        rewritten
+    });
+    let new_block = Block {
+        stmts: new_stmts,
+        tail: new_tail,
+        span: body.span.clone(),
+    };
+    (new_block, changed)
+}
+
+/// Plan A Phase 2 — apply `Ident → subst[name]` substitution AND
+/// recursively descend into nested Blocks for their own normalization
+/// (`Stmt::Perform → Stmt::Let`, `$elab_t*` substitution). Returns
+/// `(new_expr, changed)` where `changed` is `true` iff anything was
+/// substituted or any nested Block had a structural rewrite.
+///
+/// Each nested Block inherits the outer scope's substitution map (the
+/// elaborator's monotonic-fresh-name discipline guarantees no
+/// shadowing collision when an outer-scope `$elab_t*` value is applied
+/// to inner expressions). The inner Block extends a clone of the
+/// inherited map with its own local elab lets via `rewrite_block_with_-
+/// subst`.
+fn rewrite_expr_propagating(
+    e: &crate::ast::Expr,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+    effects: &std::collections::BTreeMap<String, crate::ast::EffectDecl>,
+) -> (crate::ast::Expr, bool) {
+    use crate::ast::Expr;
+    match e {
+        Expr::Ident(name, _) => {
+            if let Some(replacement) = subst.get(name) {
+                (replacement.clone(), true)
+            } else {
+                (e.clone(), false)
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => {
+            let (new_lhs, c1) = rewrite_expr_propagating(lhs, subst, effects);
+            let (new_rhs, c2) = rewrite_expr_propagating(rhs, subst, effects);
+            (
+                Expr::Binary {
+                    op: *op,
+                    lhs: Box::new(new_lhs),
+                    rhs: Box::new(new_rhs),
+                    span: span.clone(),
+                },
+                c1 || c2,
+            )
+        }
+        Expr::Unary { op, operand, span } => {
+            let (new_operand, c) = rewrite_expr_propagating(operand, subst, effects);
+            (
+                Expr::Unary {
+                    op: *op,
+                    operand: Box::new(new_operand),
+                    span: span.clone(),
+                },
+                c,
+            )
+        }
+        Expr::Call { callee, args, span } => {
+            let (new_callee, c0) = rewrite_expr_propagating(callee, subst, effects);
+            let mut any_changed = c0;
+            let new_args: Vec<Expr> = args
+                .iter()
+                .map(|a| {
+                    let (new_a, c) = rewrite_expr_propagating(a, subst, effects);
+                    any_changed = any_changed || c;
+                    new_a
+                })
+                .collect();
+            (
+                Expr::Call {
+                    callee: Box::new(new_callee),
+                    args: new_args,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Perform(p) => {
+            let mut any_changed = false;
+            let new_args: Vec<Expr> = p
+                .args
+                .iter()
+                .map(|a| {
+                    let (new_a, c) = rewrite_expr_propagating(a, subst, effects);
+                    any_changed = any_changed || c;
+                    new_a
+                })
+                .collect();
+            (
+                Expr::Perform(crate::ast::PerformExpr {
+                    effect: p.effect.clone(),
+                    op: p.op.clone(),
+                    args: new_args,
+                    span: p.span.clone(),
+                }),
+                any_changed,
+            )
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => {
+            let (new_cond, c0) = rewrite_expr_propagating(cond, subst, effects);
+            let (new_then, c1) = rewrite_block_with_subst(then_block, subst, effects);
+            let (new_else, c2) = rewrite_block_with_subst(else_block, subst, effects);
+            (
+                Expr::If {
+                    cond: Box::new(new_cond),
+                    then_block: Box::new(new_then),
+                    else_block: Box::new(new_else),
+                    span: span.clone(),
+                },
+                c0 || c1 || c2,
+            )
+        }
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => {
+            let (new_scrut, c0) = rewrite_expr_propagating(scrutinee, subst, effects);
+            let mut any_changed = c0;
+            let new_arms: Vec<crate::ast::MatchArm> = arms
+                .iter()
+                .map(|a| {
+                    let (new_body, c) = rewrite_expr_propagating(&a.body, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::MatchArm {
+                        pattern: a.pattern.clone(),
+                        body: new_body,
+                        span: a.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::Match {
+                    scrutinee: Box::new(new_scrut),
+                    arms: new_arms,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Block(b) => {
+            let (rewritten, c) = rewrite_block_with_subst(b, subst, effects);
+            (Expr::Block(Box::new(rewritten)), c)
+        }
+        Expr::RecordLit { name, fields, span } => {
+            let mut any_changed = false;
+            let new_fields: Vec<crate::ast::RecordFieldLit> = fields
+                .iter()
+                .map(|f| {
+                    let (nv, c) = rewrite_expr_propagating(&f.value, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::RecordFieldLit {
+                        name: f.name.clone(),
+                        value: nv,
+                        span: f.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::RecordLit {
+                    name: name.clone(),
+                    fields: new_fields,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Tuple { elems, span } => {
+            let mut any_changed = false;
+            let new_elems: Vec<Expr> = elems
+                .iter()
+                .map(|el| {
+                    let (ne, c) = rewrite_expr_propagating(el, subst, effects);
+                    any_changed = any_changed || c;
+                    ne
+                })
+                .collect();
+            (
+                Expr::Tuple {
+                    elems: new_elems,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::Lambda {
+            params,
+            return_type,
+            effects: lam_effects,
+            effect_row_var,
+            body,
+            span,
+        } => {
+            let (new_body, c) = rewrite_expr_propagating(body, subst, effects);
+            (
+                Expr::Lambda {
+                    params: params.clone(),
+                    return_type: return_type.clone(),
+                    effects: lam_effects.clone(),
+                    effect_row_var: effect_row_var.clone(),
+                    body: Box::new(new_body),
+                    span: span.clone(),
+                },
+                c,
+            )
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            span,
+        } => {
+            let (new_body, c0) = rewrite_expr_propagating(body, subst, effects);
+            let mut any_changed = c0;
+            let new_return_arm = return_arm.as_ref().map(|ra| {
+                let (nb, c) = rewrite_expr_propagating(&ra.body, subst, effects);
+                any_changed = any_changed || c;
+                Box::new(crate::ast::HandleReturnArm {
+                    binding: ra.binding.clone(),
+                    binding_span: ra.binding_span.clone(),
+                    body: nb,
+                    span: ra.span.clone(),
+                })
+            });
+            let new_op_arms: Vec<crate::ast::HandleOpArm> = op_arms
+                .iter()
+                .map(|arm| {
+                    let (nb, c) = rewrite_expr_propagating(&arm.body, subst, effects);
+                    any_changed = any_changed || c;
+                    crate::ast::HandleOpArm {
+                        effect: arm.effect.clone(),
+                        effect_span: arm.effect_span.clone(),
+                        op: arm.op.clone(),
+                        op_span: arm.op_span.clone(),
+                        params: arm.params.clone(),
+                        k_name: arm.k_name.clone(),
+                        k_span: arm.k_span.clone(),
+                        body: nb,
+                        span: arm.span.clone(),
+                    }
+                })
+                .collect();
+            (
+                Expr::Handle {
+                    body: Box::new(new_body),
+                    return_arm: new_return_arm,
+                    op_arms: new_op_arms,
+                    span: span.clone(),
+                },
+                any_changed,
+            )
+        }
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. } => (e.clone(), false),
+    }
+}
+
+/// Plan A Phase 2 — substitute `Ident(name)` → `subst[name]` recursively
+/// through an expression. Used to inline elaborator-lifted `$elab_t*`
+/// bindings back into their use sites; substitution is sound because
+/// each `$elab_t*` name is referenced exactly once at the immediate
+/// use site (Binary/Unary operand position).
+#[allow(dead_code)]
+fn substitute_idents_in_expr(
+    e: &crate::ast::Expr,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+) -> crate::ast::Expr {
+    use crate::ast::Expr;
+    if subst.is_empty() {
+        return e.clone();
+    }
+    match e {
+        Expr::Ident(name, _span) => {
+            if let Some(replacement) = subst.get(name) {
+                replacement.clone()
+            } else {
+                e.clone()
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(substitute_idents_in_expr(lhs, subst)),
+            rhs: Box::new(substitute_idents_in_expr(rhs, subst)),
+            span: span.clone(),
+        },
+        Expr::Unary { op, operand, span } => Expr::Unary {
+            op: *op,
+            operand: Box::new(substitute_idents_in_expr(operand, subst)),
+            span: span.clone(),
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: Box::new(substitute_idents_in_expr(callee, subst)),
+            args: args
+                .iter()
+                .map(|a| substitute_idents_in_expr(a, subst))
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Perform(p) => Expr::Perform(crate::ast::PerformExpr {
+            effect: p.effect.clone(),
+            op: p.op.clone(),
+            args: p
+                .args
+                .iter()
+                .map(|a| substitute_idents_in_expr(a, subst))
+                .collect(),
+            span: p.span.clone(),
+        }),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => Expr::If {
+            cond: Box::new(substitute_idents_in_expr(cond, subst)),
+            then_block: Box::new(substitute_idents_in_block(then_block, subst)),
+            else_block: Box::new(substitute_idents_in_block(else_block, subst)),
+            span: span.clone(),
+        },
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => Expr::Match {
+            scrutinee: Box::new(substitute_idents_in_expr(scrutinee, subst)),
+            arms: arms
+                .iter()
+                .map(|a| crate::ast::MatchArm {
+                    pattern: a.pattern.clone(),
+                    body: substitute_idents_in_expr(&a.body, subst),
+                    span: a.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Block(b) => Expr::Block(Box::new(substitute_idents_in_block(b, subst))),
+        Expr::RecordLit { name, fields, span } => Expr::RecordLit {
+            name: name.clone(),
+            fields: fields
+                .iter()
+                .map(|f| crate::ast::RecordFieldLit {
+                    name: f.name.clone(),
+                    value: substitute_idents_in_expr(&f.value, subst),
+                    span: f.span.clone(),
+                })
+                .collect(),
+            span: span.clone(),
+        },
+        Expr::Tuple { elems, span } => Expr::Tuple {
+            elems: elems
+                .iter()
+                .map(|e| substitute_idents_in_expr(e, subst))
+                .collect(),
+            span: span.clone(),
+        },
+        // Variants with no Ident-bearing children pass through.
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. }
+        | Expr::Lambda { .. }
+        | Expr::Handle { .. } => e.clone(),
+    }
+}
+
+fn substitute_idents_in_block(
+    b: &crate::ast::Block,
+    subst: &std::collections::BTreeMap<String, crate::ast::Expr>,
+) -> crate::ast::Block {
+    use crate::ast::Stmt;
+    crate::ast::Block {
+        stmts: b
+            .stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Let(l) => Stmt::Let(crate::ast::LetStmt {
+                    name: l.name.clone(),
+                    ty: l.ty.clone(),
+                    value: substitute_idents_in_expr(&l.value, subst),
+                    span: l.span.clone(),
+                }),
+                Stmt::Expr(e) => Stmt::Expr(substitute_idents_in_expr(e, subst)),
+                Stmt::Perform(p) => Stmt::Perform(crate::ast::PerformExpr {
+                    effect: p.effect.clone(),
+                    op: p.op.clone(),
+                    args: p
+                        .args
+                        .iter()
+                        .map(|a| substitute_idents_in_expr(a, subst))
+                        .collect(),
+                    span: p.span.clone(),
+                }),
+            })
+            .collect(),
+        tail: b.tail.as_ref().map(|t| substitute_idents_in_expr(t, subst)),
+        span: b.span.clone(),
+    }
+}
+
+/// Plan A Phase 2 (PR #119 review #5) — debug-only invariant check
+/// helper. Counts `Expr::Ident(name)` occurrences in an expression tree.
+/// Used by `rewrite_perform_stmts_as_lets` to verify the elaborator's
+/// single-reference contract for `$elab_t*` lifted intermediates.
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_expr(e: &crate::ast::Expr, name: &str) -> usize {
+    use crate::ast::Expr;
+    match e {
+        Expr::Ident(n, _) => {
+            if n == name {
+                1
+            } else {
+                0
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            count_ident_refs_in_expr(lhs, name) + count_ident_refs_in_expr(rhs, name)
+        }
+        Expr::Unary { operand, .. } => count_ident_refs_in_expr(operand, name),
+        Expr::Call { callee, args, .. } => {
+            count_ident_refs_in_expr(callee, name)
+                + args
+                    .iter()
+                    .map(|a| count_ident_refs_in_expr(a, name))
+                    .sum::<usize>()
+        }
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .map(|a| count_ident_refs_in_expr(a, name))
+            .sum(),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            count_ident_refs_in_expr(cond, name)
+                + count_ident_refs_in_block(then_block, name)
+                + count_ident_refs_in_block(else_block, name)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            count_ident_refs_in_expr(scrutinee, name)
+                + arms
+                    .iter()
+                    .map(|a| count_ident_refs_in_expr(&a.body, name))
+                    .sum::<usize>()
+        }
+        Expr::Block(b) => count_ident_refs_in_block(b, name),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .map(|f| count_ident_refs_in_expr(&f.value, name))
+            .sum(),
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .map(|e| count_ident_refs_in_expr(e, name))
+            .sum(),
+        // Variants that don't carry user-named Ident references (or
+        // are post-CC nodes that shouldn't appear pre-codegen-rewrite).
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. }
+        | Expr::ClosureRecord { .. }
+        | Expr::Lambda { .. }
+        | Expr::Handle { .. } => 0,
+    }
+}
+
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_stmt(s: &crate::ast::Stmt, name: &str) -> usize {
+    use crate::ast::Stmt;
+    match s {
+        Stmt::Let(l) => count_ident_refs_in_expr(&l.value, name),
+        Stmt::Expr(e) => count_ident_refs_in_expr(e, name),
+        Stmt::Perform(p) => p
+            .args
+            .iter()
+            .map(|a| count_ident_refs_in_expr(a, name))
+            .sum(),
+    }
+}
+
+#[cfg(debug_assertions)]
+fn count_ident_refs_in_block(b: &crate::ast::Block, name: &str) -> usize {
+    let stmts_refs: usize = b
+        .stmts
+        .iter()
+        .map(|s| count_ident_refs_in_stmt(s, name))
+        .sum();
+    let tail_refs = b
+        .tail
+        .as_ref()
+        .map(|t| count_ident_refs_in_expr(t, name))
+        .unwrap_or(0);
+    stmts_refs + tail_refs
+}
+
 /// The classifier is conservative — false negatives are acceptable
 /// (force the body through the existing native-ABI path), false
 /// positives are not (would cause codegen to emit incomplete
@@ -27846,7 +28637,27 @@ fn is_simple_chained_let_yield_then_pure_tail_body(
                 if seen_pure_after_yield {
                     return None;
                 }
-                if !p.args.iter().all(|a| expr_is_pure(a, ctors)) {
+                // Plan A Phase 2 — accept perform args that are
+                // non-yielding rather than the stricter `expr_is_pure`
+                // gate. The Middle synth-cont's emit lowers
+                // `next_arg_expr` via `lowerer.lower_expr`, which
+                // handles arbitrary non-yielding expressions
+                // (builtins, Sync user fn calls, BinOps over them) at
+                // the chain-step body site. The previous `expr_is_pure`
+                // gate rejected `int_to_string(x)` etc. (non-ctor
+                // calls aren't pure under the constructor-only purity
+                // rule), forcing helpers like `let _u = perform IO
+                // .println(int_to_string(x))` to fall back to Sync
+                // ABI where multi-shot is structurally broken.
+                //
+                // `expr_contains_perform` permits non-yielding Calls
+                // and rejects nested performs / Lambdas / Handles
+                // (lambdas conservatively classify as containing
+                // perform; see `expr_contains_perform`). Cps user fn
+                // calls in args route through `lower_call`'s existing
+                // Sync→Cps interop, identical to pre-Plan-A
+                // behaviour for those calls.
+                if p.args.iter().any(expr_contains_perform) {
                     return None;
                 }
                 yield_count += 1;
@@ -29623,10 +30434,14 @@ mod tests {
     }
 
     #[test]
-    fn chained_classifier_rejects_impure_perform_args() {
-        // A perform whose args aren't pure (e.g., a nested call)
-        // disqualifies — the synth-cont machinery can't lower
-        // yield-able args.
+    fn chained_classifier_accepts_non_yielding_call_perform_args() {
+        // Plan A Phase 2 — perform args with non-yielding Calls
+        // (builtins, Sync user fns) are accepted. The Middle synth-cont
+        // emit lowers them via `lowerer.lower_expr` at chain-step time.
+        // Pre-Plan-A this case rejected via the stricter `expr_is_pure`
+        // gate, forcing helpers like `let _u = perform IO.println(int_to_string(x))`
+        // to fall back to Sync ABI where multi-shot is structurally
+        // broken.
         use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
         use crate::errors::Span;
         let span = Span::synthetic("x.sigil");
@@ -29637,12 +30452,54 @@ mod tests {
                 value: Expr::Perform(PerformExpr {
                     effect: "Raise".to_string(),
                     op: "fail".to_string(),
-                    // Args contain a Call — not pure.
+                    // Args contain a Call — non-yielding (no nested
+                    // perform). The classifier permits it; the emit
+                    // pass lowers via `lowerer.lower_expr`.
                     args: vec![Expr::Call {
                         callee: Box::new(Expr::Ident("helper".to_string(), span.clone())),
                         args: Vec::new(),
                         span: span.clone(),
                     }],
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            })],
+            tail: Some(Expr::Ident("x".to_string(), span.clone())),
+            span,
+        };
+        assert_eq!(
+            is_simple_chained_let_yield_then_pure_tail_body(
+                &body,
+                &std::collections::BTreeSet::new(),
+                &|_| false,
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn chained_classifier_rejects_perform_in_perform_args() {
+        // Plan A Phase 2 — yielding args (perform inside perform args)
+        // remain rejected. The chain-step emit can't lower a yield-
+        // bearing arg expression — it would need to issue a nested
+        // perform mid-step, which the chain machinery doesn't support.
+        use crate::ast::{Block, Expr, LetStmt, PerformExpr, Stmt, TypeExpr};
+        use crate::errors::Span;
+        let span = Span::synthetic("x.sigil");
+        let body = Block {
+            stmts: vec![Stmt::Let(LetStmt {
+                name: "x".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                value: Expr::Perform(PerformExpr {
+                    effect: "Raise".to_string(),
+                    op: "fail".to_string(),
+                    // Args contain a nested perform — yielding.
+                    args: vec![Expr::Perform(PerformExpr {
+                        effect: "State".to_string(),
+                        op: "get".to_string(),
+                        args: Vec::new(),
+                        span: span.clone(),
+                    })],
                     span: span.clone(),
                 }),
                 span: span.clone(),

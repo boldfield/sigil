@@ -16047,3 +16047,346 @@ fn assert_in_function_validation_fails() {
     );
     assert_eq!(stdout, "", "stdout={stdout:?}");
 }
+
+// ---------------------------------------------------------------------
+// Plan A — multi-shot post-perform-tail correctness
+// ---------------------------------------------------------------------
+//
+// These tests pin the per-resume execution semantics of the body's
+// post-perform tail under multi-shot (`resumes: many`) effects. The
+// helper body shape `let x = perform Choose; perform IO.println(...);
+// pure_tail` previously fell back to Sync ABI because the chained-let-
+// yield classifier didn't accept mid-body `Stmt::Perform` or non-pure
+// perform args; Sync ABI multi-shot uses `sigil_continuation_identity`
+// as `k_fn`, collapsing per-resume body execution to zero. Plan A
+// Phase 2 fixes this by AST-rewriting `Stmt::Perform` to `Stmt::Let`
+// and relaxing the perform-args purity check to `!expr_contains_perform`.
+//
+// See `compiler/docs/multi-shot-tail-anomaly.md` for the diagnosis.
+
+/// Plan A — Background-section reproducer. Per-resume body execution
+/// fires the body's IO println once per `k(arg_i)` with `x = arg_i`,
+/// then the arm's combine fires once with `r_i = body_pure_tail(arg_i)
+/// = arg_i * 1000`. Pre-Plan-A this produced `711\n711000\n` (single
+/// IO with `x = 711` = arm's combine evaluated with `r_i := arg_i`,
+/// then arm combine pure-tail also produces 711000). Post-Plan-A the
+/// per-resume IO ordering matches the spec §8.3 semantics.
+#[test]
+fn multi_shot_post_perform_tail_io_per_resume() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_post_perform_tail_io_per_resume");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: per-resume body execution. k(7) → body fires with x=7, prints \"7\", \
+         returns 7*1000=7000; k(11) → body fires with x=11, prints \"11\", returns \
+         11*1000=11000; arm combine 7000*100 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — body has TWO post-perform observable effects in sequence.
+/// Both nested IO performs must fire per resume. Pre-Plan-A both
+/// would either fire once (collapsed) or with wrong x value; post-Plan-A
+/// each resume independently runs the full post-perform tail.
+#[test]
+fn multi_shot_post_perform_tail_nested_perform_per_resume() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 perform IO.println(\"got\");\n  \
+                 x * 100\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(2);\n      \
+                     let r2: Int = k(3);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(
+        src,
+        "multi_shot_post_perform_tail_nested_perform_per_resume",
+    );
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "2\ngot\n3\ngot\n500\n",
+        "Plan A: per-resume body execution with two nested performs. \
+         k(2) → prints \"2\", \"got\", returns 200. \
+         k(3) → prints \"3\", \"got\", returns 300. \
+         Arm combine 200 + 300 = 500. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — N=3 chain with distinct per-resume IO. Verifies ordering
+/// (resume 1 IO, resume 2 IO, resume 3 IO, then the arm's combine)
+/// and that each resume sees its own arg.
+#[test]
+fn multi_shot_three_resumes_distinct_io() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(0) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     let r3: Int = k(13);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_three_resumes_distinct_io");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n13\n31\n",
+        "Plan A: 3-resume chain. k(7) prints 7, returns 7. k(11) prints 11, returns 11. \
+         k(13) prints 13, returns 13. Sum = 31. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — pilot prompt P20 LITERAL (Choose pair enumeration).
+/// Single multi-shot `Choose.pick` effect; `pairs()` performs twice
+/// (a, b) and conditionally prints `a*10+b` when `a + b == 7`. The
+/// handler arm enumerates `k(v)` for v ∈ [1, 6], so the multi-shot
+/// resumption produces all 36 (a, b) combinations; only the six
+/// satisfying `a + b == 7` print. Oracle `16\n25\n34\n43\n52\n61\n`
+/// matches `spec/validation-prompts.md` §P20.
+///
+/// Pre-PR-#119-review-#4 the literal shape's body classified outside
+/// Plan A's coverage (the body's tail is an If with a perform-bearing
+/// then-branch — `classify_branched_cps_tail_branch` rejected
+/// Block-with-Stmt::Perform leaves). The recursive Phase 2 rewriter
+/// extension (`rewrite_block_with_subst` recursing through nested
+/// Blocks reachable via If/Match/Block subexpressions) normalizes the
+/// branch-Block's `Stmt::Perform` to `Stmt::Let` so the branch
+/// classifier accepts as `BranchedCpsLeaf::PerformChain`, putting the
+/// body on the let-yield-prefix-branched-cps-tail emit path.
+#[test]
+fn multi_shot_choose_pair_enumeration() {
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 if a + b == 7 {\n    \
+                   perform IO.println(int_to_string(a * 10 + b));\n    \
+                   0\n  \
+                 } else {\n    \
+                   0\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     let r3: Int = k(3);\n      \
+                     let r4: Int = k(4);\n      \
+                     let r5: Int = k(5);\n      \
+                     let r6: Int = k(6);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_choose_pair_enumeration");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "16\n25\n34\n43\n52\n61\n",
+        "Plan A literal P20: pairs() multi-shot enumeration over (a, b) \
+         in [1..6]^2 with sum-to-7 filter. Each Cons of (a, b) prints \
+         a*10+b iff a + b == 7. Oracle from spec/validation-prompts.md \
+         §P20. stderr={stderr:?}"
+    );
+}
+
+/// Plan A — pure-tail body remains correct (was already accepted by
+/// the pre-Plan-A chained-let-yield classifier; this test pins it
+/// against any future regression to the classifier or emit pass).
+/// Mirrors `examples/choose_demo.sigil` shape.
+#[test]
+fn multi_shot_pure_tail_unchanged() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 x\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(arg + 10);\n      \
+                     let r2: Int = k(arg + 20);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_pure_tail_unchanged");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "40\n",
+        "Plan A no-regression: pure-tail body. helper(5) → arm with arg=5; \
+         k(15)→15, k(25)→25; sum=40. stderr={stderr:?}"
+    );
+}
+
+/// Plan A (PR #119 review #2a) — non-trivial Binary in perform args.
+/// Pre-fix this triggered a codegen panic at the chained-let-yield
+/// body-emit's `body_first_step` extraction (`unreachable!()` at the
+/// `Stmt::Let` Binary-value match arm) because the body emit walked
+/// `f.body` un-rewritten while ABI selection saw the elaborator-
+/// inlined form. The Phase 2 re-rewrite fix at the body emit site
+/// closes the gap; this test pins it.
+#[test]
+fn multi_shot_post_perform_tail_nontrivial_perform_args() {
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int, factor: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed + factor * factor);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5, 3) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_nontrivial_perform_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: helper's perform-arg expression `seed + factor * factor` \
+         elaborator-hoists into a `$elab_t*` chain; the Phase 2 rewriter inlines \
+         them back so the chained-let-yield classifier accepts. Per-resume \
+         body execution prints arg_i and returns arg_i*1000; arm combine \
+         700000 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
+
+/// Plan A (PR #119 review #2b) — Cps user fn call inside perform args.
+/// The args-purity relaxation (`expr_is_pure → !expr_contains_perform`)
+/// permits Calls in args; the chain step's Middle synth-cont's emit
+/// lowers them via `lowerer.lower_expr`, which routes Cps user fn calls
+/// through `lower_call`'s existing Sync→Cps interop wrapper. This test
+/// exercises that path.
+#[test]
+fn multi_shot_post_perform_tail_cps_call_in_args() {
+    let src = "effect Tag { mark: () -> Int }\n\
+               fn marked_id(x: Int) -> Int ![Tag] {\n  \
+                 let _t: Int = perform Tag.mark();\n  \
+                 x\n\
+               }\n\
+               effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, Tag, IO] {\n  \
+                 let x: Int = perform Choose.choose(marked_id(seed));\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 100\n\
+               }\n\
+               fn run_tag(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Tag.mark(k) => k(1),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_tag(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_cps_call_in_args");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n1800\n",
+        "Plan A: `marked_id(seed)` is a Cps user fn call inside the multi-shot \
+         perform's args; routes through Sync→Cps interop synchronously. The \
+         args eval ONCE at the perform site (not per resume) — Tag.mark() \
+         fires once with seed=5. Per-resume body execution: x=7 prints 7 \
+         and returns 700; x=11 prints 11 and returns 1100; arm combine \
+         r1+r2 = 1800. stderr={stderr:?}"
+    );
+}
+
+/// Plan A (PR #119 review #2c) — mid-body discard `Stmt::Perform` whose
+/// op has a non-Unit return type. The Phase 2 rewriter's
+/// `rewrite_perform_stmts_as_lets` synthesizes a let with the op's
+/// actual return type (looked up via the effects registry), not a
+/// hardcoded Unit. This test exercises a Stmt::Perform of an `Int`-
+/// returning op (`Counter.tick`) whose result is discarded by source
+/// semantics.
+#[test]
+fn multi_shot_post_perform_tail_nonunit_discard_perform() {
+    let src = "effect Counter { tick: () -> Int }\n\
+               effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, Counter, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform Counter.tick();\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 x * 1000\n\
+               }\n\
+               fn run_counter(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Counter.tick(k) => k(99),\n  \
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_counter(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_post_perform_tail_nonunit_discard_perform");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n11\n711000\n",
+        "Plan A: `perform Counter.tick()` is a discard-Stmt::Perform with \
+         non-Unit return type (Int). The rewriter synthesizes \
+         `let __perform_unit_<idx>: Int = perform Counter.tick()` rather \
+         than hardcoding Unit. Per-resume body execution: x=7 prints 7 \
+         and returns 7000; x=11 prints 11 and returns 11000; arm combine \
+         700000 + 11000 = 711000. stderr={stderr:?}"
+    );
+}
