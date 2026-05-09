@@ -10296,7 +10296,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         chain_outer_post_arm_k_pushes: 0,
                         closure_ptr,
                         terminal_out_param: terminal_out,
-
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -11396,7 +11395,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -12596,7 +12594,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -13529,7 +13526,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     chain_outer_post_arm_k_pushes: 0,
                     closure_ptr,
                     terminal_out_param: terminal_out,
-
                     lit_gvs,
                     builtins,
                     handler_frame_new_ref,
@@ -13826,7 +13822,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 chain_outer_post_arm_k_pushes: 0,
                 closure_ptr,
                 terminal_out_param: terminal_out,
-
                 lit_gvs,
                 builtins,
                 handler_frame_new_ref,
@@ -14231,7 +14226,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         chain_outer_post_arm_k_pushes: 0,
                         closure_ptr: synth_closure_ptr,
                         terminal_out_param: terminal_out,
-
                         lit_gvs,
                         builtins,
                         handler_frame_new_ref,
@@ -15070,7 +15064,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_outer_post_arm_k_pushes: prior_bindings.len() as u32,
                             closure_ptr,
                             terminal_out_param: terminal_out,
-
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -15346,6 +15339,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                 if let Some(dispatch) = pattern_c_dispatch {
                                     let mut branch_chain_cursor: usize = 0;
+                                    #[allow(clippy::type_complexity)]
                                     let mut work: Vec<(
                                         cranelift::codegen::ir::Block,
                                         &[crate::ast::Stmt],
@@ -15572,16 +15566,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         vec![],
                                                     ));
                                                 }
-                                                Some(PatternCDispatch::SumType { .. }) | None => {
-                                                    // Nested sum-type or
-                                                    // classifier/emit disagreement:
-                                                    // fall through to standard-tail.
-                                                    // This can't happen under current
-                                                    // classification (Nested only
-                                                    // wraps If / Match-on-Bool), but
-                                                    // guarding against future
-                                                    // classifier extensions.
-                                                    break;
+                                                Some(PatternCDispatch::SumType { .. }) => {
+                                                    unreachable!(
+                                                        "Nested leaf with SumType dispatch: \
+                                                         classify_branched_cps_tail_branch_expr \
+                                                         only returns Nested for If / \
+                                                         2-arm BoolLit Match"
+                                                    );
+                                                }
+                                                None => {
+                                                    unreachable!(
+                                                        "classify_branched_cps_tail_branch_expr \
+                                                         accepted Nested leaf but \
+                                                         detect_pattern_c_dispatch returned \
+                                                         None at emit time"
+                                                    );
                                                 }
                                             }
                                             continue;
@@ -17915,7 +17914,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_outer_post_arm_k_pushes: 0,
                             closure_ptr,
                             terminal_out_param: terminal_out,
-
                             lit_gvs,
                             builtins,
                             handler_frame_new_ref,
@@ -18594,7 +18592,6 @@ struct Lowerer<'a, 'b> {
     ///   FFI helpers (Plan D Task 111d).
     terminal_out_param: Value,
 
-    /// Lambda-of-state Plan B preview — the enclosing function's ABI.
     /// Per-string-literal `(span, GV, byte-length)` tuples declared at
     /// fn-entry time. Span-keyed so closure-conversion reordering of
     /// the walk (hoisted `$lambda_N` bodies carry the string literals
@@ -29530,10 +29527,7 @@ fn detect_pattern_c_dispatch<'a>(
                         if leaf_is_cps_eligible(k) {
                             any_cps_eligible = true;
                         }
-                        let (stmts, leaf) = match extract_leaf(&arm.body) {
-                            Some(pair) => pair,
-                            None => return None,
-                        };
+                        let (stmts, leaf) = extract_leaf(&arm.body)?;
                         arm_infos.push(SumTypeArmDispatch {
                             pattern: &arm.pattern,
                             stmts,

@@ -16497,13 +16497,13 @@ fn lambda_of_state_three_arm_sum_type_dispatch() {
                  match c {\n    \
                    Red => 0,\n    \
                    Green => {\n      \
-                     let cur: Int = perform State.get();\n      \
-                     let _: Int = perform State.set(cur + 10);\n      \
+                     let cur_g: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur_g + 10);\n      \
                      1\n    \
                    },\n    \
                    Blue => {\n      \
-                     let cur: Int = perform State.get();\n      \
-                     let _: Int = perform State.set(cur + 100);\n      \
+                     let cur_b: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur_b + 100);\n      \
                      2\n    \
                    },\n  \
                  }\n\

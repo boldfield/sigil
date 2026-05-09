@@ -1153,11 +1153,16 @@ fn run_state(initial: Int, comp: () -> Int ![State]) -> Int ![] {
 Each handler arm returns `fn (s: Int) -> ...` — a closure that
 receives the current state and threads it through `k`. The `get` arm
 passes `s` as both the resume value and the next state; the `set` arm
-replaces the state with `s2`. `run_state(0, comp)` applies the
-resulting state-threaded closure to the initial state `0`.
+replaces the state with `s2`. This variant's `return` arm returns
+final state `s` (discarding the body value `v`); the canonical
+Plotkin encoding returns `(v, s)` or just `v` depending on context.
+`run_state(0, comp)` applies the resulting state-threaded closure to
+the initial state `0`.
 
 This encoding works with sum-type match bodies where the pattern
-dispatch contains multiple perform sites per arm.
+dispatch contains multiple perform sites per arm. The example above
+mirrors the e2e test `lambda_of_state_sum_type_state_threading_-
+returns_5` in `compiler/tests/e2e.rs`.
 
 ### §9 — `Mem` and mutation
 
