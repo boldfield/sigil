@@ -1131,6 +1131,39 @@ First-class continuations enable passing `k` to helper functions
 `all_choices` in `std.choose`). Dynamic-extent enforcement ensures
 a continuation cannot be invoked after its handler frame has exited.
 
+**Lambda-of-state (Plotkin-style) handler encoding.** Handler arms
+can return closures that capture `k` without calling it immediately.
+The standard library's `std/state.sigil` provides the canonical
+cell-backed `run_state` encoding. An alternative is the Plotkin-style
+lambda-of-state encoding, which threads state through closures:
+
+```sigil
+effect State resumes: many { get: () -> Int, set: (Int) -> Int }
+
+fn run_state(initial: Int, comp: () -> Int ![State]) -> Int ![] {
+  let runner: (Int) -> Int ![] = handle comp() with {
+    return(v) => fn (s: Int) -> Int ![] => s,
+    State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),
+    State.set(s2, k) => fn (_s: Int) -> Int ![] => k(s2)(s2),
+  };
+  runner(initial)
+}
+```
+
+Each handler arm returns `fn (s: Int) -> ...` — a closure that
+receives the current state and threads it through `k`. The `get` arm
+passes `s` as both the resume value and the next state; the `set` arm
+replaces the state with `s2`. This variant's `return` arm returns
+final state `s` (discarding the body value `v`); the canonical
+Plotkin encoding returns `(v, s)` or just `v` depending on context.
+`run_state(0, comp)` applies the resulting state-threaded closure to
+the initial state `0`.
+
+This encoding works with sum-type match bodies where the pattern
+dispatch contains multiple perform sites per arm. The example above
+mirrors the e2e test `lambda_of_state_sum_type_state_threading_-
+returns_5` in `compiler/tests/e2e.rs`.
+
 ### §9 — `Mem` and mutation
 
 `Mem` is the builtin marker effect that gates all in-place

@@ -16390,3 +16390,210 @@ fn multi_shot_post_perform_tail_nonunit_discard_perform() {
          700000 + 11000 = 711000. stderr={stderr:?}"
     );
 }
+
+// ===== Pattern C SumType dispatch — lambda-of-state runtime correctness =====
+
+/// Plotkin-style handler with sum-type match body (IntList). The
+/// handler's return arm returns final state (`s`), not the body
+/// value — `return(v) => fn(s) => s`. count_elements over a
+/// 5-element list increments state at each Cons; final state = 5.
+/// NOT the literal P19 prompt (which uses `return(v) => fn(_) => v`).
+#[test]
+fn lambda_of_state_sum_type_state_threading_returns_5() {
+    let src = "import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               fn count_elements(xs: IntList) -> Int ![State, IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(_, rest) => {\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     count_elements(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn run_state(initial: Int, comp: () -> Int ![State, IO]) -> Int ![IO] {\n  \
+                 let runner: (Int) -> Int ![IO] = handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![IO] => s,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![IO] => k(s)(s),\n    \
+                   State.set(s2, k) => fn (_s: Int) -> Int ![IO] => k(s2)(s2),\n  \
+                 };\n  \
+                 runner(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(10, Cons(20, Cons(30, Cons(40, Cons(50, Nil)))));\n  \
+                 let final_count: Int = run_state(0, fn () -> Int ![State, IO] => count_elements(xs));\n  \
+                 perform IO.println(int_to_string(final_count));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "lambda_of_state_sum_type_state_threading");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "5\n",
+        "Lambda-of-state state threading: count_elements over 5-element \
+         IntList, handler return arm returns final state s=5. Wrong \
+         output means SumType Pattern C dispatch or handler arm \
+         threading is broken. stderr={stderr:?}"
+    );
+}
+
+/// Literal P19 handler shape: `return(v) => fn(_) => v` returns the
+/// body's terminal value, not the final state. count_elements' base
+/// case is `Nil => 0`, so the output is 0. This test verifies the
+/// SumType dispatch produces the semantically correct result under
+/// the canonical Plotkin encoding where return discards state.
+#[test]
+fn lambda_of_state_literal_p19_body_value_returns_0() {
+    let src = "import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               fn count_elements(xs: IntList) -> Int ![State, IO] {\n  \
+                 match xs {\n    \
+                   Nil => 0,\n    \
+                   Cons(_, rest) => {\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     count_elements(rest)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn run_state(initial: Int, comp: () -> Int ![State, IO]) -> Int ![IO] {\n  \
+                 let runner: (Int) -> Int ![IO] = handle comp() with {\n    \
+                   return(v) => fn (_s: Int) -> Int ![IO] => v,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![IO] => k(s)(s),\n    \
+                   State.set(s2, k) => fn (_s: Int) -> Int ![IO] => k(s2)(s2),\n  \
+                 };\n  \
+                 runner(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: IntList = Cons(10, Cons(20, Cons(30, Cons(40, Cons(50, Nil)))));\n  \
+                 let result: Int = run_state(0, fn () -> Int ![State, IO] => count_elements(xs));\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "lambda_of_state_literal_p19");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "0\n",
+        "Literal P19 shape: return(v) => fn(_s) => v returns body terminal \
+         value (0 from Nil base case), not final state. This is the \
+         semantically correct output per Plotkin's encoding. stderr={stderr:?}"
+    );
+}
+
+/// 3-arm sum-type match: exercises N-arm SumType dispatch with N>2.
+/// Shape: `Red | Green | Blue` enum where Green and Blue arms
+/// perform State.set, Red arm is pure. Handler returns final state.
+#[test]
+fn lambda_of_state_three_arm_sum_type_dispatch() {
+    let src = "import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               type Color = | Red | Green | Blue\n\
+               fn process(c: Color) -> Int ![State] {\n  \
+                 match c {\n    \
+                   Red => 0,\n    \
+                   Green => {\n      \
+                     let cur_g: Int = perform State.get();\n      \
+                     let _g: Int = perform State.set(cur_g + 10);\n      \
+                     1\n    \
+                   },\n    \
+                   Blue => {\n      \
+                     let cur_b: Int = perform State.get();\n      \
+                     let _b: Int = perform State.set(cur_b + 100);\n      \
+                     2\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               fn run_state(initial: Int, comp: () -> Int ![State]) -> Int ![] {\n  \
+                 let runner: (Int) -> Int ![] = handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => s,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   State.set(s2, k) => fn (_s: Int) -> Int ![] => k(s2)(s2),\n  \
+                 };\n  \
+                 runner(initial)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r1: Int = run_state(0, fn () -> Int ![State] => process(Green));\n  \
+                 let r2: Int = run_state(0, fn () -> Int ![State] => process(Blue));\n  \
+                 let r3: Int = run_state(0, fn () -> Int ![State] => process(Red));\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 perform IO.println(int_to_string(r3));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "lambda_of_state_three_arm");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "10\n100\n0\n",
+        "3-arm sum-type dispatch: Green sets state+10 (final=10), \
+         Blue sets state+100 (final=100), Red is pure (final=0). \
+         Exercises N>2 arm SumType dispatch. stderr={stderr:?}"
+    );
+}
+
+/// Sum-type match with CPS calls in arm stmts must fall through to
+/// standard-tail path (not SumType dispatch). The g5 eval pattern:
+/// DivE arm has recursive CPS calls to eval before performs. Uses
+/// polymorphic run_state_poly, Raise/catch from the original g5 test.
+#[test]
+fn lambda_of_state_sum_type_with_cps_calls_falls_through() {
+    let src = "import std.raise\n\
+               import std.result\n\
+               import std.io\n\
+               \n\
+               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               \n\
+               fn run_state_poly[A](initial: Int, body: () -> A ![State | e]) -> A ![| e] {\n  \
+                 let state_fn: (Int) -> A ![| e] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> A ![| e] => v,\n    \
+                   State.get(k) => fn (s: Int) -> A ![| e] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> A ![| e] => k(arg)(arg),\n  \
+                 };\n  \
+                 state_fn(initial)\n\
+               }\n\
+               \n\
+               type Expr = | IntE(Int) | DivE(Expr, Expr)\n\
+               \n\
+               fn eval(e: Expr) -> Int ![Raise[String], State, ArithError, IO] {\n  \
+                 match e {\n    \
+                   IntE(i) => i,\n    \
+                   DivE(e1, e2) => {\n      \
+                     let x: Int = eval(e1);\n      \
+                     let y: Int = eval(e2);\n      \
+                     let cur: Int = perform State.get();\n      \
+                     let _: Int = perform State.set(cur + 1);\n      \
+                     perform IO.println(\"tick\");\n      \
+                     if y == 0 {\n        \
+                       let _r: Int = raise(\"divide by zero\");\n        \
+                       _r\n      \
+                     } else {\n        \
+                       x / y\n      \
+                     }\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO, ArithError] {\n  \
+                 let prog: Expr = DivE(DivE(IntE(16), IntE(2)), IntE(3));\n  \
+                 let r: Result[Int, String] = catch(fn () -> Int ![Raise[String], ArithError, IO] => run_state_poly(0, fn () -> Int ![Raise[String], State, ArithError, IO] => eval(prog)));\n  \
+                 match r {\n    \
+                   Ok(v) => perform IO.println(int_to_string(v)),\n    \
+                   Err(m) => perform IO.println(m),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "lambda_of_state_sum_type_cps_calls");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "tick\ntick\n2\n",
+        "Sum-type match with CPS calls (eval) in DivE arm must fall \
+         through to standard-tail (not SumType dispatch). DivE(DivE(16,2),3): \
+         two DivE arms each print tick, handler return(v)=>fn(s)=>v \
+         returns 16/2/3=2. Wrong output means SumType dispatch was \
+         incorrectly applied to arms with CPS calls. stderr={stderr:?}"
+    );
+}
