@@ -417,6 +417,33 @@ pub fn outer_post_arm_k_depth_snapshot() -> usize {
     OUTER_POST_ARM_K_DEPTH.with(|c| c.get())
 }
 
+// Plan D Task 112e — env-var-gated runtime trace flags. Read once
+// per thread via `OnceCell` so the hot trampoline paths pay only a
+// single TLS load + branch per trace site (vs `std::env::var_os`'s
+// process-wide env-table lock + linear scan that the original
+// implementation accidentally compiled to). The trace flags are
+// opt-in debugging aids; production runs leave them unset.
+thread_local! {
+    static TRACE_OPAK: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    static TRACE_TERM: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+    static TRACE_CALL: std::cell::OnceCell<bool> = const { std::cell::OnceCell::new() };
+}
+
+#[inline]
+fn trace_opak() -> bool {
+    TRACE_OPAK.with(|c| *c.get_or_init(|| std::env::var_os("SIGIL_TRACE_OPAK").is_some()))
+}
+
+#[inline]
+fn trace_term() -> bool {
+    TRACE_TERM.with(|c| *c.get_or_init(|| std::env::var_os("SIGIL_TRACE_TERM").is_some()))
+}
+
+#[inline]
+fn trace_call() -> bool {
+    TRACE_CALL.with(|c| *c.get_or_init(|| std::env::var_os("SIGIL_TRACE_CALL").is_some()))
+}
+
 /// Plan D Task 117 (b) Phase 4 — restore OUTER_POST_ARM_K depth to
 /// a previous snapshot. Used by `sigil_continuation_invoke` after
 /// driving the captured continuation's run_loop to drain any
@@ -802,6 +829,15 @@ pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_pt
             stack_cell.set(stack);
         });
         depth_cell.set(depth + 1);
+        if trace_opak() {
+            eprintln!(
+                "[OPAK PUSH] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
+                depth,
+                depth + 1,
+                closure_ptr as usize,
+                fn_ptr as usize
+            );
+        }
     });
 }
 
@@ -835,6 +871,15 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
                     fn_ptr: ptr::null_mut(),
                 };
                 stack_cell.set(stack);
+                if trace_opak() {
+                    eprintln!(
+                        "[OPAK POP] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
+                        depth,
+                        depth - 1,
+                        popped.closure_ptr as usize,
+                        popped.fn_ptr as usize
+                    );
+                }
                 Some(popped)
             })
         }
@@ -881,6 +926,13 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
 pub unsafe extern "C" fn sigil_outer_post_arm_k_drop(n: u32) {
     if n == 0 {
         return;
+    }
+    if trace_opak() {
+        let cur = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+        eprintln!(
+            "[OPAK DROP] requesting drop of {} entries; depth={}",
+            n, cur
+        );
     }
     OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
         let depth = depth_cell.get();
@@ -2444,6 +2496,13 @@ pub unsafe extern "C" fn sigil_run_loop(
         match tag {
             NEXT_STEP_TAG_DONE | NEXT_STEP_TAG_DISCHARGED => {
                 let v = (*current).value;
+                if trace_term() {
+                    let d = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                    eprintln!(
+                        "[TERM-BRANCH] tag={} value={} depth={} entry_depth={}",
+                        tag, v, d, outer_post_arm_k_entry_depth
+                    );
+                }
                 // Stage-6.8-followup Layer 3c — DISCHARGED bypasses
                 // outer_post_arm_k routing. Algebraic semantics of
                 // discharge: when ANY arm in a handle discharges, the
@@ -2483,6 +2542,12 @@ pub unsafe extern "C" fn sigil_run_loop(
                         // NextStep::Discharged).
                         (*out).value = v;
                         (*out).tag = tag as u64;
+                    }
+                    if trace_term() {
+                        eprintln!(
+                            "[TERM-DISCHARGED] write out=0x{:x} tag={} value={}",
+                            out as usize, tag, v
+                        );
                     }
                     // Drain outer_post_arm_k stack back to entry-time
                     // depth. Entries pushed by synth-cont Middle steps
@@ -2619,6 +2684,12 @@ pub unsafe extern "C" fn sigil_run_loop(
                         },
                     );
                 }
+                if trace_term() {
+                    eprintln!(
+                        "[TERM] write out=0x{:x} tag={} value={}",
+                        out as usize, tag, v
+                    );
+                }
                 // Reset the arena before returning so the next
                 // top-level entry starts with a clean slate.
                 crate::arena::sigil_arena_reset();
@@ -2649,6 +2720,14 @@ pub unsafe extern "C" fn sigil_run_loop(
                     for (i, slot) in args_buf.iter_mut().enumerate().take(arg_count as usize) {
                         *slot = src.add(i).read();
                     }
+                }
+                if trace_call() {
+                    eprintln!(
+                        "[CALL] fn=0x{:x} closure=0x{:x} args={:?}",
+                        fn_ptr as usize,
+                        closure_ptr as usize,
+                        &args_buf[..arg_count as usize]
+                    );
                 }
                 // Reset the arena now that we've extracted the
                 // dispatch info. Any in-arena pointer the caller might

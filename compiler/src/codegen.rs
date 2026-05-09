@@ -9429,42 +9429,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             chain_body, &ctors, &lookup, &lookup,
                         )
                     });
-                    if let Some(cl) = chain_length {
-                        if cl >= 2 {
-                            if let Some(tail) = &chain_body.tail {
-                                if let crate::ast::Expr::Call { callee, .. } = tail {
-                                    if let crate::ast::Expr::Ident(callee_name, _) = callee.as_ref()
-                                    {
-                                        if cc.colored.needs_cps_transform(callee_name) {
-                                            let performs_multi_shot = f.effects.iter().any(|er| {
-                                                checked.program.items.iter().any(
-                                                    |item| match item {
-                                                        crate::ast::Item::Effect(e) => {
-                                                            e.name == er.name && e.resumes_many
-                                                        }
-                                                        _ => false,
-                                                    },
-                                                )
-                                            });
-                                            if performs_multi_shot {
-                                                let span = tail.span();
-                                                return Err(format!(
-                                                    "[E0221] {}:{}:{}: multi-shot body's \
-                                                     post-perform tail is a Cps-call to `{}`. \
-                                                     In v1 this shape silently miscompiles — \
-                                                     only the first resume's effects fire. \
-                                                     Inline the helper's logic into the body's \
-                                                     branched tail instead. \
-                                                     Run `sigil explain E0221` for details.",
-                                                    span.file, span.line, span.column, callee_name,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Plan D Task 112e — E0221 removed. The Cps-call-
+                    // as-tail shape is now handled correctly by the
+                    // recursion gate in `lower_call_in_tail_pos`'s
+                    // Cps→Cps branch.
                     if let Some(chain_length) = chain_length {
                         let arm_body = chain_body;
                         let mut steps: Vec<ChainedNextStep> = Vec::with_capacity(chain_length);
@@ -10330,6 +10298,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         chain_outer_post_arm_k_pushes: 0,
+                        enclosing_user_fn_id: None,
                         closure_ptr,
                         terminal_out_param: terminal_out,
                         lit_gvs,
@@ -11429,6 +11398,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
+                    enclosing_user_fn_id: None,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -11863,6 +11833,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env,
                 pointer_ty,
                 chain_outer_post_arm_k_pushes: 0,
+                enclosing_user_fn_id: None,
                 closure_ptr,
                 terminal_out_param,
 
@@ -12628,6 +12599,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
+                    enclosing_user_fn_id: None,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -13560,6 +13532,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
+                    enclosing_user_fn_id: None,
                     closure_ptr,
                     terminal_out_param: terminal_out,
                     lit_gvs,
@@ -13856,6 +13829,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env,
                 pointer_ty,
                 chain_outer_post_arm_k_pushes: 0,
+                enclosing_user_fn_id: None,
                 closure_ptr,
                 terminal_out_param: terminal_out,
                 lit_gvs,
@@ -14260,6 +14234,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         env,
                         pointer_ty,
                         chain_outer_post_arm_k_pushes: 0,
+                        enclosing_user_fn_id: None,
                         closure_ptr: synth_closure_ptr,
                         terminal_out_param: terminal_out,
                         lit_gvs,
@@ -15098,6 +15073,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // it unconditionally here keeps the
                             // construction simple.
                             chain_outer_post_arm_k_pushes: prior_bindings.len() as u32,
+                            // Plan D Task 112e — set to the chain's
+                            // parent fn's func_id so `lower_call_in_tail_pos`
+                            // can detect recursive calls (callee == parent)
+                            // and balance the chain push correctly.
+                            enclosing_user_fn_id: user_fns
+                                .get(synth.parent_fn_name.as_str())
+                                .map(|e| e.func_id.as_u32()),
                             closure_ptr,
                             terminal_out_param: terminal_out,
                             lit_gvs,
@@ -17948,6 +17930,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env,
                             pointer_ty,
                             chain_outer_post_arm_k_pushes: 0,
+                            enclosing_user_fn_id: None,
                             closure_ptr,
                             terminal_out_param: terminal_out,
                             lit_gvs,
@@ -18591,11 +18574,29 @@ struct Lowerer<'a, 'b> {
     ///
     /// The Cps→Cps tail branch emits a `sigil_outer_post_arm_k_drop(N)`
     /// call before its `return_(NextStep::Call(...))` to balance these
-    /// pushes. Without this, a tail-recursive Cps fn whose body has a
-    /// chained-let-yield with N>=2 lets accumulates 1 entry per
-    /// iteration on the OUTER_POST_ARM_K_STACK and overflows at depth 32
-    /// (`OUTER_POST_ARM_K_STACK_SIZE`).
+    /// pushes — but only when the call is RECURSIVE (callee == parent).
+    /// For non-recursive Cps→Cps tail calls under multi-shot N>=2, the
+    /// chain push happens once but the tail emit fires N times (once
+    /// per resume); dropping per resume underflows OPAK and breaks the
+    /// trampoline's Done-observation pop discipline that advances the
+    /// outer multi-shot's k(N+1). See the recursion-detection logic at
+    /// the call site (Plan D Task 112e).
     chain_outer_post_arm_k_pushes: u32,
+
+    /// Plan D Task 112e — `func_id.as_u32()` of the user fn that owns
+    /// the body this Lowerer is lowering. For synth-cont Lowerers this
+    /// is the chain's parent fn (e.g., `count_down_compose`'s func_id
+    /// when lowering `count_down_compose`'s chained-let-yield Final-step
+    /// synth-cont). For top-level user fn Lowerers it equals
+    /// `self.builder.func.name`'s embedded func_id. `None` for
+    /// closure-converted lambda Lowerers and other contexts where the
+    /// "logical surrounding user fn" doesn't apply.
+    ///
+    /// Used by `lower_call_in_tail_pos`'s Cps→Cps tail branch to detect
+    /// recursive calls (callee func_id == enclosing_user_fn_id) for
+    /// the OUTER_POST_ARM_K drop discipline. See the
+    /// `chain_outer_post_arm_k_pushes` doc above for the full rationale.
+    enclosing_user_fn_id: Option<u32>,
 
     /// Arg-0 of the current fn's entry block: the closure record
     /// pointer under the closure calling convention (plan A2 task 32).
@@ -19466,30 +19467,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                     );
                                 }
 
-                                // PR #108 review follow-up — balance the
-                                // surrounding chain's accumulated
-                                // `sigil_outer_post_arm_k_push` entries
-                                // before tail-iterating. Each Middle
-                                // chain step in the surrounding chain
-                                // pushes once (codegen.rs:16622 area);
-                                // the trampoline's Done-observation
-                                // pop loop matches those pushes when
-                                // the chain completes normally. A
-                                // tail-call-out (this branch's
-                                // NextStep::Call return) bypasses the
-                                // Done path, so without an explicit
-                                // drop the entries accumulate one per
-                                // recursion iteration and overflow
-                                // OUTER_POST_ARM_K_STACK_SIZE (32) at
-                                // depth 32. `chain_outer_post_arm_k_-
-                                // pushes` is set to `prior_bindings
-                                // .len()` (= chain_length - 1) when
-                                // constructing the Final-step's
-                                // Lowerer; for chain_length == 1
-                                // (single-perform shape, no Middle
-                                // step pushes) this is 0 and we skip
-                                // the call.
-                                if self.chain_outer_post_arm_k_pushes > 0 {
+                                // Drop accumulated OPAK entries before
+                                // tail-iterating, but only for recursive
+                                // Cps→Cps calls. Recursive iterations
+                                // re-push OPAK each frame (PR #108); a
+                                // non-recursive multi-shot tail call sees
+                                // ONE push from the outer chain but fires
+                                // N times per resume — an unconditional
+                                // drop underflows OPAK and the outer
+                                // multi-shot's k(N+1) never fires.
+                                let callee_func_id =
+                                    self.user_fns.get(name).map(|e| e.func_id.as_u32());
+                                let fallback_enclosing_id =
+                                    if let UserFuncName::User(u) = &self.builder.func.name {
+                                        Some(u.index)
+                                    } else {
+                                        None
+                                    };
+                                let enclosing_id =
+                                    self.enclosing_user_fn_id.or(fallback_enclosing_id);
+                                let is_recursive = match (enclosing_id, callee_func_id) {
+                                    (Some(a), Some(b)) => a == b,
+                                    _ => false,
+                                };
+                                if is_recursive && self.chain_outer_post_arm_k_pushes > 0 {
                                     let drop_n = self.builder.ins().iconst(
                                         types::I32,
                                         self.chain_outer_post_arm_k_pushes as i64,
@@ -29335,6 +29336,17 @@ fn classify_branched_cps_tail_branch_expr(
             // calls `lower_expr` on each arg which handles nested
             // builtin / Sync user fn Calls correctly via lower_call.
             // Pure-args rejection was overly strict.
+            //
+            // Plan D Task 112e — `is_supported` predicate gates
+            // CpsCall leaf at supported-wrapper Cps callees only.
+            // General Cps callees (Pattern C bodies, etc.) fall
+            // through to the Pure-leaf path below; their `lower_expr`
+            // routes through Sync→Cps interop and the 3-branch gate
+            // delivers the result through the chain machinery
+            // correctly under multi-shot N>=2. The CpsCall leaf's
+            // direct `NextStep::Call(callee, args + caller_k_pair)`
+            // dispatch is needed only for wrapper composition where
+            // caller_k_pair forwards through the callee's chain.
             if is_supported(name) && args.iter().all(|a| !expr_contains_perform(a)) {
                 return Some(BranchedCpsLeaf::CpsCall);
             }

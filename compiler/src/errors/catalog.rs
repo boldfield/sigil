@@ -1119,29 +1119,27 @@ pub const CATALOG: &[ErrorEntry] = &[
                         Choose.pick(k) => k(1) + k(2),   // OK, multi-shot\n\
                       }",
     },
+    // E0221 retired in Plan D Task 112e — the multi-shot
+    // Cps-call-as-tail bug it rejected was fixed at the runtime
+    // level (codegen.rs's `lower_call_in_tail_pos` Cps→Cps tail
+    // branch now drops OUTER_POST_ARM_K entries only for recursive
+    // calls, leaving non-recursive Cps-call-as-tail composition
+    // intact across multi-shot resumes). The shape now compiles
+    // and runs correctly. Entry retained as a placeholder so the
+    // numbering stays stable; do not reuse for unrelated errors.
     ErrorEntry {
         code: "E0221",
-        short: "multi-shot body tail is a Cps-call",
-        long: "The body's tail expression is a call to a Cps-colored \
-               function. In v1, this shape silently miscompiles when \
-               the body has two or more performs — only the first \
-               resume's effects fire.\n\n\
-               Inline the helper's logic into the body's branched \
-               tail instead.",
-        fix_example: "// Broken (E0221):\n\
+        short: "(retired) multi-shot Cps-call-as-tail",
+        long: "Retired error code. The multi-shot Cps-call-as-tail \
+               shape that this error rejected (e.g., \
+               `let a = perform p; let b = perform p; helper(a, b)` \
+               where `helper` is Cps-colored) is now correctly \
+               supported in v1. Lifted in Plan D Task 112e (runtime fix).",
+        fix_example: "// Previously rejected, now correctly supported:\n\
                       fn pairs() -> Int ![Choose, IO] {\n\
                         let a: Int = perform Choose.pick(1, 6);\n\
                         let b: Int = perform Choose.pick(1, 6);\n\
-                        report(a, b)   // E0221: Cps-call-as-tail\n\
-                      }\n\n\
-                      // Working (inline the helper):\n\
-                      fn pairs() -> Int ![Choose, IO] {\n\
-                        let a: Int = perform Choose.pick(1, 6);\n\
-                        let b: Int = perform Choose.pick(1, 6);\n\
-                        match a + b == 7 {\n\
-                          true => { perform IO.println(int_to_string(a * 10 + b)); 0 },\n\
-                          false => 0,\n\
-                        }\n\
+                        report(a, b)   // OK\n\
                       }",
     },
     ErrorEntry {
