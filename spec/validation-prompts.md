@@ -878,12 +878,13 @@ unknown
 ## P41 — `std.string` ops
 
 **Prompt:** Write a Sigil program that imports `std.string`. Define
-`fn parse_or_invalid(s: String) -> String ![]` that calls `string_to_int_validate(s)`
-(returns `Int` error code: `0` = success, `1` = empty, `2` = non-decimal,
-`3` = overflow). On success (code `== 0`) returns `int_to_string(string_to_int_parse(s))`,
-otherwise returns `"invalid"`. In `main`, print `parse_or_invalid(string_concat("4",
-"2"))`, then print `"yes"` if `string_starts_with("hello, world", "hello")` and
-`"no"` otherwise. Return `0`.
+`fn parse_or_invalid(s: String) -> String ![]` that calls `string_to_int(s)`
+(returns `Result[Int, ParseError]` from `std.string`; `ParseError` has
+variants `Empty`, `NonDecimal`, `Overflow`). On `Ok(n)` it returns
+`int_to_string(n)`; on `Err(_)` it returns `"invalid"`. In `main`, print
+`parse_or_invalid(string_concat("4", "2"))`, then print `"yes"` if
+`string_starts_with("hello, world", "hello")` and `"no"` otherwise.
+Return `0`.
 
 **Oracle (stdout):**
 ```
@@ -893,8 +894,10 @@ yes
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises `string_to_int_validate` (error-code Int, not Option),
-`string_to_int_parse`, `string_concat`, `string_starts_with`.
+**Oracle (notes):** Exercises the canonical `string_to_int` /
+`Result[Int, ParseError]` surface, plus `string_concat`,
+`string_starts_with`. `Result` is transitively available via `import
+std.string` (which imports `std.result`).
 
 ## P42 — `std.char` ASCII classifier
 
@@ -1252,10 +1255,10 @@ ok
 
 **Prompt:** Write a Sigil program with three imports on consecutive lines:
 `import std.list`, `import std.option`, `import std.string`. Build a `List[Int]`
-`[1, 2, 3]` (`Cons(1, Cons(2, Cons(3, Nil)))`), take its `length` (= 3). Then call
-`string_to_int_validate("4")` (returns `Int` error code; `0` = success). On success,
-parse with `string_to_int_parse("4")` (= 4). Print `int_to_string` of the sum
-(3 + 4 = 7), return `0`.
+`[1, 2, 3]` (`Cons(1, Cons(2, Cons(3, Nil)))`), take its `length` (= 3). Then
+parse `"4"` via `string_to_int("4")` (returns `Result[Int, ParseError]` from
+`std.string`); pattern-match `Ok(n)` to bind `n = 4`. Print `int_to_string` of
+the sum (3 + 4 = 7), return `0`.
 
 **Oracle (stdout):**
 ```
