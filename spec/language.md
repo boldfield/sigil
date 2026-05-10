@@ -1214,8 +1214,7 @@ declared row. Mismatches fire E0042.
 #### §8.5 — First-class continuations
 
 The continuation `k` in a handler arm can be bound to a variable
-of type `Continuation[OpRet, Ret]` where `OpRet` is the operation's
-return type and `Ret` is the handler's return type:
+of type `Continuation[OpRet, Ret]`:
 
 ```sigil
 effect Step resumes: many {
@@ -1230,10 +1229,54 @@ handle body() with {
 }
 ```
 
-First-class continuations enable passing `k` to helper functions
-(including recursive helpers for runtime-N enumeration, as used by
-`all_choices` in `std.choose`). Dynamic-extent enforcement ensures
-a continuation cannot be invoked after its handler frame has exited.
+##### Type parameters
+
+`Continuation[OpRet, Ret]` is parameterized by:
+
+- **`OpRet`** — the operation's declared return type (what
+  `perform Effect.op(...)` evaluates to at the perform site, and
+  thus the type the continuation accepts as its single argument).
+- **`Ret`** — the surrounding handler's return type (what the
+  whole `handle body() with { … }` expression evaluates to, and
+  thus the type the continuation produces).
+
+For `effect Step resumes: many { step: (Int) -> Int }` handled by an
+arm whose body returns `Int`, the continuation is
+`Continuation[Int, Int]`.
+
+##### Syntactic sugar — desugared at codegen
+
+The `let f: Continuation[OpRet, Ret] = k; … f(arg) …` annotation is a
+**typing convenience**. The compiler does not allocate a separate
+continuation object: the annotation passes type-checking, and the
+codegen pass desugars `f` to direct references to `k` in the arm
+body. There is no runtime indirection through `f`.
+
+This means an arm body's reference count to `k` is the sum of all
+references through any aliases. Multi-shot accounting (and the
+single-shot E0220 invocation check) sees both `f(...)` and `k(...)`
+as the same continuation invocation.
+
+##### Dynamic-extent enforcement (E0145)
+
+Continuations cannot be invoked after their handler frame exits.
+Returning `k` from an arm body, storing it in a persistent data
+structure that outlives the `handle`, or otherwise letting the
+continuation reference escape the dynamic extent of its handler
+fires **E0145** ("Continuation escape barrier — k cannot leave
+handler frame").
+
+The escape barrier is enforced statically by the codegen color
+pass; the diagnostic points at the escape site (the `return`,
+field-store, or `let` outside the handler) and references the
+handler's `handle` keyword as the lifetime boundary.
+
+This rules out call/cc-style first-class continuations that survive
+their original handler. Within the dynamic extent, however, `k` is
+fully first-class: it can be passed to helper functions, captured
+in arm-internal closures, and (for multi-shot effects) invoked
+multiple times — see `all_choices` in `std/choose.sigil` for the
+canonical recursive-helper-driven runtime-N enumeration pattern.
 
 **Lambda-of-state (Plotkin-style) handler encoding.** Handler arms
 can return closures that capture `k` without calling it immediately.
@@ -1328,6 +1371,17 @@ Common codes:
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
+
+Recent additions (Plan D + state-cell):
+
+| Code | Meaning | Plan |
+|------|---------|------|
+| E0117 | pattern shape does not match scrutinee type | Plan D Task 113 (tuples) |
+| E0143 | row-site effect-arg arity does not match the effect-decl's generic-param count | Plan D Task 114 |
+| E0144 | per-op generic parameter shadows an effect-decl generic parameter | Plan D Task 115 |
+| E0145 | continuation `k` cannot escape its handle's arm body | Plan D Task 117 |
+| E0148 | runtime cell op called outside `std/state.sigil` | State-cell |
+| E0220 | one-shot continuation used more than once on a code path | Plan B Task 54 |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
 
