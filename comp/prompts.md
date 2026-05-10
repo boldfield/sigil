@@ -181,3 +181,93 @@ prime
 **Oracle (exit):** `0`
 
 **Notes:** Loop with state and branching, recursion in Sigil's case. Collatz(27) is a well-known landmark — long enough to surface integer-overflow bugs in 32-bit implementations (peaks at 9232), short enough to terminate quickly. Sigil's `Int` is 63-bit so overflow isn't a concern; in Python it's irrelevant; in Go `int` is platform-sized but at least 32-bit signed.
+
+---
+
+## C11 — map missing-key lookup
+
+**Prompt:** Build an associative map (or dictionary) containing two entries: the key `"alice"` mapped to the value `1`, and the key `"bob"` mapped to the value `2`. Look up the key `"carol"`. If `"carol"` is in the map, print its associated value on a single line; if `"carol"` is NOT in the map, print exactly the text `missing` on a single line. Then exit with status 0.
+
+**Oracle (stdout):**
+```
+missing
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses the missing-key handling pattern. Python's bare `d["carol"]` raises `KeyError` (process crash if uncaught); the safe pattern is `d.get("carol", "missing")` or `if "carol" in d`. Go's bare `d["carol"]` returns the value type's zero value silently — which is indistinguishable from a real-zero hit unless the agent uses the `v, ok := d["carol"]` two-value idiom. Sigil's `map_get` returns `Option[V]`; the typechecker forces a `match` on `Some` / `None`. The thesis-relevant question: does the LLM reach for the safe pattern in each language, or does it write the unsafe natural form?
+
+---
+
+## C12 — parse invalid integer
+
+**Prompt:** Attempt to parse the string `"42abc"` as a base-10 integer. If parsing succeeds, print the integer on a single line; if parsing fails (the string is not a valid integer), print exactly the text `invalid` on a single line. Then exit with status 0.
+
+**Oracle (stdout):**
+```
+invalid
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses error handling at a parsing boundary. Python's `int("42abc")` raises `ValueError` — uncaught crashes with non-zero exit. Go's `strconv.Atoi("42abc")` returns `(int, error)`; if the error is ignored, the int is 0 and the program prints `0` (silently wrong). Sigil's `string_to_int_validate("42abc")` returns a non-zero error code (per spec §13's `std.string` notes) — the typechecker forces an explicit branch.
+
+---
+
+## C13 — find first matching element when none exists
+
+**Prompt:** Given the list of integers `[3, 1, 4, 1, 5, 9, 2, 6]`, find the first element strictly less than zero. If such an element exists, print it on a single line; if no element is less than zero, print exactly the text `none` on a single line. Then exit with status 0.
+
+**Oracle (stdout):**
+```
+none
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses the "search-with-no-match" failure mode. Python's `next((x for x in xs if x < 0))` raises `StopIteration` if no match (silent if a default is provided, but a default-less call is the natural shorter form). Go requires an explicit `found` flag to distinguish "no match" from "the value zero." Sigil's `Option[Int]` return type from a recursive helper forces the empty case via `match`.
+
+---
+
+## C14 — index out of bounds
+
+**Prompt:** Build a 3-element list of integers `[10, 20, 30]`. Look up the element at index `5` (a runtime-known integer, not a literal indexing of an array of known length). If the index is in range, print the element on a single line; if out of range, print exactly the text `out of range` on a single line. Then exit with status 0.
+
+**Oracle (stdout):**
+```
+out of range
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses bounds-checking. Python's `xs[5]` raises `IndexError` — uncaught crashes. Go's `xs[5]` panics. Sigil's array `array_get` aborts the runtime on out-of-bounds (no Option-returning variant in the builtin); programs must check `array_length` first OR use a recursive list walk that returns `Option[Int]`. The thesis: each language has a different cliff; only Sigil makes the bounds-check structurally explicit at the type level.
+
+---
+
+## C15 — integer-vs-float division (average)
+
+**Prompt:** Compute the arithmetic mean (average) of the integers in the list `[3, 1, 4, 1, 5, 9, 2, 6]`. The exact answer is `31 / 8 = 3.875`. Print the result on a single line as a decimal number, then exit with status 0.
+
+**Oracle (stdout):**
+```
+3.875
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses integer-vs-float division. Python's `sum(xs) / len(xs)` defaults to true division and produces `3.875`; using `//` (integer division) silently produces `3`. Go's `sum / len(xs)` is integer division — common bug — producing `3`. The correct Go form is `float64(sum) / float64(len(xs))`. Sigil requires explicit `float_from_int` + `float_div` from `std.float`; using integer `/` drops to `3` (and also requires `ArithError` in the row).
+
+---
+
+## C16 — handle division by zero
+
+**Prompt:** Define a function that takes two integer arguments and returns their quotient. In `main`, call this function with the arguments `10` and `0`. If the call would error (the second argument being zero), recover from the error and print exactly the text `div by zero` on a single line; otherwise print the quotient on a single line. Then exit with status 0.
+
+**Oracle (stdout):**
+```
+div by zero
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses uncaught-divide-by-zero. Python's `10 // 0` raises `ZeroDivisionError`; uncaught crashes the program. Go's `10 / 0` panics on divide. Sigil's `10 / 0` performs `ArithError.div_by_zero` on a row that includes `ArithError`; an uncaught perform invokes the default handler (stderr + exit 2). All three languages force handling, but with different mechanisms: Python `try/except`, Go pre-check or `recover()`, Sigil `handle ... with { ArithError.div_by_zero(k) => ... }`. The agent must remember the exhaustive arm rule (E0142): Sigil's handler must cover BOTH `div_by_zero` AND `mod_by_zero` even if `%` isn't used.
