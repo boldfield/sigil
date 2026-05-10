@@ -145,6 +145,7 @@ pub fn format_import_hint(name: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 
