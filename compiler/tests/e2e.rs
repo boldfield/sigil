@@ -7310,7 +7310,10 @@ fn std_string_to_int_canonical_result_wrapper() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_string_to_int_canonical");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "42\nempty\nnon-decimal\noverflow\n", "stderr={stderr:?}");
+    assert_eq!(
+        stdout, "42\nempty\nnon-decimal\noverflow\n",
+        "stderr={stderr:?}"
+    );
 }
 
 /// `string_length` is the surface name for the Plan A1
