@@ -60,7 +60,8 @@ use crate::{lexer, parser, stdlib_embed};
 /// silently.
 const BUILTIN_INJECTED: &[&str] = &[
     "io.sigil",
-    "array.sigil",
+    // `array.sigil` ships real source (array_get_opt, array_set_opt
+    // — see [stdlib fallible-ops audit, Phase 2 Task 4]).
     "mut_array.sigil",
     // `byte_array.sigil` ships real source (string_from_bytes,
     // byte_array_get_opt, byte_array_slice_opt, byte_from_int —

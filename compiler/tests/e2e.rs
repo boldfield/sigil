@@ -6897,18 +6897,70 @@ fn std_array_of_string_round_trips() {
 }
 
 /// `import std.array` should be accepted (no-op since the surface
-/// is already available unconditionally as a builtin).
+/// `import std.array` loads the module's pure-Sigil wrappers
+/// (`array_get_opt`, `array_set_opt`). The builtin primitives
+/// (`array_alloc`, `array_get`, etc.) remain available
+/// unconditionally even without the import.
 #[test]
-fn std_array_import_is_noop_no_op() {
+fn std_array_import_loads_cleanly() {
     let src = "import std.array\n\
                fn main() -> Int ![IO] {\n  \
                  let arr: Array[Int] = array_alloc(1, 5);\n  \
                  perform IO.println(int_to_string(array_get(arr, 0)));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_array_import_noop");
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_import_loads");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "5\n", "stderr={stderr:?}");
+}
+
+/// Canonical `array_get_opt(arr, i) -> Option[A]` wrapper. Companion
+/// to the panic-on-OOB `array_get` builtin (stdlib fallible-ops
+/// audit Phase 2 Task 4).
+#[test]
+fn std_array_get_opt_canonical() {
+    let src = "import std.array\n\n\
+               fn show(o: Option[Int]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(n) => int_to_string(n),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: Array[Int] = array_alloc(3, 7);\n  \
+                 perform IO.println(show(array_get_opt(xs, 0)));\n  \
+                 perform IO.println(show(array_get_opt(xs, 2)));\n  \
+                 perform IO.println(show(array_get_opt(xs, 3)));\n  \
+                 perform IO.println(show(array_get_opt(xs, -1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_get_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `array_set_opt(arr, i, val) -> Option[Array[A]]` wrapper.
+/// Returns `Some(fresh_array)` when in-range; `None` when out of
+/// bounds. Companion to the panic-on-OOB `array_set` builtin.
+#[test]
+fn std_array_set_opt_canonical() {
+    let src = "import std.array\n\n\
+               fn show_arr(o: Option[Array[Int]]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(arr) => int_to_string(array_get(arr, 1)),\n    \
+                   None      => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let xs: Array[Int] = array_alloc(3, 0);\n  \
+                 perform IO.println(show_arr(array_set_opt(xs, 1, 42)));\n  \
+                 perform IO.println(show_arr(array_set_opt(xs, 5, 42)));\n  \
+                 perform IO.println(show_arr(array_set_opt(xs, -1, 42)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_array_set_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\nnone\nnone\n", "stderr={stderr:?}");
 }
 
 // ===== Plan C Task 66.5 — ByteArray runtime + builtin coverage =====

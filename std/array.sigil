@@ -1,15 +1,19 @@
 // sigil: 0.1
 //
-// std/array.sigil — Plan C Task 65.
+// std/array.sigil — Plan C Task 65 + stdlib fallible-ops audit
+//                   (post-PR-#136 follow-on).
 //
-// **Documentation only.** Like `std/io.sigil`, this file does not
-// participate in typecheck. The `Array[A]` type and its five
-// operations are registered at the typechecker as builtins via
-// `builtin_types()` and `register_builtin_array_schemes()`. Edits
-// to this file have no effect on compilation. `import std.array`
-// is allowed (the resolver loads this file, parses it, and finds
-// zero items to append) but is not required — the surface is
-// available unconditionally.
+// The `Array[A]` type and its five core operations
+// (alloc / empty / length / get / set) are registered at the
+// typechecker as builtins via `builtin_types()` and
+// `register_builtin_array_schemes()` — these are available
+// unconditionally without an explicit import.
+//
+// In addition, this file ships pure-Sigil source-level wrappers at
+// the bottom: `array_get_opt`, `array_set_opt` — the canonical
+// safe-accessor surface. `import std.array` is required to use
+// those wrappers (and is harmless when only the builtin primitives
+// are used).
 //
 // `Array[A]` is an immutable, eager, heap-allocated sequence with
 // O(1) `length` and `get`, and O(n) `set` (returns a fresh array;
@@ -30,11 +34,24 @@
 //   Read the number of elements in O(1).
 //
 // - `array_get[A](arr: Array[A], i: Int) -> A ![]`
-//   Read element `i` in O(1). Aborts on out-of-bounds.
+//   Read element `i` in O(1). Aborts on out-of-bounds — prefer
+//   `array_get_opt` for the bounds-checked surface.
 //
 // - `array_set[A](arr: Array[A], i: Int, val: A) -> Array[A] ![]`
 //   Return a fresh array with `arr[i] = val` and all other slots
-//   unchanged. The original `arr` is unchanged. O(n).
+//   unchanged. The original `arr` is unchanged. O(n). Aborts on
+//   out-of-bounds — prefer `array_set_opt` for the bounds-checked
+//   surface.
+//
+// ## Safe accessors (pure-Sigil wrappers)
+//
+// - `array_get_opt[A](arr: Array[A], i: Int) -> Option[A] ![]`
+//   Returns `Some(elem)` if `i` is in range; `None` if out of
+//   bounds. Companion to the panic-on-OOB `array_get` builtin.
+//
+// - `array_set_opt[A](arr: Array[A], i: Int, val: A) -> Option[Array[A]] ![]`
+//   Returns `Some(fresh_array)` if `i` is in range; `None` if out
+//   of bounds. Companion to the panic-on-OOB `array_set` builtin.
 //
 // ## Layout
 //
@@ -52,3 +69,40 @@
 // needed to narrow `array_get`'s I64 return to a smaller width.
 // See `[DEVIATION Task 65]` in `PLAN_C_DEVIATIONS.md` for the v2
 // closure path.
+
+// =====================================================================
+// Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
+// =====================================================================
+
+import std.option
+
+// `array_get_opt(arr, i)` returns `Some(elem)` if `i` is in range
+// (`0 <= i < length(arr)`) and `None` otherwise. Companion to the
+// panic-on-OOB `array_get` builtin.
+fn array_get_opt[A](arr: Array[A], i: Int) -> Option[A] ![] {
+  if i < 0 {
+    None
+  } else {
+    if i >= array_length(arr) {
+      None
+    } else {
+      Some(array_get(arr, i))
+    }
+  }
+}
+
+// `array_set_opt(arr, i, val)` returns `Some(arr')` (a fresh array
+// with `arr'[i] = val`) if `i` is in range, and `None` otherwise.
+// Companion to the panic-on-OOB `array_set` builtin. Note: like
+// `array_set`, this is O(n) — it allocates a fresh array.
+fn array_set_opt[A](arr: Array[A], i: Int, val: A) -> Option[Array[A]] ![] {
+  if i < 0 {
+    None
+  } else {
+    if i >= array_length(arr) {
+      None
+    } else {
+      Some(array_set(arr, i, val))
+    }
+  }
+}
