@@ -1120,6 +1120,38 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0150",
+        short: "Array / MutArray element type Bool / Char / Byte not supported in v1",
+        long: "Sigil v1's `Array[A]` and `MutArray[A]` storage runtime treats \
+               every element as a 64-bit slot. Narrower scalar types — `Bool` \
+               (i8), `Char` (i32 codepoint), `Byte` (i8) — don't fit the slot \
+               without per-call type-arg threading at codegen time, which v1 \
+               does not implement. v2 will add the threading; for now, the \
+               typechecker rejects builtin-array call sites whose inferred \
+               element type is one of these narrow scalars rather than \
+               letting the call slip through to a Cranelift verifier ICE \
+               (`arg has type i8, expected i64`).\n\n\
+               Allowed element types: `Int`, `String`, `Float`, `Int64`, and \
+               any user-defined sum or record type. (`Float` and `Int64` are \
+               heap-boxed via their TAG, so they fit the i64 slot as a \
+               pointer.)\n\n\
+               Disallowed: `Bool`, `Char`, `Byte`. Workarounds:\n\
+               - For `Bool`: use `Array[Int]` / `MutArray[Int]` with `0` and \
+                 `1` sentinels.\n\
+               - For `Byte`: use `ByteArray` / `MutByteArray` (the dedicated \
+                 flat-byte primitives — `byte_array_alloc`, \
+                 `mut_byte_array_new`, `byte_array_get`, etc.).\n\
+               - For `Char`: use `Array[Int]` of codepoints, or `String` / \
+                 `List[Char]` if the use case is text manipulation.",
+        fix_example: "// Wrong:\n\
+                      let consumed: MutArray[Bool] = mut_array_new(5, false);\n\n\
+                      // Right (Int sentinel):\n\
+                      let consumed: MutArray[Int] = mut_array_new(5, 0);\n\
+                      // ... mut_array_set(consumed, i, 1) to mark consumed\n\n\
+                      // For bytes, prefer ByteArray / MutByteArray:\n\
+                      let buf: MutByteArray = mut_byte_array_new(5, byte_truncate(0));",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \
