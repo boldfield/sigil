@@ -331,3 +331,35 @@ unbalanced
 **Oracle (exit):** `0`
 
 **Notes:** Stresses tokenization + stack manipulation + operator-operand-order correctness. Common LLM bugs: wrong operand order for non-commutative operators (`-` and `/`), forgetting to convert string tokens to integers, mishandling whitespace tokenization. In Sigil: requires `string_split` to tokenize, then `string_to_int_parse` per number token. The `/` operator requires `ArithError` in the row.
+
+---
+
+## H01 — Wordle scoring
+
+**Prompt:** Implement a Wordle-style scoring function. Given a 5-letter guess and 5-letter answer (both lowercase ASCII, exactly 5 characters each, with no surprises like spaces, punctuation, or uppercase), produce a 5-character feedback string where each character is:
+
+- `G` (green) — the guess letter at this position matches the answer's letter at the same position.
+- `Y` (yellow) — the guess letter is in the answer at a *different* position, BUT each answer letter can only be matched once. Greens claim their positions first; remaining yellows scan the guess left-to-right and consume the leftmost still-available answer letter for each match.
+- `X` (gray) — the letter is not in the answer, OR every instance of it in the answer has already been consumed by a green or earlier yellow.
+
+For `guess = "geese"` and `answer = "agree"`, print exactly the 5-character feedback string `YYXXG` followed by a newline, then exit with status 0.
+
+Position-by-position trace for the example:
+- Pos 0 — `g` vs `a`: not equal; `g` is in the answer at position 1 (still available) → `Y`, consume answer[1]
+- Pos 1 — `e` vs `g`: not equal; `e` is in the answer at positions 3 and 4. Position 4 is already claimed by the green at the very end (greens always go first). Position 3 is unclaimed → `Y`, consume answer[3]
+- Pos 2 — `e` vs `r`: not equal; `e` is in the answer but both positions are now consumed → `X`
+- Pos 3 — `s` vs `e`: not equal; `s` is not in the answer at all → `X`
+- Pos 4 — `e` vs `e`: equal → `G`
+
+**Oracle (stdout):**
+```
+YYXXG
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses correct ordering of greens before yellows AND consume-on-match bookkeeping. Common LLM failure modes: (1) the naive solution `if guess[i] == answer[i] then G elif guess[i] in answer then Y else X` produces `YYYXG` (wrong — both `e`s at positions 1 and 2 are marked `Y` because the duplicate-consumption isn't tracked); (2) a one-pass left-to-right traversal that greedily takes yellows can consume an answer letter that a later position would have matched as a green, producing wrong scores; (3) tracking consumed *guess* letters instead of consumed *answer* letters; (4) processing yellows for positions already marked `G`, double-counting consumes.
+
+Canonical algorithm: pass 1 sets greens and marks answer positions consumed; pass 2 walks remaining (non-green) guess positions left-to-right, scanning the answer for the leftmost still-unconsumed letter that matches.
+
+In Sigil: a `MutByteArray` for the feedback plus per-position tracking of which answer letters are consumed. `MutArray[Bool]` is unavailable in v1 (per `[DEVIATION Task 65]` — Bool element type unsupported); use `MutArray[Int]` with 0/1 sentinels or a separate `MutByteArray` of bytes 0/1.

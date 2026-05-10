@@ -58,7 +58,7 @@ fi
 # backticks.
 expected_stdout="$(awk -v id="## $PROMPT_ID " '
     $0 ~ "^"id { in_block=1 }
-    in_block && /^## C[0-9]/ && $0 !~ "^"id { exit }
+    in_block && /^## [A-Z][0-9]/ && $0 !~ "^"id { exit }
     in_block && /^\*\*Oracle \(stdout\):\*\*/ { in_oracle=1; next }
     in_oracle && /^```$/ {
         if (started) { exit } else { started=1; next }
@@ -68,7 +68,7 @@ expected_stdout="$(awk -v id="## $PROMPT_ID " '
 
 expected_exit="$(awk -v id="## $PROMPT_ID " '
     $0 ~ "^"id { in_block=1 }
-    in_block && /^## C[0-9]/ && $0 !~ "^"id { exit }
+    in_block && /^## [A-Z][0-9]/ && $0 !~ "^"id { exit }
     in_block && /^\*\*Oracle \(exit\):\*\*/ {
         match($0, /`[0-9]+`/)
         if (RSTART > 0) {
