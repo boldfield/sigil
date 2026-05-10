@@ -52,24 +52,44 @@ comp/scripts/eval-go.sh /tmp/c01.go C01
 
 Each driver prints `pass` or `fail: <reason>` and exits 0/1.
 
-## Future surface (API integration)
+## Running the full comparison
 
-`scripts/compare.sh` documents the Claude-API integration shape but currently exits with a stub message. To complete it:
+`scripts/compare.py` (driven by `scripts/compare.sh`) implements the full Claude API loop. For each `(prompt × language × model × run)` it sends the prompt to Claude with the language-specific system context, extracts the program from the response's fenced code block, hands it to the matching `eval-<lang>.sh` driver, and records the result. On first-shot failure it sends a follow-up turn with the eval driver's failure category for an after-one-edit retry.
 
-1. Implement `claude_call(system_prompt, user_prompt) -> response_text` using `curl` against `api.anthropic.com/v1/messages` (matching the auth pattern that `validate-spec.sh` will use when Stage 9 Task 85 lands — see `scripts/validate-spec.sh` for the future shape).
-2. Extract the program from the response (look for the first ```sigil/```python/```go fenced block).
-3. Write to a temp file; pass to the appropriate eval driver.
-4. On first-shot failure, send a second turn with the program + compile/run output and re-evaluate.
-5. Append result to `log/<timestamp>.md`.
+```shell
+export ANTHROPIC_API_KEY=sk-...
+cargo build --release        # sigil eval driver invokes target/release/sigil
+
+./comp/scripts/compare.sh                                  # full bank, both models, all langs
+./comp/scripts/compare.sh --filter C01 --runs 3            # one prompt, K/N aggregation
+./comp/scripts/compare.sh --langs sigil,python --models claude-opus-4-7
+./comp/scripts/compare.sh --no-edit-loop                   # measure first-shot only
+```
+
+Outputs:
+- `comp/log/comparison-results-<timestamp>.jsonl` — per-cell trace (raw response, extracted program, eval pass/category/detail). Local-only (gitignored).
+- `comp/log/comparison-log.md` — markdown report: per-(language, model) pass-rate table + per-prompt × per-cell K/N matrix + **failure-category histogram per language** (the central thesis-relevant comparison).
+
+See `scripts/compare.py --help` for the full CLI.
 
 ## Selection rationale
 
 The 10 prompts (`C01`–`C10`) are chosen to:
 
-- Compile cleanly in current Sigil **without** dependencies on queued plans (no `Char`, no `Env`/`Fs`/`Process`, no `Map`/`sort`, no `format`/`panic`).
+- Use only basic surface (IO, Int, recursion, match/branching) common to all three target languages, so first-shot success doesn't hinge on stdlib breadth. Sigil's `std.char`, `std.env`/`std.fs`/`std.process`, `std.map`/`list_sort_int`, `std.format`, `panic`/`assert` have all shipped (post Plan D), but the C01–C10 corpus deliberately doesn't exercise them — keeps the comparison about authoring core algorithmic idioms, not "did the LLM remember each language's stdlib name?"
 - Have deterministic stdout (no input parsing, no time/random dependence).
 - Span complexity from trivial (hello world) to moderate (fizzbuzz, Collatz steps).
 - Avoid Sigil-specific idioms in the problem statement — the prompt body never mentions Sigil, Python, or Go. The runner attaches a language-specific system prompt.
+
+### Sigil-specific traps to watch for
+
+Several prompts (C05 fizzbuzz, C06 primality, C07 gcd, C08 digit count, C10 Collatz) use the `%` (modulo) or `/` (division) operators. In Sigil, both require `ArithError` in the enclosing function's effect row (per spec §1 line 823 — the operators may abort with `ArithError.div_by_zero` / `mod_by_zero` and that effect must be discharged or propagated).
+
+The validation harness's P05/P07 data shows LLMs reliably miss this on first attempt across both Opus and Sonnet — they default to `![IO]` when the natural row is `![ArithError, IO]`. **Expect Sigil's first-shot rate on C05/C06/C07/C08/C10 to be depressed for this reason specifically.** The edit-loop catches it because the E0042 error message names ArithError verbatim.
+
+This isn't a bug in the prompts or the language — it's a measurable spec-teachability data point. If the eventual Sigil first-shot rate on `%`/`/`-using prompts approaches Python's, that's evidence the spec teaches the rule effectively. If it stays low, that's signal for spec polish (more prominent ArithError callout in §1).
+
+### Bias caveats
 
 This corpus is **biased** in two ways and the methodology work should fix both:
 
