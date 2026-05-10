@@ -1453,6 +1453,7 @@ Recent additions (Plan D + state-cell):
 | E0144 | per-op generic parameter shadows an effect-decl generic parameter | Plan D Task 115 |
 | E0145 | continuation `k` cannot escape its handle's arm body | Plan D Task 117 |
 | E0148 | runtime cell op called outside `std/state.sigil` | State-cell |
+| E0149 | perform inside statement position would silently miscompile in multi-shot context | PR #127 follow-up |
 | E0220 | one-shot continuation used more than once on a code path | Plan B Task 54 |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
