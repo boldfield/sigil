@@ -1190,13 +1190,13 @@ may be:
   type. Any arm may perform its own effects.
 
 Per-resume execution is preserved through the branched expression
-when the `if`/`match` IS the `tail_expr`. The shapes that do
-**not** currently work:
-
-- **Branched perform as a statement** followed by a separate
-  `tail_expr` (e.g., `let a = perform p; match cond { true => perform q, false => () }; 0`).
-  The match must be the tail, not a statement before the tail.
-  Rewrite as `let a = perform p; match cond { true => { perform q; 0 }, false => 0 }`.
+when the `if`/`match` is in tail position OR when it appears as
+a statement immediately before a non-perform tail (e.g.,
+`let a = perform p; match cond { true => perform q, false => () }; 0`).
+The codegen automatically lifts the trailing branched statement
+into tail position, wrapping each arm body to evaluate as a
+statement and yield the original tail value. Both shapes compose
+through the chain machinery identically.
 
 A `tail_expr` may also be a call to a separate Cps-colored function
 (e.g., `let a = perform p; let b = perform p; helper(a, b)` where

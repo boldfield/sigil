@@ -16225,6 +16225,60 @@ fn multi_shot_choose_pair_enumeration() {
     );
 }
 
+/// Harness-found defect P20 — the LLM-natural "match-as-statement
+/// followed by literal tail" body shape. Pre-fix this body classified
+/// as Sync ABI fallback (no Cps classifier accepted), silently
+/// miscompiling under multi-shot (the perform inside the match arm
+/// never observed its effects → empty stdout).
+///
+/// The codegen `lift_trailing_branched_stmt_to_tail` rewrite lifts
+/// the trailing `Stmt::Expr(Match | If)` into tail position with each
+/// arm body wrapped to evaluate as a statement and yield the original
+/// tail. The rewritten body classifies under Pattern C and lowers
+/// correctly through the multi-shot machinery.
+///
+/// Test pins the exact shape sonnet produced for P20 (validation
+/// harness run 2026-05-09): the only difference vs the canonical
+/// shape (which uses `if`-as-tail) is the `match cond { ... }; 0`
+/// statement+literal-tail framing.
+#[test]
+fn multi_shot_choose_pair_enumeration_match_as_stmt() {
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 match a + b == 7 {\n    \
+                   true => perform IO.println(int_to_string(a * 10 + b)),\n    \
+                   false => (),\n  \
+                 };\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     let r3: Int = k(3);\n      \
+                     let r4: Int = k(4);\n      \
+                     let r5: Int = k(5);\n      \
+                     let r6: Int = k(6);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_choose_pair_enumeration_match_as_stmt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "16\n25\n34\n43\n52\n61\n",
+        "Match-as-statement P20 shape: pairs() with the match-as-stmt + literal-tail \
+         framing must produce the same six pairs as the if-as-tail canonical (PR #126 \
+         harness-found defect — pre-fix this body silently miscompiled to empty stdout). \
+         stderr={stderr:?}"
+    );
+}
+
 /// Plan A — pure-tail body remains correct (was already accepted by
 /// the pre-Plan-A chained-let-yield classifier; this test pins it
 /// against any future regression to the classifier or emit pass).

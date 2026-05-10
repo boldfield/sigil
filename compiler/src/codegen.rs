@@ -9209,8 +9209,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // accept body shapes with mid-body discard performs (which
             // previously fell to Sync ABI and silently miscompiled
             // multi-shot — see compiler/docs/multi-shot-tail-anomaly.md).
-            let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
-            let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+            // P20 fix — lift trailing branched-perform stmt into tail
+            // position FIRST so subsequent perform-stmt normalization
+            // (recursive) walks the new arm blocks and converts the
+            // arm-internal Stmt::Perform → Stmt::Let.
+            let lifted_branched = lift_trailing_branched_stmt_to_tail(&f.body);
+            let body_after_lift = lifted_branched.as_ref().unwrap_or(&f.body);
+            let perform_norm = rewrite_perform_stmts_as_lets(body_after_lift, &checked.effects);
+            let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
             let normalized_body =
                 normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
             let body_for_abi = normalized_body.as_ref().unwrap_or(body_after_perform_norm);
@@ -9413,8 +9419,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // rewrite as the ABI selection above; both passes
                     // must see identical body shapes for the classifier
                     // and emit to materialize the same chain.
-                    let perform_norm = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
-                    let body_after_perform_norm = perform_norm.as_ref().unwrap_or(&f.body);
+                    let lifted_branched = lift_trailing_branched_stmt_to_tail(&f.body);
+                    let body_after_lift = lifted_branched.as_ref().unwrap_or(&f.body);
+                    let perform_norm =
+                        rewrite_perform_stmts_as_lets(body_after_lift, &checked.effects);
+                    let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
                     let chain_normalized =
                         normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
                     let chain_body = chain_normalized.as_ref().unwrap_or(body_after_perform_norm);
@@ -10915,8 +10924,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // factor * factor)` triggers the elaborator's BinOp
                 // hoisting; pre-this-fix, codegen panicked at the
                 // unreachable arm a few lines below.
-                let perform_norm_emit = rewrite_perform_stmts_as_lets(&f.body, &checked.effects);
-                let body_after_perform_norm_emit = perform_norm_emit.as_ref().unwrap_or(&f.body);
+                let lifted_branched_emit = lift_trailing_branched_stmt_to_tail(&f.body);
+                let body_after_lift_emit = lifted_branched_emit.as_ref().unwrap_or(&f.body);
+                let perform_norm_emit =
+                    rewrite_perform_stmts_as_lets(body_after_lift_emit, &checked.effects);
+                let body_after_perform_norm_emit =
+                    perform_norm_emit.as_ref().unwrap_or(body_after_lift_emit);
                 let chain_normalized_emit =
                     normalize_tail_perform_body(body_after_perform_norm_emit, &f.return_type);
                 let body_for_emit = chain_normalized_emit
@@ -27651,6 +27664,225 @@ fn normalize_tail_perform_body(
     Some(crate::ast::Block {
         stmts,
         tail: Some(Expr::Ident(binding_name, span.clone())),
+        span: body.span.clone(),
+    })
+}
+
+/// Plan A Phase 3 (harness-found defect P20) — body shape rewrite that
+/// lifts a TRAILING `Stmt::Expr(Match | If)` into tail position when
+/// the match/if arms contain perform sites and the body's actual tail
+/// is a literal/pure expression.
+///
+/// **Why.** The chained-let-yield + Pattern C body classifiers require
+/// the perform-bearing branched expression to BE the body's tail.
+/// Bodies shaped:
+///
+/// ```text
+/// {
+///   let a = perform p; let b = perform q;
+///   match cond { true => perform r, false => () };  ← Stmt::Expr
+///   0                                                ← LiteralTail
+/// }
+/// ```
+///
+/// fail every classifier (chained: rejects non-Let stmts; Pattern C:
+/// requires branched tail) and fall through to Sync ABI. Under
+/// multi-shot, Sync ABI silently miscompiles — the perform inside the
+/// match arm never observes its effects (P20 sonnet repro).
+///
+/// The spec at §8.3 documents the user-visible workaround: rewrite as
+/// `match cond { true => { perform r; 0 }, false => 0 }` (match
+/// becomes the tail). This rewrite automates that workaround at
+/// codegen time, so source code in the natural shape compiles
+/// correctly.
+///
+/// **Shape gate.** Applied iff:
+/// - `body.stmts` is non-empty.
+/// - The LAST stmt is `Stmt::Expr(Match | If)`.
+/// - At least one branch of the trailing branched expression
+///   contains a perform.
+/// - `body.tail` is `Some(_)` and the tail expression is "pure
+///   enough" to clone into every arm — literal, identifier, ctor
+///   construction, or non-perform-bearing operator. Specifically:
+///   `!expr_contains_perform(tail)`. This avoids duplicating
+///   side-effecting computation across N arms.
+///
+/// **Transformation.** Each arm body becomes
+/// `Block { stmts: [Stmt::Expr(orig_arm_body)], tail: Some(orig_tail.clone()) }`.
+/// The match/if becomes the body's new tail; the original last stmt
+/// is dropped; the original tail expression is consumed (cloned into
+/// each arm).
+///
+/// Returns `Some(rewritten)` when applied; `None` otherwise.
+fn lift_trailing_branched_stmt_to_tail(body: &crate::ast::Block) -> Option<crate::ast::Block> {
+    use crate::ast::{Block, Expr, MatchArm, Stmt};
+    if body.stmts.is_empty() {
+        return None;
+    }
+    let tail = body.tail.as_ref()?;
+    if expr_contains_perform(tail) {
+        return None;
+    }
+    let last_stmt = body.stmts.last()?;
+    let branched = match last_stmt {
+        Stmt::Expr(e @ (Expr::Match { .. } | Expr::If { .. })) => e,
+        _ => return None,
+    };
+    if !expr_contains_perform(branched) {
+        return None;
+    }
+
+    // Wrap an arm body so it evaluates the original arm body as a
+    // statement (discarding its value), then yields a clone of the
+    // original tail expression. Block-shape so codegen sees the
+    // tail-yielding shape uniformly. For bare `Expr::Perform` arm
+    // bodies we emit `Stmt::Perform` so the subsequent
+    // `rewrite_perform_stmts_as_lets` pass can normalize it into
+    // `Stmt::Let`, which is what `classify_branched_cps_tail_branch`
+    // requires to accept the arm as a `PerformChain` leaf. For other
+    // shapes (Unit literal `()`, pure expressions, etc.) `Stmt::Expr`
+    // is kept; the branch classifier accepts Block arms whose stmts
+    // are `Stmt::Let` only, so non-perform arms must be reduced to
+    // an empty stmt list (handled below for Unit literals).
+    let body_span = body.span.clone();
+    let wrap_arm_body = |arm_body: &Expr, tail_clone: &Expr| -> Expr {
+        // Unit-literal arm bodies (`()`) carry no observable effect
+        // and can be dropped; the wrapped block becomes just the
+        // tail-yielding form.
+        let drop_unit_literal = |e: &Expr| match e {
+            Expr::UnitLit(_) => true,
+            Expr::Tuple { elems, .. } if elems.is_empty() => true,
+            _ => false,
+        };
+        if drop_unit_literal(arm_body) {
+            return Expr::Block(Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(tail_clone.clone()),
+                span: body_span.clone(),
+            }));
+        }
+        // Elaborator-wrapped arm body: `Expr::Block { stmts, tail =
+        // Some(orig_perform) }`. Unwrap by appending the inner block's
+        // stmts AND lifting its tail into the new stmt list (as
+        // Stmt::Perform when the tail is a bare perform — so the
+        // recursive `rewrite_perform_stmts_as_lets` normalizes it to
+        // Stmt::Let next pass; Stmt::Expr otherwise).
+        if let Expr::Block(inner) = arm_body {
+            // Drop Stmt::Expr(unit-literal) — they're elaborator-
+            // emitted no-ops and the branch classifier rejects
+            // non-Let stmts. Non-unit Stmt::Expr we keep (an arbitrary
+            // expression-statement is a real side-effect site) — the
+            // branch classifier will reject the body but at least the
+            // semantics are preserved.
+            let mut stmts: Vec<Stmt> = inner
+                .stmts
+                .iter()
+                .filter(|s| match s {
+                    Stmt::Expr(e) => !drop_unit_literal(e),
+                    _ => true,
+                })
+                .cloned()
+                .collect();
+            if let Some(t) = inner.tail.as_ref() {
+                if !drop_unit_literal(t) {
+                    let stmt = match t.clone() {
+                        Expr::Perform(p) => Stmt::Perform(p),
+                        other => Stmt::Expr(other),
+                    };
+                    stmts.push(stmt);
+                }
+            }
+            return Expr::Block(Box::new(Block {
+                stmts,
+                tail: Some(tail_clone.clone()),
+                span: body_span.clone(),
+            }));
+        }
+        let stmts = match arm_body.clone() {
+            Expr::Perform(p) => vec![Stmt::Perform(p)],
+            other => vec![Stmt::Expr(other)],
+        };
+        Expr::Block(Box::new(Block {
+            stmts,
+            tail: Some(tail_clone.clone()),
+            span: body_span.clone(),
+        }))
+    };
+
+    let new_branched = match branched {
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => {
+            let new_arms: Vec<MatchArm> = arms
+                .iter()
+                .map(|a| MatchArm {
+                    pattern: a.pattern.clone(),
+                    body: wrap_arm_body(&a.body, tail),
+                    span: a.span.clone(),
+                })
+                .collect();
+            Expr::Match {
+                scrutinee: scrutinee.clone(),
+                arms: new_arms,
+                span: span.clone(),
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => {
+            let then_tail = then_block
+                .tail
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Expr::Tuple {
+                    elems: Vec::new(),
+                    span: then_block.span.clone(),
+                });
+            let new_then = Block {
+                stmts: {
+                    let mut s = then_block.stmts.clone();
+                    s.push(Stmt::Expr(then_tail));
+                    s
+                },
+                tail: Some(tail.clone()),
+                span: then_block.span.clone(),
+            };
+            let else_tail = else_block
+                .tail
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Expr::Tuple {
+                    elems: Vec::new(),
+                    span: else_block.span.clone(),
+                });
+            let new_else = Block {
+                stmts: {
+                    let mut s = else_block.stmts.clone();
+                    s.push(Stmt::Expr(else_tail));
+                    s
+                },
+                tail: Some(tail.clone()),
+                span: else_block.span.clone(),
+            };
+            Expr::If {
+                cond: cond.clone(),
+                then_block: Box::new(new_then),
+                else_block: Box::new(new_else),
+                span: span.clone(),
+            }
+        }
+        _ => unreachable!("matched on Match | If above"),
+    };
+
+    let new_stmts: Vec<Stmt> = body.stmts[..body.stmts.len() - 1].to_vec();
+    Some(Block {
+        stmts: new_stmts,
+        tail: Some(new_branched),
         span: body.span.clone(),
     })
 }

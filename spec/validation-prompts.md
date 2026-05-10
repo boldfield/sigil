@@ -169,12 +169,15 @@ recursion (`fib`) and cross-fn recursion (`print_range` → `fib`).
 ## P09 — partial application via a returned lambda
 
 **Prompt:** Write a Sigil program that defines a function
-`make_adder(x: Int) -> (Int) -> Int ![]` whose body is the lambda
-`fn (y: Int) -> Int ![] => x + y` (which captures `x` from
-`make_adder`'s parameter list). In `main`, bind `let add3: (Int) ->
-Int ![] = make_adder(3);` then apply it as `add3(4)`, convert the
-result via `int_to_string`, print via `perform IO.println`, and
-return `0` as the process exit status.
+`make_adder(x: Int) -> (Int) -> Int ![] ![]` (the trailing `![..] ![..]`
+is two distinct rows: the inner is the returned fn-type's row,
+the outer is `make_adder`'s own row — Sigil's per-arrow effect
+discipline requires every fn-type to carry its own row). The body
+is the lambda `fn (y: Int) -> Int ![] => x + y` (which captures
+`x` from `make_adder`'s parameter list). In `main`, bind
+`let add3: (Int) -> Int ![] = make_adder(3);` then apply it as
+`add3(4)`, convert the result via `int_to_string`, print via
+`perform IO.println`, and return `0` as the process exit status.
 
 **Oracle (stdout):**
 ```
@@ -190,11 +193,15 @@ application at the call site.
 ## P10 — compose two lambdas
 
 **Prompt:** Write a Sigil program that defines `compose(f: (Int) ->
-Int ![], g: (Int) -> Int ![]) -> (Int) -> Int ![]` whose body is the
-lambda `fn (x: Int) -> Int ![] => f(g(x))`. In `main`, call
-`compose(fn (x: Int) -> Int ![] => x + 1, fn (x: Int) -> Int ![] => x
-* 2)` and apply the resulting closure to `5`, convert via
-`int_to_string`, print via `perform IO.println`, return `0`.
+Int ![], g: (Int) -> Int ![]) -> (Int) -> Int ![] ![]` (the trailing
+`![..] ![..]` is two distinct rows: the inner is the returned
+fn-type's row, the outer is `compose`'s own row — Sigil's per-arrow
+effect discipline requires every fn-type to carry its own row).
+The body is the lambda `fn (x: Int) -> Int ![] => f(g(x))`. In
+`main`, call `compose(fn (x: Int) -> Int ![] => x + 1, fn (x: Int)
+-> Int ![] => x * 2)` and apply the resulting closure to `5`,
+convert via `int_to_string`, print via `perform IO.println`,
+return `0`.
 
 **Oracle (stdout):**
 ```
