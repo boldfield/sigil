@@ -12750,6 +12750,35 @@ fn float_string_parse_validate() {
     assert_eq!(stdout, "2.718\n");
 }
 
+/// Canonical `string_to_float(s) -> Option[Float]` wrapper over the
+/// validate/_parse builtin pair (stdlib fallible-ops audit Phase 2
+/// Task 3). Single failure mode (IEEE 754 represents overflow as
+/// ±Inf), so Option suffices — no error sum.
+#[test]
+fn std_string_to_float_canonical() {
+    let src = "import std.float\n\n\
+               fn show(o: Option[Float]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(f) => float_to_string(f),\n    \
+                   None    => \"invalid\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(show(string_to_float(\"3.14\")));\n  \
+                 perform IO.println(show(string_to_float(\"0.0\")));\n  \
+                 perform IO.println(show(string_to_float(\"\")));\n  \
+                 perform IO.println(show(string_to_float(\"abc\")));\n  \
+                 perform IO.println(show(string_to_float(\"3.14xy\")));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_to_float");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "3.14\n0.0\ninvalid\ninvalid\ninvalid\n",
+        "stderr={stderr:?}"
+    );
+}
+
 #[test]
 fn float_nan_not_equal_to_self() {
     let src = "fn main() -> Int ![IO] {\n  \

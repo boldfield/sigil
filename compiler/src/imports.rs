@@ -71,7 +71,8 @@ const BUILTIN_INJECTED: &[&str] = &[
     "mem.sigil",
     "int64.sigil",
     "string_builder.sigil",
-    "float.sigil",
+    // `float.sigil` ships real source (string_to_float — see
+    // [stdlib fallible-ops audit, Phase 2 Task 3]).
     "char.sigil",
     "panic.sigil",
 ];
