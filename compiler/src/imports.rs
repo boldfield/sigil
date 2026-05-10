@@ -62,11 +62,15 @@ const BUILTIN_INJECTED: &[&str] = &[
     "io.sigil",
     // `array.sigil` ships real source (array_get_opt, array_set_opt
     // — see [stdlib fallible-ops audit, Phase 2 Task 4]).
-    "mut_array.sigil",
+    // `mut_array.sigil` ships real source (mut_array_get_opt,
+    // mut_array_set_opt — see [stdlib fallible-ops audit, Phase 2
+    // Task 6]).
     // `byte_array.sigil` ships real source (string_from_bytes,
     // byte_array_get_opt, byte_array_slice_opt, byte_from_int —
     // see [stdlib fallible-ops audit, Phase 2 Task 2]).
-    "mut_byte_array.sigil",
+    // `mut_byte_array.sigil` ships real source (mut_byte_array_get_opt,
+    // mut_byte_array_set_opt — see [stdlib fallible-ops audit,
+    // Phase 2 Task 6]).
     // `string.sigil` ships real source (string_split / string_replace,
     // plus string_to_int / string_byte_at_opt / string_substring_opt).
     "mem.sigil",

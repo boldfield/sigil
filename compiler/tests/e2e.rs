@@ -7293,7 +7293,7 @@ fn std_mut_byte_array_mutation_visible_across_fn_boundary() {
 
 /// `import std.mut_byte_array` is a no-op (skip-list path).
 #[test]
-fn std_mut_byte_array_import_is_noop() {
+fn std_mut_byte_array_import_loads_cleanly() {
     let src = "import std.mut_byte_array\n\
                fn main() -> Int ![IO, Mem] {\n  \
                  let zero: Byte = byte_truncate(0);\n  \
@@ -7301,9 +7301,109 @@ fn std_mut_byte_array_import_is_noop() {
                  perform IO.println(int_to_string(mut_byte_array_length(ba)));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_import_noop");
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_import_loads");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// Canonical `mut_array_get_opt[A](arr, i) -> Option[A] ![Mem]`
+/// wrapper. Companion to the panic-on-OOB `mut_array_get` builtin
+/// (stdlib fallible-ops audit Phase 2 Task 6).
+#[test]
+fn std_mut_array_get_opt_canonical() {
+    let src = "import std.mut_array\n\n\
+               fn show(o: Option[Int]) -> String ![Mem] {\n  \
+                 match o {\n    \
+                   Some(n) => int_to_string(n),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let xs: MutArray[Int] = mut_array_new(3, 7);\n  \
+                 perform IO.println(show(mut_array_get_opt(xs, 0)));\n  \
+                 perform IO.println(show(mut_array_get_opt(xs, 2)));\n  \
+                 perform IO.println(show(mut_array_get_opt(xs, 3)));\n  \
+                 perform IO.println(show(mut_array_get_opt(xs, -1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_get_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `mut_array_set_opt[A](arr, i, val) -> Option[Unit] ![Mem]`
+/// wrapper. Mutates in-place when in-range (returns `Some(())`);
+/// returns `None` (no mutation applied) when out of bounds.
+#[test]
+fn std_mut_array_set_opt_canonical() {
+    let src = "import std.mut_array\n\n\
+               fn show_unit(o: Option[Unit]) -> String ![Mem] {\n  \
+                 match o {\n    \
+                   Some(_) => \"ok\",\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let xs: MutArray[Int] = mut_array_new(3, 0);\n  \
+                 perform IO.println(show_unit(mut_array_set_opt(xs, 1, 42)));\n  \
+                 perform IO.println(int_to_string(mut_array_get(xs, 1)));\n  \
+                 perform IO.println(show_unit(mut_array_set_opt(xs, 5, 99)));\n  \
+                 perform IO.println(show_unit(mut_array_set_opt(xs, -1, 99)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_array_set_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n42\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `mut_byte_array_get_opt(ba, i) -> Option[Byte] ![Mem]`
+/// wrapper. Companion to the panic-on-OOB `mut_byte_array_get`
+/// builtin.
+#[test]
+fn std_mut_byte_array_get_opt_canonical() {
+    let src = "import std.mut_byte_array\n\n\
+               fn show(o: Option[Byte]) -> String ![Mem] {\n  \
+                 match o {\n    \
+                   Some(b) => int_to_string(byte_to_int(b)),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let bs: MutByteArray = mut_byte_array_new(2, byte_truncate(7));\n  \
+                 perform IO.println(show(mut_byte_array_get_opt(bs, 0)));\n  \
+                 perform IO.println(show(mut_byte_array_get_opt(bs, 1)));\n  \
+                 perform IO.println(show(mut_byte_array_get_opt(bs, 2)));\n  \
+                 perform IO.println(show(mut_byte_array_get_opt(bs, -1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_get_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n7\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `mut_byte_array_set_opt(ba, i, val) -> Option[Unit] ![Mem]`
+/// wrapper. Mutates in-place when in-range; returns None (no mutation
+/// applied) when out of bounds.
+#[test]
+fn std_mut_byte_array_set_opt_canonical() {
+    let src = "import std.mut_byte_array\n\n\
+               fn show_unit(o: Option[Unit]) -> String ![Mem] {\n  \
+                 match o {\n    \
+                   Some(_) => \"ok\",\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO, Mem] {\n  \
+                 let bs: MutByteArray = mut_byte_array_new(2, byte_truncate(0));\n  \
+                 perform IO.println(show_unit(mut_byte_array_set_opt(bs, 0, byte_truncate(99))));\n  \
+                 perform IO.println(int_to_string(byte_to_int(mut_byte_array_get(bs, 0))));\n  \
+                 perform IO.println(show_unit(mut_byte_array_set_opt(bs, 5, byte_truncate(99))));\n  \
+                 perform IO.println(show_unit(mut_byte_array_set_opt(bs, -1, byte_truncate(99))));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_mut_byte_array_set_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n99\nnone\nnone\n", "stderr={stderr:?}");
 }
 
 // ===== Plan C Task 68 — extended String primitives =====
