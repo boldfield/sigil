@@ -7407,6 +7407,60 @@ fn std_string_byte_at_returns_byte() {
     assert_eq!(stdout, "66\n", "stderr={stderr:?}");
 }
 
+/// Canonical `string_byte_at_opt(s, i) -> Option[Byte]` wrapper.
+/// Companion to the panic-on-OOB `string_byte_at` builtin (stdlib
+/// fallible-ops audit Phase 2 Task 5).
+#[test]
+fn std_string_byte_at_opt_canonical() {
+    let src = "import std.string\n\n\
+               fn show(o: Option[Byte]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(b) => int_to_string(byte_to_int(b)),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(show(string_byte_at_opt(\"hi\", 0)));\n  \
+                 perform IO.println(show(string_byte_at_opt(\"hi\", 1)));\n  \
+                 perform IO.println(show(string_byte_at_opt(\"hi\", 2)));\n  \
+                 perform IO.println(show(string_byte_at_opt(\"hi\", -1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_byte_at_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // 'h'=104, 'i'=105
+    assert_eq!(stdout, "104\n105\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `string_substring_opt(s, start, end) -> Option[String]`
+/// wrapper. Folds all bad-range cases (negative start, start > end,
+/// end past length) into `None`. Companion to the panic-on-bad-range
+/// `string_substring` builtin.
+#[test]
+fn std_string_substring_opt_canonical() {
+    let src = "import std.string\n\n\
+               fn show(o: Option[String]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(s) => s,\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(show(string_substring_opt(\"hello\", 0, 5)));\n  \
+                 perform IO.println(show(string_substring_opt(\"hello\", 1, 4)));\n  \
+                 perform IO.println(show(string_substring_opt(\"hello\", 0, 6)));\n  \
+                 perform IO.println(show(string_substring_opt(\"hello\", 3, 1)));\n  \
+                 perform IO.println(show(string_substring_opt(\"hello\", -1, 3)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_substring_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "hello\nell\nnone\nnone\nnone\n",
+        "stderr={stderr:?}"
+    );
+}
+
 /// `string_trim` strips ASCII whitespace from both sides.
 #[test]
 fn std_string_trim_strips_whitespace() {

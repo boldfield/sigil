@@ -44,12 +44,21 @@
 // Length:
 // - `string_length(s: String) -> Int ![]`  — byte length.
 // - `string_byte_at(s: String, i: Int) -> Byte ![]`  — i-th byte;
-//   aborts on out-of-bounds.
+//   aborts on out-of-bounds. Prefer `string_byte_at_opt` for the
+//   bounds-checked surface.
+// - `string_byte_at_opt(s: String, i: Int) -> Option[Byte] ![]`  —
+//   pure-Sigil wrapper at the bottom of this file. Returns
+//   `Some(byte)` if `i` is in range; `None` if out of bounds.
 //
 // Slicing:
 // - `string_substring(s: String, start: Int, end: Int) -> String ![]`
 //   — half-open `[start, end)` range; aborts on `start > end` or
-//   `end > length(s)`. Empty range returns the empty string.
+//   `end > length(s)`. Empty range returns the empty string. Prefer
+//   `string_substring_opt` for the bounds-checked surface.
+// - `string_substring_opt(s: String, start: Int, end: Int) -> Option[String] ![]`
+//   — pure-Sigil wrapper at the bottom of this file. Folds all bad-
+//   range cases (`start < 0`, `start > end`, `end > length(s)`)
+//   into `None`.
 //
 // Construction:
 // - `string_concat(a: String, b: String) -> String ![]`  — fresh
@@ -113,6 +122,7 @@
 // =====================================================================
 
 import std.list
+import std.option
 import std.result
 
 // `ParseError` variants mirror the integer codes returned by
@@ -203,5 +213,41 @@ fn __string_replace_acc(s: String, find: String, replace: String,
     let tail: String = string_substring(s, idx + find_len, string_length(s));
     let new_acc: String = string_concat(acc, string_concat(head, replace));
     __string_replace_acc(tail, find, replace, find_len, new_acc)
+  }
+}
+
+// `string_byte_at_opt(s, i)` returns `Some(byte)` if `i` is in
+// range (`0 <= i < length(s)`) and `None` otherwise. Companion to
+// the panic-on-OOB `string_byte_at` builtin.
+fn string_byte_at_opt(s: String, i: Int) -> Option[Byte] ![] {
+  if i < 0 {
+    None
+  } else {
+    if i >= string_length(s) {
+      None
+    } else {
+      Some(string_byte_at(s, i))
+    }
+  }
+}
+
+// `string_substring_opt(s, start, end)` returns `Some(slice)` for
+// valid ranges (`0 <= start <= end <= length(s)`) and `None`
+// otherwise. Folds all three bad-range cases (negative start,
+// start > end, end past length) into `None`. Companion to the
+// panic-on-bad-range `string_substring` builtin.
+fn string_substring_opt(s: String, start: Int, end: Int) -> Option[String] ![] {
+  if start < 0 {
+    None
+  } else {
+    if start > end {
+      None
+    } else {
+      if end > string_length(s) {
+        None
+      } else {
+        Some(string_substring(s, start, end))
+      }
+    }
   }
 }
