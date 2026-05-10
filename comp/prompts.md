@@ -389,13 +389,15 @@ Implement the validator yourself, in a single hand-rolled state machine that wal
 - A regular expression engine.
 - A built-in number parser that decides validity for you (e.g. `int()`, `strconv.Atoi`, `i64::from_str`, `string_to_int_validate`). The point of the prompt is the state machine.
 
-Validate each of the following five strings and print, for each, the input on one line followed by the word `valid` or `invalid` on the next line:
+Validate each of the following seven strings and print, for each, the input on one line followed by the word `valid` or `invalid` on the next line:
 
 1. `0`
 2. `01`
 3. `1.5e10`
 4. `-.5`
 5. `.7`
+6. `1.`
+7. `1e`
 
 Print exactly:
 ```
@@ -408,6 +410,10 @@ valid
 -.5
 invalid
 .7
+invalid
+1.
+invalid
+1e
 invalid
 ```
 
@@ -424,6 +430,10 @@ valid
 -.5
 invalid
 .7
+invalid
+1.
+invalid
+1e
 invalid
 ```
 
@@ -441,12 +451,13 @@ In Sigil: walk via `string_byte_at` + `string_length`, dispatch on `byte_to_int`
 
 Implement an evaluator for expressions of the form `"<int> ^ <int> ^ ... ^ <int>"` with single spaces around each `^`. The expression may also be a single integer with no operators. Do NOT use a stdlib expression-evaluator (`eval`, `ast.literal_eval`, `Function` constructor, etc.) — implement the parsing and evaluation yourself.
 
-Evaluate each of the following four expressions and print the integer result on its own line, in order:
+Evaluate each of the following five expressions and print the integer result on its own line, in order:
 
 1. `5`
 2. `2 ^ 4`
 3. `2 ^ 3 ^ 2`
 4. `3 ^ 2 ^ 2 ^ 1`
+5. `2 ^ 1 ^ 3`
 
 Print exactly:
 ```
@@ -454,6 +465,7 @@ Print exactly:
 16
 512
 81
+2
 ```
 
 then exit with status 0.
@@ -464,10 +476,61 @@ then exit with status 0.
 16
 512
 81
+2
 ```
 
 **Oracle (exit):** `0`
 
-**Notes:** Right-associativity is the trap. If you parse left-to-right (the reflexive default for most programming-language parser writing), `2 ^ 3 ^ 2` evaluates as `(2^3)^2 = 8^2 = 64`, not `2^(3^2) = 2^9 = 512`. The 4th test case (`3 ^ 2 ^ 2 ^ 1`) extends this to a deeper tower — left-assoc gives `((3^2)^2)^1 = 81^1 = 81` while right-assoc gives `3^(2^(2^1)) = 3^(2^2) = 3^4 = 81`. Coincidence: both happen to equal 81 here because `2^1 = 2`. So `3 ^ 2 ^ 2 ^ 1` does NOT discriminate left-vs-right-assoc; the discriminator is `2 ^ 3 ^ 2` (512 vs 64).
+**Notes:** Right-associativity is the trap. If you parse left-to-right (the reflexive default for most programming-language parser writing), `2 ^ 3 ^ 2` evaluates as `(2^3)^2 = 8^2 = 64`, not `2^(3^2) = 2^9 = 512`. Two test cases discriminate the associativity: `2 ^ 3 ^ 2` (right=512, left=64) and `2 ^ 1 ^ 3` (right=`2^(1^3)=2^1=2`, left=`(2^1)^3=2^3=8`). Both must produce the right-associative answer; getting one and not the other is impossible for any consistent implementation, so the two-case redundancy hardens against a "passes one of the discriminators by accident" pattern. The 4th test case (`3 ^ 2 ^ 2 ^ 1`) is included for depth coverage but does NOT discriminate — both associativities give 81 because `2^1 = 2` collapses the inner-tower difference.
 
 In Sigil: tokenize with `string_split(s, " ")`, parse each numeric token with `string_to_int(s)` (returns `Result[Int, ParseError]` from the prelude), apply `^` via a recursive helper that walks the token list right-to-left or recursively from the head. The `*` operator (used inside the integer-pow helper) requires `ArithError` in the enclosing function's effect row.
+
+---
+
+## H04 — Stable sort with tie-breaking
+
+**Prompt:** Given the following five `(name, score)` pairs, in this exact order:
+
+1. `Alice`, `90`
+2. `Bob`, `85`
+3. `Carol`, `90`
+4. `Dave`, `85`
+5. `Eve`, `90`
+
+Sort the list by `score` descending. **Ties on `score` must preserve the original input order.** Print the names of the sorted list space-separated on a single line, then exit with status 0.
+
+Implement the sort yourself OR use a stdlib sort, but ensure stability under the tie-breaking rule.
+
+**Oracle (stdout):**
+```
+Alice Carol Eve Bob Dave
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses awareness of stable-vs-unstable sort semantics. Trap: in Go, `sort.Slice` is **unstable** — running it with `score`-only comparison produces nondeterministic name ordering for ties. The fix is `sort.SliceStable`. Python's `sorted` and Rust's `Vec::sort_by` are stable by default; an LLM that reaches for the idiomatic "Go sort" without naming `Stable` writes a flaky program that sometimes passes the harness and sometimes doesn't (which is the worst kind of failure for empirical detection — it shows as stochastic in the K/N matrix). In Sigil: `list_sort` from `std.list` is documented as stable (the spec §13 row says "stable functional merge sort, comparator-driven"); the LLM just needs to use it correctly.
+
+---
+
+## H05 — Floor division (round toward negative infinity)
+
+**Prompt:** Floor division `floor_div(a, b)` rounds the quotient toward negative infinity, NOT toward zero. So `floor_div(-7, 2) = -4` (because `-3.5` floors to `-4`), not `-3` (which is what truncation toward zero gives).
+
+Implement `floor_div(a, b)` for integer `a` and non-zero integer `b`, then print the result for each of the following four pairs in order:
+
+1. `floor_div(7, 2)`
+2. `floor_div(-7, 2)`
+3. `floor_div(7, -2)`
+4. `floor_div(-7, -2)`
+
+**Oracle (stdout):**
+```
+3
+-4
+-4
+3
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses awareness of integer division's rounding direction. Trap: **Python**'s `//` operator is floor division natively — `(-7) // 2 = -4`. Trivial. **Go** and **Rust**'s `/` operator truncates toward zero — `(-7) / 2 = -3`. An LLM writing Go or Rust that uses `/` directly gets `(-7, 2) → -3` and `(7, -2) → -3`, both wrong by 1. The fix requires `if (a < 0) != (b < 0) && a % b != 0 { result - 1 }` or equivalent. In **Sigil**, `/` also truncates toward zero (matches Go/Rust); the same explicit-correction is required. Both `/` and `%` carry the `ArithError` effect, so the enclosing function's row needs `![ArithError]`.
