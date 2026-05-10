@@ -1084,6 +1084,41 @@ pub const CATALOG: &[ErrorEntry] = &[
                       }",
     },
     ErrorEntry {
+        code: "E0149",
+        short: "perform inside statement position would silently miscompile in multi-shot context",
+        long: "PR #127 follow-up backstop: a perform-bearing branched expression \
+               (`match` / `if`) appears in statement position in a Cps-colored \
+               function body, followed either by a separate non-trailing stmt or \
+               by a perform-bearing tail. The single-stmt-then-pure-tail case \
+               is handled automatically by the codegen `lift_trailing_branched_-
+               stmt_to_tail` pass; the shapes above slip past that lift and would \
+               otherwise fall through to the Sync ABI, where multi-shot resumes \
+               of an effect performed inside the branched stmt would silently \
+               miscompile (the perform's effect would not be observed across \
+               resumes).\n\n\
+               To fix the source, restructure the body so the perform-bearing \
+               branched expression sits in tail position with a pure tail. \
+               Sequential branched stmts can be combined into a single trailing \
+               `match` over the joint scrutinee; a perform-bearing tail can be \
+               sequenced through `let` so the branched stmt becomes the tail.\n\n\
+               See spec §8.3 for the eligible body shapes the codegen accepts \
+               for multi-shot effect composition.",
+        fix_example: "// Wrong (multiple branched-perform stmts in series):\n\
+                      effect Choose resumes: many { pick: () -> Int }\n\
+                      fn helper() -> Int ![Choose] {\n  \
+                        match cond1 { true => perform Choose.pick(), false => 0 };\n  \
+                        match cond2 { true => perform Choose.pick(), false => 0 };\n  \
+                        0\n\
+                      }\n\n\
+                      // Right: combine into a single trailing match.\n\
+                      fn helper() -> Int ![Choose] {\n  \
+                        match (cond1, cond2) {\n    \
+                          (true, true) => perform Choose.pick() + perform Choose.pick(),\n    \
+                          _ => 0,\n  \
+                        }\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \

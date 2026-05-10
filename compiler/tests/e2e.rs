@@ -16334,6 +16334,82 @@ fn multi_shot_pure_tail_unchanged() {
     );
 }
 
+/// P20-backstop case 1 — multiple branched-perform stmts in series.
+/// `lift_trailing_branched_stmt_to_tail` only lifts the LAST branched
+/// stmt; the first one stays in stmts position and would silently
+/// miscompile under Sync ABI on multi-shot resumes. The codegen-entry
+/// `p20_silent_miscompile_check` rejects this shape with E0149 before
+/// any object code is emitted.
+#[test]
+fn p20_backstop_rejects_multiple_branched_stmts_in_series() {
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 match a == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
+                 match b == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
+                 0\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "E0149",
+        &["pairs", "branched expression in statement position"],
+        "p20_backstop_multiple_branched_stmts",
+    );
+}
+
+/// P20-backstop case 2 — branched-perform stmt followed by a
+/// perform-bearing tail. `lift_trailing_branched_stmt_to_tail` bails
+/// (its `!expr_contains_perform(tail)` gate fails), so the branched
+/// stmt stays in stmts position. After tail-perform normalization the
+/// body has `[..., Stmt::Expr(Match), Stmt::Let __tail_perform_v]`,
+/// fails every Cps classifier, falls through to Sync ABI, and would
+/// silently miscompile on multi-shot resumes. E0149 fires.
+#[test]
+fn p20_backstop_rejects_branched_stmt_with_perform_tail() {
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 match a == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
+                 perform Choose.pick(1, 1)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle helper() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    assert_compile_fails_with_code(
+        src,
+        "E0149",
+        &["helper", "branched expression in statement position"],
+        "p20_backstop_branched_stmt_with_perform_tail",
+    );
+}
+
 /// Plan A (PR #119 review #2a) — non-trivial Binary in perform args.
 /// Pre-fix this triggered a codegen panic at the chained-let-yield
 /// body-emit's `body_first_step` extraction (`unreachable!()` at the

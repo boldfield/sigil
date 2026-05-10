@@ -7312,6 +7312,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     if let Some(msg) = unsupported_handle_construct(&checked.program) {
         return Err(msg);
     }
+    // P20-backstop check: reject Cps-colored fns whose body would
+    // silently miscompile under Sync ABI on multi-shot resumes. Runs
+    // AFTER the lift+rewrite normalizations the ABI selector itself
+    // applies, so we only flag shapes the runtime fix could not handle.
+    {
+        let fns_by_name = build_fns_by_name(&cc.colored);
+        if let Some(msg) = p20_silent_miscompile_check(checked, &cc.colored, &fns_by_name) {
+            return Err(msg);
+        }
+    }
     // Plan D Task 117 (b) Phase 4 — pre-pass map of user-fn
     // param-Continuation flags. Computed once here so every Lowerer
     // ctor site can pass it as a borrowed reference. Keys are
@@ -27885,6 +27895,97 @@ fn lift_trailing_branched_stmt_to_tail(body: &crate::ast::Block) -> Option<crate
         tail: Some(new_branched),
         span: body.span.clone(),
     })
+}
+
+/// P20-backstop structural detector. Walks `body.stmts` and returns the
+/// span of any `Stmt::Expr(Match | If)` that contains a perform — these
+/// are the shapes `lift_trailing_branched_stmt_to_tail` could not move
+/// to tail position. Run AFTER the lift + perform-norm passes so we
+/// only flag what the runtime fix did not already handle.
+///
+/// Two structural cases reach here:
+/// - **Case 1**: a perform-bearing branched stmt is NOT the last stmt
+///   (the lift only considers the last stmt).
+/// - **Case 2**: the perform-bearing branched stmt IS the last stmt
+///   but `body.tail` is also perform-bearing — the lift bails on its
+///   `!expr_contains_perform(tail)` gate, so the branched stmt stays
+///   in stmt position.
+///
+/// Both cases would otherwise fall through to `UserFnAbi::Sync` for a
+/// Cps-colored fn and silently miscompile on multi-shot resumes (the
+/// branched stmt's perform never observes its effect across resumes).
+/// Returns the span of the offending `Stmt::Expr` so the diagnostic
+/// can point at the source location to fix.
+fn p20_silent_miscompile_risk(body: &crate::ast::Block) -> Option<crate::errors::Span> {
+    use crate::ast::{Expr, Stmt};
+    for stmt in &body.stmts {
+        if let Stmt::Expr(e @ (Expr::Match { .. } | Expr::If { .. })) = stmt {
+            if expr_contains_perform(e) {
+                return Some(e.span());
+            }
+        }
+    }
+    None
+}
+
+/// Whole-program P20 backstop: walk every Cps-colored user fn, apply
+/// the same lift + perform-norm + tail-norm passes the ABI selector
+/// uses, then run [`p20_silent_miscompile_risk`] on the normalized
+/// body. Fires only when the existing classifiers ALL reject (i.e.,
+/// `compute_user_fn_abi` would return `Sync` for a Cps-colored fn) —
+/// this is the silent-miscompile precondition.
+///
+/// Returns a formatted E0149 diagnostic string on the first hit, or
+/// `None` if every Cps-colored fn either classifies cleanly or has
+/// no offending shape. Mirrors the existing
+/// [`unsupported_handle_construct`] integration shape — called once
+/// at `emit_object` entry, surfaced via the `Result<(), String>`
+/// return so the pipeline routes it to stderr with the same shape
+/// other codegen-level structural rejections use.
+fn p20_silent_miscompile_check(
+    checked: &crate::typecheck::CheckedProgram,
+    colored: &ColoredProgram,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
+) -> Option<String> {
+    for item in &checked.program.items {
+        let f = match item {
+            crate::ast::Item::Fn(f) => f,
+            _ => continue,
+        };
+        if f.name == "main" {
+            continue;
+        }
+        if !colored.needs_cps_transform(&f.name) {
+            continue;
+        }
+        let lifted = lift_trailing_branched_stmt_to_tail(&f.body);
+        let body_after_lift = lifted.as_ref().unwrap_or(&f.body);
+        let perform_norm = rewrite_perform_stmts_as_lets(body_after_lift, &checked.effects);
+        let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
+        let normalized = normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
+        let body_for_abi = normalized.as_ref().unwrap_or(body_after_perform_norm);
+        let abi = compute_user_fn_abi(&f.name, body_for_abi, &f.params, colored, fns_by_name);
+        if abi != UserFnAbi::Sync {
+            continue;
+        }
+        if let Some(span) = p20_silent_miscompile_risk(body_for_abi) {
+            return Some(format!(
+                "error[E0149]: in fn `{}`: perform-bearing branched expression in \
+                 statement position would silently miscompile in multi-shot context\n  \
+                 --> {}:{}:{}\n  \
+                 = note: lift_trailing_branched_stmt_to_tail handles only the \
+                 single-trailing-branched-stmt-with-pure-tail case; this body has \
+                 either a non-trailing branched-perform stmt or a perform-bearing tail \
+                 that prevents the lift, so the fn would otherwise fall through to \
+                 Sync ABI and silently miscompile on multi-shot resumes\n  \
+                 = hint: restructure the source so the perform-bearing branched \
+                 expression is the body's tail with a pure tail expression — see \
+                 spec §8.3 for the eligible multi-shot body shapes",
+                f.name, span.file, span.line, span.column,
+            ));
+        }
+    }
+    None
 }
 
 /// Plan A Phase 2 — Stmt::Perform → Stmt::Let + `$elab_t*` substitution
