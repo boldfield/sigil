@@ -271,3 +271,63 @@ div by zero
 **Oracle (exit):** `0`
 
 **Notes:** Stresses uncaught-divide-by-zero. Python's `10 // 0` raises `ZeroDivisionError`; uncaught crashes the program. Go's `10 / 0` panics on divide. Sigil's `10 / 0` performs `ArithError.div_by_zero` on a row that includes `ArithError`; an uncaught perform invokes the default handler (stderr + exit 2). All three languages force handling, but with different mechanisms: Python `try/except`, Go pre-check or `recover()`, Sigil `handle ... with { ArithError.div_by_zero(k) => ... }`. The agent must remember the exhaustive arm rule (E0142): Sigil's handler must cover BOTH `div_by_zero` AND `mod_by_zero` even if `%` isn't used.
+
+---
+
+## C17 — reverse a string
+
+**Prompt:** Reverse the characters in the string `"hello"`. Print the reversed string on a single line, then exit with status 0. The expected output is `"olleh"` (no quotes).
+
+**Oracle (stdout):**
+```
+olleh
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Tests string-as-character-sequence handling. Python: `"hello"[::-1]` is the canonical idiom; manual loops also work. Go: needs rune-aware reversal (byte-level reverse breaks on multi-byte UTF-8, but ASCII works) — common LLM bug is reversing as bytes. Sigil: `string_chars` → reverse `List[Char]` → `string_from_chars`. The two-step list-reversal pattern can trip up LLMs less familiar with Sigil's string surface.
+
+---
+
+## C18 — Roman numeral to integer
+
+**Prompt:** Convert the Roman numeral string `"MCMXCIV"` to its integer value. The expected answer is `1994`. Print the integer on a single line, then exit with status 0. Roman numeral rules: `I=1, V=5, X=10, L=50, C=100, D=500, M=1000`. Subtractive notation: when a smaller numeral precedes a larger one, the smaller is subtracted (e.g., `IV=4`, `IX=9`, `XL=40`, `XC=90`, `CD=400`, `CM=900`).
+
+**Oracle (stdout):**
+```
+1994
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses correct handling of the subtractive notation rule. The naive sum-of-values approach (no subtraction) gives wrong answers like `1996` for `MCMXCIV` (M=1000 + C=100 + M=1000 + X=10 + C=100 + I=1 + V=5 = 2216 — actually wildly off if no subtraction is applied). Common LLM bug: handling the subtractive case in the wrong direction or forgetting it entirely. All three languages can solve this with a forward-scan look-ahead-by-one approach.
+
+---
+
+## C19 — validate balanced brackets
+
+**Prompt:** Given the string `"([)]"`, determine whether the brackets are balanced. Brackets are balanced if every opening bracket (`(`, `[`, `{`) has a matching closing bracket (`)`, `]`, `}`) of the same type, AND the closes occur in the reverse order of the opens (i.e., the most recently opened bracket must close first). Print exactly the text `balanced` if yes, `unbalanced` if no, then exit with status 0.
+
+**Oracle (stdout):**
+```
+unbalanced
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** `"([)]"` has equal counts of opens and closes (2+2) — naive pair-counting says "balanced." A real stack-based approach is required: when we see `)` after `[`, the stack-top doesn't match — fail. Common LLM bugs: counting opens/closes without ordering, mismatched bracket-type pairing, stack-underflow on lone closes, leftover opens at end-of-string. All three languages can solve this with a stack/list of pending opens.
+
+---
+
+## C20 — postfix expression evaluator
+
+**Prompt:** Evaluate the postfix (Reverse Polish Notation) arithmetic expression `"3 4 + 2 *"`. Tokens are separated by single spaces. Operators are `+`, `-`, `*`, `/` (integer division), each consuming the top two stack values: for binary operator `op`, the second-from-top operand is the left operand and the top is the right operand (so `a b -` is `a - b`, not `b - a`). Print the final integer result on a single line, then exit with status 0. The expected answer is `14` (because `3 4 + = 7`, then `7 2 * = 14`).
+
+**Oracle (stdout):**
+```
+14
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses tokenization + stack manipulation + operator-operand-order correctness. Common LLM bugs: wrong operand order for non-commutative operators (`-` and `/`), forgetting to convert string tokens to integers, mishandling whitespace tokenization. In Sigil: requires `string_split` to tokenize, then `string_to_int_parse` per number token. The `/` operator requires `ArithError` in the row.
