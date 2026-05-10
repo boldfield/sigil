@@ -7708,6 +7708,36 @@ fn auto_prelude_user_type_shadows_none_ctor() {
     assert_eq!(stdout, "red\ngreen\nnone-color\n", "stderr={stderr:?}");
 }
 
+/// Auto-prelude shadowing is per-constructor, not per-type. After
+/// `type Color = | Red | Green | None`, bare `None` resolves to
+/// `Color::None`, but `Some` / `Ok` / `Err` (not declared on
+/// `Color`) remain available from the prelude. Pins the asymmetry
+/// for future readers — same scoping shape as Rust's
+/// `enum Color { None }` shadowing only `Option::None`, not
+/// `Option::Some`.
+#[test]
+fn auto_prelude_per_ctor_shadowing_leaves_other_prelude_names() {
+    let src = "type Color = | Red | Green | None\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 // `Some` and `Ok` are NOT declared on Color, so the\n  \
+                 // prelude versions remain in scope and these compile.\n  \
+                 let opt: Option[Int] = Some(7);\n  \
+                 let res: Result[Int, Int] = Ok(42);\n  \
+                 match opt {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none-shadowed-as-color\"),\n  \
+                 };\n  \
+                 match res {\n    \
+                   Ok(n)  => perform IO.println(int_to_string(n)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_per_ctor_shadow");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n42\n", "stderr={stderr:?}");
+}
+
 /// Auto-prelude shadowing — user `type Option = | None |
 /// Some(Int)` (non-generic) replaces the prelude entry entirely.
 /// Cross-user collisions with the user's Option still fire E0118
