@@ -86,7 +86,7 @@ class Prompt:
     notes: str = ""
 
 
-_HEADING_RE = re.compile(r"^## (C\d+) — (.+)$")
+_HEADING_RE = re.compile(r"^## ([A-Z]\d+) — (.+)$")
 _PROMPT_FIELD_RE = re.compile(r"^\*\*Prompt:\*\*\s*(.*)$")
 _NOTES_RE = re.compile(r"^\*\*Notes:\*\*\s*(.*)$")
 
