@@ -14,18 +14,24 @@ Usage:
     python3 scripts/validate_spec.py
     python3 scripts/validate_spec.py --filter P05
     python3 scripts/validate_spec.py --models claude-opus-4-7,claude-sonnet-4-6
+    python3 scripts/validate_spec.py --runs 3 --max-concurrency 6
     python3 scripts/validate_spec.py --max-concurrency 4 --no-edit-loop
 
 Exit codes:
-    0  — all prompts passed (first attempt OR after one edit) for every model
-    1  — at least one prompt failed for some model
+    0  — every prompt passed (first attempt OR after one edit) on every run
+         for every model
+    1  — at least one prompt failed (any run, any model)
     2  — harness error (missing env, bad spec file, etc.)
 
-Per-prompt grading:
+Per-prompt grading (each run independently):
     - first_compile : did the model's first program compile?
     - first_run    : did first program run + match the oracle?
     - after_edit   : if first failed, did the one-edit retry pass?
     - final_pass   : first_run OR after_edit
+
+With `--runs N > 1`, the markdown report's per-prompt cells become K/N
+ratios. Persistent failures (0/N or N/N ❌) are deterministic signal;
+mixed cells (1/N..N-1/N ⚠️) are stochastic flickers.
 """
 
 from __future__ import annotations
@@ -397,6 +403,7 @@ class AttemptResult:
 class PromptResult:
     prompt_id: str
     model: str
+    run_idx: int  # 0-based; equal to 0 for single-run mode (--runs 1)
     first_attempt: Optional[AttemptResult]
     edit_attempt: Optional[AttemptResult]
     final_pass: bool
@@ -506,6 +513,7 @@ def run_one_prompt(
     *,
     prompt: Prompt,
     model: str,
+    run_idx: int,
     api_key: str,
     spec_text: str,
     edit_loop: bool,
@@ -523,6 +531,7 @@ def run_one_prompt(
         return PromptResult(
             prompt_id=prompt.id,
             model=model,
+            run_idx=run_idx,
             first_attempt=None,
             edit_attempt=None,
             final_pass=False,
@@ -533,6 +542,7 @@ def run_one_prompt(
         return PromptResult(
             prompt_id=prompt.id,
             model=model,
+            run_idx=run_idx,
             first_attempt=first_attempt,
             edit_attempt=None,
             final_pass=first_attempt.oracle_match,
@@ -555,6 +565,7 @@ def run_one_prompt(
         return PromptResult(
             prompt_id=prompt.id,
             model=model,
+            run_idx=run_idx,
             first_attempt=first_attempt,
             edit_attempt=None,
             final_pass=False,
@@ -564,6 +575,7 @@ def run_one_prompt(
     return PromptResult(
         prompt_id=prompt.id,
         model=model,
+        run_idx=run_idx,
         first_attempt=first_attempt,
         edit_attempt=edit_attempt,
         final_pass=edit_attempt.oracle_match,
@@ -599,6 +611,7 @@ def write_jsonl(results: list[PromptResult], path: pathlib.Path) -> None:
             f.write(json.dumps({
                 "prompt_id": r.prompt_id,
                 "model": r.model,
+                "run_idx": r.run_idx,
                 "first_attempt": _attempt_to_json(r.first_attempt),
                 "edit_attempt": _attempt_to_json(r.edit_attempt),
                 "final_pass": r.final_pass,
@@ -610,20 +623,27 @@ def render_markdown_report(
     results: list[PromptResult],
     prompts: list[Prompt],
     models: list[str],
+    runs: int,
     out_path: pathlib.Path,
     jsonl_path: pathlib.Path,
 ) -> None:
-    """Render a per-model + per-prompt markdown table to spec/validation-log.md."""
-    by_model_prompt: dict[tuple[str, str], PromptResult] = {
-        (r.model, r.prompt_id): r for r in results
-    }
+    """Render a per-model + per-prompt markdown table to spec/validation-log.md.
+
+    For multi-run mode (`runs > 1`), per-prompt cells show K/N ratios that
+    distinguish persistent failures (3/3 ❌) from stochastic flickers (1/3).
+    Aggregate pass rates average across all runs."""
+    # Group by (model, prompt_id). Each cell holds N PromptResults.
+    by_cell: dict[tuple[str, str], list[PromptResult]] = {}
+    for r in results:
+        by_cell.setdefault((r.model, r.prompt_id), []).append(r)
 
     lines: list[str] = []
     lines.append(f"# Spec validation log — run {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n")
-    lines.append(f"Trace: `{jsonl_path.relative_to(REPO_ROOT)}`\n")
+    lines.append(f"Trace: `{jsonl_path.relative_to(REPO_ROOT)}`")
+    lines.append(f"Runs per (prompt, model): **{runs}**")
     lines.append("")
 
-    # Aggregate pass-rate table.
+    # Aggregate pass-rate table — averaged across all runs per model.
     lines.append("## Pass rates\n")
     lines.append("| Model | First-compile | First-run | After-edit | Final-pass |")
     lines.append("|---|---|---|---|---|")
@@ -653,52 +673,86 @@ def render_markdown_report(
         )
     lines.append("")
 
-    # Per-prompt detail.
+    # Per-prompt detail. Cells are K/N ratios when runs > 1; otherwise ✅/❌.
+    def cell_first(model: str, prompt_id: str) -> str:
+        rs = by_cell.get((model, prompt_id), [])
+        if not rs:
+            return "—"
+        passed = sum(1 for r in rs if r.first_attempt and r.first_attempt.oracle_match)
+        if runs == 1:
+            return "✅" if passed == 1 else "❌"
+        if passed == runs:
+            return f"✅ {passed}/{runs}"
+        if passed == 0:
+            return f"❌ {passed}/{runs}"
+        return f"⚠️ {passed}/{runs}"
+
+    def cell_final(model: str, prompt_id: str) -> str:
+        rs = by_cell.get((model, prompt_id), [])
+        if not rs:
+            return "—"
+        passed = sum(1 for r in rs if r.final_pass)
+        if runs == 1:
+            return "✅" if passed == 1 else "❌"
+        if passed == runs:
+            return f"✅ {passed}/{runs}"
+        if passed == 0:
+            return f"❌ {passed}/{runs}"
+        return f"⚠️ {passed}/{runs}"
+
     lines.append("## Per-prompt results\n")
+    if runs > 1:
+        lines.append("Cells: ✅ = all runs passed; ⚠️ = some runs passed (stochastic); ❌ = all runs failed (persistent).")
+        lines.append("")
     lines.append("| Prompt | " + " | ".join(f"`{m}` first" for m in models)
                  + " | " + " | ".join(f"`{m}` final" for m in models) + " |")
     lines.append("|---" + "|---" * (2 * len(models)) + "|")
     for p in prompts:
         cells = [f"**{p.id}** — {p.title}"]
         for m in models:
-            r = by_model_prompt.get((m, p.id))
-            if r is None:
-                cells.append("—")
-            elif r.first_attempt and r.first_attempt.oracle_match:
-                cells.append("✅")
-            else:
-                cells.append("❌")
+            cells.append(cell_first(m, p.id))
         for m in models:
-            r = by_model_prompt.get((m, p.id))
-            if r is None:
-                cells.append("—")
-            elif r.final_pass:
-                cells.append("✅")
-            else:
-                cells.append("❌")
+            cells.append(cell_final(m, p.id))
         lines.append("| " + " | ".join(cells) + " |")
     lines.append("")
 
-    # Failures with diffs.
-    failures = [r for r in results if not r.final_pass]
-    if failures:
-        lines.append(f"## Failures ({len(failures)})\n")
-        for r in failures:
-            lines.append(f"### `{r.prompt_id}` × `{r.model}`\n")
-            if r.error:
-                lines.append(f"Harness error: {r.error}\n")
-            else:
-                final = r.edit_attempt or r.first_attempt
-                if final and final.oracle_diff:
-                    lines.append(f"```\n{final.oracle_diff}\n```\n")
-                if final and final.compile and not final.compile.success:
-                    stderr = final.compile.stderr.strip()
-                    if stderr:
-                        lines.append("Compile stderr (truncated):\n")
-                        lines.append("```\n")
-                        lines.append("\n".join(stderr.splitlines()[:10]))
-                        lines.append("\n```\n")
-            lines.append("")
+    # Failures: group by (prompt, model); show one diff per failed run.
+    cells_with_failures: list[tuple[str, str]] = []
+    for (model, pid), rs in by_cell.items():
+        if any(not r.final_pass for r in rs):
+            cells_with_failures.append((model, pid))
+    cells_with_failures.sort(key=lambda x: (x[1], x[0]))
+
+    if cells_with_failures:
+        total_failed_runs = sum(
+            sum(1 for r in by_cell[(m, p)] if not r.final_pass)
+            for (m, p) in cells_with_failures
+        )
+        lines.append(f"## Failures ({len(cells_with_failures)} cell(s), {total_failed_runs} run(s))\n")
+        for (model, pid) in cells_with_failures:
+            rs = sorted(by_cell[(model, pid)], key=lambda r: r.run_idx)
+            failed_rs = [r for r in rs if not r.final_pass]
+            cell_label = f"### `{pid}` × `{model}`"
+            if runs > 1:
+                cell_label += f" — {len(failed_rs)}/{runs} runs failed"
+            lines.append(cell_label + "\n")
+            for r in failed_rs:
+                if runs > 1:
+                    lines.append(f"**Run {r.run_idx}:**")
+                if r.error:
+                    lines.append(f"Harness error: {r.error}\n")
+                else:
+                    final = r.edit_attempt or r.first_attempt
+                    if final and final.oracle_diff:
+                        lines.append(f"```\n{final.oracle_diff}\n```")
+                    if final and final.compile and not final.compile.success:
+                        stderr = final.compile.stderr.strip()
+                        if stderr:
+                            lines.append("Compile stderr (truncated):")
+                            lines.append("```")
+                            lines.append("\n".join(stderr.splitlines()[:10]))
+                            lines.append("```")
+                lines.append("")
 
     out_path.write_text("\n".join(lines) + "\n")
 
@@ -725,6 +779,14 @@ def main() -> int:
         type=int,
         default=DEFAULT_MAX_CONCURRENCY,
         help=f"Max parallel prompts (default: {DEFAULT_MAX_CONCURRENCY})",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of independent runs per (prompt, model). >1 enables "
+             "K/N aggregation in the report so persistent failures are "
+             "distinguishable from stochastic flickers (default: 1)",
     )
     parser.add_argument(
         "--no-edit-loop",
@@ -764,11 +826,19 @@ def main() -> int:
     spec_text = SPEC_PATH.read_text()
     edit_loop = not args.no_edit_loop
 
-    print(f"validate_spec.py: {len(prompts)} prompt(s) × {len(models)} model(s) "
-          f"= {len(prompts) * len(models)} runs; concurrency={args.max_concurrency}; "
-          f"edit_loop={edit_loop}", file=sys.stderr)
+    if args.runs < 1:
+        print(f"validate_spec.py: --runs must be >= 1, got {args.runs}", file=sys.stderr)
+        return 2
 
-    work = [(p, m) for m in models for p in prompts]
+    total_runs = len(prompts) * len(models) * args.runs
+    print(f"validate_spec.py: {len(prompts)} prompt(s) × {len(models)} model(s) × "
+          f"{args.runs} run(s) = {total_runs} API calls; "
+          f"concurrency={args.max_concurrency}; edit_loop={edit_loop}", file=sys.stderr)
+
+    work = [(p, m, run_idx)
+            for m in models
+            for p in prompts
+            for run_idx in range(args.runs)]
     results: list[PromptResult] = []
 
     started = time.time()
@@ -778,19 +848,20 @@ def main() -> int:
                 run_one_prompt,
                 prompt=p,
                 model=m,
+                run_idx=run_idx,
                 api_key=api_key,
                 spec_text=spec_text,
                 edit_loop=edit_loop,
-            ): (p.id, m) for p, m in work
+            ): (p.id, m, run_idx) for p, m, run_idx in work
         }
         completed = 0
         for fut in concurrent.futures.as_completed(future_to_key):
-            pid, model = future_to_key[fut]
+            pid, model, run_idx = future_to_key[fut]
             try:
                 result = fut.result()
             except Exception as e:
                 result = PromptResult(
-                    prompt_id=pid, model=model,
+                    prompt_id=pid, model=model, run_idx=run_idx,
                     first_attempt=None, edit_attempt=None,
                     final_pass=False, error=f"unhandled: {e}",
                 )
@@ -804,7 +875,9 @@ def main() -> int:
                 extra = " (after edit)"
             elif result.error:
                 extra = f" (error: {result.error[:60]})"
-            print(f"  [{completed:>3}/{len(work)}] {mark} {pid} × {model}{extra}", file=sys.stderr)
+            run_label = f" run={run_idx}" if args.runs > 1 else ""
+            print(f"  [{completed:>3}/{len(work)}] {mark} {pid} × {model}{run_label}{extra}",
+                  file=sys.stderr)
 
     elapsed = time.time() - started
     print(f"validate_spec.py: completed {len(results)} runs in {elapsed:.1f}s", file=sys.stderr)
@@ -815,7 +888,7 @@ def main() -> int:
     jsonl_path = results_dir / f"validation-results-{timestamp}.jsonl"
     md_path = results_dir / "validation-log.md"
     write_jsonl(results, jsonl_path)
-    render_markdown_report(results, prompts, models, md_path, jsonl_path)
+    render_markdown_report(results, prompts, models, args.runs, md_path, jsonl_path)
     print(f"validate_spec.py: trace -> {jsonl_path}", file=sys.stderr)
     print(f"validate_spec.py: report -> {md_path}", file=sys.stderr)
 
