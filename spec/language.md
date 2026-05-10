@@ -838,6 +838,26 @@ parameter positions and in a function's own declared effect row.
 When a fn returns a fn type, both fn types carry their own row —
 see §3.2.1 for the doubled-row form.
 
+> **Operator effects to remember.** Several built-in operators carry
+> non-empty effect rows that propagate to their enclosing function:
+>
+> - **`/` and `%`** carry `![ArithError]` (may abort on zero divisor).
+>   Any function whose body contains `/` or `%` MUST include
+>   `ArithError` in its declared effect row, even when the divisor
+>   is a non-zero literal — the requirement is structural, not
+>   flow-sensitive. Trying to substitute one for the other (e.g.,
+>   `n - (n / d) * d` instead of `n % d`) does NOT eliminate the
+>   row requirement. See §4.2 for the full operator table and
+>   discharge guidance.
+> - **`perform Effect.op(...)`** carries `![Effect]` (the effect
+>   you're performing). Helper functions that perform effects need
+>   the effect in their declared row.
+>
+> The general rule: **if your function body uses anything that
+> carries effects, those effects must appear in your function's
+> declared row.** Sigil has no automatic row inference for declared
+> functions — every effect is explicit.
+
 #### §3.4 — Inference rules (overview)
 
 Sigil uses Hindley–Milner with explicit annotations. Every `let`
@@ -904,14 +924,29 @@ suggested fix.
 > `ArithError.div_by_zero` AND `ArithError.mod_by_zero` (E0142
 > requires exhaustive arm coverage per effect).
 >
-> **Don't try to dodge the row by rewriting `n % d` as `n - (n / d)
-> * d`** — that workaround substitutes one may-abort op (`%`) for
-> another (`/`), so the row requirement doesn't go away. Both `/`
-> and `%` carry `ArithError`; you cannot eliminate the row by
-> swapping between them. Either declare the row, or use a different
-> algorithm entirely (e.g., comparing magnitudes via subtraction
-> for parity, or recursive predecessor walks instead of integer
-> division).
+> **If you're tempted to dodge the row by rewriting `n % d` as
+> `n - (n / d) * d`, STOP and declare the row instead.** That
+> workaround substitutes one may-abort op (`%`) for another (`/`),
+> so the row requirement doesn't go away — your function STILL
+> needs `![ArithError]`. Don't write the dodge; just declare the
+> row. The canonical pattern is:
+>
+> ```sigil
+> fn helper(n: Int, d: Int) -> Int ![ArithError] {
+>   n % d
+> }
+> fn main() -> Int ![ArithError, IO] {
+>   perform IO.println(int_to_string(helper(10, 3)));
+>   0
+> }
+> ```
+>
+> If a particular use case truly cannot tolerate `ArithError` in the
+> row (e.g., a pure-row library helper meant to compose with discharging
+> contexts), use a different ALGORITHM — not a different operator.
+> Examples: comparing magnitudes via subtraction for parity, or
+> recursive predecessor walks instead of integer division. Substituting
+> one may-abort operator for another is never the right path.
 
 #### §4.3 — Match patterns
 
