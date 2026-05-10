@@ -405,9 +405,12 @@ non-generic `Raise` to exercise the raw `handle` surface.
 
 ## P19 — State[Int]-based counter threaded through a list walk
 
-**Prompt:** Declare `effect State { get: () -> Int, set: (Int) ->
-Int }` and a cons-list type `type IntList = | Nil | Cons(Int,
-IntList)`. Define `fn count_elements(xs: IntList) -> Int ![State, IO]`
+**Prompt:** Declare `effect State resumes: many { get: () -> Int,
+set: (Int) -> Int }` (the `resumes: many` annotation is required
+because the Plotkin lambda-of-state encoding invokes `k` through
+the returned state-fn, which the typechecker treats as repeated
+continuation use) and a cons-list type `type IntList = | Nil |
+Cons(Int, IntList)`. Define `fn count_elements(xs: IntList) -> Int ![State, IO]`
 that walks the list and increments the State counter once per `Cons`
 cell via `let cur: Int = perform State.get(); let _: Int = perform
 State.set(cur + 1); count_elements(rest)`, returning the final

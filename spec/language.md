@@ -881,14 +881,28 @@ suggested fix.
 
 | Category | Operators | Type |
 |----------|-----------|------|
-| Arithmetic | `+`, `-`, `*`, `/`, `%` | `(Int, Int) -> Int ![]` (or `![ArithError]` for `/` and `%`) |
+| Arithmetic | `+`, `-`, `*` | `(Int, Int) -> Int ![]` |
+| Arithmetic (may abort) | `/`, `%` | `(Int, Int) -> Int ![ArithError]` |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` | `(Int, Int) -> Bool ![]` |
 | Logic | `&&`, `\|\|`, `!` | `(Bool, Bool) -> Bool ![]` |
 | String compare | `string_compare(a, b)` (from `std.ordering`) | `(String, String) -> Ordering ![]` |
 
-`/` and `%` perform `ArithError.div_by_zero` / `mod_by_zero` on
-zero divisors; the top-level `main` shim installs default handlers
-that print to stderr and exit 2.
+> **Effect-row gotcha — `/` and `%` carry `ArithError`.** The
+> division and modulo operators perform `ArithError.div_by_zero` /
+> `ArithError.mod_by_zero` on zero divisors, so any function whose
+> body contains `/` or `%` MUST include `ArithError` in its declared
+> effect row. This is purely structural — even when the divisor is
+> a non-zero literal, the typechecker requires the row entry. A
+> `fn main() -> Int ![IO]` that contains `n % 2` fires E0042
+> ("`operator '%' (may abort with ArithError)` requires `ArithError`
+> in the enclosing function's effect row"); the row must be
+> `![ArithError, IO]`.
+>
+> The top-level `main` shim installs default handlers that print
+> to stderr and exit 2 on uncaught `ArithError`. To recover in
+> source, install your own `handle` arm covering BOTH
+> `ArithError.div_by_zero` AND `ArithError.mod_by_zero` (E0142
+> requires exhaustive arm coverage per effect).
 
 #### §4.3 — Match patterns
 
@@ -925,7 +939,16 @@ Two statement forms exist in v1:
 - `let name: Type = expr;` — binds `name` to the value of `expr`.
 - `expr;` — evaluates `expr` for effect; the value is discarded.
 
-There is no shadowing: `let x = 1; let x = 2;` is a compile error.
+There is no shadowing: `let x = 1; let x = 2;` is a compile error
+(E0020 — "redefinition of `x`").
+
+**`_` is not a placeholder.** `_` is a regular identifier in Sigil,
+not the throwaway-binding-name convention from Rust or Python.
+Two `let _: Int = expr;` statements in the same block re-define
+`_` and fire E0020 the same as any duplicate name. To discard a
+perform's value, use the bare-statement form `perform Effect.op();`
+instead of `let _: Int = perform Effect.op();`.
+
 There is no `return` statement; the block's value flows out
 naturally.
 
