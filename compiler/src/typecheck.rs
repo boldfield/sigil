@@ -21,7 +21,7 @@
 
 use crate::ast::*;
 use crate::errors::{self, CompilerError, Severity, Span};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Task 78.5 G2.a — strip `[e]` bracketed generic-param entries that
 /// alias the fn's row-variable name (`![... | e]`). The parser does
@@ -1218,7 +1218,21 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // exposed via builtin generic schemes in `fn_schemes` below). A
     // user `type Array = ...` declaration trips E0113 (duplicate)
     // through the existing user-type loop — Array is not shadowable.
+    //
+    // Auto-prelude (Option/Result design — 2026-05-10): a small set
+    // of prelude builtins (`Option`, `Result`) ARE shadowable by
+    // user redeclaration. Track which builtin entries still come
+    // from the prelude (vs. having been overridden by a user
+    // `type` decl) so the constructor pre-pass below can apply
+    // user-wins-over-prelude shadowing.
+    let mut prelude_types: BTreeSet<String> = BTreeSet::new();
     for builtin in builtin_types(&program.file) {
+        if !builtin.variants.is_empty() {
+            // Only types with variants participate in the prelude
+            // shadowing carve-out — opaque builtins like `Array` /
+            // `Int64` have no constructors and are not shadowable.
+            prelude_types.insert(builtin.name.clone());
+        }
         types.insert(builtin.name.clone(), builtin);
     }
     for item in &program.items {
@@ -1248,7 +1262,12 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 ));
                 continue;
             }
-            if types.contains_key(&td.name) {
+            // Auto-prelude shadowing (Option/Result): user-redeclarations
+            // of prelude type names silently override the builtin entry
+            // and the entry stops being prelude-resident — subsequent
+            // user types named the same fire E0113 normally.
+            let is_prelude_shadow = prelude_types.contains(&td.name);
+            if types.contains_key(&td.name) && !is_prelude_shadow {
                 errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0113"),
@@ -1256,6 +1275,13 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     format!("duplicate type declaration `{}`", td.name),
                 ));
             } else {
+                if is_prelude_shadow {
+                    // User redeclaration retires the prelude entry —
+                    // the user's `type` becomes the source of truth
+                    // for both type and constructor lookups in this
+                    // program.
+                    prelude_types.remove(&td.name);
+                }
                 types.insert(td.name.clone(), (**td).clone());
             }
         }
@@ -1267,8 +1293,28 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // the colliding variant's name span. The first declaration wins in
     // the registry so downstream typing always picks a single canonical
     // constructor per name.
+    //
+    // Auto-prelude (Option/Result design — 2026-05-10): prelude
+    // constructors (`Some` / `None` / `Ok` / `Err`) are inserted in a
+    // *second* pass that silently skips when a user-defined ctor
+    // already claims the name. This lets user code declare
+    // `type Color = | Red | Green | None` without the prelude `None`
+    // triggering E0118 — the user's local `None` shadows the prelude
+    // in that file's scope, matching how Rust's `enum Color { None,
+    // ... }` shadows `Option::None`. Cross-user collisions still fire
+    // E0118 normally; only the prelude→user direction is silenced.
+    //
+    // The discriminator is `prelude_types` (an origin-flag set built
+    // during type registration), NOT a name comparison — a user
+    // `type Option = ...` retired its prelude entry above and now
+    // contributes ctors via the user pass with full E0118 checking.
     let mut ctors: BTreeMap<String, CtorInfo> = BTreeMap::new();
+    // Pass 1: user / non-prelude types — full E0118 cross-collision
+    // diagnostics.
     for td in types.values() {
+        if prelude_types.contains(&td.name) {
+            continue;
+        }
         for (idx, v) in td.variants.iter().enumerate() {
             if let Some(existing) = ctors.get(&v.name) {
                 errors.push(CompilerError::new(
@@ -1281,6 +1327,25 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     ),
                 ));
             } else {
+                ctors.insert(
+                    v.name.clone(),
+                    CtorInfo {
+                        type_name: td.name.clone(),
+                        variant_index: idx,
+                    },
+                );
+            }
+        }
+    }
+    // Pass 2: prelude-resident types (`Option` / `Result` not retired
+    // by user redeclaration). Skip silently when a user ctor already
+    // claimed the name.
+    for td in types.values() {
+        if !prelude_types.contains(&td.name) {
+            continue;
+        }
+        for (idx, v) in td.variants.iter().enumerate() {
+            if !ctors.contains_key(&v.name) {
                 ctors.insert(
                     v.name.clone(),
                     CtorInfo {
@@ -2022,8 +2087,24 @@ fn builtin_fn_env() -> BTreeMap<String, Ty> {
 /// program — fine for v1's narrow surface (Array doesn't surface
 /// in user-visible diagnostics today).
 fn builtin_types(file: &str) -> Vec<TypeDecl> {
-    use crate::ast::{GenericParam, TypeDecl};
+    use crate::ast::{GenericParam, TypeDecl, TypeExpr, Variant, VariantFields};
     let span = Span::synthetic(file);
+    let gp = |name: &str| GenericParam {
+        name: name.to_string(),
+        span: span.clone(),
+    };
+    let variant_unit = |name: &str| Variant {
+        name: name.to_string(),
+        name_span: span.clone(),
+        fields: VariantFields::Unit,
+        span: span.clone(),
+    };
+    let variant_pos1 = |name: &str, payload: &str| Variant {
+        name: name.to_string(),
+        name_span: span.clone(),
+        fields: VariantFields::Positional(vec![TypeExpr::Named(payload.to_string(), span.clone())]),
+        span: span.clone(),
+    };
     vec![
         TypeDecl {
             name: "Array".to_string(),
@@ -2113,6 +2194,27 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
                 span: span.clone(),
             }],
             variants: Vec::new(),
+            span: span.clone(),
+        },
+        // Auto-prelude (Option/Result design — 2026-05-10). The
+        // canonical sum types every typed-language ecosystem
+        // auto-prelude'es; matched here to remove the
+        // forgot-to-import friction harness data surfaced post
+        // PR #138. Helpers (`map`, `and_then`, etc.) still ship
+        // in `std/option.sigil` / `std/result.sigil` and require
+        // explicit `import std.option` / `import std.result`.
+        TypeDecl {
+            name: "Option".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![gp("A")],
+            variants: vec![variant_unit("None"), variant_pos1("Some", "A")],
+            span: span.clone(),
+        },
+        TypeDecl {
+            name: "Result".to_string(),
+            name_span: span.clone(),
+            generic_params: vec![gp("A"), gp("E")],
+            variants: vec![variant_pos1("Ok", "A"), variant_pos1("Err", "E")],
             span,
         },
     ]
@@ -9382,55 +9484,56 @@ mod tests {
         );
     }
 
-    /// E0112 on a stdlib type carries an `import std.X` hint.
-    /// Reproduces the C12 sonnet failure shape (declaring a function
-    /// returning `Result[Int, ParseError]` without the imports).
+    /// E0112 on a stdlib type carries an `import std.X` hint. Uses
+    /// `List` (still import-required after the Option/Result prelude
+    /// — see the design's scope hard-limit) since `Result` is now
+    /// always in scope.
     #[test]
     fn unknown_type_for_stdlib_type_carries_import_hint() {
-        let src = "fn parse(s: String) -> Result[Int, Int] ![] { 0 }\n\
+        let src = "fn first(xs: List[Int]) -> Int ![] { 0 }\n\
              fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
-            .find(|e| e.code.as_str() == "E0112" && e.message.contains("`Result`"))
-            .unwrap_or_else(|| panic!("expected E0112 for Result: {errs:?}"));
+            .find(|e| e.code.as_str() == "E0112" && e.message.contains("`List`"))
+            .unwrap_or_else(|| panic!("expected E0112 for List: {errs:?}"));
         let hint = e
             .hint
             .as_deref()
             .unwrap_or_else(|| panic!("expected import hint on E0112: {e:?}"));
         assert!(
-            hint.contains("import std.result"),
-            "hint missing `import std.result`: {hint}"
+            hint.contains("import std.list"),
+            "hint missing `import std.list`: {hint}"
         );
     }
 
     /// E0114 on a stdlib constructor carries an `import std.X` hint.
-    /// Triggers the constructor-in-pattern path (C20-shape failures
-    /// referenced `Some` / `None` without `import std.option`).
+    /// Uses `Cons(_, _)` (still import-required after the prelude)
+    /// since `Some`/`None` are now always in scope.
     #[test]
     fn unknown_ctor_for_stdlib_ctor_carries_import_hint() {
-        // Use `Some(_)` in a match pattern. The scrutinee here is
+        // Use `Cons(_, _)` in a match pattern. The scrutinee here is
         // `Int` so the pattern itself is type-ill, but E0114 fires
         // first because the constructor lookup happens before the
         // pattern-shape check.
         let src = "fn main() -> Int ![] {\n  \
                      match 0 {\n    \
-                       Some(_) => 0,\n    \
-                       _       => 0,\n  \
+                       Cons(_, _) => 0,\n    \
+                       _          => 0,\n  \
                      }\n\
                    }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
-            .find(|e| e.code.as_str() == "E0114" && e.message.contains("`Some`"))
-            .unwrap_or_else(|| panic!("expected E0114 for Some: {errs:?}"));
+            .find(|e| e.code.as_str() == "E0114" && e.message.contains("`Cons`"))
+            .unwrap_or_else(|| panic!("expected E0114 for Cons: {errs:?}"));
         let hint = e
             .hint
             .as_deref()
             .unwrap_or_else(|| panic!("expected import hint on E0114: {e:?}"));
         assert!(
-            hint.contains("import std.option"),
-            "hint missing `import std.option`: {hint}"
+            hint.contains("import std.list"),
+            "hint missing `import std.list`: {hint}"
         );
     }
 

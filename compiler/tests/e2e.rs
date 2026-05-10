@@ -7625,6 +7625,63 @@ fn std_string_to_int_canonical_result_wrapper() {
     );
 }
 
+/// Auto-prelude (Option/Result design — 2026-05-10): `Option`,
+/// `Some`, `None`, `Result`, `Ok`, `Err` are always-available
+/// without an `import` line. End-to-end pin: a program using all
+/// six prelude names without any `import` compiles + runs cleanly.
+#[test]
+fn auto_prelude_option_result_no_imports() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let some_x: Option[Int] = Some(7);\n  \
+                 let none_x: Option[Int] = None;\n  \
+                 match some_x {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none-some\"),\n  \
+                 };\n  \
+                 match none_x {\n    \
+                   Some(_) => perform IO.println(\"some-none\"),\n    \
+                   None    => perform IO.println(\"none-none\"),\n  \
+                 };\n  \
+                 let ok_x: Result[Int, Int] = Ok(42);\n  \
+                 let err_x: Result[Int, Int] = Err(99);\n  \
+                 match ok_x {\n    \
+                   Ok(n)  => perform IO.println(int_to_string(n)),\n    \
+                   Err(_) => perform IO.println(\"err-ok\"),\n  \
+                 };\n  \
+                 match err_x {\n    \
+                   Ok(_)  => perform IO.println(\"ok-err\"),\n    \
+                   Err(e) => perform IO.println(int_to_string(e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_no_imports");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\nnone-none\n42\n99\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude composes with explicit imports: `import std.option`
+/// is harmless when prelude names are already in scope, and the
+/// helpers (`map`, `and_then`, `unwrap_or`) become available via
+/// the import. Mirrors the existing pattern from PR #136 +
+/// PR #137 where users imported std.option for helper access.
+#[test]
+fn auto_prelude_with_explicit_import_for_helpers() {
+    let src = "import std.option\n\n\
+               fn double(x: Int) -> Int ![] { x + x }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let o: Option[Int] = Some(7);\n  \
+                 let m: Option[Int] = map(o, double);\n  \
+                 match m {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_with_import");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stderr={stderr:?}");
+}
+
 /// `string_length` is the surface name for the Plan A1
 /// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
 /// strings report byte length.

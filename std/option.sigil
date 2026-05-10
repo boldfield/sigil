@@ -1,18 +1,28 @@
 // sigil: 0.1
 //
-// std/option.sigil — Plan C Task 62.
+// std/option.sigil — Plan C Task 62 + Option/Result prelude
+//                    (2026-05-10).
 //
 // `Option[A]` represents an optional value: either `None` (absent)
 // or `Some(value)` (present). Sigil's nominal sum types make the
 // distinction explicit; there is no `null` or implicit absence.
+//
+// **Auto-prelude:** the type and its constructors (`Option[A]`,
+// `Some(A)`, `None`) are pre-registered in
+// `typecheck::builtin_types()` and are always available without
+// `import std.option`. The helpers below (`map`, `and_then`,
+// `unwrap_or`) still ship as pure-Sigil source and require an
+// explicit `import std.option`. The prior source declaration
+// `type Option[A] = | None | Some(A)` is now expressed in the
+// builtin-type registry; removing it from this file avoids the
+// E0113 duplicate-declaration collision when both registrations
+// would otherwise land in `tc.types`.
 //
 // Helpers `map`, `and_then`, and `unwrap_or` are pure — they declare
 // closed effect rows `![]`. If a caller needs to compose with an
 // effecting transformation, the canonical pattern is to `match`
 // directly rather than thread the effect row through a generic
 // helper. Row-polymorphic Option helpers may ship in v2.
-
-type Option[A] = | None | Some(A)
 
 // `map(o, f)` returns `Some(f(x))` when `o = Some(x)` and `None`
 // when `o = None`. `f` must be pure (effect row `![]`).
