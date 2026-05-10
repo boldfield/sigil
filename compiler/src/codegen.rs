@@ -3505,15 +3505,9 @@ fn collect_branch_chain_allocs(
     while let Some((stmts, tail, leaf_kind, arm_bindings)) = work.pop() {
         match leaf_kind {
             BranchedCpsLeaf::Nested => {
-                // Plan C fix — propagate outer arm pattern bindings
-                // into the nested sub-branches. When a sum-type arm
-                // body is itself a branched expr (an `if` or nested
-                // `match`), the arm's pattern bindings (e.g. `t` in
-                // `Cons(_, t) => if ... { ...t... }`) must be available
-                // to any PerformChain leaf inside the nested expr.
-                // Dropping them here would leave the synth-cont's
-                // closure record short of those names and trip the
-                // env-lookup at lower_expr for the tail.
+                // Outer arm bindings must reach inner PerformChain
+                // leaves; dropping them here leaves the synth-cont's
+                // closure record short of those names.
                 seed_branch_work(
                     tail,
                     &arm_bindings,
@@ -3694,10 +3688,20 @@ fn seed_branch_work<'a>(
             let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_supported);
             if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
                 if let Some(et) = else_block.tail.as_ref() {
-                    work.push((else_block.stmts.as_slice(), et, ek, parent_bindings.to_vec()));
+                    work.push((
+                        else_block.stmts.as_slice(),
+                        et,
+                        ek,
+                        parent_bindings.to_vec(),
+                    ));
                 }
                 if let Some(tt) = then_block.tail.as_ref() {
-                    work.push((then_block.stmts.as_slice(), tt, tk, parent_bindings.to_vec()));
+                    work.push((
+                        then_block.stmts.as_slice(),
+                        tt,
+                        tk,
+                        parent_bindings.to_vec(),
+                    ));
                 }
             }
         }
@@ -3769,6 +3773,7 @@ fn seed_branch_work<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn seed_branch_work_sum_type<'a>(
     _tail: &'a crate::ast::Expr,
     parent_bindings: &[SynthContCapture],
@@ -3814,11 +3819,10 @@ fn seed_branch_work_sum_type<'a>(
                 break;
             }
         };
-        // Plan C fix — accumulate parent arm bindings (from outer
-        // enclosing match arms) with this arm's own pattern bindings.
-        // Any PerformChain leaf reached through Nested descent will
-        // need *all* enclosing arms' bindings in its synth-cont
-        // closure record.
+        // Inner pattern bindings shadow outer ones: dedup by name
+        // keeping the last (innermost) entry so the closure record
+        // doesn't carry two slots — and two pointer-bitmap bits —
+        // for one source name when types differ.
         let mut arm_bindings: Vec<SynthContCapture> = parent_bindings.to_vec();
         arm_bindings.extend(collect_pattern_binding_captures(
             &arm.pattern,
@@ -3826,6 +3830,7 @@ fn seed_branch_work_sum_type<'a>(
             type_layouts,
             None,
         ));
+        dedup_synth_captures_keep_last(&mut arm_bindings);
         arm_data.push((stmts, leaf, kind, arm_bindings));
     }
     if all_ok && !arm_data.is_empty() {
@@ -5213,6 +5218,27 @@ fn collect_pattern_binding_captures(
         }
     }
     out
+}
+
+/// Remove earlier duplicates from a capture list, keeping the last
+/// entry for each name. Used when accumulating outer + inner match-arm
+/// pattern bindings so a shadowed name occupies one closure-record
+/// slot with the innermost binding's kind (avoiding wasted slots and,
+/// when kinds differ, conflicting pointer-bitmap bits for one name).
+fn dedup_synth_captures_keep_last(captures: &mut Vec<SynthContCapture>) {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut keep: Vec<bool> = vec![true; captures.len()];
+    for (i, cap) in captures.iter().enumerate().rev() {
+        if !seen.insert(cap.name.clone()) {
+            keep[i] = false;
+        }
+    }
+    let mut idx = 0;
+    captures.retain(|_| {
+        let k = keep[idx];
+        idx += 1;
+        k
+    });
 }
 
 fn walk_collect_captures_block(

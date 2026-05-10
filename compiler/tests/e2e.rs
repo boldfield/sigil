@@ -17498,13 +17498,63 @@ fn pattern_c_outer_arm_binding_visible_to_nested_perform_branch() {
                fn main() -> Int ![IO] {\n  \
                  rec(Cons(1, Cons(2, Nil)))\n\
                }\n";
-    let (stdout, stderr, code) =
-        compile_and_run(src, "pattern_c_outer_arm_binding_nested_perform");
+    let (stdout, stderr, code) = compile_and_run(src, "pattern_c_outer_arm_binding_nested_perform");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "a\na\n",
         "Outer Cons(_, t) binding must reach the inner perform branch's \
          tail call rec(t); two list elements each take the perform branch. \
          stderr={stderr:?}"
+    );
+}
+
+/// Multi-level nesting variant of the previous regression: outer
+/// `match` arm binds `t`; arm body is an `if` (Nested level 1); the
+/// `if`'s then-branch is itself a `match` (Nested level 2); one inner
+/// `match` arm binds `et` AND has a `perform` before the tail; the
+/// tail references *both* the outer arm's binding (`t`) and the inner
+/// arm's binding (`et`). Validates `parent_bindings` accumulating
+/// through more than one Nested descent.
+#[test]
+fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
+    let src = "import std.list\n\
+               import std.io\n\
+               \n\
+               fn rec(lst: List[Int], extra: List[Int]) -> Int ![IO] {\n  \
+                 match lst {\n    \
+                   Nil => 0,\n    \
+                   Cons(h, t) => if h > 0 {\n      \
+                     match extra {\n        \
+                       Nil => {\n          \
+                         perform IO.println(\"nil\");\n          \
+                         rec(t, extra)\n        \
+                       },\n        \
+                       Cons(_, et) => {\n          \
+                         perform IO.println(\"cons\");\n          \
+                         rec(t, et)\n        \
+                       },\n      \
+                     }\n    \
+                   } else {\n      \
+                     rec(t, extra)\n    \
+                   },\n  \
+                 }\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 rec(Cons(1, Cons(2, Nil)), Cons(10, Nil))\n\
+               }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(src, "pattern_c_outer_arm_binding_two_nested_levels");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Step 1: h=1 (>0), extra=Cons(10, Nil) → inner Cons(_, et) arm
+    //         prints "cons", recurses with (t=Cons(2, Nil), et=Nil).
+    // Step 2: h=2 (>0), extra=Nil → inner Nil arm prints "nil",
+    //         recurses with (t=Nil, extra=Nil).
+    // Step 3: lst=Nil → returns 0.
+    assert_eq!(
+        stdout, "cons\nnil\n",
+        "two-level nesting must propagate outer arm binding `t` AND inner \
+         arm binding `et` into the perform branch's synth-cont closure \
+         record. stderr={stderr:?}"
     );
 }
