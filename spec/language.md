@@ -1485,14 +1485,38 @@ types and operations are registered as compiler builtins.
 Importing them is allowed (a no-op at the resolver) for
 documentary clarity.
 
+**Auto-prelude (`std.option` / `std.result`).** Six names are
+pre-registered in the typechecker's builtin set and are always
+available without an `import` line: `Option[A]`, `Some(A)`,
+`None`, `Result[A, E]`, `Ok(A)`, `Err(E)`. This carve-out matches
+Rust's `std::prelude` (which auto-includes `Option`, `Some`,
+`None`, `Result`, `Ok`, `Err`), Haskell's `Prelude`, and OCaml's
+auto-opened `Stdlib` — every typed-language ecosystem that
+inspires Sigil's idioms. The helper functions in
+`std.option` (`map`, `and_then`, `unwrap_or`) and `std.result`
+(`map`, `map_err`, `and_then`) still ship as pure-Sigil source
+and require their explicit imports.
+
+User code may shadow the prelude:
+
+- `type Color = | Red | Green | None` — the user's `None`
+  shadows `Option::None` in that file's scope (matching Rust's
+  `enum Color { None }` shadowing semantics).
+- `type Option = | None | Some(Int)` — non-generic redeclaration
+  replaces the prelude entry entirely; the user's Option becomes
+  the source of truth.
+- `let Some: Int = 7` — local binding shadows the prelude `Some`
+  constructor in its scope.
+
 All other `std.*` modules ship real source. **Their declarations
 require an explicit `import std.<module>`** to be in scope —
-including `Option`, `Result`, `List`, sum-type constructors like
-`Ok` / `Err` / `Some` / `None` / `Cons` / `Nil`, and any
-pure-Sigil canonical wrapper (`string_to_int`, `string_to_float`,
-`string_from_bytes`, `array_get_opt`, etc.). When an unknown name
-is rejected with `E0046` / `E0112` / `E0114`, the diagnostic
-attaches an `import std.X` hint pointing at the missing module.
+including `List`, sum-type constructors like `Cons` / `Nil`, and
+any pure-Sigil canonical wrapper (`string_to_int`,
+`string_to_float`, `string_from_bytes`, `array_get_opt`, etc.).
+When an unknown name is rejected with `E0046` / `E0112` /
+`E0114`, the diagnostic attaches an `import std.X` hint pointing
+at the missing module. Prelude names are never "unknown" so the
+hint never fires for them.
 
 ### §11 — Diagnostics
 
@@ -1647,8 +1671,8 @@ files are the authoritative API reference.
 
 | Module | Surface |
 |--------|---------|
-| `std.option` | `Option[A]`, `map`, `and_then`, `unwrap_or`. |
-| `std.result` | `Result[A, E]`, `map`, `map_err`, `and_then`. |
+| `std.option` | **Prelude:** `Option[A]`, `Some(A)`, `None` are always available without `import std.option`. **Helpers** require the explicit import: `map`, `and_then`, `unwrap_or`. |
+| `std.result` | **Prelude:** `Result[A, E]`, `Ok(A)`, `Err(E)` are always available without `import std.result`. **Helpers** require the explicit import: `map`, `map_err`, `and_then`. |
 | `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
 | `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` is the canonical string comparator (returns `Ordering`) — the legacy Int-returning builtin was retired in this addendum. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
 | `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |

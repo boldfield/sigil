@@ -156,23 +156,38 @@ mod tests {
     }
 
     #[test]
-    fn result_resolves_to_std_result() {
-        // `Result` is declared in std.result; even though std.string
-        // imports std.result, the index attributes the declaration to
-        // std.result alone.
-        assert_eq!(modules_declaring("Result"), vec!["result"]);
+    fn prelude_types_not_in_index() {
+        // After the Option/Result prelude (2026-05-10), the source-
+        // level type declarations were removed from std/option.sigil
+        // and std/result.sigil; the type+constructor decls now live
+        // in `typecheck::builtin_types`. The index walks stdlib
+        // sources, so it correctly returns empty for prelude names —
+        // this means the import-hint diagnostic does NOT fire for
+        // prelude names (because they're never "unknown" in the
+        // first place).
+        assert!(
+            modules_declaring("Option").is_empty(),
+            "Option is prelude — not in module index"
+        );
+        assert!(
+            modules_declaring("Result").is_empty(),
+            "Result is prelude — not in module index"
+        );
+        assert!(modules_declaring("Some").is_empty(), "Some is prelude");
+        assert!(modules_declaring("None").is_empty(), "None is prelude");
+        assert!(modules_declaring("Ok").is_empty(), "Ok is prelude");
+        assert!(modules_declaring("Err").is_empty(), "Err is prelude");
     }
 
     #[test]
-    fn ok_constructor_resolves_to_std_result() {
-        assert_eq!(modules_declaring("Ok"), vec!["result"]);
-        assert_eq!(modules_declaring("Err"), vec!["result"]);
-    }
-
-    #[test]
-    fn option_constructors_resolve_to_std_option() {
-        assert_eq!(modules_declaring("Some"), vec!["option"]);
-        assert_eq!(modules_declaring("None"), vec!["option"]);
+    fn list_resolves_to_std_list() {
+        // `List`/`Cons`/`Nil` are NOT in the prelude (per the
+        // Option/Result design's scope hard-limit) — they still
+        // require explicit `import std.list` and the index keeps
+        // suggesting that import.
+        assert_eq!(modules_declaring("List"), vec!["list"]);
+        assert_eq!(modules_declaring("Cons"), vec!["list"]);
+        assert_eq!(modules_declaring("Nil"), vec!["list"]);
     }
 
     #[test]

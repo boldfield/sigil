@@ -7625,6 +7625,157 @@ fn std_string_to_int_canonical_result_wrapper() {
     );
 }
 
+/// Auto-prelude (Option/Result design — 2026-05-10): `Option`,
+/// `Some`, `None`, `Result`, `Ok`, `Err` are always-available
+/// without an `import` line. End-to-end pin: a program using all
+/// six prelude names without any `import` compiles + runs cleanly.
+#[test]
+fn auto_prelude_option_result_no_imports() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let some_x: Option[Int] = Some(7);\n  \
+                 let none_x: Option[Int] = None;\n  \
+                 match some_x {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none-some\"),\n  \
+                 };\n  \
+                 match none_x {\n    \
+                   Some(_) => perform IO.println(\"some-none\"),\n    \
+                   None    => perform IO.println(\"none-none\"),\n  \
+                 };\n  \
+                 let ok_x: Result[Int, Int] = Ok(42);\n  \
+                 let err_x: Result[Int, Int] = Err(99);\n  \
+                 match ok_x {\n    \
+                   Ok(n)  => perform IO.println(int_to_string(n)),\n    \
+                   Err(_) => perform IO.println(\"err-ok\"),\n  \
+                 };\n  \
+                 match err_x {\n    \
+                   Ok(_)  => perform IO.println(\"ok-err\"),\n    \
+                   Err(e) => perform IO.println(int_to_string(e)),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_no_imports");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\nnone-none\n42\n99\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude composes with explicit imports: `import std.option`
+/// is harmless when prelude names are already in scope, and the
+/// helpers (`map`, `and_then`, `unwrap_or`) become available via
+/// the import. Mirrors the existing pattern from PR #136 +
+/// PR #137 where users imported std.option for helper access.
+#[test]
+fn auto_prelude_with_explicit_import_for_helpers() {
+    let src = "import std.option\n\n\
+               fn double(x: Int) -> Int ![] { x + x }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let o: Option[Int] = Some(7);\n  \
+                 let m: Option[Int] = map(o, double);\n  \
+                 match m {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_with_import");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "14\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing — user `type Color = | Red | Green |
+/// None`: the user's `None` constructor wins over the prelude
+/// `None`. Pattern-matching `None` against a `Color` scrutinee
+/// resolves to `Color::None`. Mirrors how Rust's
+/// `enum Color { None, ... }` shadows `Option::None` in scope.
+#[test]
+fn auto_prelude_user_type_shadows_none_ctor() {
+    let src = "type Color = | Red | Green | None\n\n\
+               fn name_of(c: Color) -> String ![] {\n  \
+                 match c {\n    \
+                   Red   => \"red\",\n    \
+                   Green => \"green\",\n    \
+                   None  => \"none-color\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(name_of(Red));\n  \
+                 perform IO.println(name_of(Green));\n  \
+                 perform IO.println(name_of(None));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_color_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "red\ngreen\nnone-color\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing is per-constructor, not per-type. After
+/// `type Color = | Red | Green | None`, bare `None` resolves to
+/// `Color::None`, but `Some` / `Ok` / `Err` (not declared on
+/// `Color`) remain available from the prelude. Pins the asymmetry
+/// for future readers — same scoping shape as Rust's
+/// `enum Color { None }` shadowing only `Option::None`, not
+/// `Option::Some`.
+#[test]
+fn auto_prelude_per_ctor_shadowing_leaves_other_prelude_names() {
+    let src = "type Color = | Red | Green | None\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 // `Some` and `Ok` are NOT declared on Color, so the\n  \
+                 // prelude versions remain in scope and these compile.\n  \
+                 let opt: Option[Int] = Some(7);\n  \
+                 let res: Result[Int, Int] = Ok(42);\n  \
+                 match opt {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none-shadowed-as-color\"),\n  \
+                 };\n  \
+                 match res {\n    \
+                   Ok(n)  => perform IO.println(int_to_string(n)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_per_ctor_shadow");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n42\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing — user `type Option = | None |
+/// Some(Int)` (non-generic) replaces the prelude entry entirely.
+/// Cross-user collisions with the user's Option still fire E0118
+/// normally (the typechecker treats the user-redeclared Option as
+/// a user type, not a prelude type).
+#[test]
+fn auto_prelude_user_redeclares_option_overrides() {
+    let src = "type Option = | None | Some(Int)\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let o: Option = Some(7);\n  \
+                 match o {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_option_override");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing — `let Some: Int = 7;` local binding
+/// shadows the prelude `Some` ctor in its scope. The local binding
+/// resolves to the bound value; the prelude ctor isn't reachable
+/// inside the let's body. Mirrors v1's existing behavior for any
+/// `let X = ...` that shadows a same-named ctor.
+#[test]
+fn auto_prelude_let_binding_shadows_some_ctor() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let Some: Int = 7;\n  \
+                 perform IO.println(int_to_string(Some));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_let_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
 /// `string_length` is the surface name for the Plan A1
 /// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
 /// strings report byte length.

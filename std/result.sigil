@@ -1,10 +1,21 @@
 // sigil: 0.1
 //
-// std/result.sigil — Plan C Task 63.
+// std/result.sigil — Plan C Task 63 + Option/Result prelude
+//                    (2026-05-10).
 //
 // `Result[A, E]` represents either a successful value (`Ok(value)`)
 // or an error (`Err(reason)`). Sigil's nominal sum types make the
 // distinction explicit; there is no exception machinery.
+//
+// **Auto-prelude:** the type and its constructors (`Result[A, E]`,
+// `Ok(A)`, `Err(E)`) are pre-registered in
+// `typecheck::builtin_types()` and are always available without
+// `import std.result`. The helpers below (`map`, `map_err`,
+// `and_then`) still ship as pure-Sigil source and require an
+// explicit `import std.result`. The prior source declaration
+// `type Result[A, E] = | Ok(A) | Err(E)` is now expressed in the
+// builtin-type registry; removing it from this file avoids the
+// E0113 duplicate-declaration collision.
 //
 // Helpers `map`, `map_err`, and `and_then` are pure — they declare
 // closed effect rows `![]`. The `Ok` and `Err` arms have separate
@@ -12,8 +23,6 @@
 // rewrites only the `Err` payload, and `and_then` chains a fallible
 // continuation through `Ok`. Row-polymorphic Result helpers may
 // ship in v2.
-
-type Result[A, E] = | Ok(A) | Err(E)
 
 // `map(r, f)` transforms the `Ok` payload; `Err` passes through.
 fn map[A, B, E](r: Result[A, E], f: (A) -> B ![]) -> Result[B, E] ![] {

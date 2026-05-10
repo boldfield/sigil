@@ -578,6 +578,26 @@ impl<'a> Monomorphizer<'a> {
         let mut fn_decls: BTreeMap<String, &'a FnDecl> = BTreeMap::new();
         let mut type_decls: BTreeMap<String, &'a TypeDecl> = BTreeMap::new();
         let mut ctor_to_type: BTreeMap<String, String> = BTreeMap::new();
+        // Include builtin generic types (Option / Result auto-
+        // prelude'd in `typecheck::builtin_types`) that aren't
+        // represented as `Item::Type` in `program.items`. The
+        // rewriter's ctor-mangling path requires the generic template
+        // be present in `type_decls`; without this seed pass, ctor
+        // calls to prelude constructors fall through unmangled and
+        // codegen ICEs at the "no signature source registered" guard.
+        // Only types with non-empty variants need to be cloned —
+        // opaque builtins like `Array` / `MutArray` have empty
+        // variants and don't need this treatment (their use sites
+        // are mangled via the synthetic-specialization path at the
+        // tail of `monomorphize_program`).
+        for (name, td) in &checked.types {
+            if !td.variants.is_empty() {
+                type_decls.insert(name.clone(), td);
+                for v in &td.variants {
+                    ctor_to_type.insert(v.name.clone(), name.clone());
+                }
+            }
+        }
         for item in &checked.program.items {
             match item {
                 Item::Fn(f) => {
