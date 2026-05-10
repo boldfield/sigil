@@ -1,15 +1,17 @@
 # stdlib fallible-ops audit
 
-**Status:** Phase 1 (inventory + design decisions). Awaiting user
-confirmation before Phase 2 implementation.
+**Status:** **Shipped** in PR #137. Phase 1 (inventory + design
+decisions) and Phase 2 (implementation) both landed; this doc now
+records the as-shipped state for future reference. Decisions D1–D5
+were user-confirmed before Phase 2 began.
 
 **Driver:** PR #136 (canonical `string_to_int`) closed one C12-shaped
 teachability hazard. This document catalogues the remaining stdlib
-operations that can fail at runtime without an idiomatic
-Option/Result surface, and records the design decisions for safe
-wrappers.
+operations that could fail at runtime without an idiomatic
+Option/Result surface, records the design decisions, and tracks
+what shipped where.
 
-**Plan:** [`/repos/designs/in-progress/2026-05-10-sigil-stdlib-fallible-ops-audit.md`](#)
+**Plan:** [`/repos/designs/done/2026-05-10-sigil-stdlib-fallible-ops-audit.md`](#)
 
 ---
 
@@ -208,72 +210,88 @@ real load.
 
 ---
 
-## Phase 2 task plan (revised)
+## Phase 2 — as shipped (PR #137)
 
-The original plan's tasks 2-6 map to this inventory but need
-adjustment to cover the additional `_set` / `_slice` / `byte_from_int`
-items and the BUILTIN_INJECTED moves.
+All seven Phase 2 tasks landed in PR #137 across six commits.
 
-| Task | Scope | Items |
-|---|---|---|
-| 2 | Move `byte_array.sigil` off BUILTIN_INJECTED + ship A2, B3, B4, C1 | `string_from_bytes`, `byte_array_get_opt`, `byte_array_slice_opt`, `byte_from_int` |
-| 3 | Move `float.sigil` off BUILTIN_INJECTED + ship A3 | `string_to_float` |
-| 4 | Move `array.sigil` off BUILTIN_INJECTED + ship B1, B2 | `array_get_opt`, `array_set_opt` |
-| 5 | Ship B5, B6 (string.sigil already off BUILTIN_INJECTED) | `string_byte_at_opt`, `string_substring_opt` |
-| 6 | Move `mut_array.sigil` + `mut_byte_array.sigil` off BUILTIN_INJECTED + ship B7, B8, B9, B10 | mutable accessor safe variants |
-| 7 | Composite verification + PR | Per original plan task 7 |
-| 8 | Update audit doc with as-shipped state | Per original plan task 8 |
+| Task | Commit | Module(s) | Wrappers shipped |
+|---|---|---|---|
+| 1 | `92986f6` | `compiler/docs/` | This audit doc (Phase 1 inventory + decisions) |
+| 2 | `18e7e3d` | `std/byte_array.sigil` | `string_from_bytes`, `byte_from_int`, `byte_array_get_opt`, `byte_array_slice_opt` |
+| 3 | `4626fdd` | `std/float.sigil` | `string_to_float` |
+| 4 | `835a3d2` | `std/array.sigil` | `array_get_opt`, `array_set_opt` |
+| 5 | `232ebde` | `std/string.sigil` | `string_byte_at_opt`, `string_substring_opt` |
+| 6 | `c9f8475` | `std/mut_array.sigil`, `std/mut_byte_array.sigil` | `mut_array_get_opt`, `mut_array_set_opt`, `mut_byte_array_get_opt`, `mut_byte_array_set_opt` |
+| 7 | (composite verification — no commit) | full e2e/lib suite | 248 runtime + 802 typecheck + 528 e2e pass |
+| 8 | `<this commit>` | `compiler/docs/` | This as-shipped update |
 
-Each Phase 2 commit must:
+Plus one review fixup commit (`ac84fde`): tightened
+`BUILTIN_INJECTED` comments + relaxed test-helper effect rows
+(`![Mem]` → `![]` where the helper performs no actual `Mem` effect).
 
-1. Move the relevant file off `BUILTIN_INJECTED` (where applicable).
-2. Verify the file's existing contents typecheck cleanly
-   (`cargo test --release -p sigil-compiler --lib` should pass with
-   no new errors before adding any new wrappers).
+Each implementation commit followed the same shape:
+
+1. Move the relevant file off `BUILTIN_INJECTED` (Tasks 2, 3, 4, 6).
+2. Verify the file's existing contents typecheck cleanly under real
+   loading.
 3. Add the canonical wrapper(s).
 4. Update the spec §13 row to name the new surface.
-5. Add e2e tests covering Ok/Some-path AND None/error-path.
+5. Add e2e tests covering Some/Ok happy path AND None/Err edge
+   cases (boundary, negative-index, above-range; slice variants
+   additionally test `start > end`).
+
+### Inventory deltas vs original plan
+
+The Phase 1 inventory walk surfaced 7 candidates the queued plan
+didn't enumerate:
+
+- `array_set_opt`, `byte_array_slice_opt` (parallel to their `_get`
+  siblings — D4)
+- `mut_array_set_opt`, `mut_byte_array_set_opt` (mutable
+  counterparts)
+- `byte_from_int` (already noted as a deferred wrapper in
+  std/byte_array.sigil; D5)
+- `array_alloc` / `byte_array_alloc` / `mut_array_new` /
+  `mut_byte_array_new` were considered and **excluded** per D4 —
+  programmer-error class, not recoverable
+
+### Stale inventory observations resolved
+
+1. **`map` collision concern was dead.** The historical deviation
+   note in `std/byte_array.sigil:75-87` claimed cross-module name
+   collisions on `map`. Verified false during inventory — the
+   typechecker uses `current_fn_file` qualification so each std
+   file's `map` resolves to its own scheme. The deviation note was
+   removed in Task 2's commit (`18e7e3d`).
+
+2. **`BUILTIN_INJECTED` move was uneventful.** All five moves
+   (`array.sigil`, `byte_array.sigil`, `float.sigil`,
+   `mut_array.sigil`, `mut_byte_array.sigil`) loaded cleanly under
+   real-import semantics with zero parse / typecheck failures —
+   the doc-only files had no stale comment-as-code claims that
+   would have errored.
+
+3. **Validation prompts** P41, P62 were migrated to `string_to_int`
+   in PR #136. No prompt in the bank exercises the other newly-
+   wrapped surfaces; future prompts touching those will use the
+   canonical wrappers as a matter of course.
 
 ---
 
-## Risks surfaced during inventory
+## Out-of-scope items (not migrated)
 
-1. **`BUILTIN_INJECTED` move complexity.** Each file currently in
-   the skip-list may have stale comment-only "examples" that fail to
-   parse / typecheck under real loading. Phase 2 commits should
-   front-load the move + verify-clean step before adding wrappers,
-   so failures are localized to the correct PR commit.
+These were considered during inventory and intentionally excluded:
 
-2. **`map` collision concern is dead.** The deviation note in
-   `std/byte_array.sigil:75-87` explicitly claimed cross-module name
-   collisions on `map`. **Verified false** — the typechecker uses
-   `current_fn_file` qualification so each std file's `map` resolves
-   to its own scheme. Fix the deviation note in Phase 2's
-   `byte_array.sigil` commit.
-
-3. **`Option[Unit]` for mutable `_set_opt` is awkward.** Considered
-   `Bool` instead but rejected — keeps the wrapper-shape uniform and
-   matches what an LLM trained on Rust's `try_*` mutating APIs would
-   reach for.
-
-4. **Validation prompts.** Existing prompts P41, P62 (already
-   migrated to `string_to_int`) plus any prompt referencing the
-   newly-wrapped surfaces should be migrated. Phase 2 commits each
-   handle their own prompt migrations.
-
----
-
-## Open questions
-
-None blocking Phase 2. All four design decisions (D1-D5) have a
-recommended resolution above. The user's confirmation is requested
-on:
-
-- D1 (naming `_opt`)
-- D2 (float = Option, not Result)
-- D3 (string_from_bytes = Option, not Result)
-- D4 (`_set` variants in scope; `_alloc` out of scope)
-- D5 (`byte_from_int` in scope)
-
-If any of D1-D5 is overridden, the affected Phase 2 task changes
-shape but the inventory stays.
+- `array_alloc` / `byte_array_alloc` / `mut_array_new` /
+  `mut_byte_array_new` — abort on negative/huge `len`. Programmer-
+  error class (matches Rust's `Vec::with_capacity` precedent which
+  doesn't have a safe variant). D4.
+- `int64_div` / `int64_mod` — abort on `0` / `i64::MIN/-1`. Belongs
+  to the `ArithError`-effect-row story (PR #132–#134's spec
+  teaching arc), not the Option/Result wrapper story.
+- `Int` `/` and `%` — already use `ArithError` effect row (the
+  intentional v1 idiom).
+- `panic` / `assert` — intentional aborts.
+- Effect-handler-driven ops (`Fs`, `Process`, `Random`, `Clock`,
+  `Env`, `IO`) — already use `Result[T, E]` for fallible ops via
+  the effect handlers (`std.fs`, `std.process`).
