@@ -115,24 +115,11 @@
 import std.list
 import std.result
 
-// `ParseError` discriminates the three failure modes returned by the
-// canonical `string_to_int` wrapper. The variant tags match the
-// integer error codes returned by the underlying
-// `string_to_int_validate` builtin (1=Empty, 2=NonDecimal,
-// 3=Overflow); the sum-typed wrapper exists so callers can pattern-
-// match instead of comparing against magic numbers.
+// `ParseError` variants mirror the integer codes returned by
+// `string_to_int_validate` (1=Empty, 2=NonDecimal, 3=Overflow).
 type ParseError = | Empty | NonDecimal | Overflow
 
-// `string_to_int(s)` parses `s` as a signed decimal integer.
-// Returns `Ok(n)` on success; `Err(Empty | NonDecimal | Overflow)`
-// otherwise. Pure (`![]`) — no IO, no allocation beyond the result
-// constructor.
-//
-// Implementation: thin wrapper over the `string_to_int_validate` /
-// `string_to_int_parse` builtin pair. The validate call inspects
-// the input and returns an integer error code; only on `0` (clean
-// parse) do we call `_parse` (which is unsafe-on-invalid-input by
-// contract — see the file header).
+// Thin wrapper over the validate/_parse builtin pair — see header.
 fn string_to_int(s: String) -> Result[Int, ParseError] ![] {
   match string_to_int_validate(s) {
     0 => Ok(string_to_int_parse(s)),
