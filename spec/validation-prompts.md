@@ -469,3 +469,783 @@ the let-chain shape. Note: `std.choose` provides `Choose` with
 `all_choices` / `first_choice` dischargers that use first-class
 continuations for runtime-N enumeration; this prompt uses a
 hand-rolled handler to exercise the raw multi-shot surface.
+
+## P21 — tuple construction and destructure
+
+**Prompt:** Write a Sigil program that defines `fn min_max(a: Int, b: Int) -> (Int, Int) ![]`
+returning `(a, b)` if `a <= b` and `(b, a)` otherwise. In `main`, call `min_max(7, 3)`,
+destructure the result via `match` into `(lo, hi)`, print `lo` then `hi` on separate lines
+via `perform IO.println(int_to_string(...))`, and return `0`.
+
+**Oracle (stdout):**
+```
+3
+7
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises tuple types in fn return position (Plan D Task 113), tuple
+value construction `(a, b)`, and tuple destructuring via `match`.
+
+## P22 — `std.pair` accessors
+
+**Prompt:** Write a Sigil program that imports `std.pair`. Construct the binary tuple
+`(42, "answer")`, print `int_to_string(fst(p))` then `snd(p)` via `perform IO.println` on
+separate lines, return `0`.
+
+**Oracle (stdout):**
+```
+42
+answer
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `import std.pair` and the generic `fst[A, B]` / `snd[A, B]`
+accessors on binary tuples.
+
+## P23 — type-parameterized effect row
+
+**Prompt:** Write a Sigil program that declares `effect Raise[E] { fail: (E) -> Int }`
+(generic over the error payload type). Define `fn check_positive(n: Int) -> Int
+![Raise[String]]` whose body returns `n` when `n > 0` and `perform Raise.fail("not
+positive")` otherwise. In `main`, wrap `check_positive(-5)` in a
+`handle ... with { Raise.fail(msg, k) => { perform IO.println(msg); 0 } }` arm. Print
+the handle's value via `int_to_string`, return `0`.
+
+**Oracle (stdout):**
+```
+not positive
+0
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises generic effect declarations (Plan D Task 114) — the `[E]`
+parameter in `effect Raise[E] { ... }` and its instantiation as `Raise[String]` at the
+row site.
+
+## P24 — per-op generic params
+
+**Prompt:** Write a Sigil program that declares `effect Raise[E] { fail[A]: (E) -> A }`
+— note the per-op generic `[A]` on `fail`, distinct from the effect-decl generic `[E]`.
+Define `fn check_pos(n: Int) -> Int ![Raise[String]]` returning `n` when `n > 0` and
+`perform Raise.fail("not positive")` otherwise (the per-op `A` instantiates to `Int`
+here). In `main`, wrap `check_pos(0)` in a
+`handle ... with { Raise.fail(msg, k) => { perform IO.println(msg); -1 } }` arm. Print
+the handle's value via `int_to_string`, return `0`.
+
+**Oracle (stdout):**
+```
+not positive
+-1
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises per-op generic params (Plan D Task 115). The per-op `A` in
+`fail[A]: (E) -> A` is bound at the op's scheme and instantiated fresh at each perform
+site.
+
+## P25 — row-polymorphic discharger
+
+**Prompt:** Write a Sigil program that imports `std.raise` and `std.result`, then uses
+`catch` (the row-polymorphic discharger). Define `fn risky() -> Int ![Raise[String] | e]`
+whose body unconditionally performs `raise("boom")`. In `main`, call
+`let r: Result[Int, String] = catch(fn () -> Int ![Raise[String] | e] => risky())`,
+then `match r` into `Ok(_) => perform IO.println("ok")` /
+`Err(msg) => perform IO.println(msg)`, return `0`.
+
+**Oracle (stdout):**
+```
+boom
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises row-polymorphic fn parameters (Plan D Task 116). The `e`
+in `![Raise[String] | e]` is a row variable (bound implicitly by the `| e` tail) that
+lets `catch` accept bodies with any residual effect row.
+
+## P26 — conditional k-call
+
+**Prompt:** Write a Sigil program that declares
+`effect Try resumes: many { attempt: (Int) -> Int }`. Define
+`fn body() -> Int ![Try, IO]` whose body is
+`let n: Int = perform Try.attempt(7); perform IO.println(int_to_string(n)); n`. In
+`main`, wrap `body()` in a
+`handle ... with { Try.attempt(arg, k) => if arg > 0 { k(arg) } else { 0 } }` arm.
+Print the handle's value via `int_to_string`, return `0`.
+
+**Oracle (stdout):**
+```
+7
+7
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises conditional k-call (Plan D Task 118). The handler's
+`if arg > 0 { k(arg) } else { 0 }` is the shape where one branch resumes and another
+short-circuits.
+
+## P27 — `return(v) =>` arm
+
+**Prompt:** Write a Sigil program that declares `type Option = | None | Some(Int)` and
+`effect Maybe { miss: () -> Int }`. Define
+`fn lookup(present: Bool) -> Int ![Maybe]` whose body is
+`match present { true => 42, false => perform Maybe.miss() }`. In `main`, wrap
+`lookup(true)` in a `handle` with both `return(v) => Some(v)` and
+`Maybe.miss(k) => None`. Match the handled value:
+`None => perform IO.println("none")` / `Some(n) => perform IO.println(int_to_string(n))`,
+return `0`.
+
+**Oracle (stdout):**
+```
+42
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises the `return(v) =>` discharge arm. The handle's normal-flow
+value gets transformed (wrapped in `Some`) before the handle expression evaluates.
+
+## P28 — multi-arm handler with `std.state`
+
+**Prompt:** Write a Sigil program that imports `std.state` and declares
+`effect Counter { incr: () -> Int, decr: () -> Int, read: () -> Int }`. Define
+`fn body() -> Int ![Counter, State[Int]]` that performs `incr` × 2, `decr`, then
+`read`. Define `fn run() -> Int ![State[Int]]` that handles `body()` with three arms:
+each `Counter.*` arm reads the cell via `perform State.get()`, writes back via
+`perform State.set(...)`, then resumes `k`. In `main`, call
+`let final_pair: (Int, Int) = run_state(0, run)`, destructure into
+`(returned, _state)`, print `returned` via `int_to_string`, return `0`.
+
+**Oracle (stdout):**
+```
+1
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises multi-arm handlers (one handle, three arms on the same
+effect) composed on top of `std.state.run_state`. Final state: incr × 2 + decr × 1 = 1.
+
+## P29 — nested handlers on distinct effects
+
+**Prompt:** Write a Sigil program that declares `effect Greet { say: (String) -> Int }`
+and `effect Quiet { suppress: () -> Int }`. Define
+`fn body() -> Int ![Greet, Quiet, IO]` that performs `Greet.say("hello")`,
+`Quiet.suppress()`, then returns `0`. In `main`, nest handlers: outer
+`handle (...) with { Quiet.suppress(k) => k(0) }` around inner
+`handle body() with { Greet.say(msg, k) => { perform IO.println(msg); k(0) } }`. After
+the outer handle returns, print `"done"`, return `0`.
+
+**Oracle (stdout):**
+```
+hello
+done
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises nested handlers on distinct effects. The inner handle
+discharges `Greet`; the outer discharges `Quiet`.
+
+## P30 — `MutArray` construction and indexed read/write
+
+**Prompt:** Write a Sigil program that imports `std.mut_array`. Allocate a 3-element
+`MutArray[Int]` initialized to `0` via `mut_array_new(3, 0)`. Write `10`, `20`, `30` at
+indices `0`, `1`, `2` via `mut_array_set`. Read each index back via `mut_array_get` and
+print on separate lines via `perform IO.println(int_to_string(...))`. Return `0`.
+`main`'s row should be `![Mem, IO]`.
+
+**Oracle (stdout):**
+```
+10
+20
+30
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises the `Mem` effect via `std.mut_array`. Verifies allocation,
+indexed write, indexed read.
+
+## P31 — `MutArray` in-place sum
+
+**Prompt:** Write a Sigil program that imports `std.mut_array`. Allocate a 5-element
+`MutArray[Int]` and `mut_array_set` indices 0..4 to values `1`, `2`, `3`, `4`, `5`.
+Allocate a 1-element `MutArray[Int]` accumulator initialized to `0`. Write a recursive
+helper `fn walk(arr: MutArray[Int], acc: MutArray[Int], i: Int, n: Int) -> Int ![Mem]`
+that walks each index, reads the accumulator, adds `mut_array_get(arr, i)`, writes back
+the new total, and recurses. After the walk, read the accumulator and print via
+`int_to_string` + `perform IO.println`. Return `0`. `main`'s row is `![Mem, IO]`.
+
+**Oracle (stdout):**
+```
+15
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises mutation under `![Mem]`, recursion-as-iteration over
+indices, and a mutable accumulator. 1+2+3+4+5 = 15.
+
+## P32 — `StringBuilder`
+
+**Prompt:** Write a Sigil program that imports `std.string_builder`. Use `sb_new`,
+`sb_append`, and `sb_finalize` to build `"hello world"` by appending `"hello"`, `" "`,
+`"world"` sequentially. `perform IO.println` the final string, return `0`. `main`'s
+row is `![Mem, IO]`.
+
+**Oracle (stdout):**
+```
+hello world
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `StringBuilder` rope under the `Mem` effect.
+
+## P33 — `MutByteArray` with byte conversion
+
+**Prompt:** Write a Sigil program that imports `std.mut_byte_array`. Allocate a 3-byte
+`MutByteArray` initialized to `byte_truncate(0)` via `mut_byte_array_new`. Write the
+bytes for ASCII `'A'` (65), `'B'` (66), `'C'` (67) at indices 0, 1, 2 via
+`mut_byte_array_set` (use `byte_truncate(n)` to convert `Int → Byte`). Read each byte
+back via `mut_byte_array_get`, widen via `byte_to_int`, and print via
+`int_to_string` + `perform IO.println`. Return `0`. `main`'s row is `![Mem, IO]`.
+
+**Oracle (stdout):**
+```
+65
+66
+67
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `MutByteArray` + Byte/Int conversion builtins
+(`byte_truncate`, `byte_to_int`).
+
+## P34 — `ByteArray` checksum
+
+**Prompt:** Write a Sigil program that imports `std.byte_array`. Construct a `ByteArray`
+holding the bytes for `"ABC"` via `string_to_bytes("ABC")`. Walk each byte with a
+recursive helper that calls `byte_array_get` + `byte_to_int` and accumulates the sum.
+Print the total via `int_to_string` + `perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+198
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises immutable `ByteArray` (no `Mem` needed) + byte iteration
++ `byte_to_int`. 65 + 66 + 67 = 198. (`byte_array_alloc` only takes a uniform fill;
+`string_to_bytes` is the path to a `ByteArray` containing specific bytes.)
+
+## P35 — `string_from_bytes` happy path
+
+**Prompt:** Write a Sigil program that imports `std.byte_array`. Build a `ByteArray`
+from `string_to_bytes("hi")`. Call `string_from_bytes_validate(ba)` (returns `Int`:
+`-1` on success, otherwise the byte offset of the first invalid byte). On success,
+print `string_from_bytes_alloc(ba)`; otherwise print `"invalid utf-8"`. Return `0`.
+
+**Oracle (stdout):**
+```
+hi
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises ByteArray → String conversion via the validate + alloc
+primitive pair (no `Result`-returning `string_from_bytes` wrapper exists in v1; user
+code composes the validate + alloc primitives).
+
+## P36 — `std.list.map` + `fold`
+
+**Prompt:** Write a Sigil program that imports `std.list`. Build `[1, 2, 3, 4, 5]` via
+`range(1, 6)`. Apply `map(xs, fn (n: Int) -> Int ![] => n * n)` to square each element,
+then apply `fold(squared, 0, fn (acc: Int, n: Int) -> Int ![] => acc + n)` to sum.
+Print the result via `int_to_string` + `perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+55
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `std.list` higher-order fns. 1+4+9+16+25=55.
+
+## P37 — `std.list.filter` for evens
+
+**Prompt:** Write a Sigil program that imports `std.list`. `filter`'s pred type is
+`(A) -> Bool ![]` — pure. To filter for even integers (which uses `%`, a possibly-
+ArithError-producing op), define a wrapper `fn is_even(n: Int) -> Bool ![]` that
+discharges `ArithError` via `handle n % 2 == 0 with { ArithError.div_by_zero(k) =>
+false, ArithError.mod_by_zero(k) => false }`. Build `range(1, 7)`, filter with
+`is_even`, walk the result list and print each element on its own line via
+`int_to_string` + `perform IO.println`. Return `0`.
+
+**Oracle (stdout):**
+```
+2
+4
+6
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `filter` plus the discharging-handler pattern for
+isolating an effect-having computation behind a pure interface.
+
+## P38 — `std.list.list_sort_int`
+
+**Prompt:** Write a Sigil program that imports `std.list`. Build the list
+`[3, 1, 4, 1, 5, 9, 2, 6]` (via nested `Cons` / `Nil` constructors). Sort with
+`list_sort_int`. Walk the sorted result and print each element on its own line via
+`int_to_string` + `perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+1
+1
+2
+3
+4
+5
+6
+9
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises the per-type sort wrapper `list_sort_int` (no comparator
+passed by user — wrapper threads `int_compare`).
+
+## P39 — `std.option.unwrap_or`
+
+**Prompt:** Write a Sigil program that imports `std.option`. Define
+`a: Option[Int] = Some(42)` and `b: Option[Int] = None`. Apply `unwrap_or(o, -1)` to
+each; print both results on separate lines via `int_to_string` + `perform IO.println`.
+Return `0`.
+
+**Oracle (stdout):**
+```
+42
+-1
+```
+
+**Oracle (exit):** `0`
+
+## P40 — `std.result` match
+
+**Prompt:** Write a Sigil program that imports `std.result` and `std.ordering`. Define
+`fn parse(s: String) -> Result[Int, String] ![]` that returns `Ok(7)` when
+`string_compare(s, "seven")` is `Equal` and `Err("unknown")` otherwise. In `main`, call
+`parse("seven")` and `parse("foo")` separately, `match` each into either
+`Ok(n) => perform IO.println(int_to_string(n))` or
+`Err(msg) => perform IO.println(msg)`. Return `0`.
+
+**Oracle (stdout):**
+```
+7
+unknown
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `Result[A, E]` from `std.result` + string equality via
+`std.ordering.string_compare` returning `Ordering`.
+
+## P41 — `std.string` ops
+
+**Prompt:** Write a Sigil program that imports `std.string`. Define
+`fn parse_or_invalid(s: String) -> String ![]` that calls `string_to_int_validate(s)`
+(returns `Int` error code: `0` = success, `1` = empty, `2` = non-decimal,
+`3` = overflow). On success (code `== 0`) returns `int_to_string(string_to_int_parse(s))`,
+otherwise returns `"invalid"`. In `main`, print `parse_or_invalid(string_concat("4",
+"2"))`, then print `"yes"` if `string_starts_with("hello, world", "hello")` and
+`"no"` otherwise. Return `0`.
+
+**Oracle (stdout):**
+```
+42
+yes
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `string_to_int_validate` (error-code Int, not Option),
+`string_to_int_parse`, `string_concat`, `string_starts_with`.
+
+## P42 — `std.char` ASCII classifier
+
+**Prompt:** Write a Sigil program that imports `std.char`. Define
+`fn classify(c: Char) -> String ![]` returning `"digit"` if `is_ascii_digit(c)` is
+`true` and `"not digit"` otherwise. In `main`, print `classify('5')` then
+`classify('a')` on separate lines. Return `0`.
+
+**Oracle (stdout):**
+```
+digit
+not digit
+```
+
+**Oracle (exit):** `0`
+
+## P43 — `std.format.format_int`
+
+**Prompt:** Write a Sigil program that imports `std.format`. Use `format_int` to render
+the template `"answer: {}"` with the integer `42`. Print the result via
+`perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+answer: 42
+```
+
+**Oracle (exit):** `0`
+
+## P44 — `std.raise.catch`
+
+**Prompt:** Write a Sigil program that imports `std.raise` and `std.result`. Define
+`fn body() -> Int ![Raise[String]]` that performs `raise("oops")`. In `main`, call
+`let r: Result[Int, String] = catch(fn () -> Int ![Raise[String]] => body())`. Match
+`r` into `Ok(_) => perform IO.println("ok")` or
+`Err(msg) => perform IO.println(msg)`, return `0`.
+
+**Oracle (stdout):**
+```
+oops
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises the canonical stdlib `catch` discharger.
+
+## P45 — `std.state.run_state`
+
+**Prompt:** Write a Sigil program that imports `std.state`. Define
+`fn body() -> Int ![State[Int]]` that performs
+`let n: Int = perform State.get(); perform State.set(n + 100); perform State.get()`. In
+`main`, call `let final_pair: (Int, Int) = run_state(7, body)`, destructure via
+`match final_pair { (returned, final_state) => ... }`, and print `returned` then
+`final_state` on separate lines via `int_to_string`. Return `0`.
+
+**Oracle (stdout):**
+```
+107
+107
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises the canonical `run_state` discharger from `std.state`
+(cell-backed encoding). Returned and final_state are both 107: the body returns the
+result of the final `State.get()` (107), and the cell holds 107 after the
+`State.set(7 + 100)`.
+
+## P46 — `std.choose.all_choices`
+
+**Prompt:** Write a Sigil program that imports `std.choose`. Define
+`fn body() -> Int ![Choose]` that performs `let n: Int = perform Choose.choose(3);
+n * 10`. In `main`, call `let results: List[Int] = all_choices(body)`. Walk the
+result list with a recursive helper and print each element on its own line via
+`int_to_string` + `perform IO.println`. Return `0`.
+
+**Oracle (stdout):**
+```
+0
+10
+20
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `all_choices` from `std.choose`. With `Choose.choose(3)`
+enumerating `0`, `1`, `2`, the list contains `[0, 10, 20]`.
+
+## P47 — `std.choose.first_choice`
+
+**Prompt:** Write a Sigil program that imports `std.choose` and `std.option`. Define
+`fn body() -> Int ![Choose]` that performs
+`let n: Int = perform Choose.choose(5); if n == 3 { n } else { perform Choose.fail() }`.
+In `main`, call `let r: Option[Int] = first_choice(body)`, `match r` into
+`Some(n) => perform IO.println(int_to_string(n))` or
+`None => perform IO.println("none")`, return `0`.
+
+**Oracle (stdout):**
+```
+3
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `first_choice` — short-circuits on the first non-failing
+branch (here, `n == 3`).
+
+## P48 — `std.array` immutable
+
+**Prompt:** Write a Sigil program that imports `std.array`. Use `array_alloc(3, 0)` to
+build an `Array[Int]` of length 3 filled with zeros. Call `array_set(arr, 1, 99)` to
+produce a NEW array with index 1 set to `99` (immutable surface — `array_set` returns
+a fresh array). Print `array_get(new_arr, 0)`, `array_get(new_arr, 1)`,
+`array_get(new_arr, 2)` on separate lines via `int_to_string`. Return `0`.
+
+**Oracle (stdout):**
+```
+0
+99
+0
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises immutable `Array[A]` — no `Mem` needed; `array_set` is
+functional.
+
+## P49 — `std.map` insert + lookup
+
+**Prompt:** Write a Sigil program that imports `std.map` and `std.option`. Build an
+empty `Map[String, Int]` via `map_string_keys()`. Insert `("alice", 1)` then
+`("bob", 2)` via `map_insert` (returns a new map). Look up `"bob"` via `map_get`.
+Match the result: `Some(n) => perform IO.println(int_to_string(n))` /
+`None => perform IO.println("missing")`, return `0`.
+
+**Oracle (stdout):**
+```
+2
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `std.map` persistent ordered map.
+
+## P50 — `std.env.env_var`
+
+**Prompt:** Write a Sigil program that imports `std.env` and `std.option`. Look up the
+environment variable `"SIGIL_TEST_VAR_THAT_SHOULD_NOT_BE_SET"` via `env_var(...)`
+(returns `Option[String]`). Match into `Some(v) => perform IO.println(v)` /
+`None => perform IO.println("unset")`, return `0`. `main`'s row is `![Env, IO]`.
+
+**Oracle (stdout):**
+```
+unset
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** The validation harness should run this prompt with the named env
+var unset; the `None` branch fires.
+
+## P51 — `std.random.run_seeded_random` deterministic
+
+**Prompt:** Write a Sigil program that imports `std.random` and `std.int64`. Construct
+the seed `int64_from_int(42)`. Inside `run_seeded_random(seed, fn () -> Int ![Random]
+=> random_int())` return the produced value as the process exit status. `main`'s row
+is `![Mem]`.
+
+**Oracle (stdout):** *(empty)*
+
+**Oracle (exit):** `170`
+
+**Oracle (notes):** Exit code is the seeded xorshift64 first draw mod 256. Verified
+deterministic across runs.
+
+## P52 — `std.clock.run_frozen_clock`
+
+**Prompt:** Write a Sigil program that imports `std.clock` and `std.int64`. Construct
+`ts: Int64 = int64_from_int(1234567890)`. Call
+`let t: Int = run_frozen_clock(ts, fn () -> Int ![Clock] => perform Clock.now())`
+(NOTE: `run_frozen_clock`'s body row is `![Clock]` only — no IO inside the lambda).
+After the call returns, `perform IO.println(int_to_string(t))`, return `0`.
+
+**Oracle (stdout):**
+```
+1234567890
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises deterministic clock for testability. `Clock.now()`
+returns `Int` (nanos since epoch as i64); `run_frozen_clock` takes an `Int64`
+timestamp.
+
+## P53 — float arithmetic
+
+**Prompt:** Write a Sigil program that imports `std.float`. Compute
+`float_add(1.5, float_mul(2.0, 1.25))`. Print via `float_to_string` +
+`perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+4.0
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Float literal + `std.float` ops. Operands chosen so the
+IEEE 754 result is exact (`1.5 + 2.0 * 1.25 = 4.0`).
+
+## P54 — `Int64` arithmetic near i64 max
+
+**Prompt:** Write a Sigil program that imports `std.int64`. Construct
+`a: Int64 = int64_from_int(9223372036854775000)` (near i64 max) and
+`b: Int64 = int64_from_int(100)`. Compute `int64_add(a, b)`. Print via
+`int64_to_string` + `perform IO.println`, return `0`.
+
+**Oracle (stdout):**
+```
+9223372036854775100
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises Int64 arithmetic via `int64_from_int` + `int64_add` +
+`int64_to_string`.
+
+## P55 — Bool operators
+
+**Prompt:** Write a Sigil program that defines `let a: Bool = true; let b: Bool =
+false; let c: Bool = (a && !b) || b;` and prints `match c { true => "true", false =>
+"false" }` via `perform IO.println`, returns `0`.
+
+**Oracle (stdout):**
+```
+true
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `&&`, `||`, `!` operators on `Bool`. `a && !b` =
+`true && true` = `true`; `true || false` = `true`.
+
+## P56 — `ArithError` discharge
+
+**Prompt:** Write a Sigil program that wraps `10 / 0` in a
+`handle ... with { ArithError.div_by_zero(k) => -1, ArithError.mod_by_zero(k) => -1 }`
+arm (BOTH ops must be covered — handler arms must exhaust the effect's declared
+operations). The handle's value should be `-1`; print via `int_to_string`, return `0`.
+
+**Oracle (stdout):**
+```
+-1
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises `ArithError` (the builtin effect for `/` and `%` on zero
+divisors). Verifies user-declared handler can discharge ArithError instead of letting
+the default shim fire.
+
+## P57 — wrap-on-overflow
+
+**Prompt:** Write a Sigil program that defines `let big: Int = 9223372036854775807;`
+(i64 max) and computes `let wrapped: Int = big + 1;`. Print `wrapped` via
+`int_to_string` + `perform IO.println`. Return `0`.
+
+**Oracle (stdout):**
+```
+-9223372036854775808
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises spec §1's wrap-on-overflow guarantee. i64 max + 1 wraps
+to i64 min.
+
+## P58 — 3-arity tuple destructure
+
+**Prompt:** Write a Sigil program that defines a tuple
+`let p: (Int, String, Bool) = (42, "hello", true);` and matches `p` into
+`(n, s, b) => ...`. Print `int_to_string(n)`, `s`, then `match b { true => "yes",
+false => "no" }` on three separate lines via `perform IO.println`. Return `0`.
+
+**Oracle (stdout):**
+```
+42
+hello
+yes
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises 3-arity tuple destructure.
+
+## P59 — nested constructor patterns
+
+**Prompt:** Write a Sigil program that declares
+`type Maybe = | Nothing | Just(Int)` and `type IList = | Nil | Cons(Maybe, IList)`.
+Build `Cons(Just(10), Cons(Nothing, Cons(Just(30), Nil)))`. Walk the list with a
+recursive `fn sum(xs: IList) -> Int ![]` whose body matches:
+
+```
+match xs {
+  Nil => 0,
+  Cons(Just(n), rest) => n + sum(rest),
+  Cons(Nothing, rest) => sum(rest),
+}
+```
+
+Print the sum (40), return `0`.
+
+**Oracle (stdout):**
+```
+40
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Exercises nested constructor patterns — `Cons(Just(n), rest)` is
+two levels deep. 10 + 30 = 40.
+
+## P60 — char literal patterns
+
+**Prompt:** Write a Sigil program that defines `fn classify(c: Char) -> String ![]`
+whose body is `match c { 'a' => "letter a", 'b' => "letter b", _ => "other" }`. In
+`main`, call `classify('b')` and print the result via `perform IO.println`, return
+`0`.
+
+**Oracle (stdout):**
+```
+letter b
+```
+
+**Oracle (exit):** `0`
+
+## P61 — `assert` builtin
+
+**Prompt:** Write a Sigil program that calls `assert(2 + 2 == 4, "math broken")` (a
+no-op when the predicate is true), then prints `"ok"` via `perform IO.println`,
+returns `0`. The `assert` builtin is available without import.
+
+**Oracle (stdout):**
+```
+ok
+```
+
+**Oracle (exit):** `0`
+
+## P62 — multi-import composition
+
+**Prompt:** Write a Sigil program with three imports on consecutive lines:
+`import std.list`, `import std.option`, `import std.string`. Build a `List[Int]`
+`[1, 2, 3]` (`Cons(1, Cons(2, Cons(3, Nil)))`), take its `length` (= 3). Then call
+`string_to_int_validate("4")` (returns `Int` error code; `0` = success). On success,
+parse with `string_to_int_parse("4")` (= 4). Print `int_to_string` of the sum
+(3 + 4 = 7), return `0`.
+
+**Oracle (stdout):**
+```
+7
+```
+
+**Oracle (exit):** `0`
+
+**Oracle (notes):** Verifies that multiple `import std.X` lines compose correctly.
