@@ -903,6 +903,15 @@ suggested fix.
 > source, install your own `handle` arm covering BOTH
 > `ArithError.div_by_zero` AND `ArithError.mod_by_zero` (E0142
 > requires exhaustive arm coverage per effect).
+>
+> **Don't try to dodge the row by rewriting `n % d` as `n - (n / d)
+> * d`** — that workaround substitutes one may-abort op (`%`) for
+> another (`/`), so the row requirement doesn't go away. Both `/`
+> and `%` carry `ArithError`; you cannot eliminate the row by
+> swapping between them. Either declare the row, or use a different
+> algorithm entirely (e.g., comparing magnitudes via subtraction
+> for parity, or recursive predecessor walks instead of integer
+> division).
 
 #### §4.3 — Match patterns
 
