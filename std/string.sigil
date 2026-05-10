@@ -72,10 +72,28 @@
 //   whitespace (` `, `\t`, `\n`, `\r`) from both sides.
 //
 // Parsing:
-// - `string_to_int_validate(s: String) -> Int ![]`  — returns 0 on
-//   success, 1 if empty, 2 if non-decimal, 3 on overflow.
-// - `string_to_int_parse(s: String) -> Int ![]`  — caller must
-//   have validated; on validated input returns the parsed integer.
+// - `string_to_int(s: String) -> Result[Int, ParseError] ![]`  —
+//   **canonical** decimal-integer parse. Returns `Ok(n)` for a
+//   valid signed decimal in `Int`'s range; `Err(Empty)` /
+//   `Err(NonDecimal)` / `Err(Overflow)` otherwise. Defined as
+//   pure-Sigil source at the bottom of this file; backed by the
+//   validate / parse builtin pair below.
+//
+//   ```sigil
+//   match string_to_int(s) {
+//     Ok(n)  => /* use n */,
+//     Err(_) => /* parse failed */,
+//   }
+//   ```
+//
+// - `string_to_int_validate(s: String) -> Int ![]`  — low-level
+//   builtin returning 0 on success, 1 if empty, 2 if non-decimal,
+//   3 on overflow. Prefer `string_to_int` unless you specifically
+//   need the integer error code (e.g., to discriminate without
+//   pattern-matching the `ParseError` sum).
+// - `string_to_int_parse(s: String) -> Int ![]`  — low-level
+//   builtin; caller must have validated (`string_to_int_validate(s)
+//   == 0`); on validated input returns the parsed integer.
 //
 // Codepoint surface (Plan C addendum — boxed `Char`):
 // - `string_chars(s: String) -> List[Char] ![]`  — eager UTF-8
@@ -90,33 +108,39 @@
 // See `std/char.sigil` for the full `Char` surface (literal
 // syntax, classifiers, case folding, conversion).
 //
-// ## Composition pattern for parsing
-//
-// User code wraps the validate / parse pair into a sum-typed
-// surface like `Result[Int, ParseError]`:
-//
-// ```sigil
-// type ParseError = | Empty | NonDecimal | Overflow
-//
-// fn parse_int(s: String) -> Result[Int, ParseError] ![] {
-//   match string_to_int_validate(s) {
-//     0 => Ok(string_to_int_parse(s)),
-//     1 => Err(Empty),
-//     2 => Err(NonDecimal),
-//     _ => Err(Overflow),
-//   }
-// }
-// ```
-//
-// (`Result` ships in `std/result.sigil`; the wrapper is left to
-// user code per the same flat-namespace concern as other byte/string
-// stdlib helpers.)
-
 // =====================================================================
-// Pure-Sigil source-level helpers (Tier 2 follow-up)
+// Pure-Sigil source-level helpers (Tier 2 follow-up + canonical parse)
 // =====================================================================
 
 import std.list
+import std.result
+
+// `ParseError` discriminates the three failure modes returned by the
+// canonical `string_to_int` wrapper. The variant tags match the
+// integer error codes returned by the underlying
+// `string_to_int_validate` builtin (1=Empty, 2=NonDecimal,
+// 3=Overflow); the sum-typed wrapper exists so callers can pattern-
+// match instead of comparing against magic numbers.
+type ParseError = | Empty | NonDecimal | Overflow
+
+// `string_to_int(s)` parses `s` as a signed decimal integer.
+// Returns `Ok(n)` on success; `Err(Empty | NonDecimal | Overflow)`
+// otherwise. Pure (`![]`) — no IO, no allocation beyond the result
+// constructor.
+//
+// Implementation: thin wrapper over the `string_to_int_validate` /
+// `string_to_int_parse` builtin pair. The validate call inspects
+// the input and returns an integer error code; only on `0` (clean
+// parse) do we call `_parse` (which is unsafe-on-invalid-input by
+// contract — see the file header).
+fn string_to_int(s: String) -> Result[Int, ParseError] ![] {
+  match string_to_int_validate(s) {
+    0 => Ok(string_to_int_parse(s)),
+    1 => Err(Empty),
+    2 => Err(NonDecimal),
+    _ => Err(Overflow),
+  }
+}
 
 // `string_split(s, sep)` returns a list of the substrings of `s`
 // separated by `sep`. Examples:

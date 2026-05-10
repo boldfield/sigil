@@ -7286,6 +7286,33 @@ fn std_string_to_int_validate_and_parse() {
     assert_eq!(stdout, "42\n1\n2\n3\n", "stderr={stderr:?}");
 }
 
+/// Canonical `string_to_int(s) -> Result[Int, ParseError]` wrapper
+/// (defined in std/string.sigil over the validate/_parse builtin
+/// pair). Round-trips Ok / Err(Empty) / Err(NonDecimal) / Err(Overflow)
+/// to verify each ParseError variant is reachable end-to-end.
+#[test]
+fn std_string_to_int_canonical_result_wrapper() {
+    let src = "import std.string\n\n\
+               fn classify(s: String) -> String ![] {\n  \
+                 match string_to_int(s) {\n    \
+                   Ok(n)           => int_to_string(n),\n    \
+                   Err(Empty)      => \"empty\",\n    \
+                   Err(NonDecimal) => \"non-decimal\",\n    \
+                   Err(Overflow)   => \"overflow\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(classify(\"42\"));\n  \
+                 perform IO.println(classify(\"\"));\n  \
+                 perform IO.println(classify(\"42abc\"));\n  \
+                 perform IO.println(classify(\"9223372036854775808\"));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_to_int_canonical");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\nempty\nnon-decimal\noverflow\n", "stderr={stderr:?}");
+}
+
 /// `string_length` is the surface name for the Plan A1
 /// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
 /// strings report byte length.
