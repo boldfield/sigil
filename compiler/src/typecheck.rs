@@ -3181,6 +3181,29 @@ impl Tc {
         ));
     }
 
+    /// Push an error and, if `name` is a known stdlib symbol the
+    /// caller likely forgot to import, attach an `import std.X` hint.
+    /// No-op (degrades to `push_error`) when the name isn't from
+    /// stdlib — typos and user-defined names yield no hint, matching
+    /// the prior diagnostic shape.
+    ///
+    /// Used by E0046 (unknown identifier), E0112 (unknown type), and
+    /// E0114 (unknown constructor) to teach which `import std.X` line
+    /// brings the missing name into scope.
+    fn push_error_with_import_hint(
+        &mut self,
+        code: &'static str,
+        span: Span,
+        msg: impl Into<String>,
+        name: &str,
+    ) {
+        let mut err = CompilerError::new(Severity::Error, errors::code(code), span, msg);
+        if let Some(hint) = crate::stdlib_index::format_import_hint(name) {
+            err = err.with_hint(hint);
+        }
+        self.errors.push(err);
+    }
+
     /// Task 78.5 G6 — shared E0137 emission for unbound row-variable
     /// names. Used by both the `TypeExpr::Fn` walk in
     /// `check_type_expr_known` (annotation position) and the
@@ -4183,12 +4206,13 @@ impl Tc {
         match t {
             TypeExpr::Named(name, _) => {
                 if self.ty_from_type_expr_here(t).is_none() {
-                    self.push_error(
+                    self.push_error_with_import_hint(
                         "E0112",
                         t.span(),
                         format!(
                             "unknown type `{name}` (expected a primitive, a type declared via `type {name} = ...`, or an in-scope generic parameter)",
                         ),
+                        name,
                     );
                 }
             }
@@ -4286,12 +4310,13 @@ impl Tc {
                         );
                     }
                 } else {
-                    self.push_error(
+                    self.push_error_with_import_hint(
                         "E0112",
                         t.span(),
                         format!(
                             "unknown type `{name}` (expected a primitive, a type declared via `type {name} = ...`, or an in-scope generic parameter)",
                         ),
+                        name,
                     );
                 }
             }
@@ -4608,12 +4633,13 @@ impl Tc {
                 for f in fields {
                     let _ = self.check_expr(&f.value, row, row_tail);
                 }
-                self.push_error(
+                self.push_error_with_import_hint(
                     "E0114",
                     span.clone(),
                     format!(
                         "unknown constructor `{name}` — no `type` declaration has this variant"
                     ),
+                    name,
                 );
                 return None;
             }
@@ -5336,10 +5362,11 @@ impl Tc {
                 if self.ctors.contains_key(name) {
                     self.resolve_ctor_unit_use(name, span)
                 } else {
-                    self.push_error(
+                    self.push_error_with_import_hint(
                         "E0046",
                         span.clone(),
                         format!("unknown identifier `{name}`"),
+                        name,
                     );
                     None
                 }
@@ -7410,10 +7437,11 @@ impl Tc {
             }
             Pattern::Ctor { name, fields, span } => {
                 let Some(info) = self.ctors.get(name).cloned() else {
-                    self.push_error(
+                    self.push_error_with_import_hint(
                         "E0114",
                         span.clone(),
                         format!("unknown constructor `{name}` in pattern"),
+                        name,
                     );
                     // Still walk sub-patterns shape-only so nested
                     // errors surface.
@@ -9311,6 +9339,123 @@ mod tests {
         assert!(e.message.contains("ghost"), "message lacks ident: {e:?}");
         // Span should point at the identifier (line 1, column > 0).
         assert!(e.span.line >= 1, "span missing: {e:?}");
+    }
+
+    /// E0046 on a stdlib symbol carries an `import std.X` hint
+    /// (stdlib_index suggestion machinery — see C12 cross-language
+    /// harness data: LLMs reach for `string_to_int` but forget the
+    /// import).
+    #[test]
+    fn unknown_ident_for_stdlib_symbol_carries_import_hint() {
+        let src = "fn main() -> Int ![IO] {\n  \
+                     let _x: Int = string_to_int_validate(\"42\");\n  \
+                     match string_to_int(\"42\") {\n    \
+                       _ => 0,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0046" && e.message.contains("string_to_int"))
+            .unwrap_or_else(|| panic!("expected E0046 for string_to_int: {errs:?}"));
+        let hint = e
+            .hint
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected import hint on E0046: {e:?}"));
+        assert!(
+            hint.contains("import std.string"),
+            "hint missing `import std.string`: {hint}"
+        );
+    }
+
+    /// E0046 on a typo (no stdlib match) emits no hint — degrading
+    /// to the prior diagnostic shape.
+    #[test]
+    fn unknown_ident_typo_emits_no_import_hint() {
+        let src = "fn main() -> Int ![] { let x: Int = ghost; 0 }\n";
+        let errs = pipeline(src);
+        let e = errs.iter().find(|e| e.code.as_str() == "E0046").unwrap();
+        assert!(
+            e.hint.is_none(),
+            "typo should produce no hint, got: {:?}",
+            e.hint
+        );
+    }
+
+    /// E0112 on a stdlib type carries an `import std.X` hint.
+    /// Reproduces the C12 sonnet failure shape (declaring a function
+    /// returning `Result[Int, ParseError]` without the imports).
+    #[test]
+    fn unknown_type_for_stdlib_type_carries_import_hint() {
+        let src = "fn parse(s: String) -> Result[Int, Int] ![] { 0 }\n\
+             fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0112" && e.message.contains("`Result`"))
+            .unwrap_or_else(|| panic!("expected E0112 for Result: {errs:?}"));
+        let hint = e
+            .hint
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected import hint on E0112: {e:?}"));
+        assert!(
+            hint.contains("import std.result"),
+            "hint missing `import std.result`: {hint}"
+        );
+    }
+
+    /// E0114 on a stdlib constructor carries an `import std.X` hint.
+    /// Triggers the constructor-in-pattern path (C20-shape failures
+    /// referenced `Some` / `None` without `import std.option`).
+    #[test]
+    fn unknown_ctor_for_stdlib_ctor_carries_import_hint() {
+        // Use `Some(_)` in a match pattern. The scrutinee here is
+        // `Int` so the pattern itself is type-ill, but E0114 fires
+        // first because the constructor lookup happens before the
+        // pattern-shape check.
+        let src = "fn main() -> Int ![] {\n  \
+                     match 0 {\n    \
+                       Some(_) => 0,\n    \
+                       _       => 0,\n  \
+                     }\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0114" && e.message.contains("`Some`"))
+            .unwrap_or_else(|| panic!("expected E0114 for Some: {errs:?}"));
+        let hint = e
+            .hint
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected import hint on E0114: {e:?}"));
+        assert!(
+            hint.contains("import std.option"),
+            "hint missing `import std.option`: {hint}"
+        );
+    }
+
+    /// Multi-module hint lists every declaring stdlib module (`map`
+    /// is in `std.list`, `std.option`, `std.result`). The user picks
+    /// the right one from context — typechecker can't disambiguate
+    /// from name alone.
+    #[test]
+    fn unknown_ident_multi_module_lists_all_candidates() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let f: Int = map;\n  \
+                     f\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0046" && e.message.contains("`map`"))
+            .unwrap_or_else(|| panic!("expected E0046 for map: {errs:?}"));
+        let hint = e
+            .hint
+            .as_deref()
+            .unwrap_or_else(|| panic!("expected hint: {e:?}"));
+        assert!(hint.contains("std.list"), "hint missing list: {hint}");
+        assert!(hint.contains("std.option"), "hint missing option: {hint}");
+        assert!(hint.contains("std.result"), "hint missing result: {hint}");
     }
 
     #[test]

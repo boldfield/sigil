@@ -1479,11 +1479,20 @@ Imports are flat — every public item from each imported module
 becomes available in the importing file's scope. There is no
 re-export, alias, or namespace qualification in v1.
 
-The `std.io` / `std.array` / `std.mut_array` / `std.byte_array` /
-`std.mut_byte_array` / `std.mem` / `std.string` / `std.int64` /
-`std.string_builder` modules are **documentation-only**; their
-types and operations are registered as compiler builtins. Importing
-them is allowed (a no-op at the resolver) for documentary clarity.
+The `std.io` / `std.mem` / `std.int64` / `std.string_builder` /
+`std.char` / `std.panic` modules are **documentation-only**; their
+types and operations are registered as compiler builtins.
+Importing them is allowed (a no-op at the resolver) for
+documentary clarity.
+
+All other `std.*` modules ship real source. **Their declarations
+require an explicit `import std.<module>`** to be in scope —
+including `Option`, `Result`, `List`, sum-type constructors like
+`Ok` / `Err` / `Some` / `None` / `Cons` / `Nil`, and any
+pure-Sigil canonical wrapper (`string_to_int`, `string_to_float`,
+`string_from_bytes`, `array_get_opt`, etc.). When an unknown name
+is rejected with `E0046` / `E0112` / `E0114`, the diagnostic
+attaches an `import std.X` hint pointing at the missing module.
 
 ### §11 — Diagnostics
 
