@@ -1851,6 +1851,33 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             Item::Effect(_) => {}
         }
     }
+    // E0150 gate — Array / MutArray builtins reject Bool / Char /
+    // Byte element types because the v1 runtime treats every slot as
+    // i64. Without this typecheck-time check, the call slips through
+    // to Cranelift's verifier and surfaces as "arg has type i8,
+    // expected i64" — a useless diagnostic for the user. The gate
+    // catches the construction sites; once construction is rejected,
+    // accessor sites (get / set / length) on the bad-element-type
+    // arrays are unreachable.
+    const E0150_GATED_BUILTINS: &[&str] = &[
+        "array_alloc",
+        "array_empty",
+        "array_get",
+        "array_set",
+        "array_length",
+        "mut_array_new",
+        "mut_array_get",
+        "mut_array_set",
+        "mut_array_length",
+    ];
+    fn e0150_disallowed_element_kind(t: &Ty) -> Option<&'static str> {
+        match t {
+            Ty::Bool => Some("Bool"),
+            Ty::Char => Some("Char"),
+            Ty::Byte => Some("Byte"),
+            _ => None,
+        }
+    }
     let pending_calls = std::mem::take(&mut tc.pending_call_instantiations);
     let mut resolved_calls: BTreeMap<Span, GenericInstantiation> = BTreeMap::new();
     for (span, name, var_ids) in pending_calls {
@@ -1874,6 +1901,35 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 }
             }
             type_args.push(resolved);
+        }
+        // E0150 gate: if the call is to one of the array/mut-array
+        // builtins and the inferred element type is a narrow scalar,
+        // emit the dedicated diagnostic before the call slips into
+        // codegen.
+        if E0150_GATED_BUILTINS.contains(&name.as_str()) {
+            for ta in &type_args {
+                if let Some(kind) = e0150_disallowed_element_kind(ta) {
+                    let container = if name.starts_with("mut_array") {
+                        "MutArray"
+                    } else {
+                        "Array"
+                    };
+                    tc.push_error(
+                        "E0150",
+                        span.clone(),
+                        format!(
+                            "`{container}[A]` element type `{kind}` is not supported in v1 \
+                             (the runtime element slot is i64; narrow scalars don't fit \
+                             without per-call type-arg threading at codegen — see v2). \
+                             For Bool: use `{container}[Int]` with 0/1 sentinels. \
+                             For Byte: use `ByteArray` / `MutByteArray` (the flat-byte \
+                             primitives). For Char: use `{container}[Int]` of codepoints \
+                             or `String` / `List[Char]`."
+                        ),
+                    );
+                    break;
+                }
+            }
         }
         resolved_calls.insert(span, GenericInstantiation { name, type_args });
     }
@@ -14955,6 +15011,100 @@ mod tests {
                    }\n";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+    }
+
+    /// E0150 — `Array[A]` / `MutArray[A]` reject narrow-scalar element
+    /// types (`Bool`, `Char`, `Byte`) at typecheck time. Without this
+    /// gate, the call slips into codegen and surfaces as a Cranelift
+    /// verifier ICE (`arg has type i8, expected i64`). Pin all three
+    /// disallowed scalars across both Array and MutArray, plus
+    /// confirm `array_alloc[Int]` / `Array[String]` / a user-sum
+    /// element type still pass.
+    #[test]
+    fn array_alloc_with_bool_element_fires_e0150() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: Array[Bool] = array_alloc(3, false);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
+        let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
+        assert!(e.message.contains("Bool"), "message lacks Bool: {e:?}");
+        assert!(
+            e.message.contains("0/1 sentinels"),
+            "message lacks workaround: {e:?}"
+        );
+    }
+
+    #[test]
+    fn array_alloc_with_byte_element_fires_e0150() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: Array[Byte] = array_alloc(3, byte_truncate(0));\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
+        let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
+        assert!(e.message.contains("Byte"), "message lacks Byte: {e:?}");
+        assert!(
+            e.message.contains("ByteArray"),
+            "message lacks ByteArray pointer: {e:?}"
+        );
+    }
+
+    #[test]
+    fn array_alloc_with_char_element_fires_e0150() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: Array[Char] = array_alloc(3, 'x');\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
+    }
+
+    #[test]
+    fn mut_array_new_with_bool_element_fires_e0150() {
+        let src = "fn main() -> Int ![Mem] {\n  \
+                     let xs: MutArray[Bool] = mut_array_new(3, false);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
+        let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
+        assert!(
+            e.message.contains("MutArray"),
+            "message names container: {e:?}"
+        );
+    }
+
+    #[test]
+    fn array_alloc_with_string_element_typechecks_cleanly() {
+        // String elements are a normal supported case — no E0150.
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: Array[String] = array_alloc(3, \"x\");\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0150"),
+            "E0150 should NOT fire for String elements: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn array_alloc_with_user_sum_element_typechecks_cleanly() {
+        // User-defined sum types are pointer-shaped (TAG_USER) and
+        // fit the i64 element slot — no E0150.
+        let src = "type Color = | Red | Blue\n\n\
+                   fn main() -> Int ![] {\n  \
+                     let xs: Array[Color] = array_alloc(3, Red);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0150"),
+            "E0150 should NOT fire for user-sum elements: {errs:?}"
+        );
     }
 
     #[test]
