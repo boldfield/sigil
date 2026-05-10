@@ -923,7 +923,7 @@ match's overall type is that unified arm-body type.
 
 ```sigil
 effect Raise[E] {
-  fail: (E) -> Int,
+  fail[A]: (E) -> A,
 }
 
 effect State[S] resumes: many {
@@ -946,6 +946,54 @@ The optional `resumes: many` annotation marks a multi-shot effect
 activation). Default is single-shot.
 
 In v1 only the builtin `Mem` effect has zero ops (it's a marker).
+
+##### Generic effect declarations
+
+Effects may take type parameters bound at the effect-decl level. The
+parameter binds across every op signature in the effect:
+
+```sigil
+effect Raise[E] {
+  fail[A]: (E) -> A,
+}
+```
+
+Here `E` is the effect-decl parameter — the error type — and is
+substituted at the row site (`![Raise[String]]`, `![Raise[ParseError]]`,
+etc.). Row-arity mismatches at the row site fire **E0143**
+("Row-argument arity mismatch").
+
+The canonical example is `std/raise.sigil`. The full file shape:
+
+```sigil
+effect Raise[E] {
+  fail[A]: (E) -> A,
+}
+
+fn raise[A, E](e: E) -> A ![Raise[E]] {
+  perform Raise.fail(e)
+}
+```
+
+##### Per-op generic parameters
+
+An op may carry its own generic parameters in `op_name[…]: …` form.
+These are bound at the op's scheme and instantiated **fresh at each
+perform site** — the canonical "never returns" idiom:
+
+```sigil
+fail[A]: (E) -> A,
+```
+
+`A` here is unconstrained; it unifies with the surrounding context's
+expected type at each `perform Raise.fail(...)` call. At runtime the
+discharging handler arm discards the continuation, so `fail` never
+returns — the per-op `A` is a typing convenience that lets the perform
+site appear in any return-type position.
+
+Per-op generic parameters must not shadow the enclosing effect-decl's
+parameters; doing so fires **E0144** ("Per-op generic param shadows
+effect-decl param").
 
 ##### Reserved effect names
 
@@ -1069,6 +1117,44 @@ This shape generalizes to any `resumes: many` effect. `std.choose`'s
 `all_choices` (see §13) is layered on top of this primitive — when
 the bodies passed to `all_choices` contain side effects, the
 per-resume IO ordering specified here is what the caller observes.
+
+##### Row-polymorphic handlers
+
+A discharging handler may be **row-polymorphic** in the body's
+residual effects — the handler discharges the named effect and
+forwards everything else through to its caller's row. The canonical
+example is `std/raise.sigil`'s `catch`:
+
+```sigil
+fn catch[A, E](
+  body: () -> A ![Raise[E] | e]
+) -> Result[A, E] ![| e] {
+  handle body() with {
+    return(v) => Ok(v),
+    Raise.fail(err, k) => Err(err),
+  }
+}
+```
+
+The signature reads:
+
+- `e` is a **row variable**, bound at `catch`'s generic-param list
+  alongside `A` and `E`. It stands for "whatever other effects the
+  body performs."
+- `body`'s row `![Raise[E] | e]` says "Raise[E], plus the effects
+  named by `e`." The pipe (`|`) separates the named effect(s) from
+  the row-tail variable.
+- The `handle` discharges `Raise[E]`. The result row `![| e]` shows
+  Raise[E] gone; only `e` remains.
+- This lets `catch` be called from any context: pure (`e := []`),
+  IO-doing (`e := [IO]`), state-threading (`e := [State[Int]]`), or
+  any combination — the row-tail unification picks up whatever
+  effects the body declared.
+
+Row-variable names that appear in a function's signature must be
+bound by that function's generic-param list. An unbound row variable
+fires **E0137** ("Unbound row variable") with a fix-suggestion
+pointing at the missing generic-param declaration.
 
 **Eligible body shapes for v1.** The compiler classifies the helper
 fn's body into one of several supported Cps-ABI shapes that
