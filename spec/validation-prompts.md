@@ -566,7 +566,9 @@ boom
 
 **Oracle (notes):** Exercises row-polymorphic fn parameters (Plan D Task 116). The `e`
 in `![Raise[String] | e]` is a row variable (bound implicitly by the `| e` tail) that
-lets `catch` accept bodies with any residual effect row.
+lets `catch` accept bodies with any residual effect row. Companion to P44 — P25 tests
+the row-polymorphic `| e` tail mechanism; P44 tests the canonical discharger pattern
+without row-tail variation.
 
 ## P26 — conditional k-call
 
@@ -927,7 +929,9 @@ oops
 
 **Oracle (exit):** `0`
 
-**Oracle (notes):** Exercises the canonical stdlib `catch` discharger.
+**Oracle (notes):** Exercises the canonical stdlib `catch` discharger. Companion to
+P25 — P44 tests the discharger as documented in §13 (no `| e` row-tail variation);
+P25 tests the row-polymorphic `| e` tail surface.
 
 ## P45 — `std.state.run_state`
 
@@ -1056,7 +1060,9 @@ is `![Mem]`.
 **Oracle (exit):** `170`
 
 **Oracle (notes):** Exit code is the seeded xorshift64 first draw mod 256. Verified
-deterministic across runs.
+deterministic across runs. Oracle is coupled to the xorshift64 variant + seeding
+strategy documented in `std/random.sigil`; if either changes, this prompt's oracle
+must be re-pinned.
 
 ## P52 — `std.clock.run_frozen_clock`
 

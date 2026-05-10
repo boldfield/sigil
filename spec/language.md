@@ -560,7 +560,9 @@ identifiers.
 
 **Literals.**
 - Integer: decimal `42`, `-7`, `0`. No hex/oct/bin literals in v1.
-  Range: `[-2^62, 2^62)` (63-bit tagged Int).
+  Range: `[-2^63, 2^63)` (signed 64-bit). Literals outside this
+  range fire E0050; arithmetic overflow wraps modulo 2^64 (see §1
+  "Wrap-on-overflow").
 - String: `"..."` with escapes `\\`, `\"`, `\n`, `\t`, `\r`.
 - Char: `'a'`, `'\n'`, `'\u{1F600}'`. Heap-boxed (`TAG_CHAR=0x0C`,
   16 bytes per allocation) Unicode scalar value in
@@ -632,7 +634,7 @@ without a top-level handler frame is rejected at typecheck (E0041).
 
 | Type | Description |
 |------|-------------|
-| `Int` | 63-bit signed integer. |
+| `Int` | Signed 64-bit integer. |
 | `Bool` | `true` / `false`. |
 | `String` | Immutable UTF-8 byte sequence. |
 | `Char` | Boxed Unicode codepoint (`TAG_CHAR=0x0C`, 21-bit codepoint payload). |
@@ -1400,8 +1402,9 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
 
 - **Memory:** Boehm conservative GC. Every heap object begins with
   an 8-byte header `(tag, count, bitmap, reserved)`.
-- **Tagged values:** `Int` is 63-bit at FFI boundaries (one bit
-  reserved for the heap-vs-immediate tag); `Int64` and `Float` are heap-boxed.
+- **Tagged values:** `Int` is signed 64-bit (full i64) and travels
+  through the runtime ABI as a 64-bit register value. `Int64` and
+  `Float` are heap-boxed.
 - **Effects:** dispatched through a CPS trampoline
   (`sigil_run_loop`); each `perform` returns a `NextStep` packet
   that the trampoline routes to the matching arm fn or the
