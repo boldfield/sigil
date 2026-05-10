@@ -5456,6 +5456,33 @@ impl Tc {
                                 .collect();
                             modules.sort();
                             modules.dedup();
+                            // 2026-05-10 cross-language harness data: when
+                            // a user fn collides with a stdlib export
+                            // (e.g. user `fn int_compare` vs
+                            // `std.ordering.int_compare`), the LLM-natural
+                            // recovery is "use the stdlib version" — but
+                            // the original E0147 message only suggested
+                            // renaming the user fn. Detect the user-vs-
+                            // stdlib collision shape and surface a more
+                            // actionable hint pointing at the stdlib
+                            // already-exists path.
+                            let stdlib_origins: Vec<String> = origins
+                                .iter()
+                                .filter(|p| self.stdlib_files.contains(*p))
+                                .map(|p| __module_label_from_file(p))
+                                .collect();
+                            let has_user_origin =
+                                origins.iter().any(|p| !self.stdlib_files.contains(p));
+                            let stdlib_hint = if !stdlib_origins.is_empty() && has_user_origin {
+                                format!(
+                                    " Note: `{}` already exports `{name}`; if your \
+                                     declaration duplicates that surface, remove it and \
+                                     call the stdlib version directly.",
+                                    stdlib_origins.join(", ")
+                                )
+                            } else {
+                                String::new()
+                            };
                             self.push_error(
                                 "E0147",
                                 span.clone(),
@@ -5464,7 +5491,7 @@ impl Tc {
                                      Multiple imported modules export `{name}`; \
                                      remove all but one of these imports, or rename \
                                      the user fn to avoid the collision (qualified-call \
-                                     syntax `module.fn(...)` is a future v2 surface).",
+                                     syntax `module.fn(...)` is a future v2 surface).{stdlib_hint}",
                                     modules.join(", ")
                                 ),
                             );
@@ -16850,6 +16877,67 @@ mod tests {
         assert!(
             has_code(&errs, "E0147"),
             "expected E0147 on ambiguous bare `map`; got {errs:?}"
+        );
+    }
+
+    /// E0147 stdlib-shadow extension (2026-05-10 harness-data fix):
+    /// when a user fn collides with a stdlib export, the diagnostic
+    /// appends a hint pointing at the stdlib version. Without this,
+    /// the LLM's natural retry path ("rename my fn") is harder to
+    /// arrive at — the cross-language harness showed sonnet
+    /// repeatedly defining `fn int_compare` because std.ordering
+    /// already exports one and the original E0147 message didn't
+    /// surface that.
+    #[test]
+    fn bare_name_user_vs_stdlib_collision_includes_stdlib_hint() {
+        // User redeclares `int_compare` (already exported by
+        // std.ordering). Trips E0147 with the new stdlib-side hint.
+        let src = "import std.list\n\
+                   import std.ordering\n\
+                   fn int_compare(a: Int, b: Int) -> Ordering ![] {\n  \
+                     if a < b { Less } else { if a > b { Greater } else { Equal } }\n\
+                   }\n\n\
+                   fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = Cons(2, Cons(1, Nil));\n  \
+                     let _ys: List[Int] = list_sort(xs, int_compare);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0147")
+            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
+        assert!(
+            e.message.contains("std.ordering"),
+            "stdlib origin should appear in message: {e:?}"
+        );
+        assert!(
+            e.message.contains("call the stdlib version directly"),
+            "stdlib-shadow hint missing: {e:?}"
+        );
+    }
+
+    /// Cross-stdlib collision (no user fn) does NOT get the
+    /// stdlib-shadow hint. The hint is specifically for user-fn-vs-
+    /// stdlib-fn collisions; cross-stdlib (`std.list::map` vs
+    /// `std.option::map`) needs a different fix (drop one import).
+    #[test]
+    fn bare_name_cross_stdlib_collision_no_stdlib_hint() {
+        let src = "import std.list\n\
+                   import std.option\n\
+                   fn main() -> Int ![] {\n  \
+                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
+                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0147")
+            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
+        assert!(
+            !e.message.contains("call the stdlib version directly"),
+            "stdlib-shadow hint should NOT fire on cross-stdlib collision: {e:?}"
         );
     }
 

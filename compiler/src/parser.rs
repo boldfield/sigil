@@ -1121,6 +1121,39 @@ impl<'a> Parser<'a> {
                 if !self.no_record_lits && matches!(self.peek().kind, TokenKind::LBrace) {
                     return self.parse_record_lit(name, name_span);
                 }
+                // E0151 — `IDENT.IDENT` in expression position. Sigil
+                // v1 has no field-access operator by design (per the
+                // 2026-05-10 cross-language harness data: LLMs trained
+                // on Rust/Go/Python reflexively write `e.field`, hit
+                // generic E0010 "expected `)`", and don't recover on
+                // retry). Records are read by pattern-match destructure
+                // only. Catch the natural-but-wrong shape here and
+                // surface a teaching diagnostic instead of letting the
+                // parser-error recovery emit the misleading "expected
+                // `)`" one stack frame up.
+                //
+                // This branch deliberately does not consume the `Dot`
+                // — the parser stays at a known-bad token so the outer
+                // recovery can resume from the caller's expected
+                // boundary (most commonly a `,` or `)` in a call's arg
+                // list). Returning the parsed `Ident` keeps the
+                // partial-AST shape for downstream diagnostics; the
+                // caller may emit additional errors (which is fine —
+                // E0151 lands first and points at the actual mistake).
+                if matches!(self.peek().kind, TokenKind::Dot) {
+                    let dot_span = self.peek().span.clone();
+                    self.errors.push(CompilerError::new(
+                        Severity::Error,
+                        errors::code("E0151"),
+                        dot_span,
+                        format!(
+                            "Sigil v1 has no field-access operator (`.field`); records \
+                             are read by pattern-match destructure. Replace `{name}.field` \
+                             with `match {name} {{ TypeName {{ field, .. }} => field }}`, \
+                             or define a small accessor fn over the same destructure"
+                        ),
+                    ));
+                }
                 Some(Expr::Ident(name, name_span))
             }
             TokenKind::Perform => self.parse_perform_expr().map(Expr::Perform),
@@ -2384,6 +2417,65 @@ mod tests {
         // `fn () -> Int ![] =>` — no body after `=>`.
         let errs = parse_errs("fn main() -> Int ![] { fn () -> Int ![] => }\n");
         assert!(!errs.is_empty(), "missing lambda body should parse-error");
+    }
+
+    /// E0151 — `.field` access in expression position. Sigil v1 has
+    /// no field-access operator; the natural-but-wrong shape that
+    /// LLMs trained on Rust/Go/Python reach for (`e.score`) hits
+    /// this. The diagnostic teaches the destructure pattern; without
+    /// it, the user sees a misleading generic E0010 ("expected `)`")
+    /// from the parser-recovery one stack frame up.
+    #[test]
+    fn ident_dot_ident_fires_e0151() {
+        let errs = parse_errs(
+            "fn main() -> Int ![IO] {\n  \
+                 let x: Int = e.score;\n  \
+                 0\n\
+               }\n",
+        );
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0151"),
+            "expected E0151 for `e.score`, got: {errs:?}"
+        );
+        let e = errs.iter().find(|e| e.code.as_str() == "E0151").unwrap();
+        assert!(
+            e.message.contains("pattern-match destructure"),
+            "diagnostic should teach the destructure pattern: {e:?}"
+        );
+    }
+
+    /// `import std.list` — module-path dots in imports MUST NOT fire
+    /// E0151. Imports are parsed by `parse_import` (separate path),
+    /// so this is a sanity check that the parse_primary E0151 doesn't
+    /// leak into import handling.
+    #[test]
+    fn import_dot_does_not_fire_e0151() {
+        let errs = parse_errs(
+            "import std.list\n\n\
+               fn main() -> Int ![] { 0 }\n",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0151"),
+            "import dot should not fire E0151: {errs:?}"
+        );
+    }
+
+    /// `perform IO.println(...)` — effect-op syntax uses a dot
+    /// between the effect name and the operation. This goes through
+    /// `parse_perform_expr`, NOT `parse_primary`'s Ident arm, so
+    /// E0151 must not fire.
+    #[test]
+    fn perform_effect_dot_does_not_fire_e0151() {
+        let errs = parse_errs(
+            "fn main() -> Int ![IO] {\n  \
+                 perform IO.println(\"hi\");\n  \
+                 0\n\
+               }\n",
+        );
+        assert!(
+            !errs.iter().any(|e| e.code.as_str() == "E0151"),
+            "effect-op dot should not fire E0151: {errs:?}"
+        );
     }
 
     // ===== Plan A3 Task 37 — Stage 4 grammar ============================

@@ -1152,6 +1152,45 @@ pub const CATALOG: &[ErrorEntry] = &[
                       let buf: MutByteArray = mut_byte_array_new(5, byte_truncate(0));",
     },
     ErrorEntry {
+        code: "E0151",
+        short: "no field-access operator (`.field`) in v1 — use pattern-match destructure",
+        long: "Sigil v1 does not provide a field-access operator. Records \
+               are read by pattern-match destructure only. The expression \
+               `e.field` triggers this diagnostic; the underlying parser \
+               recovery would otherwise emit a generic `expected ')'` (or \
+               similar) one stack frame up, which doesn't help the user \
+               find the actual problem.\n\n\
+               This is a deliberate v1 design decision (see the \
+               2026-05-10 cross-language harness data: LLMs trained on \
+               Rust/Go/Python reflexively write `e.field` and the \
+               generic-recovery error confused them on retry; this \
+               diagnostic is the structural fix).\n\n\
+               To read a record field:\n\
+               - Pattern-match destructure: `match e { TypeName { field, .. } => field }`.\n\
+               - Define a small accessor fn over the same destructure: \
+                 `fn entry_score(e: Entry) -> Int ![] { match e { Entry { score, .. } => score } }`.\n\n\
+               The accessor-fn pattern is the typical idiom in stdlib \
+               (e.g. `std.pair`'s `fst` / `snd`); user-defined record \
+               types follow the same shape.\n\n\
+               Module-qualified call syntax (`module.fn(arg)`) also uses \
+               `.` between an identifier and another identifier; that \
+               surface is reserved for v2 (per E0147's long form). In v1, \
+               imported stdlib functions are referenced by bare name.",
+        fix_example: "// Wrong:\n\
+                      // fn print_score(e: Entry) -> Int ![IO] {\n\
+                      //   perform IO.println(int_to_string(e.score));\n\
+                      //   0\n\
+                      // }\n\n\
+                      // Right — define an accessor fn:\n\
+                      fn entry_score(e: Entry) -> Int ![] {\n  \
+                        match e { Entry { score, .. } => score }\n\
+                      }\n\
+                      fn print_score(e: Entry) -> Int ![IO] {\n  \
+                        perform IO.println(int_to_string(entry_score(e)));\n  \
+                        0\n\
+                      }",
+    },
+    ErrorEntry {
         code: "E0220",
         short: "one-shot continuation used more than once on a code path",
         long: "Plan B task 54: in a handler arm for a one-shot effect, \
