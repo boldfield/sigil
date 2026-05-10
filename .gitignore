@@ -1,7 +1,6 @@
 /target/
 **/*.rs.bk
 .DS_Store
-comp/
 __pycache__/
 *.pyc
 
@@ -9,3 +8,14 @@ __pycache__/
 # spec/validation-log.md is the checked-in artifact; per-run traces
 # are local-only).
 spec/validation-results-*.jsonl
+
+# Cross-language comparison harness — per-run JSONL traces are
+# local-only; the markdown report at comp/log/comparison-log.md is
+# the checked-in summary.
+comp/log/comparison-results-*.jsonl
+
+# Cross-language harness — agent-driven run artifacts (the markdown
+# report at comp/log/comparison-log.md is the checked-in summary).
+comp/log/agent-inputs/
+comp/log/agent-outputs*.json
+comp/log/agent-results*.json
