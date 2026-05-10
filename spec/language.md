@@ -964,8 +964,8 @@ effect Raise[E] {
 
 Here `E` is the effect-decl parameter — the error type — and is
 substituted at the row site (`![Raise[String]]`, `![Raise[ParseError]]`,
-etc.). Row-arity mismatches at the row site fire **E0143**
-("Row-argument arity mismatch").
+etc.). Row-arity mismatches at the row site fire **E0143** (see
+§11).
 
 The canonical example is `std/raise.sigil`. The full file shape:
 
@@ -996,8 +996,7 @@ returns — the per-op `A` is a typing convenience that lets the perform
 site appear in any return-type position.
 
 Per-op generic parameters must not shadow the enclosing effect-decl's
-parameters; doing so fires **E0144** ("Per-op generic param shadows
-effect-decl param").
+parameters; doing so fires **E0144** (see §11).
 
 ##### Reserved effect names
 
@@ -1148,9 +1147,10 @@ fn catch[A, E](
 
 The signature reads:
 
-- `e` is a **row variable**, bound at `catch`'s generic-param list
-  alongside `A` and `E`. It stands for "whatever other effects the
-  body performs."
+- `e` is a **row variable**, introduced by the `| e` tail in the
+  effect row — it is not listed in the `[A, E]` generic-param
+  brackets. It stands for "whatever other effects the body
+  performs."
 - `body`'s row `![Raise[E] | e]` says "Raise[E], plus the effects
   named by `e`." The pipe (`|`) separates the named effect(s) from
   the row-tail variable.
@@ -1161,10 +1161,12 @@ The signature reads:
   any combination — the row-tail unification picks up whatever
   effects the body declared.
 
-Row-variable names that appear in a function's signature must be
-bound by that function's generic-param list. An unbound row variable
-fires **E0137** ("Unbound row variable") with a fix-suggestion
-pointing at the missing generic-param declaration.
+A row variable referenced anywhere in a function's signature
+(`![Effect | e]`, `![| e]`, or in a fn-typed parameter's row) must
+be introduced by the same `| <name>` tail somewhere in that
+function's signature. An unreferenced row variable is rejected at
+typecheck with a fix-suggestion pointing at the missing
+declaration.
 
 **Eligible body shapes for v1.** The compiler classifies the helper
 fn's body into one of several supported Cps-ABI shapes that
@@ -1273,11 +1275,10 @@ Continuations cannot be invoked after their handler frame exits.
 Returning `k` from an arm body, storing it in a persistent data
 structure that outlives the `handle`, or otherwise letting the
 continuation reference escape the dynamic extent of its handler
-fires **E0145** ("Continuation escape barrier — k cannot leave
-handler frame").
+fires **E0145** (see §11).
 
-The escape barrier is enforced statically by the codegen color
-pass; the diagnostic points at the escape site (the `return`,
+The escape barrier is enforced statically by the typecheck pass;
+the diagnostic points at the escape site (the `return`,
 field-store, or `let` outside the handler) and references the
 handler's `handle` keyword as the lifetime boundary.
 
