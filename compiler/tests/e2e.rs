@@ -16267,7 +16267,8 @@ fn multi_shot_choose_pair_enumeration_match_as_stmt() {
                  };\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "multi_shot_choose_pair_enumeration_match_as_stmt");
+    let (stdout, stderr, code) =
+        compile_and_run(src, "multi_shot_choose_pair_enumeration_match_as_stmt");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "16\n25\n34\n43\n52\n61\n",

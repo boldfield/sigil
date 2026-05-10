@@ -9213,8 +9213,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // position FIRST so subsequent perform-stmt normalization
             // (recursive) walks the new arm blocks and converts the
             // arm-internal Stmt::Perform → Stmt::Let.
-            let lifted_branched =
-                lift_trailing_branched_stmt_to_tail(&f.body);
+            let lifted_branched = lift_trailing_branched_stmt_to_tail(&f.body);
             let body_after_lift = lifted_branched.as_ref().unwrap_or(&f.body);
             let perform_norm = rewrite_perform_stmts_as_lets(body_after_lift, &checked.effects);
             let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
@@ -9420,13 +9419,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // rewrite as the ABI selection above; both passes
                     // must see identical body shapes for the classifier
                     // and emit to materialize the same chain.
-                    let lifted_branched =
-                        lift_trailing_branched_stmt_to_tail(&f.body);
+                    let lifted_branched = lift_trailing_branched_stmt_to_tail(&f.body);
                     let body_after_lift = lifted_branched.as_ref().unwrap_or(&f.body);
                     let perform_norm =
                         rewrite_perform_stmts_as_lets(body_after_lift, &checked.effects);
-                    let body_after_perform_norm =
-                        perform_norm.as_ref().unwrap_or(body_after_lift);
+                    let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
                     let chain_normalized =
                         normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
                     let chain_body = chain_normalized.as_ref().unwrap_or(body_after_perform_norm);
@@ -10927,14 +10924,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // factor * factor)` triggers the elaborator's BinOp
                 // hoisting; pre-this-fix, codegen panicked at the
                 // unreachable arm a few lines below.
-                let lifted_branched_emit =
-                    lift_trailing_branched_stmt_to_tail(&f.body);
+                let lifted_branched_emit = lift_trailing_branched_stmt_to_tail(&f.body);
                 let body_after_lift_emit = lifted_branched_emit.as_ref().unwrap_or(&f.body);
                 let perform_norm_emit =
                     rewrite_perform_stmts_as_lets(body_after_lift_emit, &checked.effects);
-                let body_after_perform_norm_emit = perform_norm_emit
-                    .as_ref()
-                    .unwrap_or(body_after_lift_emit);
+                let body_after_perform_norm_emit =
+                    perform_norm_emit.as_ref().unwrap_or(body_after_lift_emit);
                 let chain_normalized_emit =
                     normalize_tail_perform_body(body_after_perform_norm_emit, &f.return_type);
                 let body_for_emit = chain_normalized_emit
@@ -27640,8 +27635,7 @@ fn prepare_per_fn_refs(
 fn normalize_tail_perform_body(
     body: &crate::ast::Block,
     return_type: &crate::ast::TypeExpr,
-)
-    -> Option<crate::ast::Block> {
+) -> Option<crate::ast::Block> {
     use crate::ast::{Expr, LetStmt, Stmt};
     if body.stmts.is_empty() {
         return None;
@@ -27816,7 +27810,11 @@ fn lift_trailing_branched_stmt_to_tail(body: &crate::ast::Block) -> Option<crate
     };
 
     let new_branched = match branched {
-        Expr::Match { scrutinee, arms, span } => {
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => {
             let new_arms: Vec<MatchArm> = arms
                 .iter()
                 .map(|a| MatchArm {
@@ -27831,10 +27829,20 @@ fn lift_trailing_branched_stmt_to_tail(body: &crate::ast::Block) -> Option<crate
                 span: span.clone(),
             }
         }
-        Expr::If { cond, then_block, else_block, span } => {
-            let then_tail = then_block.tail.as_ref().cloned().unwrap_or_else(|| {
-                Expr::Tuple { elems: Vec::new(), span: then_block.span.clone() }
-            });
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            span,
+        } => {
+            let then_tail = then_block
+                .tail
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Expr::Tuple {
+                    elems: Vec::new(),
+                    span: then_block.span.clone(),
+                });
             let new_then = Block {
                 stmts: {
                     let mut s = then_block.stmts.clone();
@@ -27844,9 +27852,14 @@ fn lift_trailing_branched_stmt_to_tail(body: &crate::ast::Block) -> Option<crate
                 tail: Some(tail.clone()),
                 span: then_block.span.clone(),
             };
-            let else_tail = else_block.tail.as_ref().cloned().unwrap_or_else(|| {
-                Expr::Tuple { elems: Vec::new(), span: else_block.span.clone() }
-            });
+            let else_tail = else_block
+                .tail
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| Expr::Tuple {
+                    elems: Vec::new(),
+                    span: else_block.span.clone(),
+                });
             let new_else = Block {
                 stmts: {
                     let mut s = else_block.stmts.clone();
