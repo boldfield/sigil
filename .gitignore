@@ -4,3 +4,8 @@
 comp/
 __pycache__/
 *.pyc
+
+# Validation harness per-run JSONL traces (the markdown report at
+# spec/validation-log.md is the checked-in artifact; per-run traces
+# are local-only).
+spec/validation-results-*.jsonl
