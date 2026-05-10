@@ -210,7 +210,7 @@ invalid
 
 **Oracle (exit):** `0`
 
-**Notes:** Stresses error handling at a parsing boundary. Python's `int("42abc")` raises `ValueError` — uncaught crashes with non-zero exit. Go's `strconv.Atoi("42abc")` returns `(int, error)`; if the error is ignored, the int is 0 and the program prints `0` (silently wrong). Sigil's `string_to_int_validate("42abc")` returns a non-zero error code (per spec §13's `std.string` notes) — the typechecker forces an explicit branch.
+**Notes:** Stresses error handling at a parsing boundary. Python's `int("42abc")` raises `ValueError` — uncaught crashes with non-zero exit. Go's `strconv.Atoi("42abc")` returns `(int, error)`; if the error is ignored, the int is 0 and the program prints `0` (silently wrong). Sigil's canonical surface is `string_to_int(s) -> Result[Int, ParseError]` (per spec §13's `std.string` row, post PR #136); the typechecker forces a `match` on `Ok` / `Err`. The low-level `string_to_int_validate` (Int error code) / `string_to_int_parse` builtins remain available for callers that prefer them.
 
 ---
 
