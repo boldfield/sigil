@@ -1090,8 +1090,9 @@ pub const CATALOG: &[ErrorEntry] = &[
                (`match` / `if`) appears in statement position in a Cps-colored \
                function body, followed either by a separate non-trailing stmt or \
                by a perform-bearing tail. The single-stmt-then-pure-tail case \
-               is handled automatically by the codegen `lift_trailing_branched_-
-               stmt_to_tail` pass; the shapes above slip past that lift and would \
+               is handled automatically by the codegen \
+               `lift_trailing_branched_stmt_to_tail` pass; the shapes above \
+               slip past that lift and would \
                otherwise fall through to the Sync ABI, where multi-shot resumes \
                of an effect performed inside the branched stmt would silently \
                miscompile (the perform's effect would not be observed across \
