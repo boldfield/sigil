@@ -1,14 +1,20 @@
 // sigil: 0.1
 //
-// std/mut_byte_array.sigil — Plan C Task 66.6.
+// std/mut_byte_array.sigil — Plan C Task 66.6 + stdlib fallible-ops
+//                            audit (post-PR-#136 follow-on).
 //
-// **Documentation only.** Like `std/io.sigil`, `std/array.sigil`,
-// `std/mut_array.sigil`, and `std/byte_array.sigil`, this file does
-// not participate in typecheck. The `MutByteArray` type and its four
-// operations are registered at the typechecker as builtins via
-// `builtin_types()` and `register_builtin_mut_byte_array_schemes()`.
-// `import std.mut_byte_array` is allowed (skip-list path) but is
-// not required.
+// The `MutByteArray` type and its four core operations
+// (new / length / get / set, all `![Mem]`-gated) are registered at
+// the typechecker as builtins via `builtin_types()` and
+// `register_builtin_mut_byte_array_schemes()` — these are available
+// unconditionally without an explicit import.
+//
+// In addition, this file ships pure-Sigil source-level wrappers at
+// the bottom: `mut_byte_array_get_opt`, `mut_byte_array_set_opt` —
+// the canonical safe-accessor surface (each carries `![Mem]` to
+// match the underlying primitive). `import std.mut_byte_array` is
+// required to use those wrappers (and is harmless when only the
+// builtin primitives are used).
 //
 // `MutByteArray` is the mutable companion to `ByteArray` (Task 66.5)
 // — same flat-byte payload, same Boehm-atomic GC layout, but with
@@ -26,10 +32,24 @@
 //   Read the byte count in O(1).
 //
 // - `mut_byte_array_get(ba: MutByteArray, i: Int) -> Byte ![Mem]`
-//   Read byte `i` in O(1). Aborts on out-of-bounds.
+//   Read byte `i` in O(1). Aborts on out-of-bounds. Prefer
+//   `mut_byte_array_get_opt` for the bounds-checked surface.
 //
 // - `mut_byte_array_set(ba: MutByteArray, i: Int, val: Byte) -> Unit ![Mem]`
 //   Mutate byte `i` to `val` in place. Aborts on out-of-bounds.
+//   Prefer `mut_byte_array_set_opt` for the bounds-checked surface.
+//
+// ## Safe accessors (pure-Sigil wrappers)
+//
+// - `mut_byte_array_get_opt(ba: MutByteArray, i: Int) -> Option[Byte] ![Mem]`
+//   Returns `Some(byte)` if `i` is in range; `None` if out of
+//   bounds. Companion to the panic-on-OOB `mut_byte_array_get`
+//   builtin.
+//
+// - `mut_byte_array_set_opt(ba: MutByteArray, i: Int, val: Byte) -> Option[Unit] ![Mem]`
+//   Returns `Some(())` after mutating in-place if `i` is in range;
+//   `None` (no mutation applied) if out of bounds. Companion to the
+//   panic-on-OOB `mut_byte_array_set` builtin.
 //
 // ## Layout
 //
@@ -57,3 +77,43 @@
 // helpers like `byte_array_to_mut(ba) -> MutByteArray` (clone) and
 // `mut_byte_array_freeze(mba) -> ByteArray` (no-clone freeze) once
 // the Mem effect grows generic ops in v2.
+
+// =====================================================================
+// Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
+// =====================================================================
+
+import std.option
+
+// `mut_byte_array_get_opt(ba, i)` returns `Some(byte)` if `i` is in
+// range and `None` otherwise. Companion to the panic-on-OOB
+// `mut_byte_array_get` builtin. Carries `![Mem]` to match the
+// underlying primitive's effect row.
+fn mut_byte_array_get_opt(ba: MutByteArray, i: Int) -> Option[Byte] ![Mem] {
+  if i < 0 {
+    None
+  } else {
+    if i >= mut_byte_array_length(ba) {
+      None
+    } else {
+      Some(mut_byte_array_get(ba, i))
+    }
+  }
+}
+
+// `mut_byte_array_set_opt(ba, i, val)` mutates `ba[i] = val` in
+// place when `i` is in range and returns `Some(())`; on out-of-
+// bounds the mutation is NOT applied and the wrapper returns
+// `None`. Companion to the panic-on-OOB `mut_byte_array_set`
+// builtin.
+fn mut_byte_array_set_opt(ba: MutByteArray, i: Int, val: Byte) -> Option[Unit] ![Mem] {
+  if i < 0 {
+    None
+  } else {
+    if i >= mut_byte_array_length(ba) {
+      None
+    } else {
+      mut_byte_array_set(ba, i, val);
+      Some(())
+    }
+  }
+}

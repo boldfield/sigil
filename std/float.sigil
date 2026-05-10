@@ -1,14 +1,19 @@
 // sigil: 0.1
 //
-// std/float.sigil — **Documentation only.**
+// std/float.sigil — `Float` type + operations.
 //
-// This file is listed in `compiler/src/imports.rs::BUILTIN_INJECTED`
-// — `import std.float` is a no-op at the resolver. The `Float`
-// type and its operations are registered as builtins via
+// The `Float` type and its arithmetic/comparison/math/conversion
+// builtins are registered at the typechecker via
 // `typecheck::builtin_types()` and `register_builtin_float_schemes()`;
 // codegen dispatches each call site through the `BuiltinFuncIds` /
-// `BuiltinFuncRefs` aggregate. Users never need to write the import;
-// the type and ops are in scope from program start.
+// `BuiltinFuncRefs` aggregate. Builtin primitives are available
+// without an explicit import.
+//
+// In addition, this file ships a pure-Sigil source-level wrapper at
+// the bottom: `string_to_float(s) -> Option[Float]` — the canonical
+// parse surface (stdlib fallible-ops audit, post-PR-#136 follow-on).
+// `import std.float` is required to use the wrapper (and is harmless
+// when only the builtin primitives are used).
 //
 // == Type ==
 //
@@ -44,11 +49,51 @@
 // float_from_int(Int) -> Float
 // float_to_int(Float) -> Int   (truncate toward zero, clamp, NaN → 0)
 // float_to_string(Float) -> String  (whole numbers include ".0"; inf/NaN unchanged)
-// string_to_float_validate(String) -> Int  (0 = valid, 1 = invalid)
-// string_to_float_parse(String) -> Float   (caller must validate first)
+//
+// == Parsing ==
+//
+// **Canonical surface (pure-Sigil wrapper, defined below):**
+//
+//   string_to_float(s: String) -> Option[Float] ![]
+//       Returns `Some(f)` if `s` parses as a valid f64; `None`
+//       otherwise. Single failure mode (Rust's `f64::parse` doesn't
+//       distinguish overflow because IEEE 754 represents overflow as
+//       ±Inf rather than an error), so Option suffices — no error
+//       sum needed.
+//
+// **Builtin primitives (low-level):**
+//
+//   string_to_float_validate(s: String) -> Int  (0 = valid, 1 = invalid)
+//   string_to_float_parse(s: String) -> Float   (caller must validate first)
+//
+//   Prefer `string_to_float` unless you specifically want the
+//   integer error code without pattern-matching.
 //
 // == Per-op allocation ==
 //
 // Every arithmetic/math/conversion op that returns a Float allocates
 // a fresh 16-byte record (8-byte header + 8-byte f64 payload).
 // Comparisons and float_to_int do not allocate.
+
+// =====================================================================
+// Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
+// =====================================================================
+
+import std.option
+
+// `string_to_float(s)` parses `s` as an IEEE 754 f64.
+// Returns `Some(f)` on success; `None` on parse failure (empty
+// input, invalid UTF-8, or unparseable as f64).
+//
+// Implementation: thin wrapper over the
+// `string_to_float_validate` / `string_to_float_parse` builtin
+// pair. The validate call inspects the input and returns 0 for a
+// clean parse; only on `0` do we call `_parse` (which is unsafe-on-
+// invalid-input by contract).
+fn string_to_float(s: String) -> Option[Float] ![] {
+  if string_to_float_validate(s) == 0 {
+    Some(string_to_float_parse(s))
+  } else {
+    None
+  }
+}

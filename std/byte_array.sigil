@@ -1,15 +1,20 @@
 // sigil: 0.1
 //
-// std/byte_array.sigil — Plan C Task 66.5.
+// std/byte_array.sigil — Plan C Task 66.5 + stdlib fallible-ops audit
+//                        (post-PR-#136 follow-on).
 //
-// **Documentation only.** Like `std/io.sigil`, `std/array.sigil`,
-// and `std/mut_array.sigil`, this file does not participate in
-// typecheck. The `ByteArray` type and its core operations are
-// registered at the typechecker as builtins via `builtin_types()`
-// and `register_builtin_byte_array_schemes()`. Edits to this file
-// have no effect on compilation. `import std.byte_array` is allowed
-// (skip-list path) but is not required — the surface is available
-// unconditionally.
+// The `ByteArray` type and its core operations (alloc / empty /
+// length / get / concat / slice plus the string-interop and
+// byte-helper primitives) are registered at the typechecker as
+// builtins via `builtin_types()` and
+// `register_builtin_byte_array_schemes()` — these are available
+// unconditionally without an explicit import.
+//
+// In addition, this file ships pure-Sigil source-level wrappers at
+// the bottom (the canonical surface): `string_from_bytes`,
+// `byte_from_int`, `byte_array_get_opt`, `byte_array_slice_opt`.
+// `import std.byte_array` is required to use those wrappers
+// (and is harmless when only the builtin primitives are used).
 //
 // `ByteArray` is an immutable, eager, heap-allocated byte sequence
 // with a flat-byte payload (one byte per slot, no per-element
@@ -40,7 +45,16 @@
 //   Return `ba[start..end)` as a fresh byte-array. Aborts when
 //   `start > end` or `end > length(ba)`.
 //
-// ## String interop (builtin primitives)
+// ## String interop
+//
+// **Canonical surface:**
+//
+// - `string_from_bytes(ba: ByteArray) -> Option[String] ![]`
+//   Pure-Sigil wrapper at the bottom of this file. Returns
+//   `Some(s)` if `ba` is valid UTF-8; `None` otherwise. Most
+//   callers want this.
+//
+// **Builtin primitives (low-level):**
 //
 // - `string_to_bytes(s: String) -> ByteArray ![]`
 //   Copy a string's UTF-8 payload into a fresh byte-array. Always
@@ -48,22 +62,46 @@
 //
 // - `string_from_bytes_validate(ba: ByteArray) -> Int ![]`
 //   Returns -1 if the byte payload is valid UTF-8; otherwise the
-//   byte offset of the first invalid byte.
+//   byte offset of the first invalid byte. Use directly only if
+//   you need the offset of the first invalid byte —
+//   `string_from_bytes` collapses both cases into `Option`.
 //
 // - `string_from_bytes_alloc(ba: ByteArray) -> String ![]`
 //   Allocate a `String` from a previously-validated byte-array.
 //   The caller is responsible for having checked
 //   `string_from_bytes_validate(ba) == -1` first; this primitive
-//   does NOT re-validate.
+//   does NOT re-validate. Prefer `string_from_bytes`.
 //
-// ## Byte helpers (builtin)
+// ## Byte helpers
+//
+// **Canonical surface:**
+//
+// - `byte_from_int(n: Int) -> Option[Byte] ![]`
+//   Pure-Sigil wrapper at the bottom of this file. Returns
+//   `Some(byte)` if `0 <= n < 256`; `None` otherwise.
+//
+// **Builtin primitives (low-level):**
 //
 // - `byte_in_range(n: Int) -> Bool ![]`
 //   Returns `true` iff `0 <= n < 256`.
 //
 // - `byte_truncate(n: Int) -> Byte ![]`
 //   Truncates `n` to the low 8 bits. Caller is responsible for
-//   `byte_in_range(n)` first if a defined-output guarantee matters.
+//   `byte_in_range(n)` first if a defined-output guarantee
+//   matters. Prefer `byte_from_int` for the bounds-checked surface.
+//
+// ## Safe accessors
+//
+// - `byte_array_get_opt(ba: ByteArray, i: Int) -> Option[Byte] ![]`
+//   Pure-Sigil wrapper at the bottom of this file. Returns
+//   `Some(byte)` if `i` is in range; `None` if out of bounds.
+//   Companion to the panic-on-OOB `byte_array_get` builtin.
+//
+// - `byte_array_slice_opt(ba: ByteArray, start: Int, end: Int) -> Option[ByteArray] ![]`
+//   Pure-Sigil wrapper at the bottom of this file. Returns
+//   `Some(slice)` for valid ranges (`0 <= start <= end <=
+//   length(ba)`); `None` otherwise. Companion to the panic-on-bad-
+//   range `byte_array_slice` builtin.
 //
 // ## Layout
 //
@@ -71,17 +109,68 @@
 // bitmap=0), length: u64, byte[0..N] }`. Bitmap=0 selects Boehm's
 // `GC_malloc_atomic`: bytes are pure scalars, never pointers, so the
 // mark phase skips the payload entirely.
-//
-// ## Higher-level helpers (deferred)
-//
-// User-side wrappers — `byte_from_int(n) -> Option[Byte]`,
-// `string_from_bytes(ba) -> Result[String, Utf8Error]`,
-// `from_list(xs: List[Byte]) -> ByteArray`, and
-// `to_list(ba) -> List[Byte]` — are deferred per
-// `[DEVIATION Task 66.5]`. The deferral is triggered by Sigil v1's
-// flat stdlib namespace: a single `import std.byte_array` cannot
-// transitively pull in `std.list` + `std.option` + `std.result`
-// without colliding on shared fn names (each declares `map`).
-// Until the namespace work shipping in Tasks 67-72 lands, callers
-// who want these wrappers write them in their own program against
-// the builtin primitives above.
+
+// =====================================================================
+// Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
+// =====================================================================
+
+import std.option
+
+// `byte_from_int(n)` returns `Some(b)` for `0 <= n < 256` and
+// `None` otherwise. Bounds-checked companion to the unchecked
+// `byte_truncate` builtin.
+fn byte_from_int(n: Int) -> Option[Byte] ![] {
+  if byte_in_range(n) {
+    Some(byte_truncate(n))
+  } else {
+    None
+  }
+}
+
+// `byte_array_get_opt(ba, i)` returns `Some(b)` if `i` is in range
+// and `None` otherwise. Companion to the panic-on-OOB
+// `byte_array_get` builtin.
+fn byte_array_get_opt(ba: ByteArray, i: Int) -> Option[Byte] ![] {
+  if i < 0 {
+    None
+  } else {
+    if i >= byte_array_length(ba) {
+      None
+    } else {
+      Some(byte_array_get(ba, i))
+    }
+  }
+}
+
+// `byte_array_slice_opt(ba, start, end)` returns `Some(slice)` for
+// valid ranges (`0 <= start <= end <= length(ba)`) and `None`
+// otherwise. Companion to the panic-on-bad-range
+// `byte_array_slice` builtin.
+fn byte_array_slice_opt(ba: ByteArray, start: Int, end: Int) -> Option[ByteArray] ![] {
+  if start < 0 {
+    None
+  } else {
+    if start > end {
+      None
+    } else {
+      if end > byte_array_length(ba) {
+        None
+      } else {
+        Some(byte_array_slice(ba, start, end))
+      }
+    }
+  }
+}
+
+// `string_from_bytes(ba)` returns `Some(s)` if `ba` is valid UTF-8
+// and `None` otherwise. The validate-then-alloc pattern is hidden
+// behind the wrapper; callers who need the byte offset of the first
+// invalid byte (e.g. for diagnostics) call
+// `string_from_bytes_validate` directly.
+fn string_from_bytes(ba: ByteArray) -> Option[String] ![] {
+  if string_from_bytes_validate(ba) == -1 {
+    Some(string_from_bytes_alloc(ba))
+  } else {
+    None
+  }
+}

@@ -60,15 +60,19 @@ use crate::{lexer, parser, stdlib_embed};
 /// silently.
 const BUILTIN_INJECTED: &[&str] = &[
     "io.sigil",
-    "array.sigil",
-    "mut_array.sigil",
-    "byte_array.sigil",
-    "mut_byte_array.sigil",
-    // `string.sigil` ships real source (string_split / string_replace).
+    // `array.sigil` ships real source (array_get_opt, array_set_opt).
+    // `mut_array.sigil` ships real source (mut_array_get_opt,
+    // mut_array_set_opt).
+    // `byte_array.sigil` ships real source (string_from_bytes,
+    // byte_from_int, byte_array_get_opt, byte_array_slice_opt).
+    // `mut_byte_array.sigil` ships real source
+    // (mut_byte_array_get_opt, mut_byte_array_set_opt).
+    // `string.sigil` ships real source (string_split, string_replace,
+    // string_to_int, string_byte_at_opt, string_substring_opt).
     "mem.sigil",
     "int64.sigil",
     "string_builder.sigil",
-    "float.sigil",
+    // `float.sigil` ships real source (string_to_float).
     "char.sigil",
     "panic.sigil",
 ];

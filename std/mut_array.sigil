@@ -1,12 +1,20 @@
 // sigil: 0.1
 //
-// std/mut_array.sigil — Plan C Task 66.
+// std/mut_array.sigil — Plan C Task 66 + stdlib fallible-ops audit
+//                       (post-PR-#136 follow-on).
 //
-// **Documentation only.** Like `std/io.sigil` and `std/array.sigil`,
-// this file does not participate in typecheck. The `MutArray[A]`
-// type and its four operations are registered at the typechecker
-// as builtins via `builtin_types()` and
-// `register_builtin_mut_array_schemes()`.
+// The `MutArray[A]` type and its four core operations
+// (new / length / get / set, all `![Mem]`-gated) are registered at
+// the typechecker as builtins via `builtin_types()` and
+// `register_builtin_mut_array_schemes()` — these are available
+// unconditionally without an explicit import.
+//
+// In addition, this file ships pure-Sigil source-level wrappers at
+// the bottom: `mut_array_get_opt`, `mut_array_set_opt` — the
+// canonical safe-accessor surface (each carries `![Mem]` to match
+// the underlying primitive's effect row). `import std.mut_array` is
+// required to use those wrappers (and is harmless when only the
+// builtin primitives are used).
 //
 // `MutArray[A]` is a heap-allocated, in-place mutable sequence
 // with O(1) `length`, `get`, and `set`. It mirrors the heap layout
@@ -23,11 +31,25 @@
 //   Read the number of elements in O(1).
 //
 // - `mut_array_get[A](arr: MutArray[A], i: Int) -> A ![Mem]`
-//   Read element `i` in O(1). Aborts on out-of-bounds.
+//   Read element `i` in O(1). Aborts on out-of-bounds. Prefer
+//   `mut_array_get_opt` for the bounds-checked surface.
 //
 // - `mut_array_set[A](arr: MutArray[A], i: Int, val: A) -> Unit ![Mem]`
 //   Mutate element `i` in place. Aborts on out-of-bounds. Returns
-//   Unit (no fresh allocation).
+//   Unit (no fresh allocation). Prefer `mut_array_set_opt` for the
+//   bounds-checked surface.
+//
+// ## Safe accessors (pure-Sigil wrappers)
+//
+// - `mut_array_get_opt[A](arr: MutArray[A], i: Int) -> Option[A] ![Mem]`
+//   Returns `Some(elem)` if `i` is in range; `None` if out of
+//   bounds. Companion to the panic-on-OOB `mut_array_get` builtin.
+//
+// - `mut_array_set_opt[A](arr: MutArray[A], i: Int, val: A) -> Option[Unit] ![Mem]`
+//   Returns `Some(())` after mutating in-place if `i` is in range;
+//   `None` (no mutation applied) if out of bounds. Companion to the
+//   panic-on-OOB `mut_array_set` builtin. `Option[Unit]` is awkward
+//   but principled — matches the safe-accessor shape used elsewhere.
 //
 // ## The Mem effect (marker, zero ops)
 //
@@ -60,3 +82,42 @@
 // Element type `A` must be `Int`, `String`, or a user-defined sum
 // or record type. Narrower scalar types (`Bool`, `Char`, `Byte`)
 // are not supported in v1 — same restriction as immutable Array.
+
+// =====================================================================
+// Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
+// =====================================================================
+
+import std.option
+
+// `mut_array_get_opt(arr, i)` returns `Some(elem)` if `i` is in
+// range and `None` otherwise. Companion to the panic-on-OOB
+// `mut_array_get` builtin. Carries `![Mem]` to match the underlying
+// primitive's effect row.
+fn mut_array_get_opt[A](arr: MutArray[A], i: Int) -> Option[A] ![Mem] {
+  if i < 0 {
+    None
+  } else {
+    if i >= mut_array_length(arr) {
+      None
+    } else {
+      Some(mut_array_get(arr, i))
+    }
+  }
+}
+
+// `mut_array_set_opt(arr, i, val)` mutates `arr[i] = val` in place
+// when `i` is in range and returns `Some(())`; on out-of-bounds
+// the mutation is NOT applied and the wrapper returns `None`.
+// Companion to the panic-on-OOB `mut_array_set` builtin.
+fn mut_array_set_opt[A](arr: MutArray[A], i: Int, val: A) -> Option[Unit] ![Mem] {
+  if i < 0 {
+    None
+  } else {
+    if i >= mut_array_length(arr) {
+      None
+    } else {
+      mut_array_set(arr, i, val);
+      Some(())
+    }
+  }
+}
