@@ -15091,6 +15091,25 @@ mod tests {
         );
     }
 
+    /// `array_empty[A]()` is the inference-only path — no value
+    /// argument constrains `A`, so the element type flows entirely
+    /// from the let-binding annotation. Pin that the E0150 gate
+    /// fires here too: if `array_empty`'s type parameter ever stops
+    /// flowing through `pending_call_instantiations` (e.g. due to
+    /// a different registration shape or a special-case bypass),
+    /// this test catches the regression.
+    #[test]
+    fn array_empty_with_bool_element_fires_e0150() {
+        let src = "fn main() -> Int ![] {\n  \
+                     let xs: Array[Bool] = array_empty();\n  \
+                     0\n\
+                   }\n";
+        let errs = pipeline(src);
+        assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
+        let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
+        assert!(e.message.contains("Bool"), "message lacks Bool: {e:?}");
+    }
+
     #[test]
     fn array_alloc_with_user_sum_element_typechecks_cleanly() {
         // User-defined sum types are pointer-shaped (TAG_USER) and
