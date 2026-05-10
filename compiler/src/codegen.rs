@@ -3494,6 +3494,7 @@ fn collect_branch_chain_allocs(
 
     seed_branch_work(
         tail_expr,
+        &[],
         ctors,
         is_supported,
         ctor_index,
@@ -3504,8 +3505,18 @@ fn collect_branch_chain_allocs(
     while let Some((stmts, tail, leaf_kind, arm_bindings)) = work.pop() {
         match leaf_kind {
             BranchedCpsLeaf::Nested => {
+                // Plan C fix — propagate outer arm pattern bindings
+                // into the nested sub-branches. When a sum-type arm
+                // body is itself a branched expr (an `if` or nested
+                // `match`), the arm's pattern bindings (e.g. `t` in
+                // `Cons(_, t) => if ... { ...t... }`) must be available
+                // to any PerformChain leaf inside the nested expr.
+                // Dropping them here would leave the synth-cont's
+                // closure record short of those names and trip the
+                // env-lookup at lower_expr for the tail.
                 seed_branch_work(
                     tail,
+                    &arm_bindings,
                     ctors,
                     is_supported,
                     ctor_index,
@@ -3660,6 +3671,7 @@ fn collect_branch_chain_allocs(
 /// first (matching the emit's work-stack discipline).
 fn seed_branch_work<'a>(
     tail: &'a crate::ast::Expr,
+    parent_bindings: &[SynthContCapture],
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
     ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
@@ -3682,10 +3694,10 @@ fn seed_branch_work<'a>(
             let else_kind = classify_branched_cps_tail_branch(else_block, ctors, is_supported);
             if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
                 if let Some(et) = else_block.tail.as_ref() {
-                    work.push((else_block.stmts.as_slice(), et, ek, vec![]));
+                    work.push((else_block.stmts.as_slice(), et, ek, parent_bindings.to_vec()));
                 }
                 if let Some(tt) = then_block.tail.as_ref() {
-                    work.push((then_block.stmts.as_slice(), tt, tk, vec![]));
+                    work.push((then_block.stmts.as_slice(), tt, tk, parent_bindings.to_vec()));
                 }
             }
         }
@@ -3721,10 +3733,10 @@ fn seed_branch_work<'a>(
                         classify_branched_cps_tail_branch_expr(&else_arm.body, ctors, is_supported);
                     if let (Some(tk), Some(ek)) = (then_kind, else_kind) {
                         if let Some((es, et)) = extract_arm(&else_arm.body) {
-                            work.push((es, et, ek, vec![]));
+                            work.push((es, et, ek, parent_bindings.to_vec()));
                         }
                         if let Some((ts, tt)) = extract_arm(&then_arm.body) {
-                            work.push((ts, tt, tk, vec![]));
+                            work.push((ts, tt, tk, parent_bindings.to_vec()));
                         }
                     }
                     return;
@@ -3732,6 +3744,7 @@ fn seed_branch_work<'a>(
             }
             seed_branch_work_sum_type(
                 tail,
+                parent_bindings,
                 arms,
                 ctors,
                 is_supported,
@@ -3743,6 +3756,7 @@ fn seed_branch_work<'a>(
         Expr::Match { arms, .. } if arms.len() >= 2 => {
             seed_branch_work_sum_type(
                 tail,
+                parent_bindings,
                 arms,
                 ctors,
                 is_supported,
@@ -3757,6 +3771,7 @@ fn seed_branch_work<'a>(
 
 fn seed_branch_work_sum_type<'a>(
     _tail: &'a crate::ast::Expr,
+    parent_bindings: &[SynthContCapture],
     arms: &'a [crate::ast::MatchArm],
     ctors: &std::collections::BTreeSet<String>,
     is_supported: &impl Fn(&str) -> bool,
@@ -3799,8 +3814,18 @@ fn seed_branch_work_sum_type<'a>(
                 break;
             }
         };
-        let arm_bindings =
-            collect_pattern_binding_captures(&arm.pattern, ctor_index, type_layouts, None);
+        // Plan C fix — accumulate parent arm bindings (from outer
+        // enclosing match arms) with this arm's own pattern bindings.
+        // Any PerformChain leaf reached through Nested descent will
+        // need *all* enclosing arms' bindings in its synth-cont
+        // closure record.
+        let mut arm_bindings: Vec<SynthContCapture> = parent_bindings.to_vec();
+        arm_bindings.extend(collect_pattern_binding_captures(
+            &arm.pattern,
+            ctor_index,
+            type_layouts,
+            None,
+        ));
         arm_data.push((stmts, leaf, kind, arm_bindings));
     }
     if all_ok && !arm_data.is_empty() {
