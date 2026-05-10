@@ -331,3 +331,206 @@ unbalanced
 **Oracle (exit):** `0`
 
 **Notes:** Stresses tokenization + stack manipulation + operator-operand-order correctness. Common LLM bugs: wrong operand order for non-commutative operators (`-` and `/`), forgetting to convert string tokens to integers, mishandling whitespace tokenization. In Sigil: requires `string_split` to tokenize, then `string_to_int_parse` per number token. The `/` operator requires `ArithError` in the row.
+
+---
+
+## H01 — Wordle scoring
+
+**Prompt:** Implement a Wordle-style scoring function. Given a 5-letter guess and 5-letter answer (both lowercase ASCII, exactly 5 characters each, with no surprises like spaces, punctuation, or uppercase), produce a 5-character feedback string where each character is:
+
+- `G` (green) — the guess letter at this position matches the answer's letter at the same position.
+- `Y` (yellow) — the guess letter is in the answer at a *different* position, BUT each answer letter can only be matched once. Greens claim their positions first; remaining yellows scan the guess left-to-right and consume the leftmost still-available answer letter for each match.
+- `X` (gray) — the letter is not in the answer, OR every instance of it in the answer has already been consumed by a green or earlier yellow.
+
+For `guess = "geese"` and `answer = "agree"`, print exactly the 5-character feedback string `YYXXG` followed by a newline, then exit with status 0.
+
+Position-by-position trace for the example:
+- Pos 0 — `g` vs `a`: not equal; `g` is in the answer at position 1 (still available) → `Y`, consume answer[1]
+- Pos 1 — `e` vs `g`: not equal; `e` is in the answer at positions 3 and 4. Position 4 is already claimed by the green at the very end (greens always go first). Position 3 is unclaimed → `Y`, consume answer[3]
+- Pos 2 — `e` vs `r`: not equal; `e` is in the answer but both positions are now consumed → `X`
+- Pos 3 — `s` vs `e`: not equal; `s` is not in the answer at all → `X`
+- Pos 4 — `e` vs `e`: equal → `G`
+
+**Oracle (stdout):**
+```
+YYXXG
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses correct ordering of greens before yellows AND consume-on-match bookkeeping. Common LLM failure modes: (1) the naive solution `if guess[i] == answer[i] then G elif guess[i] in answer then Y else X` produces `YYYXG` (wrong — both `e`s at positions 1 and 2 are marked `Y` because the duplicate-consumption isn't tracked); (2) a one-pass left-to-right traversal that greedily takes yellows can consume an answer letter that a later position would have matched as a green, producing wrong scores; (3) tracking consumed *guess* letters instead of consumed *answer* letters; (4) processing yellows for positions already marked `G`, double-counting consumes.
+
+Canonical algorithm: pass 1 sets greens and marks answer positions consumed; pass 2 walks remaining (non-green) guess positions left-to-right, scanning the answer for the leftmost still-unconsumed letter that matches.
+
+In Sigil: a `MutByteArray` for the feedback plus per-position tracking of which answer letters are consumed. `MutArray[Bool]` is unavailable in v1 (per `[DEVIATION Task 65]` — Bool element type unsupported); use `MutArray[Int]` with 0/1 sentinels or a separate `MutByteArray` of bytes 0/1.
+
+---
+
+## H02 — JSON number validator
+
+**Prompt:** A JSON number (per RFC 8259 §6) has this grammar (ABNF-ish):
+
+```
+number = [ "-" ] int [ frac ] [ exp ]
+int    = "0" | (digit1-9 *digit)
+frac   = "." 1*digit
+exp    = ("e" | "E") [ "+" | "-" ] 1*digit
+```
+
+Notable rules:
+- Leading zeros are forbidden in `int` — `"0"` is valid; `"01"` is not.
+- `frac` requires AT LEAST ONE digit before the dot — `"0.5"` is valid; `".5"` is not.
+- `frac` requires AT LEAST ONE digit after the dot — `"1.5"` is valid; `"1."` is not.
+- `exp` requires AT LEAST ONE digit after `e`/`E` (and an optional `+`/`-` between them) — `"1e10"` is valid; `"1e"` is not; `"1e-"` is not.
+- `-` may only appear at the very start (the optional sign on `int`); other positions are invalid.
+
+Implement the validator yourself, in a single hand-rolled state machine that walks the input character by character. Do NOT use any of the following:
+- A JSON library (e.g. `json.loads`, `encoding/json`, `serde_json`).
+- A regular expression engine.
+- A built-in number parser that decides validity for you (e.g. `int()`, `strconv.Atoi`, `i64::from_str`, `string_to_int_validate`). The point of the prompt is the state machine.
+
+Validate each of the following seven strings and print, for each, the input on one line followed by the word `valid` or `invalid` on the next line:
+
+1. `0`
+2. `01`
+3. `1.5e10`
+4. `-.5`
+5. `.7`
+6. `1.`
+7. `1e`
+
+Print exactly:
+```
+0
+valid
+01
+invalid
+1.5e10
+valid
+-.5
+invalid
+.7
+invalid
+1.
+invalid
+1e
+invalid
+```
+
+then exit with status 0.
+
+**Oracle (stdout):**
+```
+0
+valid
+01
+invalid
+1.5e10
+valid
+-.5
+invalid
+.7
+invalid
+1.
+invalid
+1e
+invalid
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses correct hand-rolled state-machine implementation against an explicit grammar. Common LLM failure modes (observed across all four target languages on the comparable C19/C20 prompts): (1) accept `"01"` as valid because `0` is a prefix and digits follow — the leading-zero rule is missed; (2) accept `".5"` / `"-.5"` because the LLM mentally categorises them as "decimals" rather than reading the grammar's "int [ frac ]" structure (frac requires int prefix); (3) accept `"1."` because the LLM doesn't enforce `1*digit` after the dot; (4) accept `"1e"` because the LLM doesn't enforce `1*digit` after the exponent marker. Each of these is a single-rule miss; getting all four right on the first attempt requires reading the grammar carefully OR generating a methodical state machine from scratch.
+
+In Sigil: walk via `string_byte_at` + `string_length`, dispatch on `byte_to_int` against ASCII codes (`'0'=48`, `'9'=57`, `'.'=46`, `'-'=45`, `'+'=43`, `'e'=101`, `'E'=69`). State can be threaded as a recursive helper's `Int`/sum-type argument. No `Mem` effect needed — purely functional state-machine encoding works.
+
+---
+
+## H03 — Right-associative power evaluator
+
+**Prompt:** The `^` operator (integer power, non-negative exponents) follows right-associative parsing: `a ^ b ^ c` evaluates as `a ^ (b ^ c)`, not `(a ^ b) ^ c`. This is the standard mathematical convention (and matches Python's `**`, Haskell's `^`, etc.) but differs from the left-associative default that most binary operators use in most languages.
+
+Implement an evaluator for expressions of the form `"<int> ^ <int> ^ ... ^ <int>"` with single spaces around each `^`. The expression may also be a single integer with no operators. Do NOT use a stdlib expression-evaluator (`eval`, `ast.literal_eval`, `Function` constructor, etc.) — implement the parsing and evaluation yourself.
+
+Evaluate each of the following five expressions and print the integer result on its own line, in order:
+
+1. `5`
+2. `2 ^ 4`
+3. `2 ^ 3 ^ 2`
+4. `3 ^ 2 ^ 2 ^ 1`
+5. `2 ^ 1 ^ 3`
+
+Print exactly:
+```
+5
+16
+512
+81
+2
+```
+
+then exit with status 0.
+
+**Oracle (stdout):**
+```
+5
+16
+512
+81
+2
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Right-associativity is the trap. If you parse left-to-right (the reflexive default for most programming-language parser writing), `2 ^ 3 ^ 2` evaluates as `(2^3)^2 = 8^2 = 64`, not `2^(3^2) = 2^9 = 512`. Two test cases discriminate the associativity: `2 ^ 3 ^ 2` (right=512, left=64) and `2 ^ 1 ^ 3` (right=`2^(1^3)=2^1=2`, left=`(2^1)^3=2^3=8`). Both must produce the right-associative answer; getting one and not the other is impossible for any consistent implementation, so the two-case redundancy hardens against a "passes one of the discriminators by accident" pattern. The 4th test case (`3 ^ 2 ^ 2 ^ 1`) is included for depth coverage but does NOT discriminate — both associativities give 81 because `2^1 = 2` collapses the inner-tower difference.
+
+In Sigil: tokenize with `string_split(s, " ")`, parse each numeric token with `string_to_int(s)` (returns `Result[Int, ParseError]` from the prelude), apply `^` via a recursive helper that walks the token list right-to-left or recursively from the head. The `*` operator (used inside the integer-pow helper) requires `ArithError` in the enclosing function's effect row.
+
+---
+
+## H04 — Stable sort with tie-breaking
+
+**Prompt:** Given the following five `(name, score)` pairs, in this exact order:
+
+1. `Alice`, `90`
+2. `Bob`, `85`
+3. `Carol`, `90`
+4. `Dave`, `85`
+5. `Eve`, `90`
+
+Sort the list by `score` descending. **Ties on `score` must preserve the original input order.** Print the names of the sorted list space-separated on a single line, then exit with status 0.
+
+Implement the sort yourself OR use a stdlib sort, but ensure stability under the tie-breaking rule.
+
+**Oracle (stdout):**
+```
+Alice Carol Eve Bob Dave
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses awareness of stable-vs-unstable sort semantics. Trap: in Go, `sort.Slice` is **unstable** — running it with `score`-only comparison produces nondeterministic name ordering for ties. The fix is `sort.SliceStable`. Python's `sorted` and Rust's `Vec::sort_by` are stable by default; an LLM that reaches for the idiomatic "Go sort" without naming `Stable` writes a flaky program that sometimes passes the harness and sometimes doesn't (which is the worst kind of failure for empirical detection — it shows as stochastic in the K/N matrix). In Sigil: `list_sort` from `std.list` is documented as stable (the spec §13 row says "stable functional merge sort, comparator-driven"); the LLM just needs to use it correctly.
+
+---
+
+## H05 — Floor division (round toward negative infinity)
+
+**Prompt:** Floor division `floor_div(a, b)` rounds the quotient toward negative infinity, NOT toward zero. So `floor_div(-7, 2) = -4` (because `-3.5` floors to `-4`), not `-3` (which is what truncation toward zero gives).
+
+Implement `floor_div(a, b)` for integer `a` and non-zero integer `b`, then print the result for each of the following four pairs in order:
+
+1. `floor_div(7, 2)`
+2. `floor_div(-7, 2)`
+3. `floor_div(7, -2)`
+4. `floor_div(-7, -2)`
+
+**Oracle (stdout):**
+```
+3
+-4
+-4
+3
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses awareness of integer division's rounding direction. Trap: **Python**'s `//` operator is floor division natively — `(-7) // 2 = -4`. Trivial. **Go** and **Rust**'s `/` operator truncates toward zero — `(-7) / 2 = -3`. An LLM writing Go or Rust that uses `/` directly gets `(-7, 2) → -3` and `(7, -2) → -3`, both wrong by 1. The fix requires `if (a < 0) != (b < 0) && a % b != 0 { result - 1 }` or equivalent. In **Sigil**, `/` also truncates toward zero (matches Go/Rust); the same explicit-correction is required. Both `/` and `%` carry the `ArithError` effect, so the enclosing function's row needs `![ArithError]`.

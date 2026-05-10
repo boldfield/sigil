@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# eval-go.sh — compile + run + diff oracle for one Go program.
+# eval-rust.sh — compile + run + diff oracle for one Rust program.
 #
-# Usage: eval-go.sh <program.go> <prompt-id>
+# Usage: eval-rust.sh <program.rs> <prompt-id>
 #
-# Same shape as eval-sigil.sh. Go has a real compile step via
-# `go build`; failures there are categorized as "compile". Runtime
-# errors (panics, nil derefs) are categorized as "runtime".
+# Same shape as eval-go.sh / eval-sigil.sh / eval-python.sh. Rust
+# has a real compile step via `rustc`; failures there are
+# categorized as "compile". Runtime errors (panics, unwraps) are
+# categorized as "runtime".
 #
 # Output:
 #   pass                              — stdout + exit match oracle
 #   fail: <category> — <details>      — anything else
 #
 # Categories:
-#   compile  — go build failed
+#   compile  — rustc failed
 #   runtime  — non-zero exit during execution
 #   stdout   — exit matched but stdout differed
 #   timeout  — exceeded TIMEOUT seconds
@@ -33,7 +34,7 @@ else
 fi
 
 if [ "$#" -ne 2 ]; then
-    echo "usage: $0 <program.go> <prompt-id>" >&2
+    echo "usage: $0 <program.rs> <prompt-id>" >&2
     exit 2
 fi
 
@@ -45,7 +46,7 @@ if [ ! -f "$PROGRAM" ]; then
     exit 1
 fi
 
-# Parse oracle from prompts.md (same shape as eval-sigil.sh).
+# Parse oracle from prompts.md (same shape as eval-go.sh).
 expected_stdout="$(awk -v id="## $PROMPT_ID " '
     $0 ~ "^"id { in_block=1 }
     in_block && /^## [A-Z][0-9]/ && $0 !~ "^"id { exit }
@@ -73,21 +74,21 @@ if [ -z "$expected_exit" ]; then
     exit 1
 fi
 
-GO="${GO:-go}"
-if ! command -v "$GO" >/dev/null 2>&1; then
-    echo "fail: harness — $GO not on PATH" >&2
+RUSTC="${RUSTC:-rustc}"
+if ! command -v "$RUSTC" >/dev/null 2>&1; then
+    echo "fail: harness — $RUSTC not on PATH" >&2
     exit 1
 fi
 
-# Build. Go requires the source file to be in a package; for
-# package main with a main() it can be built directly via
-# `go build -o <out> <file.go>` without a module file as long as
-# imports are stdlib-only.
+# Build. Single-file Rust programs build via `rustc -O <file.rs>
+# -o <out>` without a Cargo manifest. `-O` enables release-level
+# optimizations; matches Go's default release shape and keeps
+# wall-clock comparable to the other compiled languages.
 OUTBIN="$(mktemp)"
 build_err_file="$(mktemp)"
 trap 'rm -f "$OUTBIN" "$build_err_file" 2>/dev/null || true' EXIT
 
-if ! "$GO" build -o "$OUTBIN" "$PROGRAM" 2>"$build_err_file"; then
+if ! "$RUSTC" -O --edition 2021 "$PROGRAM" -o "$OUTBIN" 2>"$build_err_file"; then
     echo "fail: compile — $(head -c 400 "$build_err_file")"
     exit 1
 fi

@@ -60,7 +60,7 @@ SPEC_PATH = REPO_ROOT / "spec" / "language.md"
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_API_VERSION = "2023-06-01"
 
-DEFAULT_LANGUAGES = ["sigil", "python", "go"]
+DEFAULT_LANGUAGES = ["sigil", "python", "go", "rust"]
 DEFAULT_MODELS = ["claude-opus-4-7", "claude-sonnet-4-6"]
 DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_MAX_TOKENS = 4096
@@ -86,7 +86,7 @@ class Prompt:
     notes: str = ""
 
 
-_HEADING_RE = re.compile(r"^## (C\d+) — (.+)$")
+_HEADING_RE = re.compile(r"^## ([A-Z]\d+) — (.+)$")
 _PROMPT_FIELD_RE = re.compile(r"^\*\*Prompt:\*\*\s*(.*)$")
 _NOTES_RE = re.compile(r"^\*\*Notes:\*\*\s*(.*)$")
 
@@ -95,7 +95,7 @@ def parse_prompts(path: pathlib.Path) -> list[Prompt]:
     """Parse comp/prompts.md into structured Prompt records.
 
     Note: oracle parsing is deferred entirely to the per-language eval
-    drivers (eval-{sigil,python,go}.sh) — they parse the same prompts.md
+    drivers (eval-{sigil,python,go,rust}.sh) — they parse the same prompts.md
     file via awk to extract their oracle. We only need the prompt text
     here (what the LLM sees) plus the id (for routing to the driver)."""
     text = path.read_text()
@@ -281,7 +281,12 @@ def run_eval(program: str, prompt_id: str, lang: str) -> EvalResult:
     """Write `program` to a temp file with a language-appropriate
     suffix, then invoke comp/scripts/eval-<lang>.sh. Parses the
     driver's `pass` / `fail: <category> — <details>` output."""
-    suffix_by_lang = {"sigil": ".sigil", "python": ".py", "go": ".go"}
+    suffix_by_lang = {
+        "sigil": ".sigil",
+        "python": ".py",
+        "go": ".go",
+        "rust": ".rs",
+    }
     suffix = suffix_by_lang.get(lang)
     if suffix is None:
         return EvalResult(
