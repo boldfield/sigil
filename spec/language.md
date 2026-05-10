@@ -225,7 +225,7 @@ fn main() -> Int ![IO] {
 `std.raise` ships a generic effect:
 
 ```sigil
-effect Raise[E] { fail: (E) -> Int }
+effect Raise[E] { fail[A]: (E) -> A }
 ```
 
 Calling `raise(s)` performs `Raise.fail(s)`; under `catch`'s
@@ -900,6 +900,10 @@ match pair { (n, s) => perform IO.println(s) };
 Binary tuples have `fst[A, B]` and `snd[A, B]` accessors in
 `std.pair`. Larger tuples use match destructuring.
 
+Tuple arity is limited to **31 elements** (architectural: the heap
+header carries a 32-bit pointer bitmap, with one bit reserved). Use
+records or nested tuples for wider structures.
+
 ### §7 — Pattern matching
 
 See E3, E4 for examples. The `match` expression evaluates the
@@ -1117,6 +1121,12 @@ This shape generalizes to any `resumes: many` effect. `std.choose`'s
 `all_choices` (see §13) is layered on top of this primitive — when
 the bodies passed to `all_choices` contain side effects, the
 per-resume IO ordering specified here is what the caller observes.
+
+Per-resume execution applies regardless of whether `k` is invoked
+unconditionally on every iteration of the let-chain or conditionally
+inside an `if`/`match` (see the **Conditional k-call** subsection
+below). Branches that don't invoke `k` contribute no per-resume side
+effects.
 
 ##### Row-polymorphic handlers
 
