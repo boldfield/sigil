@@ -363,3 +363,72 @@ YYXXG
 Canonical algorithm: pass 1 sets greens and marks answer positions consumed; pass 2 walks remaining (non-green) guess positions left-to-right, scanning the answer for the leftmost still-unconsumed letter that matches.
 
 In Sigil: a `MutByteArray` for the feedback plus per-position tracking of which answer letters are consumed. `MutArray[Bool]` is unavailable in v1 (per `[DEVIATION Task 65]` — Bool element type unsupported); use `MutArray[Int]` with 0/1 sentinels or a separate `MutByteArray` of bytes 0/1.
+
+---
+
+## H02 — JSON number validator
+
+**Prompt:** A JSON number (per RFC 8259 §6) has this grammar (ABNF-ish):
+
+```
+number = [ "-" ] int [ frac ] [ exp ]
+int    = "0" | (digit1-9 *digit)
+frac   = "." 1*digit
+exp    = ("e" | "E") [ "+" | "-" ] 1*digit
+```
+
+Notable rules:
+- Leading zeros are forbidden in `int` — `"0"` is valid; `"01"` is not.
+- `frac` requires AT LEAST ONE digit before the dot — `"0.5"` is valid; `".5"` is not.
+- `frac` requires AT LEAST ONE digit after the dot — `"1.5"` is valid; `"1."` is not.
+- `exp` requires AT LEAST ONE digit after `e`/`E` (and an optional `+`/`-` between them) — `"1e10"` is valid; `"1e"` is not; `"1e-"` is not.
+- `-` may only appear at the very start (the optional sign on `int`); other positions are invalid.
+
+Implement the validator yourself, in a single hand-rolled state machine that walks the input character by character. Do NOT use any of the following:
+- A JSON library (e.g. `json.loads`, `encoding/json`, `serde_json`).
+- A regular expression engine.
+- A built-in number parser that decides validity for you (e.g. `int()`, `strconv.Atoi`, `i64::from_str`, `string_to_int_validate`). The point of the prompt is the state machine.
+
+Validate each of the following five strings and print, for each, the input on one line followed by the word `valid` or `invalid` on the next line:
+
+1. `0`
+2. `01`
+3. `1.5e10`
+4. `-.5`
+5. `.7`
+
+Print exactly:
+```
+0
+valid
+01
+invalid
+1.5e10
+valid
+-.5
+invalid
+.7
+invalid
+```
+
+then exit with status 0.
+
+**Oracle (stdout):**
+```
+0
+valid
+01
+invalid
+1.5e10
+valid
+-.5
+invalid
+.7
+invalid
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Stresses correct hand-rolled state-machine implementation against an explicit grammar. Common LLM failure modes (observed across all four target languages on the comparable C19/C20 prompts): (1) accept `"01"` as valid because `0` is a prefix and digits follow — the leading-zero rule is missed; (2) accept `".5"` / `"-.5"` because the LLM mentally categorises them as "decimals" rather than reading the grammar's "int [ frac ]" structure (frac requires int prefix); (3) accept `"1."` because the LLM doesn't enforce `1*digit` after the dot; (4) accept `"1e"` because the LLM doesn't enforce `1*digit` after the exponent marker. Each of these is a single-rule miss; getting all four right on the first attempt requires reading the grammar carefully OR generating a methodical state machine from scratch.
+
+In Sigil: walk via `string_byte_at` + `string_length`, dispatch on `byte_to_int` against ASCII codes (`'0'=48`, `'9'=57`, `'.'=46`, `'-'=45`, `'+'=43`, `'e'=101`, `'E'=69`). State can be threaded as a recursive helper's `Int`/sum-type argument. No `Mem` effect needed — purely functional state-machine encoding works.
