@@ -1097,15 +1097,12 @@ when the `if`/`match` IS the `tail_expr`. The shapes that do
   `tail_expr` (e.g., `let a = perform p; match cond { true => perform q, false => () }; 0`).
   The match must be the tail, not a statement before the tail.
   Rewrite as `let a = perform p; match cond { true => { perform q; 0 }, false => 0 }`.
-- **Cps-call-as-tail** — a `tail_expr` that's a call to a separate
-  Cps-colored function (e.g., `let a = perform p; let b = perform p; helper(a, b)`
-  where `helper` itself performs IO): the Cps-call-as-tail breaks
-  per-resume execution and only the first resume's effects fire.
-  **The compiler rejects this shape with E0221.** Inline the
-  helper's logic as a branched `tail_expr` instead of hoisting
-  branched performs into a separate Cps helper.
 
-These restrictions lift in a follow-on plan.
+A `tail_expr` may also be a call to a separate Cps-colored function
+(e.g., `let a = perform p; let b = perform p; helper(a, b)` where
+`helper` itself performs effects). Per-resume execution composes
+correctly: each resume re-invokes `helper` with that resume's
+arguments, and the helper's effects fire per resume in order.
 
 **Conditional k-call.** Handler arm bodies may use `if`/`else` and
 `match` to conditionally invoke `k`:
@@ -1245,7 +1242,6 @@ Common codes:
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
-| E0221 | multi-shot body's post-perform tail is a Cps-call (§8.3) |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
 

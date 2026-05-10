@@ -16598,11 +16598,23 @@ fn lambda_of_state_sum_type_with_cps_calls_falls_through() {
     );
 }
 
-// ===== E0221 — Cps-call-as-tail rejection in multi-shot bodies =====
+// ===== Multi-shot Cps-call-as-tail (Plan D Task 112e — runtime fix) =====
 
-/// Multi-shot body with 2 performs + CPS-call-as-tail → E0221.
+/// Multi-shot body with 2 performs + CPS-call-as-tail. Previously
+/// rejected by E0221 (PR #122) because the chain machinery's
+/// `OUTER_POST_ARM_K_DROP` discipline dropped the chain push per
+/// resume, underflowing the stack and preventing the trampoline's
+/// Done-pop from advancing the outer multi-shot to k(N+1). Plan D
+/// Task 112e refined the drop to fire ONLY for recursive Cps→Cps
+/// tail calls (callee == enclosing fn), leaving non-recursive
+/// Cps-call-as-tail composition intact across multi-shot resumes.
+///
+/// Oracle: full enumeration of all 36 (a, b) pairs from `pick(1, 6)`,
+/// printing the six matching pairs `16, 25, 34, 43, 52, 61`. Pre-fix
+/// only the first inner resume's matching pair fired (or, depending
+/// on classifier path, no output at all). Post-fix all six fire.
 #[test]
-fn cps_call_as_tail_in_multi_shot_rejected_with_e0221() {
+fn cps_call_as_tail_in_multi_shot_runtime_correct() {
     let src = "import std.io\n\
                \n\
                effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
@@ -16630,11 +16642,13 @@ fn cps_call_as_tail_in_multi_shot_rejected_with_e0221() {
                  };\n  \
                  total\n\
                }\n";
-    assert_compile_fails_with_code(
-        src,
-        "E0221",
-        &["report"],
-        "cps_call_as_tail_multi_shot_e0221",
+    let (stdout, stderr, code) =
+        compile_and_run(src, "cps_call_as_tail_multi_shot_runtime_correct");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "16\n25\n34\n43\n52\n61\n",
+        "Multi-shot Cps-call-as-tail enumerates all matching pairs. \
+         stderr={stderr:?}"
     );
 }
 
