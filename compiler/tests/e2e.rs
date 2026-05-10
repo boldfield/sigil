@@ -7040,18 +7040,121 @@ fn std_byte_in_range_accepts_zero_to_255() {
     assert_eq!(stdout, "in0\nin255\nout256\n", "stderr={stderr:?}");
 }
 
-/// `import std.byte_array` is a no-op (skip-list path).
+/// `import std.byte_array` loads the module's pure-Sigil wrappers
+/// (`string_from_bytes`, `byte_from_int`, `byte_array_get_opt`,
+/// `byte_array_slice_opt`). The builtin primitives (`byte_array_empty`
+/// etc.) remain available unconditionally.
 #[test]
-fn std_byte_array_import_is_noop() {
+fn std_byte_array_import_loads_cleanly() {
     let src = "import std.byte_array\n\
                fn main() -> Int ![IO] {\n  \
                  let ba: ByteArray = byte_array_empty();\n  \
                  perform IO.println(int_to_string(byte_array_length(ba)));\n  \
                  0\n\
                }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_import_noop");
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_import_loads");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// Canonical `byte_from_int(n) -> Option[Byte]` wrapper. Returns
+/// `Some(byte)` for n in [0, 256) and `None` otherwise. Companion
+/// to the unchecked `byte_truncate` builtin.
+#[test]
+fn std_byte_from_int_canonical() {
+    let src = "import std.byte_array\n\n\
+               fn show(o: Option[Byte]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(b) => int_to_string(byte_to_int(b)),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(show(byte_from_int(0)));\n  \
+                 perform IO.println(show(byte_from_int(255)));\n  \
+                 perform IO.println(show(byte_from_int(256)));\n  \
+                 perform IO.println(show(byte_from_int(-1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_from_int");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n255\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `byte_array_get_opt(ba, i) -> Option[Byte]` wrapper.
+/// Companion to the panic-on-OOB `byte_array_get` builtin.
+#[test]
+fn std_byte_array_get_opt_canonical() {
+    let src = "import std.byte_array\n\n\
+               fn show(o: Option[Byte]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(b) => int_to_string(byte_to_int(b)),\n    \
+                   None    => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = string_to_bytes(\"hi\");\n  \
+                 perform IO.println(show(byte_array_get_opt(ba, 0)));\n  \
+                 perform IO.println(show(byte_array_get_opt(ba, 1)));\n  \
+                 perform IO.println(show(byte_array_get_opt(ba, 2)));\n  \
+                 perform IO.println(show(byte_array_get_opt(ba, -1)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_get_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // 'h' = 104, 'i' = 105
+    assert_eq!(stdout, "104\n105\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `byte_array_slice_opt(ba, start, end) -> Option[ByteArray]`
+/// wrapper. Folds both abort conditions (`start > end`, `end > length`,
+/// negative `start`) into `None`. Companion to the panic-on-bad-range
+/// `byte_array_slice` builtin.
+#[test]
+fn std_byte_array_slice_opt_canonical() {
+    let src = "import std.byte_array\n\n\
+               fn show(o: Option[ByteArray]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(ba) => int_to_string(byte_array_length(ba)),\n    \
+                   None     => \"none\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let ba: ByteArray = string_to_bytes(\"hello\");\n  \
+                 perform IO.println(show(byte_array_slice_opt(ba, 0, 3)));\n  \
+                 perform IO.println(show(byte_array_slice_opt(ba, 0, 5)));\n  \
+                 perform IO.println(show(byte_array_slice_opt(ba, 0, 6)));\n  \
+                 perform IO.println(show(byte_array_slice_opt(ba, 3, 1)));\n  \
+                 perform IO.println(show(byte_array_slice_opt(ba, -1, 3)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_byte_array_slice_opt");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n5\nnone\nnone\nnone\n", "stderr={stderr:?}");
+}
+
+/// Canonical `string_from_bytes(ba) -> Option[String]` wrapper over
+/// the validate/_alloc pair. Returns `Some(s)` for valid UTF-8;
+/// `None` otherwise. The existing `std_byte_array_string_round_trip_ascii`
+/// test continues to cover the underlying validate/_alloc primitives.
+#[test]
+fn std_string_from_bytes_canonical() {
+    let src = "import std.byte_array\n\n\
+               fn show(o: Option[String]) -> String ![] {\n  \
+                 match o {\n    \
+                   Some(s) => s,\n    \
+                   None    => \"invalid\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(show(string_from_bytes(string_to_bytes(\"hello\"))));\n  \
+                 let bad: ByteArray = byte_array_alloc(2, byte_truncate(255));\n  \
+                 perform IO.println(show(string_from_bytes(bad)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_string_from_bytes");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "hello\ninvalid\n", "stderr={stderr:?}");
 }
 
 // ===== Plan C Task 66.6 — MutByteArray runtime + Mem-gated coverage =====
