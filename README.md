@@ -3,17 +3,21 @@
 A compiled, statically-typed programming language designed to be reliably
 authored by large language models — not humans.
 
-Sigil is under active construction. **Plans A1, A2, A3, and B are
-complete**; **Plan C** (stdlib + demos + spec + polish) is currently in
-progress, with the stdlib core (`Option`, `Result`, `List`, `Array`,
-`MutArray`, `ByteArray`, `MutByteArray`, `String`, `Int64`,
-`StringBuilder`, `IO`, `Mem`, `Random`, `Clock`, `Raise`, `State`,
-`Choose`) shipped and the interpreter + JSON pretty-printer demos in
-[`examples/`](examples). The remaining major work items are
-specification authoring (Stage 9) and a v2 architectural cluster
-covering first-class continuations + conditional-k arm bodies +
-wrapper-fn-frame composition, which together would unlock
-arbitrary-arity `Choose` dischargers and the Sudoku demo.
+Sigil is in late v1. Plans A1, A2, A3, B, B', C, and D are complete; the
+v1 surface includes mandatory effect rows, first-class continuations
+(with dynamic-extent escape barrier), multi-shot handlers,
+type-parameterized effects (`Raise[E]`, `State[S]`), per-op generic
+params (`fail[A]: (E) -> A`), row-polymorphic dischargers, tuples,
+mutable collections, conditional/branched k-call in arm bodies, and
+wrapper-fn-frame composition. The stdlib covers effects (`Raise`,
+`State`, `Choose`, `Mem`, `IO`, `Env`, `Random`, `Clock`, `Fs`,
+`Process`), data (`Option`, `Result`, `List`, `Array`, `MutArray`,
+`Map`, `Set`), and primitives (`Float`, `Int64`, `Char`, `ByteArray`,
+`MutByteArray`, `String`, `StringBuilder`). Examples in
+[`examples/`](examples) cover the interpreter, JSON pretty-printer, and
+Sudoku demos. Remaining work is the v2 architectural cluster (precise
+GC + Cranelift stackmaps, runtime profile-data emission, per-context
+CPS color refinement) — none required for v1.
 
 ## Why sigil exists
 

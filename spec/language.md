@@ -225,7 +225,7 @@ fn main() -> Int ![IO] {
 `std.raise` ships a generic effect:
 
 ```sigil
-effect Raise[E] { fail: (E) -> Int }
+effect Raise[E] { fail[A]: (E) -> A }
 ```
 
 Calling `raise(s)` performs `Raise.fail(s)`; under `catch`'s
@@ -900,6 +900,10 @@ match pair { (n, s) => perform IO.println(s) };
 Binary tuples have `fst[A, B]` and `snd[A, B]` accessors in
 `std.pair`. Larger tuples use match destructuring.
 
+Tuple arity is limited to **31 elements** (architectural: the heap
+header carries a 32-bit pointer bitmap, with one bit reserved). Use
+records or nested tuples for wider structures.
+
 ### §7 — Pattern matching
 
 See E3, E4 for examples. The `match` expression evaluates the
@@ -923,7 +927,7 @@ match's overall type is that unified arm-body type.
 
 ```sigil
 effect Raise[E] {
-  fail: (E) -> Int,
+  fail[A]: (E) -> A,
 }
 
 effect State[S] resumes: many {
@@ -946,6 +950,53 @@ The optional `resumes: many` annotation marks a multi-shot effect
 activation). Default is single-shot.
 
 In v1 only the builtin `Mem` effect has zero ops (it's a marker).
+
+##### Generic effect declarations
+
+Effects may take type parameters bound at the effect-decl level. The
+parameter binds across every op signature in the effect:
+
+```sigil
+effect Raise[E] {
+  fail[A]: (E) -> A,
+}
+```
+
+Here `E` is the effect-decl parameter — the error type — and is
+substituted at the row site (`![Raise[String]]`, `![Raise[ParseError]]`,
+etc.). Row-arity mismatches at the row site fire **E0143** (see
+§11).
+
+The canonical example is `std/raise.sigil`. The full file shape:
+
+```sigil
+effect Raise[E] {
+  fail[A]: (E) -> A,
+}
+
+fn raise[A, E](e: E) -> A ![Raise[E]] {
+  perform Raise.fail(e)
+}
+```
+
+##### Per-op generic parameters
+
+An op may carry its own generic parameters in `op_name[…]: …` form.
+These are bound at the op's scheme and instantiated **fresh at each
+perform site** — the canonical "never returns" idiom:
+
+```sigil
+fail[A]: (E) -> A,
+```
+
+`A` here is unconstrained; it unifies with the surrounding context's
+expected type at each `perform Raise.fail(...)` call. At runtime the
+discharging handler arm discards the continuation, so `fail` never
+returns — the per-op `A` is a typing convenience that lets the perform
+site appear in any return-type position.
+
+Per-op generic parameters must not shadow the enclosing effect-decl's
+parameters; doing so fires **E0144** (see §11).
 
 ##### Reserved effect names
 
@@ -1070,6 +1121,53 @@ This shape generalizes to any `resumes: many` effect. `std.choose`'s
 the bodies passed to `all_choices` contain side effects, the
 per-resume IO ordering specified here is what the caller observes.
 
+Per-resume execution applies regardless of whether `k` is invoked
+unconditionally on every iteration of the let-chain or conditionally
+inside an `if`/`match` (see the **Conditional k-call** subsection
+below). Branches that don't invoke `k` contribute no per-resume side
+effects.
+
+##### Row-polymorphic handlers
+
+A discharging handler may be **row-polymorphic** in the body's
+residual effects — the handler discharges the named effect and
+forwards everything else through to its caller's row. The canonical
+example is `std/raise.sigil`'s `catch`:
+
+```sigil
+fn catch[A, E](
+  body: () -> A ![Raise[E] | e]
+) -> Result[A, E] ![| e] {
+  handle body() with {
+    return(v) => Ok(v),
+    Raise.fail(err, k) => Err(err),
+  }
+}
+```
+
+The signature reads:
+
+- `e` is a **row variable**, introduced by the `| e` tail in the
+  effect row — it is not listed in the `[A, E]` generic-param
+  brackets. It stands for "whatever other effects the body
+  performs."
+- `body`'s row `![Raise[E] | e]` says "Raise[E], plus the effects
+  named by `e`." The pipe (`|`) separates the named effect(s) from
+  the row-tail variable.
+- The `handle` discharges `Raise[E]`. The result row `![| e]` shows
+  Raise[E] gone; only `e` remains.
+- This lets `catch` be called from any context: pure (`e := []`),
+  IO-doing (`e := [IO]`), state-threading (`e := [State[Int]]`), or
+  any combination — the row-tail unification picks up whatever
+  effects the body declared.
+
+A row variable referenced anywhere in a function's signature
+(`![Effect | e]`, `![| e]`, or in a fn-typed parameter's row) must
+be introduced by the same `| <name>` tail somewhere in that
+function's signature. An unreferenced row variable is rejected at
+typecheck with a fix-suggestion pointing at the missing
+declaration.
+
 **Eligible body shapes for v1.** The compiler classifies the helper
 fn's body into one of several supported Cps-ABI shapes that
 implement per-resume execution. The chained-let-yield shape covers
@@ -1128,8 +1226,7 @@ declared row. Mismatches fire E0042.
 #### §8.5 — First-class continuations
 
 The continuation `k` in a handler arm can be bound to a variable
-of type `Continuation[OpRet, Ret]` where `OpRet` is the operation's
-return type and `Ret` is the handler's return type:
+of type `Continuation[OpRet, Ret]`:
 
 ```sigil
 effect Step resumes: many {
@@ -1144,10 +1241,53 @@ handle body() with {
 }
 ```
 
-First-class continuations enable passing `k` to helper functions
-(including recursive helpers for runtime-N enumeration, as used by
-`all_choices` in `std.choose`). Dynamic-extent enforcement ensures
-a continuation cannot be invoked after its handler frame has exited.
+##### Type parameters
+
+`Continuation[OpRet, Ret]` is parameterized by:
+
+- **`OpRet`** — the operation's declared return type (what
+  `perform Effect.op(...)` evaluates to at the perform site, and
+  thus the type the continuation accepts as its single argument).
+- **`Ret`** — the surrounding handler's return type (what the
+  whole `handle body() with { … }` expression evaluates to, and
+  thus the type the continuation produces).
+
+For `effect Step resumes: many { step: (Int) -> Int }` handled by an
+arm whose body returns `Int`, the continuation is
+`Continuation[Int, Int]`.
+
+##### Syntactic sugar — desugared at codegen
+
+The `let f: Continuation[OpRet, Ret] = k; … f(arg) …` annotation is a
+**typing convenience**. The compiler does not allocate a separate
+continuation object: the annotation passes type-checking, and the
+codegen pass desugars `f` to direct references to `k` in the arm
+body. There is no runtime indirection through `f`.
+
+This means an arm body's reference count to `k` is the sum of all
+references through any aliases. Multi-shot accounting (and the
+single-shot E0220 invocation check) sees both `f(...)` and `k(...)`
+as the same continuation invocation.
+
+##### Dynamic-extent enforcement (E0145)
+
+Continuations cannot be invoked after their handler frame exits.
+Returning `k` from an arm body, storing it in a persistent data
+structure that outlives the `handle`, or otherwise letting the
+continuation reference escape the dynamic extent of its handler
+fires **E0145** (see §11).
+
+The escape barrier is enforced statically by the typecheck pass;
+the diagnostic points at the escape site (the `return`,
+field-store, or `let` outside the handler) and references the
+handler's `handle` keyword as the lifetime boundary.
+
+This rules out call/cc-style first-class continuations that survive
+their original handler. Within the dynamic extent, however, `k` is
+fully first-class: it can be passed to helper functions, captured
+in arm-internal closures, and (for multi-shot effects) invoked
+multiple times — see `all_choices` in `std/choose.sigil` for the
+canonical recursive-helper-driven runtime-N enumeration pattern.
 
 **Lambda-of-state (Plotkin-style) handler encoding.** Handler arms
 can return closures that capture `k` without calling it immediately.
@@ -1242,6 +1382,17 @@ Common codes:
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
+
+Recent additions (Plan D + state-cell):
+
+| Code | Meaning | Plan |
+|------|---------|------|
+| E0117 | pattern shape does not match scrutinee type | Plan D Task 113 (tuples) |
+| E0143 | row-site effect-arg arity does not match the effect-decl's generic-param count | Plan D Task 114 |
+| E0144 | per-op generic parameter shadows an effect-decl generic parameter | Plan D Task 115 |
+| E0145 | continuation `k` cannot escape its handle's arm body | Plan D Task 117 |
+| E0148 | runtime cell op called outside `std/state.sigil` | State-cell |
+| E0220 | one-shot continuation used more than once on a code path | Plan B Task 54 |
 
 Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
 
