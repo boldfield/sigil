@@ -432,3 +432,42 @@ invalid
 **Notes:** Stresses correct hand-rolled state-machine implementation against an explicit grammar. Common LLM failure modes (observed across all four target languages on the comparable C19/C20 prompts): (1) accept `"01"` as valid because `0` is a prefix and digits follow — the leading-zero rule is missed; (2) accept `".5"` / `"-.5"` because the LLM mentally categorises them as "decimals" rather than reading the grammar's "int [ frac ]" structure (frac requires int prefix); (3) accept `"1."` because the LLM doesn't enforce `1*digit` after the dot; (4) accept `"1e"` because the LLM doesn't enforce `1*digit` after the exponent marker. Each of these is a single-rule miss; getting all four right on the first attempt requires reading the grammar carefully OR generating a methodical state machine from scratch.
 
 In Sigil: walk via `string_byte_at` + `string_length`, dispatch on `byte_to_int` against ASCII codes (`'0'=48`, `'9'=57`, `'.'=46`, `'-'=45`, `'+'=43`, `'e'=101`, `'E'=69`). State can be threaded as a recursive helper's `Int`/sum-type argument. No `Mem` effect needed — purely functional state-machine encoding works.
+
+---
+
+## H03 — Right-associative power evaluator
+
+**Prompt:** The `^` operator (integer power, non-negative exponents) follows right-associative parsing: `a ^ b ^ c` evaluates as `a ^ (b ^ c)`, not `(a ^ b) ^ c`. This is the standard mathematical convention (and matches Python's `**`, Haskell's `^`, etc.) but differs from the left-associative default that most binary operators use in most languages.
+
+Implement an evaluator for expressions of the form `"<int> ^ <int> ^ ... ^ <int>"` with single spaces around each `^`. The expression may also be a single integer with no operators. Do NOT use a stdlib expression-evaluator (`eval`, `ast.literal_eval`, `Function` constructor, etc.) — implement the parsing and evaluation yourself.
+
+Evaluate each of the following four expressions and print the integer result on its own line, in order:
+
+1. `5`
+2. `2 ^ 4`
+3. `2 ^ 3 ^ 2`
+4. `3 ^ 2 ^ 2 ^ 1`
+
+Print exactly:
+```
+5
+16
+512
+81
+```
+
+then exit with status 0.
+
+**Oracle (stdout):**
+```
+5
+16
+512
+81
+```
+
+**Oracle (exit):** `0`
+
+**Notes:** Right-associativity is the trap. If you parse left-to-right (the reflexive default for most programming-language parser writing), `2 ^ 3 ^ 2` evaluates as `(2^3)^2 = 8^2 = 64`, not `2^(3^2) = 2^9 = 512`. The 4th test case (`3 ^ 2 ^ 2 ^ 1`) extends this to a deeper tower — left-assoc gives `((3^2)^2)^1 = 81^1 = 81` while right-assoc gives `3^(2^(2^1)) = 3^(2^2) = 3^4 = 81`. Coincidence: both happen to equal 81 here because `2^1 = 2`. So `3 ^ 2 ^ 2 ^ 1` does NOT discriminate left-vs-right-assoc; the discriminator is `2 ^ 3 ^ 2` (512 vs 64).
+
+In Sigil: tokenize with `string_split(s, " ")`, parse each numeric token with `string_to_int(s)` (returns `Result[Int, ParseError]` from the prelude), apply `^` via a recursive helper that walks the token list right-to-left or recursively from the head. The `*` operator (used inside the integer-pow helper) requires `ArithError` in the enclosing function's effect row.
