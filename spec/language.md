@@ -535,6 +535,31 @@ helpers `format1`...`format8` build the args list mechanically; the
 per-type wrappers (`format_int`, `format_string`, ...) save the
 constructor ceremony for the common single-arg case. See §13.
 
+### E18 — Partial application via a returned closure
+
+```sigil
+fn make_adder(x: Int) -> (Int) -> Int ![] ![] {
+  fn (y: Int) -> Int ![] => x + y
+}
+
+fn main() -> Int ![IO] {
+  let add3: (Int) -> Int ![] = make_adder(3);
+  perform IO.println(int_to_string(add3(4)));
+  0
+}
+```
+
+`make_adder`'s return type is `(Int) -> Int ![]` — a pure unary fn
+type — and `make_adder` itself is pure, hence the trailing `![]`
+on the fn declaration. The two `![]` rows are independent: the
+inner one belongs to the returned fn type; the outer one to
+`make_adder`. See §3.2.1 for the rule.
+
+The lambda `fn (y: Int) -> Int ![] => x + y` captures `x` from
+`make_adder`'s parameter list. At the call site, `make_adder(3)`
+produces a closure that adds `3` to its argument; `add3(4)` invokes
+that closure and yields `7`.
+
 ---
 
 ## Reference
@@ -745,6 +770,37 @@ Tuple types are written `(T1, T2)` — parentheses with comma-separated
 element types. Arity 1 is not a tuple (it's just a parenthesized
 type); arity 2+ creates a distinct tuple type.
 
+##### §3.2.1 — Fn types that return fn types
+
+A fn type that returns another fn type carries **two** effect rows:
+the inner returned fn-type's row, and the outer fn's own row. The
+doubled-`![..] ![..]` form is required because Sigil's per-arrow
+effect discipline gives every fn-type its own row.
+
+```sigil
+fn make_adder(x: Int) -> (Int) -> Int ![] ![] {
+  //                              ↑     ↑
+  //                              │     │ make_adder's own row (outer)
+  //                              │ inner returned (Int) -> Int's row
+  fn (y: Int) -> Int ![] => x + y
+}
+```
+
+Both `![]` slots are required — read right-to-left, the trailing
+`![..]` always binds to the nearest preceding `->` (the outer fn's
+own arrow), and the next `![..]` binds to the inner arrow.
+
+A common pattern is to drop the outer row (writing
+`(Int) -> Int ![]`); this hits **E0010** because the trailing `![..]`
+parses as the **inner** fn-type's row, leaving the outer fn without
+one. Always include both rows when the return type is itself a fn
+type.
+
+The same rule applies recursively for fn-returning-fn-returning-fn
+(three rows) and beyond, but those shapes are rare in practice; v1
+worked examples and stdlib stay at one level of return-type fn
+nesting. See E18 below for a complete program.
+
 #### §3.3 — Effect rows
 
 An effect row is a comma-separated set of effect names enclosed in
@@ -778,6 +834,9 @@ explicitly listed. Effects performed by the body that aren't in the
 explicit list are absorbed by the row variable and resolved at call
 sites via row unification. Row variables work both in fn-typed
 parameter positions and in a function's own declared effect row.
+
+When a fn returns a fn type, both fn types carry their own row —
+see §3.2.1 for the doubled-row form.
 
 #### §3.4 — Inference rules (overview)
 

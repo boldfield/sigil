@@ -6361,6 +6361,30 @@ fn make_adder_returns_12() {
     );
 }
 
+/// Spec worked-example E18 (§3.2.1, fn-types-that-return-fn-types
+/// rule). Same shape as `make_adder_returns_12` above, but the
+/// closure is bound to a `let` of explicit fn-type before being
+/// called — verifies the doubled `![..] ![..]` form parses, types,
+/// and runs end-to-end exactly as the spec example shows. Keep this
+/// test's source in sync with the E18 listing in spec/language.md.
+#[test]
+fn e18_make_adder_then_call_returns_7() {
+    let src = "fn make_adder(x: Int) -> (Int) -> Int ![] ![] {\n  \
+                 fn (y: Int) -> Int ![] => x + y\n\
+               }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let add3: (Int) -> Int ![] = make_adder(3);\n  \
+                 perform IO.println(int_to_string(add3(4)));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "e18_make_adder_then_call");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "7\n",
+        "E18: add3 = make_adder(3); add3(4) = 7. stderr={stderr:?}"
+    );
+}
+
 /// Phase C+ Part 2 — ClosureEnvLoad-callee dispatch. The lambda
 /// body invokes a captured fn-typed value `f`; closure-convert
 /// rewrites `f` inside the synth lambda body to `ClosureEnvLoad`.
