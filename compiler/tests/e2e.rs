@@ -7312,7 +7312,7 @@ fn std_mut_byte_array_import_loads_cleanly() {
 #[test]
 fn std_mut_array_get_opt_canonical() {
     let src = "import std.mut_array\n\n\
-               fn show(o: Option[Int]) -> String ![Mem] {\n  \
+               fn show(o: Option[Int]) -> String ![] {\n  \
                  match o {\n    \
                    Some(n) => int_to_string(n),\n    \
                    None    => \"none\",\n  \
@@ -7337,7 +7337,7 @@ fn std_mut_array_get_opt_canonical() {
 #[test]
 fn std_mut_array_set_opt_canonical() {
     let src = "import std.mut_array\n\n\
-               fn show_unit(o: Option[Unit]) -> String ![Mem] {\n  \
+               fn show_unit(o: Option[Unit]) -> String ![] {\n  \
                  match o {\n    \
                    Some(_) => \"ok\",\n    \
                    None    => \"none\",\n  \
@@ -7362,7 +7362,7 @@ fn std_mut_array_set_opt_canonical() {
 #[test]
 fn std_mut_byte_array_get_opt_canonical() {
     let src = "import std.mut_byte_array\n\n\
-               fn show(o: Option[Byte]) -> String ![Mem] {\n  \
+               fn show(o: Option[Byte]) -> String ![] {\n  \
                  match o {\n    \
                    Some(b) => int_to_string(byte_to_int(b)),\n    \
                    None    => \"none\",\n  \
@@ -7387,7 +7387,7 @@ fn std_mut_byte_array_get_opt_canonical() {
 #[test]
 fn std_mut_byte_array_set_opt_canonical() {
     let src = "import std.mut_byte_array\n\n\
-               fn show_unit(o: Option[Unit]) -> String ![Mem] {\n  \
+               fn show_unit(o: Option[Unit]) -> String ![] {\n  \
                  match o {\n    \
                    Some(_) => \"ok\",\n    \
                    None    => \"none\",\n  \
