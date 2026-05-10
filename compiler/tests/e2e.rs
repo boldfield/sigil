@@ -7682,6 +7682,70 @@ fn auto_prelude_with_explicit_import_for_helpers() {
     assert_eq!(stdout, "14\n", "stderr={stderr:?}");
 }
 
+/// Auto-prelude shadowing — user `type Color = | Red | Green |
+/// None`: the user's `None` constructor wins over the prelude
+/// `None`. Pattern-matching `None` against a `Color` scrutinee
+/// resolves to `Color::None`. Mirrors how Rust's
+/// `enum Color { None, ... }` shadows `Option::None` in scope.
+#[test]
+fn auto_prelude_user_type_shadows_none_ctor() {
+    let src = "type Color = | Red | Green | None\n\n\
+               fn name_of(c: Color) -> String ![] {\n  \
+                 match c {\n    \
+                   Red   => \"red\",\n    \
+                   Green => \"green\",\n    \
+                   None  => \"none-color\",\n  \
+                 }\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(name_of(Red));\n  \
+                 perform IO.println(name_of(Green));\n  \
+                 perform IO.println(name_of(None));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_color_none");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "red\ngreen\nnone-color\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing — user `type Option = | None |
+/// Some(Int)` (non-generic) replaces the prelude entry entirely.
+/// Cross-user collisions with the user's Option still fire E0118
+/// normally (the typechecker treats the user-redeclared Option as
+/// a user type, not a prelude type).
+#[test]
+fn auto_prelude_user_redeclares_option_overrides() {
+    let src = "type Option = | None | Some(Int)\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let o: Option = Some(7);\n  \
+                 match o {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none\"),\n  \
+                 };\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_option_override");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
+/// Auto-prelude shadowing — `let Some: Int = 7;` local binding
+/// shadows the prelude `Some` ctor in its scope. The local binding
+/// resolves to the bound value; the prelude ctor isn't reachable
+/// inside the let's body. Mirrors v1's existing behavior for any
+/// `let X = ...` that shadows a same-named ctor.
+#[test]
+fn auto_prelude_let_binding_shadows_some_ctor() {
+    let src = "fn main() -> Int ![IO] {\n  \
+                 let Some: Int = 7;\n  \
+                 perform IO.println(int_to_string(Some));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_let_some");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
+}
+
 /// `string_length` is the surface name for the Plan A1
 /// `sigil_string_len` runtime primitive. Both ASCII and UTF-8
 /// strings report byte length.
