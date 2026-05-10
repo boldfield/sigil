@@ -87,11 +87,9 @@ fn build() -> BTreeMap<String, BTreeSet<String>> {
                     }
                 }
                 Item::Import(_) | Item::Effect(_) => {
-                    // Imports don't declare names; effect declarations
-                    // contribute the effect name but E0046/E0112/E0114
-                    // diagnostics fire on identifiers / types /
-                    // constructors, not on effect names — skip for now
-                    // (could extend to E0138 unknown-effect later).
+                    // Imports don't declare names; effect names live in
+                    // their own diagnostic surface (E0138) which doesn't
+                    // route through this index.
                 }
             }
         }
