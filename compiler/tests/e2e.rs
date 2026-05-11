@@ -17710,6 +17710,201 @@ fn emit_symbol_table_writes_sorted_sidecar_with_main_and_runtime_symbols() {
     );
 }
 
+/// 2026-05-08 v2 runtime profile-data, Phase 6 Task 10 — end-to-end
+/// smoke. Compile a tiny example with `--emit-symbol-table`, run it
+/// under `SIGIL_CPU_PROFILE=<tmp>/cpu.pb` with a short
+/// `SIGIL_CPU_PROFILE_HZ`, and assert:
+/// - the program exits 0;
+/// - the output file exists and is non-empty;
+/// - the file looks like pprof (varint-decodable; first byte's
+///   field-number is 1 = `sample_type`).
+///
+/// This is the integration test for the full Phase 3 → Phase 5
+/// path on the linux-x86_64 host. macOS aarch64 is exercised
+/// separately by the CI matrix.
+#[test]
+fn cpu_profile_writes_pprof_when_env_set() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+
+    let test_id = std::process::id();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_cpu_prof_{test_id}"));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+    let profile_path = std::env::temp_dir().join(format!("sigil_e2e_cpu_prof_{test_id}.pb"));
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    // We use a small example that loops enough to take >50ms so
+    // the 99 Hz timer fires at least a handful of times. fib_perf
+    // computes fib(20) in <50ms which is borderline; nudge it by
+    // looping the perf script. Use fib_cps_perf which is ~250-500ms
+    // and gives the sampler real opportunities.
+    let source = root.join("examples/fib_cps_perf.sigil");
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_CPU_PROFILE", profile_path.to_str().unwrap())
+        .env("SIGIL_CPU_PROFILE_HZ", "999") // 999 Hz boosts hit count
+        .output()
+        .expect("execute compiled binary");
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let bytes = match std::fs::read(&profile_path) {
+        Ok(b) => b,
+        Err(e) => panic!("profile file `{}` not created: {e}", profile_path.display()),
+    };
+    let _ = std::fs::remove_file(&profile_path);
+
+    assert!(
+        !bytes.is_empty(),
+        "profile output must be non-empty (sampler may have missed all ticks)"
+    );
+
+    // Tiny pprof sanity: read the first protobuf tag. We expect
+    // field 1 (sample_type) with wire-type 2 (length-delimited).
+    // tag = (1 << 3) | 2 = 0x0A. The varint decoder for a 1-byte
+    // tag is just the byte itself when < 0x80.
+    let first = bytes[0];
+    assert_eq!(
+        first, 0x0A,
+        "first protobuf tag in pprof output must be `field 1, wire 2` = 0x0A; got 0x{first:02x}"
+    );
+}
+
+/// 2026-05-08 v2 runtime profile-data, Phase 6 Task 10 — alloc-
+/// profile smoke. Same shape as the CPU smoke but routes through
+/// the allocation sampler instead.
+#[test]
+fn alloc_profile_writes_pprof_when_env_set() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+
+    let test_id = std::process::id();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_alloc_prof_{test_id}"));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+    let profile_path = std::env::temp_dir().join(format!("sigil_e2e_alloc_prof_{test_id}.pb"));
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    // Use a program that allocates predictably. interpreter.sigil
+    // builds AST nodes; fib examples mostly arithmetic. Pick a
+    // program with visible allocation; hello.sigil allocates one
+    // string. We use the lower SAMPLE_RATE to ensure we capture
+    // even a small allocation count.
+    let source = root.join("examples/hello.sigil");
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(compile.status.success(), "compile failed");
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_ALLOC_PROFILE", profile_path.to_str().unwrap())
+        .env("SIGIL_ALLOC_SAMPLE_RATE", "1") // every alloc is a sample
+        .output()
+        .expect("execute compiled binary");
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+
+    assert!(run.status.success(), "run failed");
+
+    let bytes = std::fs::read(&profile_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&profile_path);
+
+    assert!(
+        !bytes.is_empty(),
+        "alloc profile must be non-empty at SAMPLE_RATE=1"
+    );
+    assert_eq!(
+        bytes[0], 0x0A,
+        "first protobuf tag in pprof output must be 0x0A; got 0x{:02x}",
+        bytes[0]
+    );
+}
+
+/// 2026-05-08 v2 runtime profile-data, Phase 6 Task 10 — folded-
+/// stacks variant. Output path with `.txt` extension routes to the
+/// FlameGraph-compatible writer; assert the file is human-readable
+/// text with at least one `<stack> <count>` row.
+#[test]
+fn cpu_profile_writes_folded_for_txt_extension() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+
+    let test_id = std::process::id();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_folded_{test_id}"));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+    let profile_path = std::env::temp_dir().join(format!("sigil_e2e_folded_{test_id}.txt"));
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(compile.status.success());
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_CPU_PROFILE", profile_path.to_str().unwrap())
+        .env("SIGIL_CPU_PROFILE_HZ", "999")
+        .output()
+        .expect("execute compiled binary");
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+    assert!(run.status.success(), "run failed");
+
+    let text = match std::fs::read_to_string(&profile_path) {
+        Ok(s) => s,
+        Err(e) => panic!("folded output not created: {e}"),
+    };
+    let _ = std::fs::remove_file(&profile_path);
+
+    assert!(
+        !text.is_empty(),
+        "folded output must contain at least one row"
+    );
+    // Each line: `<frame>;<frame> <count>`. The count is the last
+    // space-separated token; parse one as u64 to confirm format.
+    let first_line = text.lines().next().expect("at least one line");
+    let count_str = first_line.rsplit(' ').next().expect("count column");
+    assert!(
+        count_str.parse::<u64>().is_ok(),
+        "last column of folded output must be a numeric count; got `{count_str}` on line `{first_line}`"
+    );
+}
+
 /// 2026-05-08 v2 runtime profile-data, Phase 1 Task 2 — compile
 /// without `--emit-symbol-table` and assert NO sidecar is written.
 /// Pins the gate so the default compile path stays zero-cost.

@@ -1848,3 +1848,87 @@ cargo build --release
 
 The compiler produces a self-contained native binary; no runtime
 installation is needed beyond the Boehm GC system library.
+
+### §16 — Profiling and instrumentation
+
+Sigil ships a runtime profile-data surface (v2 prerequisite work) that
+emits CPU and allocation samples to an on-disk profile, consumable by
+standard tools (`pprof`, `flamegraph.pl`, `speedscope`, `perfetto`).
+The surface is **zero-overhead when disabled**: the env-var gates
+short-circuit before any allocation, syscall, or signal-handler
+install, and the alloc-profile hot path on `sigil_alloc` is a single
+relaxed atomic load + branch.
+
+#### Compiler flag
+
+| Flag | Behaviour |
+|------|-----------|
+| `--emit-symbol-table` | Writes `<output>.symtab` next to the compiled executable. The sidecar is a tab-separated map from text-section offsets to demangled function names, sorted ascending by offset: `<text_offset_hex>\t<size_hex>\t<demangled_name>`. The runtime profiler reads it at flush time to resolve sampled PCs. Without this flag, profile output records raw `0x<hex>` addresses. |
+
+#### Environment variables
+
+| Variable | Effect | Default |
+|----------|--------|---------|
+| `SIGIL_CPU_PROFILE=<path>` | Install a `SIGPROF` handler at `SIGIL_CPU_PROFILE_HZ`, capture stack traces, write the profile to `<path>` at process exit. | unset (no CPU profile) |
+| `SIGIL_CPU_PROFILE_HZ=<N>` | Sampling frequency in Hz. Range `[1, 10000]`; values outside fall back to default. | 99 |
+| `SIGIL_ALLOC_PROFILE=<path>` | Sample every `SIGIL_ALLOC_SAMPLE_RATE`-th `sigil_alloc` call, capture stack traces, write the profile to `<path>` at process exit. The recorded `value` is `requested_bytes * rate`, so the unsampled total renders as "bytes allocated". | unset (no allocation profile) |
+| `SIGIL_ALLOC_SAMPLE_RATE=<N>` | Sample every Nth allocation. `N >= 1`. | 512 |
+| `SIGIL_PROFILE_FORMAT=pprof\|folded` | Override the output format. Case-insensitive. Falls back to extension detection on any other value. | extension-based |
+
+#### Output format auto-detection
+
+| Path ends in | Format | Renders with |
+|--------------|--------|--------------|
+| `.txt` | folded stacks | `flamegraph.pl < out.txt > flame.svg` |
+| anything else (`.pb`, `.proto`, no extension) | pprof | `pprof -http=:0 out.pb`, `speedscope out.pb`, `perfetto trace_to_text out.pb` |
+
+#### Stack-walking mechanism
+
+Stack traces are captured via the saved-frame-pointer chain — every
+emitted function (compiler-generated user code and the runtime crate)
+preserves the `%rbp` (x86_64) / `x29` (aarch64) prologue save, and
+the walker follows `[fp + 0] -> prev_fp` while reading return
+addresses from `[fp + 8]`. The walk is signal-safe (no allocation,
+no libc, bounded `MAX_DEPTH = 128`).
+
+**Tradeoff:** tail-called functions don't appear in profiles. The
+compiler aggressively TCO's tail-recursive sigil functions
+(`return_call` IR at `CallConv::Tail`); the caller's frame is
+replaced by the callee's, so a sample inside the callee shows the
+callee's caller, not the intermediate callees. This is the
+intentional cost of Sigil's "recursion is the only loop" model.
+
+**aarch64 pointer-authentication:** Apple Silicon may sign return
+addresses; the walker strips PAC bits with a 48-bit canonical-VA
+mask before recording.
+
+#### Recommended workflow
+
+```shell
+# 1. Compile with the symbol sidecar.
+sigil examples/json.sigil -o json --emit-symbol-table
+
+# 2. Run under profile collection.
+SIGIL_CPU_PROFILE=/tmp/cpu.pb ./json < input.json
+
+# 3. Render with your preferred tool.
+pprof -http=:0 /tmp/cpu.pb              # interactive flame graph in browser
+speedscope /tmp/cpu.pb                  # standalone viewer
+flamegraph.pl < /tmp/cpu.txt > /tmp/flame.svg  # if exported as folded stacks
+```
+
+For allocation profiling:
+
+```shell
+SIGIL_ALLOC_PROFILE=/tmp/alloc.pb SIGIL_ALLOC_SAMPLE_RATE=32 ./json < input.json
+pprof -alloc_space /tmp/alloc.pb        # bytes-allocated heatmap
+```
+
+#### Out of scope (v3+)
+
+- DWARF-driven source-line resolution in pprof `Location.line[]`.
+- Wall-clock / off-CPU profile (would require `perf_events` /
+  `proc_pidinfo`).
+- Continuous / streaming profiles.
+- GC heap-snapshot profile.
+- Effect-aware per-handler-frame attribution.
