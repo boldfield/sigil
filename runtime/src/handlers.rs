@@ -457,121 +457,14 @@ pub fn outer_post_arm_k_depth_restore(target: usize) {
     OUTER_POST_ARM_K_DEPTH.with(|c| c.set(target));
 }
 
-// ---------------------------------------------------------------------
-// Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack
-// (replaces the iter-2 single-cell triplet TLS per PR #80 review §1)
-// ---------------------------------------------------------------------
-//
-// Mirrors `OUTER_POST_ARM_K_STACK`'s discipline. Each entry holds a
-// (closure_ptr, fn_ptr, fired) triple identifying the active handle's
-// return arm at the body-fn natural-exit emit sites. Stack discipline:
-//
-//   - **Custom handle body-call wrapper** pushes (return_arm_closure,
-//     return_arm_fn) BEFORE driving the body's run_loop; pops AFTER,
-//     yielding the popped entry's `fired` flag for Phase 4g.
-//   - **Sync→Cps interop wrappers** (`lower_call`'s Cps branch + Sync
-//     shim) push (null, null) BEFORE the nested run_loop to mask the
-//     outer pair (Risk 3 discipline — sub-Cps-fn calls' natural-exit
-//     helpers see null and emit `Done(v)` directly); pop AFTER.
-//   - **Helper** `sigil_done_or_dispatch_return_arm` reads the top
-//     entry; if depth==0 OR fn==null OR fired → emit `Done(v)`; else
-//     mark top.fired=true + dispatch return arm.
-//
-// **Why a stack** (vs the iter-2 single-cell triplet): the stack
-// pattern co-locates push+pop discipline at every nested-run_loop
-// boundary, eliminating the SAVE+CLEAR+SET / RESTORE call-quartet that
-// future Cps-interop sites could forget (Risk-3-style silent bug).
-// Mirrors the existing `OUTER_POST_ARM_K_STACK` discipline so push/pop
-// invariants and Boehm-rooting reasoning are uniform across both.
-//
-// **GC rooting**: closures are heap pointers — the stack array is
-// registered as a Boehm root via
-// `register_body_return_arm_stack_root_for_calling_thread`, mirroring
-// `OUTER_POST_ARM_K_STACK`'s registration. Pop clears the popped
-// slot's pointers so a stale entry doesn't outlive its useful
-// lifetime in the rooted range.
-//
-// **Cap = 256** bounds **handle-body nesting + sub-Cps-call
-// nesting**, not user-fn recursion depth in general — at most one
-// entry per nested `sigil_run_loop` invocation on the calling
-// thread (handle-body wrapper or sub-Cps-call wrapper).
-//
-// Plan C Task 81 cap-bump-rework reduced this from a temporary
-// 4096 by introducing the conditional null-mask
-// (`sigil_body_return_arm_push_mask_if_needed`) at the
-// `lower_call`'s `UserFnAbi::Cps` shim and `__sync_shim` emit
-// sites: the (null, null) Risk-3 mask is skipped when the top
-// of stack already has a null `fn_ptr`, since the natural-exit
-// helper emits Done either way. The conditional skip eliminated
-// most accumulation (Sudoku 9×9 went from 128 → ~51 deep).
-//
-// 256 covers: Sudoku 9×9 Wikipedia easy (~51 empty cells, one
-// `lower_handle_body_direct_cps_call` non-null push per nested
-// `solve_with_undo` handle), hardest Sudoku puzzles (16-clue
-// puzzles need ~65 nested handles), and generic backtracking
-// demos with ~5x safety margin. Overflow aborts via
-// `eprintln!` + `abort()` in `sigil_body_return_arm_push`
-// rather than dynamic resize — codegen invariant violations
-// should surface loudly.
-//
-// **v2 follow-up.** Genuine non-null handle pushes (return-arm
-// pairs from `lower_handle_body_direct_cps_call`) are load-
-// bearing — the natural-exit helper dispatches via the top
-// entry's `fn_ptr`, and skipping a non-null push would lose
-// the return arm. Eliminating those would require an
-// architectural change: pass the return arm to the body fn via
-// `args_ptr` trailing slots (like `caller_k_pair` for synth-
-// conts) instead of via a thread-local stack. That change is
-// out of scope for v1.
-
-const BODY_RETURN_ARM_STACK_SIZE: usize = 256;
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct BodyReturnArmEntry {
-    closure_ptr: *mut u8,
-    fn_ptr: *mut u8,
-    fired: bool,
-}
-
-thread_local! {
-    static BODY_RETURN_ARM_STACK: Cell<[BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE]> = const {
-        Cell::new([BodyReturnArmEntry {
-            closure_ptr: ptr::null_mut(),
-            fn_ptr: ptr::null_mut(),
-            fired: false,
-        }; BODY_RETURN_ARM_STACK_SIZE])
-    };
-    static BODY_RETURN_ARM_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static BODY_RETURN_ARM_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Register the calling thread's `BODY_RETURN_ARM_STACK` TLS cell as
-/// a Boehm GC root. Idempotent per thread. Mirrors
-/// [`register_outer_post_arm_k_stack_root_for_calling_thread`].
-pub(crate) fn register_body_return_arm_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
-{
-    BODY_RETURN_ARM_STACK.with(|cell| {
-        let start =
-            cell as *const Cell<[BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE]> as *mut c_void;
-        let end = unsafe {
-            (start as *mut u8).add(core::mem::size_of::<
-                [BodyReturnArmEntry; BODY_RETURN_ARM_STACK_SIZE],
-            >()) as *mut c_void
-        };
-        let already_registered = BODY_RETURN_ARM_STACK_ROOTED.with(|rooted| {
-            let r = rooted.get();
-            rooted.set(true);
-            r
-        });
-        if !already_registered {
-            unsafe {
-                crate::gc::GC_add_roots(start, end);
-            }
-        }
-        (start, end)
-    })
-}
+// 2026-05-04 return-arm-via-args lift Stage 5 — the
+// `BODY_RETURN_ARM_STACK` TLS (Task 78.5 G4 Approach 6 deep-redo)
+// retired here. Its only consumer was the `fired` flag in the args-
+// helper (closure_ptr / fn_ptr were already gone post-Stage 4). The
+// flag is now a per-handle stack cell allocated at
+// `lower_handle_body_direct_cps_call` and threaded through args_ptr +
+// synth-cont closure records by the codegen layout extension; the
+// helper gates dispatch on `*fired_ptr`.
 
 // Nested-effect-forwarding fix: when sigil_perform crosses intervening
 // handlers, record the crossed frame pointers so lower_k_pair_call can
@@ -715,20 +608,6 @@ pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut
         let new_len = stack.len() - remove;
         stack.truncate(new_len);
     });
-}
-
-/// Inverse of [`register_body_return_arm_stack_root_for_calling_thread`].
-/// Used by `GcThreadEnrolment::drop` in tests.
-#[cfg(test)]
-pub(crate) fn unregister_body_return_arm_stack_root_for_calling_thread(
-    start: *mut c_void,
-    end: *mut c_void,
-) {
-    BODY_RETURN_ARM_STACK_ROOTED.with(|rooted| rooted.set(false));
-    BODY_RETURN_ARM_DEPTH.with(|depth| depth.set(0));
-    unsafe {
-        crate::gc::GC_remove_roots(start, end);
-    }
 }
 
 /// Register the calling thread's `OUTER_POST_ARM_K_STACK` TLS cell as
@@ -1325,190 +1204,30 @@ pub unsafe extern "C" fn sigil_next_step_done(value: u64) -> *mut NextStep {
 // became authoritative once the ABI threading completed and the TLS
 // path is now removed entirely.
 
-// ---------------------------------------------------------------------
-// Task 78.5 G4 Approach 6 deep-redo — body-return-arm stack helpers
-// (PR #80 review §1: replaces single-cell-triplet TLS + SAVE+CLEAR+SET
-// /RESTORE call quartet with stack discipline mirroring
-// `OUTER_POST_ARM_K_STACK`)
-// ---------------------------------------------------------------------
+// 2026-05-04 return-arm-via-args lift Stage 5 — the four body-return-
+// arm TLS push/pop/mask helpers (`sigil_body_return_arm_push`, `_pop`,
+// `_push_mask_if_needed`, `_pop_if_flag`) retired. Codegen no longer
+// emits calls to them; the per-handle `fired` cell is the structural
+// replacement.
 
-/// Push a body-return-arm entry onto the thread-local stack with
-/// `fired = false`. Codegen emits this:
+/// 2026-05-04 return-arm-via-args lift — natural-exit dispatch helper.
 ///
-/// 1. From the **custom handle body-call wrapper** with the active
-///    handle's `(return_arm_closure, return_arm_fn)` — the body's
-///    natural-exit helper sites read the top entry and dispatch the
-///    return arm.
-/// 2. From **`lower_call`'s `UserFnAbi::Cps` branch + Sync shim**
-///    around their nested `run_loop` calls with `(null, null)` —
-///    masks the outer pair so sub-Cps-fn calls' natural-exit helpers
-///    see null and emit `Done(v)` directly (Risk 3 discipline).
+/// `return_arm_fired_ptr: *mut u64` points at a 1-u64 cell on the
+/// handle expression's stack frame. The cell starts at 0 and is
+/// mutated to 1 on first dispatch; chain-unwind synth-conts inheriting
+/// the same `fired_ptr` (via forward-copy through closure records)
+/// observe the mutation and short-circuit. The Stage-5 structural
+/// replacement for the retired TLS `BODY_RETURN_ARM_STACK[depth-1].
+/// fired` flag.
 ///
-/// Aborts on stack overflow (cap = `BODY_RETURN_ARM_STACK_SIZE` = 256).
-/// Every push must be paired with one `sigil_body_return_arm_pop` (the
-/// codegen wrapper that pushes also emits the matching pop).
-///
-/// # Panic-safety (PR #80 review iter 3 N4)
-///
-/// If a Rust panic propagates through `sigil_run_loop` between push
-/// and the matching pop, the pop is skipped and depth stays
-/// incremented; subsequent push/pop pairs on the same thread still
-/// balance correctly relative to each other but observe a stale
-/// outer frame at depths above the panic site. In practice Rust
-/// panics through `extern "C"` boundaries are UB anyway and our
-/// runtime aborts loudly on `sigil_alloc` exhaustion / unreachable!,
-/// so this is theoretical. v2 follow-up: revisit if any runtime path
-/// catches panics.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state. `closure_ptr` may be null
-/// (return arms with no captures, or sub-call-mask pushes); `fn_ptr`
-/// may be null (sub-call-mask pushes — the helper checks for null fn
-/// and emits `Done(v)` instead of dispatching).
-#[no_mangle]
-pub unsafe extern "C" fn sigil_body_return_arm_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
-    BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        if depth >= BODY_RETURN_ARM_STACK_SIZE {
-            eprintln!(
-                "sigil_body_return_arm_push: stack overflow (depth {} >= cap {})",
-                depth, BODY_RETURN_ARM_STACK_SIZE
-            );
-            std::process::abort();
-        }
-        BODY_RETURN_ARM_STACK.with(|stack_cell| {
-            let mut stack = stack_cell.get();
-            stack[depth] = BodyReturnArmEntry {
-                closure_ptr,
-                fn_ptr,
-                fired: false,
-            };
-            stack_cell.set(stack);
-        });
-        depth_cell.set(depth + 1);
-    });
-}
-
-/// Plan C Task 81 cap-bump-rework — conditional null-mask push.
-///
-/// The Risk-3 protection at sub-Cps-call boundaries (lower_call's
-/// UserFnAbi::Cps shim, __sync_shim, and chain step CallCps emit)
-/// pushes `(null, null)` to mask the outer body's return arm so the
-/// sub-call's natural-exit helper (`sigil_done_or_dispatch_return_arm`)
-/// emits `Done(v)` instead of dispatching the outer's return arm.
-///
-/// **The mask is redundant when the top of the stack already has a
-/// null `fn_ptr` OR the stack is empty.** The natural-exit helper
-/// (`sigil_done_or_dispatch_return_arm`) emits Done either way.
-/// Stacking redundant `(null, null)` masks just inflates depth —
-/// for Sudoku 9×9 with `cell_valid (Sync) → check_conflict (Cps)
-/// via shim` recursion, the depth grows past the original 32 cap
-/// purely on these redundant masks.
-///
-/// This helper checks the top before pushing. Returns 1 if pushed,
-/// 0 if skipped. The matching `sigil_body_return_arm_pop_if_flag`
-/// pops only when the flag is 1.
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_body_return_arm_push_mask_if_needed() -> u8 {
-    let needs_mask = BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        if depth == 0 {
-            return false;
-        }
-        BODY_RETURN_ARM_STACK.with(|stack_cell| {
-            let stack = stack_cell.get();
-            !stack[depth - 1].fn_ptr.is_null()
-        })
-    });
-    if !needs_mask {
-        return 0;
-    }
-    sigil_body_return_arm_push(ptr::null_mut(), ptr::null_mut());
-    1
-}
-
-/// Plan C Task 81 cap-bump-rework — paired conditional pop. Pops
-/// only when the flag is 1 (i.e., the matching
-/// `sigil_body_return_arm_push_mask_if_needed` actually pushed).
-/// Returns the popped entry's `fired` flag (0 if didn't pop).
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_body_return_arm_pop_if_flag(flag: u8) -> u8 {
-    if flag == 0 {
-        return 0;
-    }
-    sigil_body_return_arm_pop()
-}
-
-/// Pop the top body-return-arm entry. Returns the popped entry's
-/// `fired` flag as a u8 (0 or 1) so Phase 4g's suppression branch can
-/// check it without a separate TLS read. Aborts on underflow (push/pop
-/// imbalance is a codegen bug, not a user-program error).
-///
-/// # Safety
-///
-/// Safe to call. Writes thread-local state. The popped slot's pointer
-/// fields are zeroed so a stale entry doesn't survive in the
-/// Boehm-rooted range across the next GC scan.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_body_return_arm_pop() -> u8 {
-    BODY_RETURN_ARM_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        if depth == 0 {
-            eprintln!("sigil_body_return_arm_pop: underflow (depth=0)");
-            std::process::abort();
-        }
-        depth_cell.set(depth - 1);
-        BODY_RETURN_ARM_STACK.with(|stack_cell| {
-            let mut stack = stack_cell.get();
-            let popped = stack[depth - 1];
-            stack[depth - 1] = BodyReturnArmEntry {
-                closure_ptr: ptr::null_mut(),
-                fn_ptr: ptr::null_mut(),
-                fired: false,
-            };
-            stack_cell.set(stack);
-            if popped.fired {
-                1
-            } else {
-                0
-            }
-        })
-    })
-}
-
-/// 2026-05-04 return-arm-via-args lift Stage 3a — args-passing variant.
-///
-/// Stage 5 added a 4th parameter `return_arm_fired_ptr: *mut u64`
-/// pointing at a 1-u64 cell on the handle expression's stack frame.
-/// The cell starts at 0 and is mutated to 1 on first dispatch; chain-
-/// unwind synth-conts inheriting the same `fired_ptr` observe the
-/// mutation and short-circuit. This replaces the TLS
-/// `BODY_RETURN_ARM_STACK[depth-1].fired` flag.
-///
-/// The implementation has TWO paths during the Stage 5 staged
-/// migration:
-///
-/// - **`fired_ptr` path** (non-null): pure args-passing. Reads/writes
-///   `*fired_ptr` for the gate; ignores TLS. The lift's terminal shape.
-///
-/// - **TLS fallback** (null `fired_ptr`): in-progress migration sites
-///   that haven't been flipped yet pass null. Behaves identically to
-///   the pre-Stage-5 helper (consults TLS `BODY_RETURN_ARM_STACK
-///   [depth-1].fired`). Removed when the final emit site flips.
-///
-/// Semantics (both paths):
-/// - `fired` (whichever channel) already set → emit `Done(v)`.
-/// - `return_arm_fn` null → emit `Done(v)`.
-/// - Otherwise set `fired = 1` and dispatch
+/// Semantics:
+/// - Null `return_arm_fired_ptr` (sub-Cps-call boundary — no outer
+///   handle in flight) → emit `Done(v)`.
+/// - `*fired_ptr != 0` (already dispatched at the body's deepest
+///   natural-exit) → emit `Done(v)`.
+/// - Null `return_arm_fn` (no return arm even though a handle is in
+///   flight) → emit `Done(v)`.
+/// - Otherwise set `*fired_ptr = 1` and dispatch
 ///   `Call(return_arm_closure, return_arm_fn, [v, null, identity])`.
 ///
 /// # Safety
@@ -1525,43 +1244,16 @@ pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm_via_args(
     return_arm_fn: *mut u8,
     return_arm_fired_ptr: *mut u64,
 ) -> *mut NextStep {
-    if !return_arm_fired_ptr.is_null() {
-        if ptr::read(return_arm_fired_ptr) != 0 {
-            return sigil_next_step_done(v);
-        }
-        if return_arm_fn.is_null() {
-            return sigil_next_step_done(v);
-        }
-        ptr::write(return_arm_fired_ptr, 1u64);
-        let ns = sigil_next_step_call(return_arm_closure, return_arm_fn, 3);
-        let args = sigil_next_step_args_ptr(ns);
-        ptr::write(args.add(0), v);
-        ptr::write(args.add(1), 0u64);
-        ptr::write(
-            args.add(2),
-            sigil_continuation_identity as *const () as usize as u64,
-        );
-        return ns;
+    if return_arm_fired_ptr.is_null() {
+        return sigil_next_step_done(v);
     }
-    // TLS fallback — Stage 5 migration in-progress. Mirrors the
-    // pre-Stage-5 helper.
-    let depth = BODY_RETURN_ARM_DEPTH.with(|c| c.get());
-    if depth > 0 {
-        let top = BODY_RETURN_ARM_STACK.with(|c| c.get()[depth - 1]);
-        if top.fired {
-            return sigil_next_step_done(v);
-        }
+    if ptr::read(return_arm_fired_ptr) != 0 {
+        return sigil_next_step_done(v);
     }
     if return_arm_fn.is_null() {
         return sigil_next_step_done(v);
     }
-    if depth > 0 {
-        BODY_RETURN_ARM_STACK.with(|stack_cell| {
-            let mut stack = stack_cell.get();
-            stack[depth - 1].fired = true;
-            stack_cell.set(stack);
-        });
-    }
+    ptr::write(return_arm_fired_ptr, 1u64);
     let ns = sigil_next_step_call(return_arm_closure, return_arm_fn, 3);
     let args = sigil_next_step_args_ptr(ns);
     ptr::write(args.add(0), v);
