@@ -10680,18 +10680,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                            let alloc_call = lowerer
-                                .builder
-                                .ins()
-                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                alloc_call,
-                            ));
-                            let closure_record = lowerer.builder.inst_results(alloc_call)[0];
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(closure_record);
+                            let closure_record = lower_alloc_call(
+                                &mut lowerer.builder,
+                                lowerer.stackmap,
+                                lowerer.builtins.alloc_ref,
+                                &[header_v, payload_v],
+                            );
 
                             // Null code_ptr at +8.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -11372,10 +11366,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
-                        stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
-                        let cp = builder.inst_results(alloc_call)[0];
-                        builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            &mut stackmap,
+                            alloc_ref,
+                            &[header_v, payload_v],
+                        );
 
                         // Null code_ptr at offset 8.
                         let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -11535,10 +11531,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
-                        stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
-                        let cp = builder.inst_results(alloc_call)[0];
-                        builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            &mut stackmap,
+                            alloc_ref,
+                            &[header_v, payload_v],
+                        );
 
                         let null_v = builder.ins().iconst(pointer_ty, 0);
                         builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
@@ -13064,17 +13062,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
                     let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                    let alloc_call = lowerer
-                        .builder
-                        .ins()
-                        .call(builtins.alloc_ref, &[header_v, payload_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                    let step_0_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                    lowerer
-                        .builder
-                        .declare_value_needs_stack_map(step_0_closure_ptr);
+                    let step_0_closure_ptr = lower_alloc_call(
+                        &mut lowerer.builder,
+                        lowerer.stackmap,
+                        builtins.alloc_ref,
+                        &[header_v, payload_v],
+                    );
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                     lowerer
                         .builder
@@ -13348,15 +13341,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let payload_bytes: i64 = 8 + 8 * total_slots as i64;
                         let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                         let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                        let alloc_call = lowerer
-                            .builder
-                            .ins()
-                            .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                        let cp = lowerer.builder.inst_results(alloc_call)[0];
-                        lowerer.builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut lowerer.builder,
+                            lowerer.stackmap,
+                            lowerer.builtins.alloc_ref,
+                            &[header_v, payload_v],
+                        );
                         // Null code_ptr at offset 8.
                         let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                         lowerer
@@ -14995,18 +14985,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let payload_bytes: i64 = 8 + 8 * next_capture_count as i64;
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                            let alloc_call = lowerer
-                                .builder
-                                .ins()
-                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                alloc_call,
-                            ));
-                            let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(next_closure_ptr);
+                            let next_closure_ptr = lower_alloc_call(
+                                &mut lowerer.builder,
+                                lowerer.stackmap,
+                                lowerer.builtins.alloc_ref,
+                                &[header_v, payload_v],
+                            );
                             // code_ptr at offset 8 = null.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                             lowerer.builder.ins().store(
@@ -16622,18 +16606,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .builder
                                                     .ins()
                                                     .iconst(pointer_ty, branch_payload);
-                                                let balloc = lowerer.builder.ins().call(
+                                                let branch_closure = lower_alloc_call(
+                                                    &mut lowerer.builder,
+                                                    lowerer.stackmap,
                                                     lowerer.builtins.alloc_ref,
                                                     &[bh_v, bp_v],
                                                 );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(&lowerer.builder, balloc),
-                                                );
-                                                let branch_closure =
-                                                    lowerer.builder.inst_results(balloc)[0];
-                                                lowerer
-                                                    .builder
-                                                    .declare_value_needs_stack_map(branch_closure);
 
                                                 // Null code_ptr at +8.
                                                 let null_v =
@@ -17559,18 +17537,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.builder.ins().iconst(types::I64, header as i64);
                                 let payload_v =
                                     lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                                let alloc_call = lowerer
-                                    .builder
-                                    .ins()
-                                    .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    alloc_call,
-                                ));
-                                let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(next_closure_ptr);
+                                let next_closure_ptr = lower_alloc_call(
+                                    &mut lowerer.builder,
+                                    lowerer.stackmap,
+                                    lowerer.builtins.alloc_ref,
+                                    &[header_v, payload_v],
+                                );
 
                                 // Null code_ptr at +8.
                                 let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -21743,24 +21715,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::FloatLit(f, _span) => {
                 let bits = f.to_bits() as i64;
                 let raw = self.builder.ins().iconst(types::I64, bits);
-                let call = self.builder.ins().call(self.builtins.float_box_ref, &[raw]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_box_ref;
+                self.lower_alloc_call(callee, &[raw])
             }
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => {
                 // Plan C addendum (Char) — boxed Char literal: codepoint
                 // immediate as i64, then sigil_char_box → pointer_ty.
                 let cp = self.builder.ins().iconst(types::I64, *c as i64);
-                let call = self.builder.ins().call(self.builtins.char_box_ref, &[cp]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_box_ref;
+                self.lower_alloc_call(callee, &[cp])
             }
             Expr::UnitLit(_) => self.builder.ins().iconst(types::I8, 0),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
@@ -23161,14 +23125,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let header_v = self.builder.ins().iconst(types::I64, header as i64);
                 let payload_bytes: i64 = (n as i64) * 8;
                 let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-                let alloc_call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.alloc_ref, &[header_v, size_v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                let ptr = self.builder.inst_results(alloc_call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
+                let callee = self.builtins.alloc_ref;
+                let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
                 for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
                     let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
                         val
@@ -23808,14 +23766,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // `return(v) => ...`.
                     let (return_closure, return_fn) =
                         self.source_arm_return_pair_for_continuation_arg();
-                    let alloc_call = self.builder.ins().call(
-                        self.builtins.cont_alloc_ref,
-                        &[k_closure, k_fn, return_closure, return_fn],
-                    );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
-                    self.builder.declare_value_needs_stack_map(cont_ptr);
+
+                    let callee = self.builtins.cont_alloc_ref;
+                    let cont_ptr = self
+                        .lower_alloc_call(callee, &[k_closure, k_fn, return_closure, return_fn]);
                     return cont_ptr;
                 }
             }
@@ -23839,14 +23793,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 if name == arm_k_name {
                     let (return_closure, return_fn) =
                         self.source_arm_return_pair_for_continuation_arg();
-                    let alloc_call = self.builder.ins().call(
-                        self.builtins.cont_alloc_ref,
-                        &[k_closure, k_fn, return_closure, return_fn],
-                    );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
-                    self.builder.declare_value_needs_stack_map(cont_ptr);
+
+                    let callee = self.builtins.cont_alloc_ref;
+                    let cont_ptr = self
+                        .lower_alloc_call(callee, &[k_closure, k_fn, return_closure, return_fn]);
                     return cont_ptr;
                 }
             }
@@ -24283,15 +24233,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int_to_string" => {
                 assert_eq!(args.len(), 1, "int_to_string builtin arg count is not 1");
                 let arg_val = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int_to_string_ref, &[arg_val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int_to_string_ref;
+                self.lower_alloc_call(callee, &[arg_val])
             }
             // Plan C Task 65 — runtime Array primitives. Each lowers to
             // a single FFI invocation. `array_alloc` and `array_set`
@@ -24304,24 +24247,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "array_alloc builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.array_alloc_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_alloc_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "array_empty" => {
                 assert_eq!(args.len(), 0, "array_empty builtin arg count is not 0");
-                let call = self.builder.ins().call(self.builtins.array_empty_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_empty_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "array_length" => {
                 assert_eq!(args.len(), 1, "array_length builtin arg count is not 1");
@@ -24347,15 +24279,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let arr = self.lower_expr(&args[0]);
                 let idx = self.lower_expr(&args[1]);
                 let val = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.array_set_ref, &[arr, idx, val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_set_ref;
+                self.lower_alloc_call(callee, &[arr, idx, val])
             }
             // Plan C Task 66 — runtime MutArray primitives. Same
             // dispatch shape as Array, except `mut_array_set` returns
@@ -24379,15 +24304,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "mut_array_new builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.mut_array_new_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.mut_array_new_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "mut_array_length" => {
                 assert_eq!(args.len(), 1, "mut_array_length builtin arg count is not 1");
@@ -24432,27 +24350,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "byte_array_alloc builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_alloc_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_alloc_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "byte_array_empty" => {
                 assert_eq!(args.len(), 0, "byte_array_empty builtin arg count is not 0");
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_empty_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_empty_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "byte_array_length" => {
                 assert_eq!(
@@ -24485,43 +24389,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_concat_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_concat_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "byte_array_slice" => {
                 assert_eq!(args.len(), 3, "byte_array_slice builtin arg count is not 3");
                 let arr = self.lower_expr(&args[0]);
                 let start = self.lower_expr(&args[1]);
                 let end = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_slice_ref, &[arr, start, end]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_slice_ref;
+                self.lower_alloc_call(callee, &[arr, start, end])
             }
             Expr::Ident(name, _) if name == "string_to_bytes" => {
                 assert_eq!(args.len(), 1, "string_to_bytes builtin arg count is not 1");
                 let s = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_to_bytes_ref, &[s]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_to_bytes_ref;
+                self.lower_alloc_call(callee, &[s])
             }
             Expr::Ident(name, _) if name == "string_from_bytes_validate" => {
                 assert_eq!(
@@ -24543,15 +24426,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     "string_from_bytes_alloc builtin arg count is not 1"
                 );
                 let arr = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_from_bytes_alloc_ref, &[arr]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_from_bytes_alloc_ref;
+                self.lower_alloc_call(callee, &[arr])
             }
             Expr::Ident(name, _) if name == "byte_in_range" => {
                 assert_eq!(args.len(), 1, "byte_in_range builtin arg count is not 1");
@@ -24590,15 +24466,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.mut_byte_array_new_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.mut_byte_array_new_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "mut_byte_array_length" => {
                 assert_eq!(
@@ -24654,95 +24523,49 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int64_from_int" => {
                 assert_eq!(args.len(), 1, "int64_from_int builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_from_int_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_from_int_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "int64_add" => {
                 assert_eq!(args.len(), 2, "int64_add builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_add_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_add_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_sub" => {
                 assert_eq!(args.len(), 2, "int64_sub builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_sub_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_sub_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_mul" => {
                 assert_eq!(args.len(), 2, "int64_mul builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_mul_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_mul_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_div" => {
                 assert_eq!(args.len(), 2, "int64_div builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_div_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_div_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_mod" => {
                 assert_eq!(args.len(), 2, "int64_mod builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_mod_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_mod_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_neg" => {
                 assert_eq!(args.len(), 1, "int64_neg builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.int64_neg_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_neg_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "int64_eq" => {
                 assert_eq!(args.len(), 2, "int64_eq builtin arg count is not 2");
@@ -24791,15 +24614,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int64_to_string" => {
                 assert_eq!(args.len(), 1, "int64_to_string builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_to_string_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_to_string_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             // Plan D — boxed Float primitives. Arithmetic / math /
             // construction ops allocate and emit stackmap placeholders.
@@ -24815,93 +24631,52 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "float_sub builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_sub_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_sub_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_mul" => {
                 assert_eq!(args.len(), 2, "float_mul builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_mul_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_mul_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_div" => {
                 assert_eq!(args.len(), 2, "float_div builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_div_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_div_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_neg" => {
                 assert_eq!(args.len(), 1, "float_neg builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_neg_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_neg_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_abs" => {
                 assert_eq!(args.len(), 1, "float_abs builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_abs_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_abs_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_floor" => {
                 assert_eq!(args.len(), 1, "float_floor builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_floor_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_floor_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_ceil" => {
                 assert_eq!(args.len(), 1, "float_ceil builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_ceil_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_ceil_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_sqrt" => {
                 assert_eq!(args.len(), 1, "float_sqrt builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_sqrt_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_sqrt_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_eq" => {
                 assert_eq!(args.len(), 2, "float_eq builtin arg count is not 2");
@@ -24941,15 +24716,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "float_from_int" => {
                 assert_eq!(args.len(), 1, "float_from_int builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_from_int_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_from_int_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "float_to_int" => {
                 assert_eq!(args.len(), 1, "float_to_int builtin arg count is not 1");
@@ -24963,15 +24731,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "float_to_string" => {
                 assert_eq!(args.len(), 1, "float_to_string builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_to_string_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_to_string_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "string_to_float_validate" => {
                 assert_eq!(
@@ -24993,15 +24754,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     "string_to_float_parse builtin arg count is not 1"
                 );
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_to_float_parse_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_to_float_parse_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             // Plan C addendum (Char) — dispatch to runtime char
             // primitives. Comparators / classifiers return I8 (Bool);
@@ -25057,15 +24811,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "char_to_string" => {
                 assert_eq!(args.len(), 1, "char_to_string builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_string_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_string_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "is_ascii" => {
                 assert_eq!(args.len(), 1, "is_ascii builtin arg count is not 1");
@@ -25123,28 +24870,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "to_lower_ascii" => {
                 assert_eq!(args.len(), 1, "to_lower_ascii builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_lower_ascii_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_lower_ascii_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "to_upper_ascii" => {
                 assert_eq!(args.len(), 1, "to_upper_ascii builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_upper_ascii_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_upper_ascii_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "int_to_char" => {
                 assert_eq!(args.len(), 1, "int_to_char builtin arg count is not 1");
@@ -25178,12 +24911,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // placeholder).
             Expr::Ident(name, _) if name == "sb_new" => {
                 assert_eq!(args.len(), 0, "sb_new builtin arg count is not 0");
-                let call = self.builder.ins().call(self.builtins.sb_new_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sb_new_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "sb_append" => {
                 assert_eq!(args.len(), 2, "sb_append builtin arg count is not 2");
@@ -25202,15 +24931,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "sb_finalize" => {
                 assert_eq!(args.len(), 1, "sb_finalize builtin arg count is not 1");
                 let sb = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.sb_finalize_ref, &[sb]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sb_finalize_ref;
+                self.lower_alloc_call(callee, &[sb])
             }
             // Plan C Task 68 — extended String primitives. All
             // dispatch through `runtime/src/string.rs`.
@@ -25218,30 +24940,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "string_concat builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_concat_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_concat_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "string_substring" => {
                 assert_eq!(args.len(), 3, "string_substring builtin arg count is not 3");
                 let s = self.lower_expr(&args[0]);
                 let start = self.lower_expr(&args[1]);
                 let end = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_substring_ref, &[s, start, end]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_substring_ref;
+                self.lower_alloc_call(callee, &[s, start, end])
             }
             Expr::Ident(name, _) if name == "string_byte_at" => {
                 assert_eq!(args.len(), 2, "string_byte_at builtin arg count is not 2");
@@ -25300,12 +25008,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "string_trim" => {
                 assert_eq!(args.len(), 1, "string_trim builtin arg count is not 1");
                 let s = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.string_trim_ref, &[s]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_trim_ref;
+                self.lower_alloc_call(callee, &[s])
             }
             Expr::Ident(name, _) if name == "string_to_int_validate" => {
                 assert_eq!(
@@ -25491,15 +25195,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let v = self.lower_expr(&args[0]);
                 let widened =
                     widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_alloc");
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.sigil_ref_alloc_ref, &[widened]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sigil_ref_alloc_ref;
+                self.lower_alloc_call(callee, &[widened])
             }
             Expr::Ident(name, _) if name == "sigil_ref_deref" => {
                 assert_eq!(args.len(), 1, "sigil_ref_deref builtin arg count is not 1");
@@ -25867,14 +25564,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let closure_ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(closure_ptr);
+        let callee = self.builtins.alloc_ref;
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
 
         // Store null at offset 8 (code_ptr slot — unused by arm fns;
         // the runtime dispatches via `HandlerFrame.arms[i].fn_ptr`).
@@ -25988,14 +25679,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Call sigil_alloc(header, payload_bytes) -> *u8.
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let closure_ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(closure_ptr);
+        let callee = self.builtins.alloc_ref;
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
 
         // Store code_ptr at offset 8 (past header).
         //
@@ -26151,14 +25836,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, size_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
+        let callee = self.builtins.alloc_ref;
+        let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
 
         // Discriminant in payload word 0 (bytes 8..16 past header).
         // We store the full 8-byte word even though only the low
@@ -26222,14 +25901,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Some(sigil_int_to_char_box(n))
         self.builder.switch_to_block(some_blk);
         self.builder.seal_block(some_blk);
-        let box_call = self
-            .builder
-            .ins()
-            .call(self.builtins.int_to_char_box_ref, &[n]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, box_call));
-        let char_ptr = self.builder.inst_results(box_call)[0];
-        self.builder.declare_value_needs_stack_map(char_ptr);
+        let callee = self.builtins.int_to_char_box_ref;
+        let char_ptr = self.lower_alloc_call(callee, &[n]);
         let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
         self.builder.ins().jump(merge_blk, &[some_v.into()]);
 
@@ -26267,14 +25940,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         self.builder.switch_to_block(some_blk);
         self.builder.seal_block(some_blk);
-        let fetch_call = self
-            .builder
-            .ins()
-            .call(self.builtins.string_char_at_ref, &[s, idx]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, fetch_call));
-        let char_ptr = self.builder.inst_results(fetch_call)[0];
-        self.builder.declare_value_needs_stack_map(char_ptr);
+        let callee = self.builtins.string_char_at_ref;
+        let char_ptr = self.lower_alloc_call(callee, &[s, idx]);
         let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
         self.builder.ins().jump(merge_blk, &[some_v.into()]);
 
@@ -26298,15 +25965,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
         let nil_h_v = self.builder.ins().iconst(types::I64, nil_h as i64);
         let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
-        let call = self.builder.ins().call(
-            self.builtins.string_chars_ref,
-            &[s, cons_h_v, cons_d_v, nil_h_v, nil_d_v],
-        );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_chars_ref;
+        self.lower_alloc_call(callee, &[s, cons_h_v, cons_d_v, nil_h_v, nil_d_v])
     }
 
     /// Plan C addendum (Char) — `string_from_chars(list)` lowering.
@@ -26317,15 +25977,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let (_cons_h, cons_d, _nil_h, nil_d) = self.list_char_layout_immediates();
         let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
         let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
-        let call = self.builder.ins().call(
-            self.builtins.string_from_chars_ref,
-            &[list, cons_d_v, nil_d_v],
-        );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_from_chars_ref;
+        self.lower_alloc_call(callee, &[list, cons_d_v, nil_d_v])
     }
 
     /// Plan C addendum (Char) helper — return `(option_type_name,
@@ -26448,15 +26101,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             });
         let bytes_ptr = self.builder.ins().symbol_value(self.pointer_ty, gv);
         let len_v = self.builder.ins().iconst(self.pointer_ty, len as i64);
-        let call = self
-            .builder
-            .ins()
-            .call(self.builtins.string_new_ref, &[bytes_ptr, len_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_new_ref;
+        self.lower_alloc_call(callee, &[bytes_ptr, len_v])
     }
 
     fn emit_binop(&mut self, op: crate::ast::BinOp, l: Value, r: Value) -> Value {
