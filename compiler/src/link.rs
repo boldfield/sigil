@@ -90,8 +90,49 @@ fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
 }
 
 fn locate_runtime_lib() -> Option<PathBuf> {
+    // Explicit override wins — release-archive consumers who unpack to
+    // a non-standard prefix can `export SIGIL_RUNTIME_LIB=...` rather
+    // than restructure their tree to match a built-in lookup path.
+    if let Ok(p) = std::env::var("SIGIL_RUNTIME_LIB") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Release-archive layout: when the `sigil` binary ships in a
+    // tarball like
+    //
+    //   sigil-<version>-<triple>/
+    //     bin/sigil
+    //     lib/libsigil_runtime.a
+    //     std/...
+    //
+    // walking up one level from the executable's parent and into
+    // `lib/` recovers the staticlib. Also try the flat-bundle layout
+    // (`libsigil_runtime.a` next to the binary).
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().map(PathBuf::from);
+        let candidates = [
+            // bin/sigil → ../lib/libsigil_runtime.a
+            exe_dir
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|p| p.join("lib").join("libsigil_runtime.a")),
+            // flat: sigil + libsigil_runtime.a in the same dir
+            exe_dir
+                .as_ref()
+                .map(|d| d.join("libsigil_runtime.a")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+
     // `cargo build` places libsigil_runtime.a under target/<profile>/.
-    // We walk a few candidate profile directories in preference order.
+    // Walk a few candidate profile directories in preference order.
     for profile in &["release", "debug"] {
         let p = PathBuf::from("target")
             .join(profile)

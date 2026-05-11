@@ -1,0 +1,167 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger — useful for retroactively releasing an existing
+  # tag (e.g., v1.0.0 was created before this workflow existed) and
+  # for re-running a failed build without re-pushing the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (defaults to the workflow ref)'
+        required: false
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  SOURCE_DATE_EPOCH: "0"
+  TZ: UTC
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          # Need the full history so the changelog generator (below)
+          # can walk back to the previous tag.
+          fetch-depth: 0
+
+      - name: install Boehm GC + lld (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev pkg-config lld clang
+
+      - name: install Boehm GC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install bdw-gc pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      # Rust toolchain pinned via rust-toolchain.toml.
+
+      - name: build release artifacts
+        run: |
+          rm -f target/debug/libsigil_runtime.a target/release/libsigil_runtime.a
+          cargo build --release -p sigil-runtime
+          cargo build --release -p sigil-compiler
+
+      - name: smoke (compile + run hello)
+        run: |
+          ./target/release/sigil examples/hello.sigil -o /tmp/sigil-release-hello
+          /tmp/sigil-release-hello
+
+      - name: stage release tarball
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Resolve the tag we're building. workflow_dispatch may pass
+          # one in; otherwise the trigger was a tag push, so github.ref
+          # is `refs/tags/<name>`.
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          # Sanitise — bail loudly if we're not building a tagged
+          # version (workflow_dispatch defaults are easy to fat-finger).
+          if [[ ! "$TAG" =~ ^v[0-9] ]]; then
+            echo "::error::release.yml expects a v* tag; got '$TAG'"
+            exit 1
+          fi
+          STAGE="sigil-${TAG}-${{ matrix.target }}"
+          mkdir -p "$STAGE/bin" "$STAGE/lib"
+          cp target/release/sigil "$STAGE/bin/sigil"
+          cp target/release/libsigil_runtime.a "$STAGE/lib/libsigil_runtime.a"
+          cp LICENSE "$STAGE/LICENSE" 2>/dev/null || true
+          # Minimal install / run notes that ship in the tarball.
+          cat > "$STAGE/README.md" <<EOF
+          # Sigil ${TAG} (${{ matrix.target }})
+
+          Compiled language designed around LLM authorship. v1 spec
+          lives at https://sigillang.ai/language/ — drop the raw md
+          (https://sigillang.ai/language.raw.md) into a system prompt
+          and ask the model to write Sigil.
+
+          ## Install
+
+          \`\`\`
+          tar xzf sigil-${TAG}-${{ matrix.target }}.tar.gz
+          export PATH="\$PWD/sigil-${TAG}-${{ matrix.target }}/bin:\$PATH"
+          # Or move bin/sigil + lib/libsigil_runtime.a into your prefix
+          # of choice. \`sigil\` finds the runtime via \`../lib/\` from
+          # its own directory; \`SIGIL_RUNTIME_LIB=/path/to/libsigil_runtime.a\`
+          # overrides if you need a non-standard layout.
+          \`\`\`
+
+          ## Prereqs (system libraries)
+
+          The compiled programs link against Boehm GC, which must be
+          present on the host:
+
+          - Ubuntu / Debian: \`sudo apt install libgc-dev\`
+          - macOS: \`brew install bdw-gc\`
+
+          ## Quick start
+
+          \`\`\`
+          cat > hello.sigil <<EOF2
+          import std.io
+          fn main() -> Int ![IO] {
+            perform IO.println("hello, world");
+            0
+          }
+          EOF2
+          sigil hello.sigil -o hello
+          ./hello
+          \`\`\`
+
+          ## Links
+
+          - Site: https://sigillang.ai/
+          - Source: https://github.com/boldfield/sigil
+          - Spec (LLM-ready): https://sigillang.ai/language.raw.md
+          EOF
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          ls -lh "$STAGE.tar.gz" "$STAGE.tar.gz.sha256"
+          echo "tarball=$STAGE.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=$STAGE.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: upload tarball + sha to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.stage.outputs.tag }}"
+          TARBALL="${{ steps.stage.outputs.tarball }}"
+          SHA="${{ steps.stage.outputs.sha }}"
+          # Create the release if it doesn't exist yet. The first matrix
+          # job to reach this step wins; subsequent jobs fail the create
+          # (already-exists) and fall through to the upload.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Sigil $TAG" \
+              --notes "See https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG for the human-written release notes (if any). Binary archives are attached below for $TAG."
+          # `--clobber` so re-running the workflow on the same tag (via
+          # workflow_dispatch) overwrites stale assets instead of erroring.
+          gh release upload "$TAG" "$TARBALL" "$SHA" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
