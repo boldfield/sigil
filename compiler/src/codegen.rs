@@ -8800,15 +8800,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     //               args_ptr: *const u64, args_len: u32,
     //               k_closure_ptr: *mut u8, k_fn_ptr: *mut u8,
     //               return_arm_closure_ptr: *mut u8,
-    //               return_arm_fn_ptr: *mut u8)
+    //               return_arm_fn_ptr: *mut u8,
+    //               return_arm_fired_ptr: *mut u64)
     //               -> *mut NextStep
     //
-    // 2026-05-04 return-arm-via-args lift Stage 3b — the trailing pair
-    // `(return_arm_closure, return_arm_fn)` carries the active handle's
-    // return arm forward into the arm fn's args_ptr. The arm fn's body
-    // copies it into the post-arm-k synth-cont's closure record so
-    // synth-cont natural-exit emits can pass it to the args-passing
-    // helper.
+    // 2026-05-04 return-arm-via-args lift Stage 3b/5 — the trailing
+    // triple `(return_arm_closure, return_arm_fn, return_arm_fired_ptr)`
+    // carries the active handle's return arm + fired_ptr forward into
+    // the arm fn's args_ptr. The arm fn's body copies it into the post-
+    // arm-k synth-cont's closure record so synth-cont natural-exit
+    // emits can pass it to the args-passing helper, which gates
+    // dispatch on `*fired_ptr`.
     let mut perform_sig = Signature::new(isa_call_conv(&module));
     perform_sig.params.push(AbiParam::new(types::I32)); // effect_id
     perform_sig.params.push(AbiParam::new(types::I32)); // op_id
@@ -8818,6 +8820,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     perform_sig.params.push(AbiParam::new(pointer_ty)); // k_fn_ptr
     perform_sig.params.push(AbiParam::new(pointer_ty)); // return_arm_closure_ptr
     perform_sig.params.push(AbiParam::new(pointer_ty)); // return_arm_fn_ptr
+    perform_sig.params.push(AbiParam::new(pointer_ty)); // return_arm_fired_ptr
     perform_sig.returns.push(AbiParam::new(pointer_ty)); // *mut NextStep
     let perform_func = module
         .declare_function("sigil_perform", Linkage::Import, &perform_sig)
@@ -8970,10 +8973,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // 2026-05-04 return-arm-via-args lift Stage 4 — the TLS-reading
     // helper `sigil_done_or_dispatch_return_arm` is retired; all four
     // natural-exit emit sites use the args-passing variant below.
+    //
+    // 2026-05-04 return-arm-via-args lift Stage 5 — added 4th param
+    // `return_arm_fired_ptr: *mut u64`. Points to a 1-u64 cell on the
+    // handle expression's stack frame; the helper gates on `*fired_ptr`
+    // (was: TLS `BODY_RETURN_ARM_STACK[depth-1].fired`). Null fired_ptr
+    // means "no handler in flight" — same effect as the prior depth==0
+    // shortcut.
     let mut done_or_dispatch_return_arm_via_args_sig = Signature::new(isa_call_conv(&module));
     done_or_dispatch_return_arm_via_args_sig
         .params
         .push(AbiParam::new(types::I64));
+    done_or_dispatch_return_arm_via_args_sig
+        .params
+        .push(AbiParam::new(pointer_ty));
     done_or_dispatch_return_arm_via_args_sig
         .params
         .push(AbiParam::new(pointer_ty));
@@ -10695,23 +10708,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // encoding for both Int and pointer kinds).
                             //
                             // 2026-05-04 return-arm-via-args lift Stage 3a —
-                            // 2 additional trailing slots after captures
-                            // carry `(return_arm_closure, return_arm_fn)`
-                            // so the synth-cont's B.3 recursive Cps→Cps
-                            // dispatch (CompoundMatchArmPostPerform's
-                            // recursive-Cps-call emit) can forward
-                            // return_arm into the recursive callee's
-                            // args_ptr trailing slots — bridging the
-                            // body fn's args_ptr-based return_arm channel
-                            // across the synth-cont boundary.
+                            // trailing slots after captures carry
+                            // `(return_arm_closure, return_arm_fn,
+                            // return_arm_fired_ptr)` so the synth-cont's
+                            // B.3 recursive Cps→Cps dispatch
+                            // (CompoundMatchArmPostPerform's recursive-
+                            // Cps-call emit) can forward return_arm into
+                            // the recursive callee's args_ptr trailing
+                            // slots — bridging the body fn's args_ptr-
+                            // based return_arm channel across the
+                            // synth-cont boundary.
+                            //
+                            // Stage 5 extension: third trailing slot
+                            // `return_arm_fired_ptr` carries the per-
+                            // handle fired cell address forward through
+                            // the synth-cont so chain-unwind emit sites
+                            // gate dispatch on the same cell as the body
+                            // fn's natural-exit emit.
                             let total_capture_slots =
                                 arm_pattern_captures.len() + helper_param_captures.len();
-                            let total_slots_with_return_arm = total_capture_slots + 2;
+                            let total_slots_with_return_arm = total_capture_slots + 3;
                             assert!(
                                 total_slots_with_return_arm < MAX_CLOSURE_ENV_SLOTS,
-                                "Plan B Task 78.5 G4 Phase B.2 + Stage 3a: synth-cont closure \
+                                "Plan B Task 78.5 G4 Phase B.2 + Stage 5: synth-cont closure \
                                  env {total_slots_with_return_arm} \
-                                 (= {total_capture_slots} captures + 2 return_arm) \
+                                 (= {total_capture_slots} captures + 3 return_arm \
+                                 [closure, fn, fired_ptr]) \
                                  >= {MAX_CLOSURE_ENV_SLOTS} \
                                  exceeds bitmap layout for fn `{}` arm {arm_idx}. \
                                  Reduce per-arm capture count.",
@@ -10731,6 +10753,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // return_arm_closure is a heap-allocated
                             // closure record (or null) — pointer slot.
                             // return_arm_fn is a code address — unmarked.
+                            // return_arm_fired_ptr is a stack pointer
+                            // (raw, not GC-managed) — unmarked.
                             bitmap |= 1u32 << (total_capture_slots + 1);
                             let count: u8 = 1 + total_slots_with_return_arm as u8;
                             let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -10819,9 +10843,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                             // 2026-05-04 return-arm-via-args lift Stage 3a —
                             // copy return_arm from this body fn's args_ptr
-                            // (Stage 2 wrote it at handle entry) into the
-                            // synth-cont's closure record so B.3 recursive
-                            // Cps→Cps dispatch can forward it.
+                            // into the synth-cont's closure record so B.3
+                            // recursive Cps→Cps dispatch can forward it.
+                            //
+                            // Stage 5 extension: also copy fired_ptr at
+                            // the third trailing slot.
                             let body_user_arg_count_b2 = f.params.len();
                             let ra_closure_b2 = lowerer.builder.ins().load(
                                 pointer_ty,
@@ -10835,8 +10861,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fn_offset(body_user_arg_count_b2),
                             );
+                            let ra_fired_b2 = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                args_ptr,
+                                return_arm_fired_offset(body_user_arg_count_b2),
+                            );
                             let ra_closure_in_cp_b2: i32 = 16 + 8 * total_capture_slots as i32;
                             let ra_fn_in_cp_b2: i32 = ra_closure_in_cp_b2 + 8;
+                            let ra_fired_in_cp_b2: i32 = ra_fn_in_cp_b2 + 8;
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_b2,
@@ -10848,6 +10881,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 ra_fn_b2,
                                 closure_record,
                                 ra_fn_in_cp_b2,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                ra_fired_b2,
+                                closure_record,
+                                ra_fired_in_cp_b2,
                             );
 
                             // Lower perform's args via Lowerer (env
@@ -10934,8 +10973,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // (a NextStep::Call dispatching the
                             // matched arm with k = (closure_record,
                             // synth_cont_fn_addr)).
-                            let (ra_closure_perform, ra_fn_perform) =
-                                lowerer.load_return_arm_pair();
+                            let (ra_closure_perform, ra_fn_perform, ra_fired_perform) =
+                                lowerer.load_return_arm_triple();
                             let perform_call = lowerer.builder.ins().call(
                                 lowerer.perform_ref,
                                 &[
@@ -10947,6 +10986,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_cont_fn_addr,
                                     ra_closure_perform,
                                     ra_fn_perform,
+                                    ra_fired_perform,
                                 ],
                             );
                             lowerer.stackmap.push_placeholder(function_code_offset(
@@ -10990,9 +11030,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fn_offset(body_user_arg_count),
                             );
+                            // 2026-05-04 return-arm-via-args lift Stage 5 —
+                            // load fired_ptr from args_ptr's 5th trailing
+                            // slot (handle entry allocated the cell + stored
+                            // its address). Helper gates dispatch on
+                            // `*fired_ptr` instead of TLS.
+                            let ra_fired_ptr = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                args_ptr,
+                                return_arm_fired_offset(body_user_arg_count),
+                            );
                             let done_call = lowerer.builder.ins().call(
                                 done_or_dispatch_return_arm_via_args_ref,
-                                &[const_v, ra_closure, ra_fn],
+                                &[const_v, ra_closure, ra_fn, ra_fired_ptr],
                             );
                             lowerer.stackmap.push_placeholder(function_code_offset(
                                 &lowerer.builder,
@@ -11353,18 +11404,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // chain's CallCps emit it's the calling
                         // chain step's synth-cont pair.
                         // 2026-05-04 return-arm-via-args lift Stage 3a —
-                        // 2 additional trailing slots after caller_k_pair
-                        // carry `(return_arm_closure, return_arm_fn)` so
-                        // the chained-let-yield Final-step's tail emit
+                        // trailing slots after caller_k_pair carry
+                        // `(return_arm_closure, return_arm_fn,
+                        // return_arm_fired_ptr)` so the chained-let-
+                        // yield Final-step's tail emit
                         // (`lower_call_in_tail_pos` Cps→Cps tail) can
                         // load return_arm from this synth-cont's
                         // closure_ptr and forward it to the recursive
                         // Cps call's args_ptr trailing slots.
-                        let total_slots = captures.len() + 4;
+                        //
+                        // Stage 5 extension: third trailing return_arm
+                        // slot carries fired_ptr (per-handle fired cell
+                        // address) so chain-unwind emits gate dispatch
+                        // on the same cell as the body fn's natural-
+                        // exit emit.
+                        let total_slots = captures.len() + 5;
                         assert!(
                             total_slots < MAX_CLOSURE_ENV_SLOTS,
-                            "Plan D Task 112b + Stage 3a: chained-step closure env {} \
-                                 (= {} captures + 2 caller_k_pair + 2 return_arm) >= {} \
+                            "Plan D Task 112b + Stage 5: chained-step closure env {} \
+                                 (= {} captures + 2 caller_k_pair + 3 return_arm \
+                                 [closure, fn, fired_ptr]) >= {} \
                                  exceeds the bitmap layout for fn `{}`",
                             total_slots,
                             captures.len(),
@@ -11381,6 +11440,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // heap-allocated closure records (or null at
                         // top-level) — pointer slots. caller_k_fn /
                         // return_arm_fn are code addresses, unmarked.
+                        // return_arm_fired_ptr is a raw stack pointer,
+                        // not GC-managed — unmarked.
                         bitmap |= 1u32 << (captures.len() + 1);
                         bitmap |= 1u32 << (captures.len() + 3);
                         let count: u8 = 1 + total_slots as u8;
@@ -11459,10 +11520,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         // 2026-05-04 return-arm-via-args lift Stage 3a —
                         // copy return_arm from this body fn's args_ptr
-                        // trailing slots (Stage 2 wrote them at handle
-                        // entry) into the synth-cont's closure record
-                        // so the Final-step's tail emit can forward it
-                        // to the recursive Cps call.
+                        // trailing slots into the synth-cont's closure
+                        // record so the Final-step's tail emit can
+                        // forward it to the recursive Cps call.
+                        //
+                        // Stage 5 extension: also copy fired_ptr from
+                        // args_ptr's third trailing slot.
                         let return_arm_closure_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11475,8 +11538,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
+                        let return_arm_fired_v = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_fired_offset(user_arg_count),
+                        );
                         let ra_closure_in_cp_off: i32 = 16 + 8 * (captures.len() + 2) as i32;
                         let ra_fn_in_cp_off: i32 = ra_closure_in_cp_off + 8;
+                        let ra_fired_in_cp_off: i32 = ra_fn_in_cp_off + 8;
                         builder.ins().store(
                             MemFlags::trusted(),
                             return_arm_closure_v,
@@ -11489,25 +11559,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             cp,
                             ra_fn_in_cp_off,
                         );
+                        builder.ins().store(
+                            MemFlags::trusted(),
+                            return_arm_fired_v,
+                            cp,
+                            ra_fired_in_cp_off,
+                        );
 
                         cp
                     } else {
                         // ConstantDone synth-cont — always allocate
                         // (even with empty captures) so the closure
                         // record can carry `(return_arm_closure,
-                        // return_arm_fn)` at the trailing slots. The
-                        // synth-cont's body Done emit (codegen.rs
-                        // ~15206) loads return_arm from closure_ptr
-                        // and passes it to the args-passing helper.
-                        // Pre-Stage-4 the empty-captures path returned
-                        // a null closure_ptr — the always-alloc here
-                        // is the precondition for flipping site 4
-                        // (ConstantDone synth-cont dispatch) off TLS.
-                        let total_slots = captures.len() + 2;
+                        // return_arm_fn, return_arm_fired_ptr)` at the
+                        // trailing slots. The synth-cont's body Done
+                        // emit (ConstantDone natural-exit dispatch)
+                        // loads all three from closure_ptr and passes
+                        // them to the args-passing helper.
+                        //
+                        // Stage 5 — third trailing slot carries the
+                        // per-handle fired cell address so the helper
+                        // gates dispatch on the same cell as the body
+                        // fn's natural-exit emit.
+                        let total_slots = captures.len() + 3;
                         assert!(
                             total_slots < MAX_CLOSURE_ENV_SLOTS,
                             "ConstantDone synth-cont closure env {} \
-                             (= {} captures + 2 return_arm) >= {} exceeds \
+                             (= {} captures + 3 return_arm \
+                             [closure, fn, fired_ptr]) >= {} exceeds \
                              the bitmap layout",
                             total_slots,
                             captures.len(),
@@ -11522,8 +11601,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // return_arm_closure at slot index
                         // captures.len(); bit (captures.len() + 1)
                         // marks it as a GC pointer. return_arm_fn at
-                        // slot captures.len() + 1 (bit captures.len()
-                        // + 2) is a code address — unmarked.
+                        // captures.len() + 1 is a code address —
+                        // unmarked. return_arm_fired_ptr at
+                        // captures.len() + 2 is a raw stack pointer —
+                        // unmarked.
                         bitmap |= 1u32 << (captures.len() + 1);
                         let count: u8 = 1 + total_slots as u8;
                         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -11563,9 +11644,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 .ins()
                                 .store(MemFlags::trusted(), slot_val, cp, offset);
                         }
-                        // Copy return_arm from this body fn's
-                        // args_ptr (Stage 2 wrote it at handle entry)
-                        // into the synth-cont's closure record.
+                        // Copy return_arm + fired_ptr from this body
+                        // fn's args_ptr into the synth-cont's closure
+                        // record.
                         let ra_closure_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11578,14 +11659,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
+                        let ra_fired_v = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_fired_offset(user_arg_count),
+                        );
                         let ra_closure_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_off: i32 = ra_closure_off + 8;
+                        let ra_fired_off: i32 = ra_fn_off + 8;
                         builder
                             .ins()
                             .store(MemFlags::trusted(), ra_closure_v, cp, ra_closure_off);
                         builder
                             .ins()
                             .store(MemFlags::trusted(), ra_fn_v, cp, ra_fn_off);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), ra_fired_v, cp, ra_fired_off);
                         cp
                     };
                     (k_closure, synth_cont_addr)
@@ -11859,6 +11950,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fn_offset(user_arg_count),
                             );
+                            let ra_fired_perform = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                args_ptr,
+                                return_arm_fired_offset(user_arg_count),
+                            );
                             let perform_call = lowerer.builder.ins().call(
                                 lowerer.perform_ref,
                                 &[
@@ -11870,6 +11967,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     k_fn_loaded,
                                     ra_closure_perform,
                                     ra_fn_perform,
+                                    ra_fired_perform,
                                 ],
                             );
                             lowerer.stackmap.push_placeholder(function_code_offset(
@@ -11955,19 +12053,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // fires. Mirrors the perform-site debug_assert
                             // at `lower_perform_to_value` (codegen.rs:14586).
                             debug_assert!(
-                                (user_arg_count_call as u32).saturating_add(4)
+                                (user_arg_count_call as u32).saturating_add(5)
                                     <= sigil_abi::effect::MAX_INLINE_ARGS,
                                 "codegen Plan D Task 112a: wrapper-Call to `{}` has {} \
-                             user args, exceeding MAX_INLINE_ARGS - 4 = {}",
+                             user args, exceeding MAX_INLINE_ARGS - 5 = {}",
                                 callee_name,
                                 user_arg_count_call,
-                                sigil_abi::effect::MAX_INLINE_ARGS - 4
+                                sigil_abi::effect::MAX_INLINE_ARGS - 5
                             );
-                            // 2026-05-04 return-arm-via-args lift Stage 1 —
-                            // alloc room for the second trailing pair
-                            // `(return_arm_closure, return_arm_fn)` at
-                            // offsets `return_arm_*_offset(N)`.
-                            let total_arg_count = user_arg_count_call + 4;
+                            // 2026-05-04 return-arm-via-args lift Stage 5 —
+                            // alloc room for return_arm pair + fired_ptr
+                            // at offsets `return_arm_{closure,fn,fired}_-
+                            // offset(N)`.
+                            let total_arg_count = user_arg_count_call + 5;
                             let arg_count_v = lowerer
                                 .builder
                                 .ins()
@@ -12046,13 +12144,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 argp_v,
                                 k_fn_offset(user_arg_count_call),
                             );
-                            // 2026-05-04 return-arm-via-args lift Stage 1 —
+                            // 2026-05-04 return-arm-via-args lift Stage 5 —
                             // sub-Cps-call boundary: no outer return arm
                             // propagates into the callee. Helper sees null
-                            // fn and emits Done(v).
+                            // fired_ptr and emits Done(v).
                             let null_return_arm_closure =
                                 lowerer.builder.ins().iconst(pointer_ty, 0);
                             let null_return_arm_fn = lowerer.builder.ins().iconst(pointer_ty, 0);
+                            let null_return_arm_fired = lowerer.builder.ins().iconst(pointer_ty, 0);
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 null_return_arm_closure,
@@ -12064,6 +12163,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 null_return_arm_fn,
                                 argp_v,
                                 return_arm_fn_offset(user_arg_count_call),
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                null_return_arm_fired,
+                                argp_v,
+                                return_arm_fired_offset(user_arg_count_call),
                             );
                             ns_ptr
                         }
@@ -13032,16 +13137,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // to apply the return arm before binding.
                     let extra_for_return_arm: usize = if chain.has_return_arm { 1 } else { 0 };
                     // 2026-05-04 return-arm-via-args lift Stage 4 —
-                    // 2 additional trailing slots carry `(return_arm_-
-                    // closure, return_arm_fn)` so the Slice C chain
-                    // Final step's Done emit (site 3) loads them from
-                    // its closure_ptr and dispatches via the args-
-                    // passing helper. Source: the arm-fn's args_ptr,
-                    // populated by sigil_perform (Stage 3b ABI).
-                    let total_capture_slots: usize = 2 + captures.len() + extra_for_return_arm + 2;
+                    // 3 additional trailing slots carry `(return_arm_-
+                    // closure, return_arm_fn, return_arm_fired_ptr)` so
+                    // the Slice C chain Final step's Done emit (site 3)
+                    // loads them from its closure_ptr and dispatches
+                    // via the args-passing helper. Source: the arm-fn's
+                    // args_ptr (Stage 3b ABI + Stage 5 fired_ptr).
+                    let total_capture_slots: usize = 2 + captures.len() + extra_for_return_arm + 3;
                     assert!(
                         total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
-                        "Plan B' Stage 6.7 Task 100b + Stage 4: arm-fn step_0 closure \
+                        "Plan B' Stage 6.7 Task 100b + Stage 5: arm-fn step_0 closure \
                          capture count {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
                          exceeds bitmap layout"
                     );
@@ -13140,11 +13245,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
                     }
                     // 2026-05-04 return-arm-via-args lift Stage 4 —
-                    // store return_arm pair at end of step 0's closure
-                    // record. Source: this arm-fn's incoming args_ptr
-                    // (sigil_perform routed the active handle's pair
-                    // there per Stage 3b ABI). Offset:
-                    // 32 + 8 * (captures.len() + extra_for_return_arm).
+                    // store return_arm pair + fired_ptr (Stage 5) at
+                    // end of step 0's closure record. Source: this
+                    // arm-fn's incoming args_ptr (sigil_perform routed
+                    // the active handle's triple there per Stage 3b/5
+                    // ABI).
                     let arm_ra_closure = lowerer.builder.ins().load(
                         pointer_ty,
                         MemFlags::trusted(),
@@ -13157,9 +13262,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         args_ptr,
                         return_arm_fn_offset(n_user_args),
                     );
+                    let arm_ra_fired = lowerer.builder.ins().load(
+                        pointer_ty,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        return_arm_fired_offset(n_user_args),
+                    );
                     let ra_closure_off_step0: i32 =
                         32 + 8 * (captures.len() + extra_for_return_arm) as i32;
                     let ra_fn_off_step0: i32 = ra_closure_off_step0 + 8;
+                    let ra_fired_off_step0: i32 = ra_fn_off_step0 + 8;
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
                         arm_ra_closure,
@@ -13171,6 +13283,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         arm_ra_fn,
                         step_0_closure_ptr,
                         ra_fn_off_step0,
+                    );
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        arm_ra_fired,
+                        step_0_closure_ptr,
+                        ra_fired_off_step0,
                     );
 
                     let step_0_fn_ref =
@@ -13306,11 +13424,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // unconditional alloc.
                     let post_arm_k_closure_v = {
                         let captures = &post_arm_k.captures;
-                        let total_slots = captures.len() + 2;
+                        let total_slots = captures.len() + 3;
                         assert!(
                             total_slots < MAX_CLOSURE_ENV_SLOTS,
-                            "Plan B Task 78.5 G1 + Stage 3b: post-arm-k closure env \
-                             {total_slots} (= {} captures + 2 return_arm) \
+                            "Plan B Task 78.5 G1 + Stage 5: post-arm-k closure env \
+                             {total_slots} (= {} captures + 3 return_arm \
+                             [closure, fn, fired_ptr]) \
                              >= {MAX_CLOSURE_ENV_SLOTS} slots exceeds bitmap layout",
                             captures.len()
                         );
@@ -13324,7 +13443,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // bitmap bit (captures.len() + 1) marks it as a
                         // pointer slot (heap-allocated closure record or
                         // null). return_arm_fn is a code address —
-                        // unmarked.
+                        // unmarked. return_arm_fired_ptr at captures.len()
+                        // + 2 is a raw stack pointer — unmarked.
                         bitmap |= 1u32 << (captures.len() + 1);
                         let count: u8 = 1 + total_slots as u8;
                         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -13425,6 +13545,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // handle's pair into the arm-fn's args_ptr
                         // trailing slots) and store at the post-arm-k
                         // closure record's trailing slots.
+                        //
+                        // Stage 5 — also load + store fired_ptr.
                         let ra_closure_arm = lowerer.builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -13437,8 +13559,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(n_user_args),
                         );
+                        let ra_fired_arm = lowerer.builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_fired_offset(n_user_args),
+                        );
                         let ra_closure_in_pak_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_in_pak_off: i32 = ra_closure_in_pak_off + 8;
+                        let ra_fired_in_pak_off: i32 = ra_fn_in_pak_off + 8;
                         lowerer.builder.ins().store(
                             MemFlags::trusted(),
                             ra_closure_arm,
@@ -13450,6 +13579,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ra_fn_arm,
                             cp,
                             ra_fn_in_pak_off,
+                        );
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            ra_fired_arm,
+                            cp,
+                            ra_fired_in_pak_off,
                         );
                         cp
                     };
@@ -14310,12 +14445,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // this synth fn's closure_ptr at the trailing slots the
             // arm-fn's body emit wrote at synth-cont allocation time
             // (post-arm-k synth-cont closure-record allocator,
-            // offset `16 + 8 * captures.len()`). The helper's TLS
-            // `fired` short-circuit still applies for chain-unwind
-            // invocations after the body's deepest natural-exit has
-            // already dispatched.
+            // offset `16 + 8 * captures.len()`).
+            //
+            // Stage 5 — load fired_ptr (3rd trailing slot in the
+            // closure record). Synth-cont allocator forwarded it from
+            // body args_ptr at synth-cont alloc time.
             let pak_ra_closure_off: i32 = 16 + 8 * post_arm_k.captures.len() as i32;
             let pak_ra_fn_off: i32 = pak_ra_closure_off + 8;
+            let pak_ra_fired_off: i32 = pak_ra_fn_off + 8;
             let ra_closure_pak = lowerer.builder.ins().load(
                 pointer_ty,
                 MemFlags::trusted(),
@@ -14328,9 +14465,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 lowerer.closure_ptr,
                 pak_ra_fn_off,
             );
+            let ra_fired_ptr_pak = lowerer.builder.ins().load(
+                pointer_ty,
+                MemFlags::trusted(),
+                lowerer.closure_ptr,
+                pak_ra_fired_off,
+            );
             let done_call = lowerer.builder.ins().call(
                 done_or_dispatch_return_arm_via_args_ref,
-                &[widened_tail, ra_closure_pak, ra_fn_pak],
+                &[widened_tail, ra_closure_pak, ra_fn_pak, ra_fired_ptr_pak],
             );
             lowerer
                 .stackmap
@@ -14778,9 +14921,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // from this synth-cont's closure record
                                 // at the end-of-layout offset (after
                                 // captures + frame_ptr? + prior_bindings).
+                                //
+                                // Stage 5 — load fired_ptr (3rd trailing
+                                // slot in the closure record). Forward-
+                                // copy site propagates it from the
+                                // outgoing synth-cont's closure record.
                                 let ra_closure_off_slc: i32 =
                                     prior_offset_base + 8 * step.prior_bindings.len() as i32;
                                 let ra_fn_off_slc: i32 = ra_closure_off_slc + 8;
+                                let ra_fired_off_slc: i32 = ra_fn_off_slc + 8;
                                 let ra_closure_slc = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -14793,9 +14942,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     ra_fn_off_slc,
                                 );
+                                let ra_fired_ptr_slc = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    ra_fired_off_slc,
+                                );
                                 let done_call = lowerer.builder.ins().call(
                                     done_or_dispatch_return_arm_via_args_ref,
-                                    &[widened_tail, ra_closure_slc, ra_fn_slc],
+                                    &[widened_tail, ra_closure_slc, ra_fn_slc, ra_fired_ptr_slc],
                                 );
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
@@ -14877,10 +15032,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let frame_off: i32 = cap_off + 8 * c as i32;
                                 let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
                                 // 2026-05-04 return-arm-via-args lift
-                                // Stage 4 — +2 trailing slots for
-                                // return_arm pair.
+                                // Stage 4/5 — +3 trailing slots for
+                                // return_arm triple (closure, fn,
+                                // fired_ptr).
                                 (
-                                    2 + c + extra_for_return_arm + p + 2,
+                                    2 + c + extra_for_return_arm + p + 3,
                                     cap_off,
                                     frame_off,
                                     prior_off,
@@ -14892,7 +15048,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let frame_off: i32 = cap_off + 8 * c as i32;
                                 let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
                                 (
-                                    c + extra_for_return_arm + p + 2,
+                                    c + extra_for_return_arm + p + 3,
                                     cap_off,
                                     frame_off,
                                     prior_off,
@@ -15067,21 +15223,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 this_binding_offset,
                             );
 
-                            // 2026-05-04 return-arm-via-args lift Stage 4 —
-                            // forward-copy return_arm pair from THIS
-                            // step's closure record to NEXT step's
-                            // closure record. THIS step's return_arm
-                            // sits at the end of its layout (after its
-                            // captures + frame_ptr? + prior_bindings).
-                            // NEXT step's return_arm sits at the end of
-                            // its layout (after captures + frame_ptr? +
-                            // prior_bindings + this_binding).
+                            // 2026-05-04 return-arm-via-args lift Stage 4/5 —
+                            // forward-copy return_arm triple (closure,
+                            // fn, fired_ptr) from THIS step's closure
+                            // record to NEXT step's closure record. The
+                            // triple sits at the end of each step's
+                            // layout (after captures + frame_ptr? +
+                            // prior_bindings, plus this_binding on the
+                            // next step). Shared fired_ptr means all
+                            // chain-unwind synth-conts gate on the same
+                            // cell.
                             let this_ra_closure_off: i32 =
                                 prior_offset_base + 8 * step.prior_bindings.len() as i32;
                             let this_ra_fn_off: i32 = this_ra_closure_off + 8;
+                            let this_ra_fired_off: i32 = this_ra_fn_off + 8;
                             let next_ra_closure_off: i32 =
                                 next_prior_offset_base + 8 * prior_count_next as i32;
                             let next_ra_fn_off: i32 = next_ra_closure_off + 8;
+                            let next_ra_fired_off: i32 = next_ra_fn_off + 8;
                             let ra_closure_v = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -15094,6 +15253,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 synth_closure_ptr,
                                 this_ra_fn_off,
                             );
+                            let ra_fired_v = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                this_ra_fired_off,
+                            );
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_v,
@@ -15105,6 +15270,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 ra_fn_v,
                                 next_closure_ptr,
                                 next_ra_fn_off,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                ra_fired_v,
+                                next_closure_ptr,
+                                next_ra_fired_off,
                             );
 
                             // func_addr for the next step's synth fn.
@@ -15337,10 +15508,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // `captures = Vec::new()` (the pre-pass
                         // structurally guarantees ConstantDone's tail
                         // is an `IntLit` with no captures), so the
-                        // layout is fixed: `[header @ 0,
-                        // null_code_ptr @ 8, return_arm_closure @ 16,
-                        // return_arm_fn @ 24]`. Load and pass to the
-                        // args-passing helper variant.
+                        // layout is fixed.
+                        //
+                        // Stage 5 — layout extended with fired_ptr slot:
+                        // `[header @ 0, null_code_ptr @ 8,
+                        //   return_arm_closure @ 16, return_arm_fn @ 24,
+                        //   return_arm_fired_ptr @ 32]`. Helper gates
+                        // dispatch on `*fired_ptr`.
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
                         let synth_closure_ptr = block_params[0];
                         let ra_closure = builder.ins().load(
@@ -15355,9 +15529,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             synth_closure_ptr,
                             24,
                         );
+                        let ra_fired_ptr = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            32,
+                        );
                         let done_call = builder.ins().call(
                             done_or_dispatch_return_arm_via_args_ref,
-                            &[constant_v, ra_closure, ra_fn],
+                            &[constant_v, ra_closure, ra_fn, ra_fired_ptr],
                         );
                         stackmap.push_placeholder(function_code_offset(&builder, done_call));
                         let next_step = builder.inst_results(done_call)[0];
@@ -16473,8 +16653,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // return from this synth
                                                 // fn directly.
                                                 //
-                                                let (ra_closure_perform, ra_fn_perform) =
-                                                    lowerer.load_return_arm_pair();
+                                                let (
+                                                    ra_closure_perform,
+                                                    ra_fn_perform,
+                                                    ra_fired_perform,
+                                                ) = lowerer.load_return_arm_triple();
                                                 let perform_call = lowerer.builder.ins().call(
                                                     lowerer.perform_ref,
                                                     &[
@@ -16486,6 +16669,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         caller_k_fn,
                                                         ra_closure_perform,
                                                         ra_fn_perform,
+                                                        ra_fired_perform,
                                                     ],
                                                 );
                                                 lowerer.stackmap.push_placeholder(
@@ -16779,8 +16963,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // sigil_perform with
                                                 // branch_closure + step0
                                                 // as the continuation.
-                                                let (ra_closure_pc, ra_fn_pc) =
-                                                    lowerer.load_return_arm_pair();
+                                                let (ra_closure_pc, ra_fn_pc, ra_fired_pc) =
+                                                    lowerer.load_return_arm_triple();
                                                 let perf_call = lowerer.builder.ins().call(
                                                     lowerer.perform_ref,
                                                     &[
@@ -16792,6 +16976,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         step0_addr,
                                                         ra_closure_pc,
                                                         ra_fn_pc,
+                                                        ra_fired_pc,
                                                     ],
                                                 );
                                                 lowerer.stackmap.push_placeholder(
@@ -17775,8 +17960,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // `next_closure_ptr` it loaded
                                         // from.
                                         //
-                                        let (ra_closure_mid, ra_fn_mid) =
-                                            lowerer.load_return_arm_pair();
+                                        let (ra_closure_mid, ra_fn_mid, ra_fired_mid) =
+                                            lowerer.load_return_arm_triple();
                                         let perform_call = lowerer.builder.ins().call(
                                             lowerer.perform_ref,
                                             &[
@@ -17788,6 +17973,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 next_step_fn_addr,
                                                 ra_closure_mid,
                                                 ra_fn_mid,
+                                                ra_fired_mid,
                                             ],
                                         );
                                         lowerer.stackmap.push_placeholder(function_code_offset(
@@ -17871,19 +18057,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // debug_assert at
                                         // `lower_perform_to_value`.
                                         debug_assert!(
-                                            (user_arg_count as u32).saturating_add(4)
+                                            (user_arg_count as u32).saturating_add(5)
                                                 <= sigil_abi::effect::MAX_INLINE_ARGS,
                                             "codegen Plan D Task 112a: wrapper-Call to \
                                              `{}` has {} user args, exceeding \
-                                             MAX_INLINE_ARGS - 4 = {}",
+                                             MAX_INLINE_ARGS - 5 = {}",
                                             callee_name,
                                             user_arg_count,
-                                            sigil_abi::effect::MAX_INLINE_ARGS - 4
+                                            sigil_abi::effect::MAX_INLINE_ARGS - 5
                                         );
                                         // 2026-05-04 return-arm-via-args lift
-                                        // Stage 1 — room for the second
-                                        // trailing pair.
-                                        let total_arg_count = user_arg_count + 4;
+                                        // Stage 5 — room for return_arm pair
+                                        // + fired_ptr (5 trailing slots after
+                                        // user args).
+                                        let total_arg_count = user_arg_count + 5;
                                         let arg_count_v = lowerer
                                             .builder
                                             .ins()
@@ -17961,10 +18148,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             k_fn_offset(user_arg_count),
                                         );
                                         // 2026-05-04 return-arm-via-args lift
-                                        // Stage 1 — sub-Cps-call boundary.
+                                        // Stage 5 — sub-Cps-call boundary.
+                                        // No outer return arm to dispatch:
+                                        // store (null, null, null) at the
+                                        // three trailing slots. Helper sees
+                                        // null fired_ptr → emits Done(v).
                                         let null_ra_closure =
                                             lowerer.builder.ins().iconst(pointer_ty, 0);
                                         let null_ra_fn =
+                                            lowerer.builder.ins().iconst(pointer_ty, 0);
+                                        let null_ra_fired =
                                             lowerer.builder.ins().iconst(pointer_ty, 0);
                                         lowerer.builder.ins().store(
                                             MemFlags::trusted(),
@@ -17977,6 +18170,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             null_ra_fn,
                                             argp_v,
                                             return_arm_fn_offset(user_arg_count),
+                                        );
+                                        lowerer.builder.ins().store(
+                                            MemFlags::trusted(),
+                                            null_ra_fired,
+                                            argp_v,
+                                            return_arm_fired_offset(user_arg_count),
                                         );
                                         ns_ptr
                                     }
@@ -18295,8 +18494,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .iconst(types::I32, user_arg_count as i64),
                                             )
                                         };
-                                        let (ra_closure_branch, ra_fn_branch) =
-                                            lowerer.load_return_arm_pair();
+                                        let (ra_closure_branch, ra_fn_branch, ra_fired_branch) =
+                                            lowerer.load_return_arm_triple();
                                         let perf_call = lowerer.builder.ins().call(
                                             lowerer.perform_ref,
                                             &[
@@ -18308,6 +18507,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 caller_k_fn,
                                                 ra_closure_branch,
                                                 ra_fn_branch,
+                                                ra_fired_branch,
                                             ],
                                         );
                                         lowerer.stackmap.push_placeholder(function_code_offset(
@@ -18744,13 +18944,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 push_call,
                             ));
 
-                            // arg_count = N + 4 so the trampoline
+                            // arg_count = N + 5 so the trampoline
                             // allocates an arena args buffer with room
-                            // for both trailing pairs (`caller_k_pair`
-                            // and the 2026-05-04 return-arm-via-args
-                            // lift's `(return_arm_closure, return_arm_fn)`).
+                            // for `caller_k_pair`, `return_arm_closure /
+                            // return_arm_fn`, and Stage 5's
+                            // `return_arm_fired_ptr`.
                             let user_arg_count = widened_args.len();
-                            let total_arg_count = user_arg_count + 4;
+                            let total_arg_count = user_arg_count + 5;
                             let total_arg_count_v = lowerer
                                 .builder
                                 .ins()
@@ -18810,17 +19010,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // 2026-05-04 return-arm-via-args lift Stage 3a —
                             // recursive Cps→Cps sub-call inside a compound-
                             // match arm's B.2 synth-cont. Forward
-                            // `(return_arm_closure, return_arm_fn)` from
-                            // the surrounding B.2 synth-cont's closure
-                            // record (the body fn's return_arm was copied
-                            // into it at synth-cont alloc; codegen.rs
-                            // ~10810 area). The recursive iterate(rest)
-                            // call thus carries the outer handle's
-                            // return arm forward through the chain so the
-                            // deepest iterate(Nil)'s body fn natural-exit
-                            // emit can read it from its args_ptr trailing
-                            // slots.
-                            let (ra_closure_b3, ra_fn_b3) = lowerer.load_return_arm_pair();
+                            // `(return_arm_closure, return_arm_fn,
+                            // return_arm_fired_ptr)` from the surrounding
+                            // B.2 synth-cont's closure record (the body fn's
+                            // return_arm + Stage 5 fired_ptr were copied
+                            // into it at synth-cont alloc; CompoundMatch-
+                            // ArmPostPerform alloc site). The recursive
+                            // iterate(rest) call thus carries the outer
+                            // handle's return arm forward through the chain
+                            // so the deepest iterate(Nil)'s body fn natural-
+                            // exit emit can read it from its args_ptr
+                            // trailing slots.
+                            let (ra_closure_b3, ra_fn_b3, ra_fired_ptr_b3) =
+                                lowerer.load_return_arm_triple();
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_b3,
@@ -18832,6 +19034,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 ra_fn_b3,
                                 argp_v,
                                 return_arm_fn_offset(user_arg_count),
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                ra_fired_ptr_b3,
+                                argp_v,
+                                return_arm_fired_offset(user_arg_count),
                             );
 
                             // Return NextStep::Call up to the outer
@@ -19003,13 +19211,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let user_args: Vec<Value> = block_params[1..terminal_out_idx].to_vec();
         let user_arg_count = user_args.len();
 
-        // Pack args + two trailing pairs into a stack slot of size
-        // `(N + 4) * 8` bytes. The second trailing pair carries
-        // `(return_arm_closure, return_arm_fn)` per the 2026-05-04
-        // return-arm-via-args lift; for `__sync_shim` (a sub-Cps-call
-        // boundary) those slots are always `(null, null)` — no outer
-        // return arm propagates into the Cps callee.
-        let slot_bytes = ((user_arg_count + 4) * 8) as u32;
+        // Pack args + trailing slots into a stack slot of size
+        // `(N + 5) * 8` bytes. The trailing slots carry
+        // `(return_arm_closure, return_arm_fn, return_arm_fired_ptr)`
+        // per the 2026-05-04 return-arm-via-args lift; for `__sync_shim`
+        // (a sub-Cps-call boundary) all three slots are null — no
+        // outer return arm propagates into the Cps callee, so the
+        // helper sees null fired_ptr and emits Done(v).
+        let slot_bytes = ((user_arg_count + 5) * 8) as u32;
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             slot_bytes,
@@ -19041,9 +19250,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder
             .ins()
             .stack_store(identity_addr, slot, k_fn_offset(user_arg_count));
-        // 2026-05-04 return-arm-via-args lift Stage 1 — (null, null).
+        // 2026-05-04 return-arm-via-args lift Stage 5 — sync_shim is a
+        // sub-Cps-call boundary; null all three slots.
         let null_ra_closure_v = builder.ins().iconst(pointer_ty, 0);
         let null_ra_fn_v = builder.ins().iconst(pointer_ty, 0);
+        let null_ra_fired_v = builder.ins().iconst(pointer_ty, 0);
         builder.ins().stack_store(
             null_ra_closure_v,
             slot,
@@ -19052,6 +19263,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder
             .ins()
             .stack_store(null_ra_fn_v, slot, return_arm_fn_offset(user_arg_count));
+        builder.ins().stack_store(
+            null_ra_fired_v,
+            slot,
+            return_arm_fired_offset(user_arg_count),
+        );
 
         let args_ptr = builder.ins().stack_addr(pointer_ty, slot, 0);
         let args_len_v = builder.ins().iconst(types::I32, user_arg_count as i64);
@@ -19680,17 +19896,19 @@ enum TailResult {
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
-    /// 2026-05-04 return-arm-via-args lift Stage 3b — load the active
-    /// handle's `(return_arm_closure, return_arm_fn)` pair for forward
-    /// propagation into a sub-call's args_ptr (e.g., at a `perform` or
-    /// `lower_call_in_tail_pos` Cps→Cps tail emit). Body-fn Lowerers
-    /// read from args_ptr trailing slots; synth-cont Lowerers read
-    /// from closure_ptr at `synth_cont_return_arm_closure_off` if the
-    /// surrounding synth-cont's closure record carries return_arm
-    /// (Stage 3a / Stage 3b extensions). Returns `(null, null)` when
-    /// neither source is set — pre-Stage-3 behavior (the natural-exit
-    /// helper sees null and emits Done).
-    fn load_return_arm_pair(&mut self) -> (Value, Value) {
+    /// 2026-05-04 return-arm-via-args lift Stage 3b/5 — load the active
+    /// handle's `(return_arm_closure, return_arm_fn, return_arm_fired_-
+    /// ptr)` triple for forward propagation into a sub-call's args_ptr
+    /// (at a `perform` or `lower_call_in_tail_pos` Cps→Cps tail emit)
+    /// or for direct pass to the args-helper at natural-exit sites.
+    ///
+    /// Body-fn Lowerers read from args_ptr trailing slots; synth-cont
+    /// Lowerers read from closure_ptr at
+    /// `synth_cont_return_arm_closure_off` (closure offset 0 / +8 / +16
+    /// for closure / fn / fired_ptr respectively). Returns all-null
+    /// when neither source is set — the helper sees null fired_ptr
+    /// and emits Done.
+    fn load_return_arm_triple(&mut self) -> (Value, Value, Value) {
         if let Some((args_ptr, user_arg_count)) = self.body_args_ptr_for_return_arm {
             let rc = self.builder.ins().load(
                 self.pointer_ty,
@@ -19704,7 +19922,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 args_ptr,
                 return_arm_fn_offset(user_arg_count),
             );
-            (rc, rf)
+            let rfp = self.builder.ins().load(
+                self.pointer_ty,
+                MemFlags::trusted(),
+                args_ptr,
+                return_arm_fired_offset(user_arg_count),
+            );
+            (rc, rf, rfp)
         } else if let Some(off) = self.synth_cont_return_arm_closure_off {
             let rc = self.builder.ins().load(
                 self.pointer_ty,
@@ -19718,11 +19942,18 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.closure_ptr,
                 off + 8,
             );
-            (rc, rf)
+            let rfp = self.builder.ins().load(
+                self.pointer_ty,
+                MemFlags::trusted(),
+                self.closure_ptr,
+                off + 16,
+            );
+            (rc, rf, rfp)
         } else {
             let null_rc = self.builder.ins().iconst(self.pointer_ty, 0);
             let null_rf = self.builder.ins().iconst(self.pointer_ty, 0);
-            (null_rc, null_rf)
+            let null_rfp = self.builder.ins().iconst(self.pointer_ty, 0);
+            (null_rc, null_rf, null_rfp)
         }
     }
 
@@ -19988,12 +20219,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 // surrounding fn is a Slice A synth-cont.
                                 // Today: synth-conts are the only path.
                                 let user_arg_count = args.len();
-                                // 2026-05-04 return-arm-via-args lift Stage 1 —
-                                // `+ 4` for both trailing pairs (caller_k_pair
-                                // and return_arm pair). At this recursive
-                                // tail-call site the return_arm slots are
-                                // always (null, null) — see the store below.
-                                let total_arg_count = user_arg_count + 4;
+                                // 2026-05-04 return-arm-via-args lift Stage 5 —
+                                // `+ 5` for caller_k_pair + return_arm triple
+                                // (closure, fn, fired_ptr). Forwarded from
+                                // the surrounding synth-cont's closure
+                                // record when present.
+                                let total_arg_count = user_arg_count + 5;
 
                                 // Load surrounding synth-cont's incoming
                                 // post_arm_k pair from its args_ptr (entry
@@ -20104,46 +20335,52 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 // 2026-05-04 return-arm-via-args lift Stage 3a —
                                 // recursive Cps→Cps tail call from inside a
                                 // synth-cont. Forward `(return_arm_closure,
-                                // return_arm_fn)` from the surrounding synth-
-                                // cont's closure record (the chained-let-
-                                // yield Final-step closure layout carries
-                                // them at `synth_cont_return_arm_closure_off`)
-                                // into the recursive callee's args_ptr
-                                // trailing slots so the callee's body fn
-                                // natural-exit emit can read them. When the
-                                // surrounding synth-cont's layout doesn't
-                                // carry return_arm yet (other chain shapes;
-                                // future sub-stage work), fall back to
-                                // (null, null) — the body fn's natural-exit
-                                // helper will see null and emit Done. That's
-                                // pre-Stage-3 behavior, not a regression.
+                                // return_arm_fn, return_arm_fired_ptr)` from
+                                // the surrounding synth-cont's closure record
+                                // (Stage 5 extension stores fired_ptr in the
+                                // third trailing slot).
+                                //
+                                // When the surrounding synth-cont's layout
+                                // doesn't carry return_arm yet, fall back to
+                                // null triple — the body fn's natural-exit
+                                // helper sees null fired_ptr and emits Done.
                                 let surrounding_closure_ptr =
                                     self.builder.func.dfg.block_params(surrounding_entry)[0];
-                                let (forwarded_ra_closure, forwarded_ra_fn) = match self
-                                    .synth_cont_return_arm_closure_off
-                                {
-                                    Some(ra_closure_off) => {
-                                        let ra_fn_off = ra_closure_off + 8;
-                                        let rc = self.builder.ins().load(
-                                            self.pointer_ty,
-                                            MemFlags::trusted(),
-                                            surrounding_closure_ptr,
-                                            ra_closure_off,
-                                        );
-                                        let rf = self.builder.ins().load(
-                                            self.pointer_ty,
-                                            MemFlags::trusted(),
-                                            surrounding_closure_ptr,
-                                            ra_fn_off,
-                                        );
-                                        (rc, rf)
-                                    }
-                                    None => {
-                                        let null_rc = self.builder.ins().iconst(self.pointer_ty, 0);
-                                        let null_rf = self.builder.ins().iconst(self.pointer_ty, 0);
-                                        (null_rc, null_rf)
-                                    }
-                                };
+                                let (forwarded_ra_closure, forwarded_ra_fn, forwarded_ra_fired) =
+                                    match self.synth_cont_return_arm_closure_off {
+                                        Some(ra_closure_off) => {
+                                            let ra_fn_off = ra_closure_off + 8;
+                                            let ra_fired_off = ra_fn_off + 8;
+                                            let rc = self.builder.ins().load(
+                                                self.pointer_ty,
+                                                MemFlags::trusted(),
+                                                surrounding_closure_ptr,
+                                                ra_closure_off,
+                                            );
+                                            let rf = self.builder.ins().load(
+                                                self.pointer_ty,
+                                                MemFlags::trusted(),
+                                                surrounding_closure_ptr,
+                                                ra_fn_off,
+                                            );
+                                            let rfp = self.builder.ins().load(
+                                                self.pointer_ty,
+                                                MemFlags::trusted(),
+                                                surrounding_closure_ptr,
+                                                ra_fired_off,
+                                            );
+                                            (rc, rf, rfp)
+                                        }
+                                        None => {
+                                            let null_rc =
+                                                self.builder.ins().iconst(self.pointer_ty, 0);
+                                            let null_rf =
+                                                self.builder.ins().iconst(self.pointer_ty, 0);
+                                            let null_rfp =
+                                                self.builder.ins().iconst(self.pointer_ty, 0);
+                                            (null_rc, null_rf, null_rfp)
+                                        }
+                                    };
                                 self.builder.ins().stack_store(
                                     forwarded_ra_closure,
                                     slot,
@@ -20153,6 +20390,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                     forwarded_ra_fn,
                                     slot,
                                     return_arm_fn_offset(user_arg_count),
+                                );
+                                self.builder.ins().stack_store(
+                                    forwarded_ra_fired,
+                                    slot,
+                                    return_arm_fired_offset(user_arg_count),
                                 );
 
                                 // Build NextStep::Call(callee_addr,
@@ -20604,22 +20846,38 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         });
         let ret_ty = callee_entry.ret_ty;
 
-        // Pack user args + two trailing pairs into a stack slot of
-        // `(N + 4) * 8` bytes. Layout matches `lower_call`'s Cps
+        // Pack user args + trailing slots into a stack slot of
+        // `(N + 5) * 8` bytes. Layout matches `lower_call`'s Cps
         // branch + the 2026-05-04 return-arm-via-args lift's second
-        // trailing pair `(return_arm_closure, return_arm_fn)`.
+        // trailing pair `(return_arm_closure, return_arm_fn)` and
+        // Stage 5's third trailing slot `return_arm_fired_ptr`.
         //
-        // **Stage 1 only:** this site writes `(null, null)` to the
-        // return_arm slots (parallel infrastructure; TLS push below is
-        // still authoritative). Stage 2 swaps to writing the real
-        // return arm.
+        // **Stage 5:** allocate a 1-u64 `fired` cell on this handle
+        // expression's stack frame and store its address in the
+        // trailing slot. The helper at body fn natural-exit emit
+        // sites reads `*fired_ptr` to gate dispatch (was: TLS
+        // `BODY_RETURN_ARM_STACK[depth-1].fired`).
         let user_arg_count = args.len();
-        let slot_bytes = ((user_arg_count + 4) * 8) as u32;
+        let slot_bytes = ((user_arg_count + 5) * 8) as u32;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             slot_bytes,
             3,
         ));
+
+        // Per-handle fired cell — 1 u64, zero-initialized. Flipped to
+        // 1 by the args-helper on first dispatch.
+        let fired_slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        let zero_u64 = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().stack_store(zero_u64, fired_slot, 0);
+        let fired_ptr_v = self
+            .builder
+            .ins()
+            .stack_addr(self.pointer_ty, fired_slot, 0);
 
         for (i, arg_expr) in args.iter().enumerate() {
             let arg_v = self.lower_expr(arg_expr);
@@ -20676,6 +20934,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder
             .ins()
             .stack_store(ret_fn_ptr_v, slot, return_arm_fn_offset(user_arg_count));
+        // 2026-05-04 return-arm-via-args lift Stage 5 — write the
+        // fired_ptr (address of the per-handle fired cell allocated
+        // above) into the third trailing slot. The body fn forward-
+        // copies this pointer into every synth-cont closure record;
+        // all forward-copies share the same cell, so a first-dispatch
+        // mutation by the helper is visible to chain-unwind invocations.
+        self.builder
+            .ins()
+            .stack_store(fired_ptr_v, slot, return_arm_fired_offset(user_arg_count));
 
         let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
         let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
@@ -21452,9 +21719,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .func_addr(self.pointer_ty, self.continuation_identity_ref);
-        // 2026-05-04 return-arm-via-args lift Stage 3b — forward
-        // return_arm from this Lowerer's source.
-        let (ra_closure_lpv, ra_fn_lpv) = self.load_return_arm_pair();
+        // 2026-05-04 return-arm-via-args lift Stage 3b/5 — forward
+        // return_arm triple from this Lowerer's source.
+        let (ra_closure_lpv, ra_fn_lpv, ra_fired_lpv) = self.load_return_arm_triple();
         let perform_call = self.builder.ins().call(
             self.perform_ref,
             &[
@@ -21466,6 +21733,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 k_fn,
                 ra_closure_lpv,
                 ra_fn_lpv,
+                ra_fired_lpv,
             ],
         );
         self.stackmap
@@ -24004,11 +24272,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         // way the synchronous wrapper unwinds to
                         // `sigil_run_loop`'s u64 return.
                         let user_arg_count = args.len();
-                        // 2026-05-04 return-arm-via-args lift Stage 1 —
-                        // `+ 4` to accommodate the second trailing pair
-                        // (return_arm); set to (null, null) below since
-                        // this is a sub-Cps-call boundary.
-                        let slot_bytes = ((user_arg_count + 4) * 8) as u32;
+                        // 2026-05-04 return-arm-via-args lift Stage 5 —
+                        // `+ 5` for caller_k_pair + return_arm triple
+                        // (closure, fn, fired_ptr); set to all-null below
+                        // since native↔CPS interop is a sub-Cps-call
+                        // boundary.
+                        let slot_bytes = ((user_arg_count + 5) * 8) as u32;
                         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
                             StackSlotKind::ExplicitSlot,
                             slot_bytes,
@@ -24053,11 +24322,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             slot,
                             k_fn_offset(user_arg_count),
                         );
-                        // 2026-05-04 return-arm-via-args lift Stage 1 —
-                        // native↔CPS interop wrapper is a sub-Cps-call
-                        // boundary; (null, null).
+                        // 2026-05-04 return-arm-via-args lift Stage 5 —
+                        // native↔CPS interop is a sub-Cps-call boundary;
+                        // null triple (closure, fn, fired_ptr).
                         let null_ra_closure_v = self.builder.ins().iconst(self.pointer_ty, 0);
                         let null_ra_fn_v = self.builder.ins().iconst(self.pointer_ty, 0);
+                        let null_ra_fired_v = self.builder.ins().iconst(self.pointer_ty, 0);
                         self.builder.ins().stack_store(
                             null_ra_closure_v,
                             slot,
@@ -24067,6 +24337,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             null_ra_fn_v,
                             slot,
                             return_arm_fn_offset(user_arg_count),
+                        );
+                        self.builder.ins().stack_store(
+                            null_ra_fired_v,
+                            slot,
+                            return_arm_fired_offset(user_arg_count),
                         );
                         let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
                         // D2 fix from PR #26 mid-flight at 33f2231:
@@ -27620,6 +27895,25 @@ fn return_arm_closure_offset(user_arg_count: usize) -> i32 {
 /// Companion to [`return_arm_closure_offset`].
 fn return_arm_fn_offset(user_arg_count: usize) -> i32 {
     return_arm_closure_offset(user_arg_count) + 8
+}
+
+/// 2026-05-04 return-arm-via-args lift Stage 5 — byte offset within
+/// `args_ptr` for the `return_arm_fired_ptr` slot. Always
+/// `return_arm_fn_offset + 8`. The slot holds a pointer to a 1-u64
+/// cell on the handle expression's stack frame. The cell starts at 0
+/// and is mutated to 1 by `sigil_done_or_dispatch_return_arm_via_args`
+/// when the active handle's return arm dispatches; subsequent helper
+/// invocations (chain-unwind synth-conts inheriting forward-copied
+/// return_arm) read the cell and short-circuit to `Done(v)`. The cell
+/// is the structural replacement for the TLS
+/// `BODY_RETURN_ARM_STACK[depth - 1].fired` flag that Stages 1–4 left
+/// in place.
+///
+/// Sub-Cps-call boundaries write a null pointer here (no outer return
+/// arm to dispatch); the helper treats null `fired_ptr` like a null
+/// `return_arm_fn` and emits `Done(v)`.
+fn return_arm_fired_offset(user_arg_count: usize) -> i32 {
+    return_arm_fn_offset(user_arg_count) + 8
 }
 
 /// Plan B Task 55, Phase 4e captures+ Slice A — trailing-pair
