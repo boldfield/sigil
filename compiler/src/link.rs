@@ -120,9 +120,7 @@ fn locate_runtime_lib() -> Option<PathBuf> {
                 .and_then(|d| d.parent())
                 .map(|p| p.join("lib").join("libsigil_runtime.a")),
             // flat: sigil + libsigil_runtime.a in the same dir
-            exe_dir
-                .as_ref()
-                .map(|d| d.join("libsigil_runtime.a")),
+            exe_dir.as_ref().map(|d| d.join("libsigil_runtime.a")),
         ];
         for c in candidates.into_iter().flatten() {
             if c.exists() {
