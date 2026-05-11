@@ -22,9 +22,7 @@ v1.0.0 shipped. Currently working through the v2 architectural cluster
   what makes Sigil-compiled binaries shippable without inheriting
   Apache 2.0 notice obligations.
 
-## Pre-commit sync discipline (load-bearing)
-
-**Run `./scripts/sync-docs.sh` before every commit.**
+## Docs sync (tag-triggered)
 
 The published GitHub Pages site at `sigillang.ai` serves
 `docs/language.md`, `docs/capabilities.md`, and `docs/for-llms.md` —
@@ -43,29 +41,22 @@ Pages-specific callouts (like the "for LLM ingestion" note on
 `<!-- BEGIN SYNCED CONTENT -->` sentinel. `sync-docs.sh` preserves
 that region across syncs.
 
-`scripts/sync-docs.sh` regenerates the published copies from the
-canonical sources (preserving each page's front matter, rewriting
-relative links to site-relative or GitHub-blob URLs).
+**Sync runs automatically on every `v*` tag push** via the `sync-docs`
+job in `.github/workflows/release.yml`. The job re-runs
+`scripts/sync-docs.sh` against `main`, commits any drift back to
+`main` as `Sync docs/ for <tag>`, and pushes. Between tags, `docs/`
+may lag the canonical source — that's expected. The published site
+reflects whatever was last synced (the last tagged release).
 
-CI gates drift via `scripts/check-docs-sync.sh` — runs on every
-build-test job. If the published copies don't match the canonical
-sources, CI fails with `check-docs-sync: docs/X.md drifted from <source>`.
+Editing a canonical source (`spec/language.md`, `CAPABILITIES.md`,
+`SIGIL_FOR_LLMS.md`) does **not** require a same-commit sync. Don't
+run sync-docs locally as a pre-commit ritual; let the tag workflow
+handle it. If you want the site to reflect a change immediately,
+either cut a tag or run `./scripts/sync-docs.sh` + commit + push
+explicitly.
 
-**The convention:** just run sync-docs at the end of every working
-session (or before every commit). It's a no-op when nothing changed.
-Don't try to remember "did I edit a canonical source?" — let the
-script do the bookkeeping.
-
-```sh
-./scripts/sync-docs.sh
-```
-
-If sync-docs produces a non-empty diff, **stage and commit the
-regenerated `docs/*.md` files in the same commit as the canonical-
-source edit**. A separate "sync docs" commit is fine but discouraged
-— the CI gate is per-commit, so leaving the docs lag behind the
-canonical source by even one commit produces a red CI lane on every
-subsequent push until the sync lands.
+`scripts/check-docs-sync.sh` is still available for local sanity
+checks but is no longer CI-gated.
 
 ## CI surface (sigil-specific)
 
@@ -81,7 +72,6 @@ sigil-specific scripts in `scripts/`:
 - `smoke.sh` — every example compiles + runs + matches its oracle.
 - `plan-b-invariants.sh` — multi-shot continuation + selective CPS
   charter invariants.
-- `check-docs-sync.sh` — the docs-sync gate described above.
 
 The `pod-verify.sh` script is the fastest "did I break something
 load-bearing" check during a working session. The full e2e suite
