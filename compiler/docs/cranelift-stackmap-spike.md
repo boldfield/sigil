@@ -258,6 +258,18 @@ The combined evidence is the minimum proof that:
   `lower_call_in_tail_pos` for the Sync CallConv uses `return_call`,
   which is *not* a safepoint — but it also can't allocate (the callee
   takes over). Cranelift's automatic safepoint coverage is sufficient.
+  **Audit performed 2026-05-11**: `grep -nE '\.ins\(\)\.return_call\(|\.ins\(\)\.return_call_indirect\(' compiler/src/codegen.rs`
+  returns exactly **one** site at codegen.rs:19987, inside
+  `lower_call_in_tail_pos`'s `UserFnAbi::Sync` arm. The args carried
+  across this tail call (`null_closure`, user-arg `Value`s,
+  `terminal_out`) transfer ownership to the callee — at the moment
+  `return_call` executes, the caller's frame is released, and any
+  heap-pointer args become roots in the callee's frame. The callee's
+  own safepoint pass (auto-inserted at its first non-tail call inside
+  the body) handles them. *No annotation is needed at the `return_call`
+  site itself.* Marking the callee's received block-params as
+  needs-stack-map is a separate concern handled by Task 2b's block-arg
+  sweep — Task 3 is closed here.
 
 - **Task 4 (v1 section writer).** Translate each `(pc_off_in_fn,
   frame_size, UserStackMap)` to the v1 record shape declared in
