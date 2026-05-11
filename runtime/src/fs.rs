@@ -121,7 +121,7 @@ pub unsafe extern "C" fn sigil_fs_exists_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 7);
+    debug_assert!(args_len == 6);
     debug_assert!(!in_args.is_null());
     let path_ptr = *in_args as *const u8;
     let k_closure = *in_args.add(1) as *mut u8;
@@ -496,7 +496,7 @@ pub unsafe extern "C" fn sigil_fs_write_file_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 6);
+    debug_assert!(args_len == 7);
     debug_assert!(!in_args.is_null());
     let path_ptr = *in_args as *const u8;
     let data_ptr = *in_args.add(1) as *const u8;
