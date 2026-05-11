@@ -20,6 +20,13 @@ env:
   SOURCE_DATE_EPOCH: "0"
   TZ: UTC
 
+# `GITHUB_TOKEN` defaults to read-only for public repositories. The
+# release-upload step (`gh release create` / `upload`) needs `contents:
+# write` to attach tarballs. Surfaced as HTTP 403 "Resource not
+# accessible by integration" on the first run against v1.0.0.
+permissions:
+  contents: write
+
 jobs:
   build:
     name: build ${{ matrix.target }}
