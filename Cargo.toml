@@ -5,7 +5,7 @@ members = ["abi", "compiler", "header-constants", "runtime"]
 [workspace.package]
 edition = "2021"
 rust-version = "1.95.0"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 cranelift = "=0.131.0"
