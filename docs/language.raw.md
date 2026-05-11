@@ -1,17 +1,3 @@
----
-layout: default
-title: Language Specification
-permalink: /language/
----
-
-> **For LLM ingestion:** this page is the rendered version of the
-> spec. The same content as raw markdown — no HTML wrap, no theme,
-> link-rewritten for direct ingestion — is at
-> [`/language.raw.md`]({{ '/language.raw.md' | relative_url }}).
-> Drop it into a system prompt and ask the model to author Sigil.
-
-<!-- BEGIN SYNCED CONTENT -->
-
 # Sigil — Language Specification (v1)
 
 Sigil is a compiled, statically-typed programming language designed to

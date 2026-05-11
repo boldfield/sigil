@@ -124,6 +124,25 @@ cargo build --release
 The full toolchain setup and platform notes are in the
 [language spec]({{ '/language/' | relative_url }}).
 
+## Hand it to an LLM
+
+The spec is intentionally LLM-ready. Drop it into a system prompt
+and ask the model to author Sigil:
+
+- **Raw markdown for direct ingestion:**
+  [`https://sigillang.ai/language.raw.md`]({{ '/language.raw.md' | relative_url }}) —
+  ~80 KB, no HTML wrap, no theme. Relative links are pre-rewritten to
+  absolute GitHub URLs so the model can chase examples without
+  resolving paths.
+- **Rendered HTML version:** [`/language/`]({{ '/language/' | relative_url }}) —
+  same content, paginated chrome for humans.
+
+The [authorship case]({{ '/for-llms/' | relative_url }}) page covers
+the empirical evidence (1,626 trials, the harness scripts, the
+edit-loop discipline). If you want to reproduce the numbers, the
+scripts are in [`scripts/`](https://github.com/boldfield/sigil/tree/main/scripts)
+and [`comp/scripts/`](https://github.com/boldfield/sigil/tree/main/comp/scripts).
+
 ## Sigil isn't trying to be the language humans want most
 
 It's trying to be the language LLMs get right.
