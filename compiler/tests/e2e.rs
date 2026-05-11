@@ -18024,3 +18024,163 @@ fn perf_gate_zero_overhead_when_profile_env_unset() {
         elapsed_on.as_secs_f64() / elapsed_off.as_secs_f64()
     );
 }
+
+/// 2026-05-08 v2 runtime profile-data, Phase 6 Task 12 — end-to-end
+/// validation on the plan's canonical example, `examples/json.sigil`.
+///
+/// Substitutes for the human screenshot the plan asks for. Compiles
+/// the JSON pretty-printer + parser round-trip with
+/// `--emit-symbol-table`, runs it under both folded-stacks and pprof
+/// profilers, asserts the outputs are well-formed, and writes both
+/// artifacts to the CI test-results directory so a maintainer can
+/// render an SVG with `flamegraph.pl` (a CI workflow step uploads
+/// the folded text as a build artifact for the same purpose).
+///
+/// Also prints the top folded rows to stderr so CI logs carry visible
+/// evidence that real json.sigil + runtime symbols are flowing through
+/// the pipeline (the test can't take a screenshot, but the text
+/// output is the next-best thing).
+#[test]
+fn task_12_validation_profile_json_sigil_end_to_end() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let source = root.join("examples/json.sigil");
+
+    let test_id = std::process::id();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_json_validation_{test_id}"));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+    let folded_path = std::env::temp_dir().join(format!("sigil_e2e_json_validation_{test_id}.txt"));
+    let pprof_path = std::env::temp_dir().join(format!("sigil_e2e_json_validation_{test_id}.pb"));
+
+    // Pre-clean.
+    let _ = std::fs::remove_file(&folded_path);
+    let _ = std::fs::remove_file(&pprof_path);
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "json.sigil compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    // Run under folded-stacks profile.
+    let run_folded = Command::new(&bin_path)
+        .env("SIGIL_CPU_PROFILE", folded_path.to_str().unwrap())
+        .env("SIGIL_CPU_PROFILE_HZ", "999")
+        .output()
+        .expect("execute json.sigil under folded profile");
+    assert!(
+        run_folded.status.success(),
+        "json.sigil folded-run failed: stderr={}",
+        String::from_utf8_lossy(&run_folded.stderr)
+    );
+
+    // Run under pprof profile.
+    let run_pprof = Command::new(&bin_path)
+        .env("SIGIL_CPU_PROFILE", pprof_path.to_str().unwrap())
+        .env("SIGIL_CPU_PROFILE_HZ", "999")
+        .output()
+        .expect("execute json.sigil under pprof profile");
+    assert!(
+        run_pprof.status.success(),
+        "json.sigil pprof-run failed: stderr={}",
+        String::from_utf8_lossy(&run_pprof.stderr)
+    );
+
+    let folded = std::fs::read_to_string(&folded_path).expect("folded sidecar exists");
+    let pprof_bytes = std::fs::read(&pprof_path).expect("pprof sidecar exists");
+
+    // Keep artifacts in a known CI-visible location so the workflow
+    // step can pick them up + render the SVG. tempdir is the parent
+    // for both — the workflow uploads matching glob.
+    eprintln!(
+        "task_12_validation: folded={} ({} bytes), pprof={} ({} bytes)",
+        folded_path.display(),
+        folded.len(),
+        pprof_path.display(),
+        pprof_bytes.len()
+    );
+
+    assert!(!folded.is_empty(), "folded output must be non-empty");
+    assert!(!pprof_bytes.is_empty(), "pprof output must be non-empty");
+
+    // pprof first tag = field 1 (sample_type) length-delimited.
+    assert_eq!(
+        pprof_bytes[0], 0x0A,
+        "pprof must start with field 1 (sample_type) tag = 0x0A"
+    );
+
+    // Every folded line: `<root>;<...>;<leaf> <count>`. Parse the
+    // count column and assert it's a positive integer.
+    let mut total_samples: u64 = 0;
+    let mut json_or_runtime_names = 0usize;
+    let mut row_count = 0usize;
+    for line in folded.lines() {
+        row_count += 1;
+        let last_space = line
+            .rfind(' ')
+            .unwrap_or_else(|| panic!("malformed folded row: `{line}`"));
+        let (stack, count_str) = line.split_at(last_space);
+        let count_str = count_str.trim();
+        let count: u64 = count_str
+            .parse()
+            .unwrap_or_else(|_| panic!("folded count column must be u64 on `{line}`"));
+        total_samples += count;
+        // Stack column should contain at least one named frame
+        // belonging to json.sigil (user fn) or to the runtime crate
+        // (sigil_*). Hex addresses indicate either symtab gaps or
+        // libc frames — both acceptable, but at least *some* rows
+        // should resolve to real names for the test to be evidence.
+        if stack.contains("sigil_") || stack.contains("main") || stack.contains("parse") {
+            json_or_runtime_names += 1;
+        }
+    }
+    assert!(row_count > 0, "at least one folded row must be produced");
+    assert!(
+        total_samples > 0,
+        "folded output must contain at least one positive sample count"
+    );
+    assert!(
+        json_or_runtime_names > 0,
+        "at least one folded row must reference a resolved name \
+         (json.sigil user fn or runtime symbol); got 0 of {row_count}.\n\
+         First few rows:\n{}",
+        folded.lines().take(5).collect::<Vec<_>>().join("\n")
+    );
+
+    // Print the top 10 folded rows by count (after parsing) so CI
+    // logs carry a visible flame-graph-shaped artifact — this is
+    // the text-mode substitute for the plan's screenshot.
+    let mut rows: Vec<(u64, &str)> = folded
+        .lines()
+        .filter_map(|l| {
+            let space = l.rfind(' ')?;
+            let (stack, count_str) = l.split_at(space);
+            let count: u64 = count_str.trim().parse().ok()?;
+            Some((count, stack))
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    eprintln!(
+        "task_12_validation: top {} folded rows by sample count (text flame-graph evidence):",
+        rows.len().min(10)
+    );
+    for (count, stack) in rows.iter().take(10) {
+        eprintln!("  {count:>6}  {stack}");
+    }
+    eprintln!("task_12_validation: total samples = {total_samples}, unique stacks = {row_count}");
+
+    // Leave artifacts in place — the CI workflow's flame-graph
+    // step picks them up via glob. For local runs the temp files
+    // are cleaned up by the OS.
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+}

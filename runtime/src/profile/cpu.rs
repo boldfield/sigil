@@ -29,7 +29,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::profile::ring::{Ring, RING_SIZE};
 use crate::profile::sample::{Sample, SampleKind};
 use crate::profile::sys::{
-    setitimer, signal, Itimerval, SignalHandler, Timeval, ITIMER_PROF, SIGPROF, SIG_ERR,
+    setitimer, sigaction, ucontext_fp, Itimerval, Sigaction, SigactionHandler, Timeval,
+    ITIMER_PROF, SA_RESTART, SA_SIGINFO, SIGPROF,
 };
 use crate::profile::unwind;
 
@@ -97,13 +98,26 @@ pub fn maybe_init() -> bool {
         let ring: &'static Ring = Box::leak(Box::new(Ring::new()));
         CPU_RING_PTR.store(ring as *const Ring as *mut Ring, Ordering::Release);
 
-        // Install SIGPROF handler before enabling the flag — the
-        // first signal can be delivered immediately after setitimer.
-        // SAFETY: `signal(2)` is the documented signal-handler
-        // installer; the handler we pass is a plain `extern "C" fn`.
-        let prev = unsafe { signal(SIGPROF, sigprof_handler as SignalHandler) };
-        if prev as usize == SIG_ERR {
-            eprintln!("sigil profile: signal(SIGPROF) failed; profiling disabled");
+        // Install SIGPROF handler via `sigaction(SA_SIGINFO|SA_RESTART)`
+        // so the handler receives `ucontext_t*` for the interrupted
+        // thread. We then read the saved frame pointer directly from
+        // the ucontext and pass it to the walker — this is the
+        // migration from the original `signal(2)`-based approach
+        // (PR #148 review item #4).
+        //
+        // SAFETY: `sigaction(2)` reads `&act` for the duration of the
+        // call. The struct's flags / mask / handler are all populated
+        // before the call. Passing `null_mut` for `oldact` discards
+        // any previously-installed handler (the sigil runtime is the
+        // sole owner of SIGPROF in this process).
+        let act = Sigaction {
+            sa_sigaction: sigprof_handler as SigactionHandler as usize,
+            sa_flags: SA_SIGINFO | SA_RESTART,
+            ..Sigaction::default()
+        };
+        let rc = unsafe { sigaction(SIGPROF, &act, core::ptr::null_mut()) };
+        if rc != 0 {
+            eprintln!("sigil profile: sigaction(SIGPROF) failed; profiling disabled");
             return false;
         }
 
@@ -165,12 +179,23 @@ fn make_itimerval(usec_period: u64) -> Itimerval {
     }
 }
 
-/// SIGPROF handler. Signal-safe by construction:
+/// SIGPROF handler with `SA_SIGINFO`. Signal-safe by construction:
 /// - reads only relaxed/acquire atomics;
-/// - walks the frame-pointer chain via the Phase 2 walker (no alloc,
-///   no libc);
+/// - reads the interrupted thread's saved fp from `ucontext_t` and
+///   walks from there via the Phase 2 walker (no alloc, no libc);
 /// - pushes into the lock-free [`Ring`].
-extern "C" fn sigprof_handler(_sig: core::ffi::c_int) {
+///
+/// The handler receives the kernel-supplied `siginfo_t*` and
+/// `ucontext_t*` opaquely; only the `ucontext` pointer is used (to
+/// recover the interrupted thread's frame pointer). Reading from the
+/// walker's own fp instead of the ucontext's would put 2-3
+/// trampoline / walker frames at the bottom of every sample, which
+/// PR #148 review item #4 flagged.
+extern "C" fn sigprof_handler(
+    _sig: core::ffi::c_int,
+    _info: *mut core::ffi::c_void,
+    ucontext: *mut core::ffi::c_void,
+) {
     // Bail early if profiling has been disabled between signal
     // arming and delivery (atexit path).
     if !CPU_PROFILE_ENABLED.load(Ordering::Relaxed) {
@@ -181,12 +206,25 @@ extern "C" fn sigprof_handler(_sig: core::ffi::c_int) {
         return;
     }
 
+    // Recover the interrupted code's frame pointer from ucontext. If
+    // we can't (null or unrecognised layout), fall back to the
+    // walker's own fp — same behaviour as the original signal(2)
+    // path, just slightly noisier samples.
+    // SAFETY: ucontext is the kernel-supplied pointer for this
+    // SA_SIGINFO delivery; reading the saved fp is a single aligned
+    // load at a platform-pinned offset.
+    let interrupted_fp = unsafe { ucontext_fp(ucontext) };
+
     // Capture stack via the Phase 2 walker.
     let mut frames = [0usize; unwind::MAX_DEPTH];
     // SAFETY: we're on a live thread with frame pointers preserved
     // (the runtime crate has -C force-frame-pointers=yes; the
     // cranelift-emitted user code has preserve_frame_pointers=true).
-    let depth = unsafe { unwind::capture_stack(&mut frames) };
+    let depth = if interrupted_fp != 0 {
+        unsafe { unwind::capture_stack_from(interrupted_fp, &mut frames) }
+    } else {
+        unsafe { unwind::capture_stack(&mut frames) }
+    };
     if depth == 0 {
         return;
     }

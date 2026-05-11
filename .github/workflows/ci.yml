@@ -110,6 +110,67 @@ jobs:
       - name: test
         run: cargo test --workspace --no-fail-fast
 
+      # Plan 2026-05-08 Phase 6 Task 12 — validation evidence.
+      # The `task_12_validation_profile_json_sigil_end_to_end` e2e
+      # test writes a folded-stacks profile from examples/json.sigil
+      # to $TMPDIR with a known prefix. This step renders that
+      # profile to SVG via flamegraph.pl and uploads it as a build
+      # artifact, so a maintainer (or anyone reviewing this PR) can
+      # download a real flame graph rather than reading the textual
+      # top-rows summary printed to the test's stderr.
+      #
+      # Best-effort: if the folded file isn't where we expect (e.g.
+      # the e2e test was filtered out, or TMPDIR differs from
+      # mktemp's default), the step prints a notice and moves on.
+      # The test itself does not depend on this step succeeding.
+      - name: render flame-graph evidence (Task 12)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/profile-artifacts"
+          # Collect every folded text the e2e test produced.
+          folded_files=$(find "${TMPDIR:-/tmp}" -maxdepth 2 -name 'sigil_e2e_json_validation_*.txt' 2>/dev/null || true)
+          if [ -z "$folded_files" ]; then
+            echo "::notice::no folded profile found; Task 12 test may have been filtered or skipped"
+            exit 0
+          fi
+          for f in $folded_files; do
+            cp "$f" "$GITHUB_WORKSPACE/profile-artifacts/$(basename "$f")"
+          done
+          # Try to render an SVG. flamegraph.pl is a single Perl
+          # script; download it inline to keep the workflow self-
+          # contained (vs depending on apt's flamegraph package which
+          # doesn't exist on macos-14 runners). Pinned to a tagged
+          # release SHA so the URL is stable. Fall back gracefully
+          # if the download or rendering fails — the folded text is
+          # still uploaded as the primary artifact.
+          flamegraph_url="https://raw.githubusercontent.com/brendangregg/FlameGraph/cd9ee4c4449775a2f867acf31c84b7fe4b132ad5/flamegraph.pl"
+          curl -sSfL --max-time 30 -o /tmp/flamegraph.pl "$flamegraph_url" || {
+            echo "::notice::flamegraph.pl download failed; uploading folded text only"
+            exit 0
+          }
+          chmod +x /tmp/flamegraph.pl
+          for f in $folded_files; do
+            base=$(basename "$f" .txt)
+            /tmp/flamegraph.pl --title="json.sigil — sigil v2 profile-data validation (${{ matrix.os }})" \
+              --countname="samples" \
+              < "$f" \
+              > "$GITHUB_WORKSPACE/profile-artifacts/${base}.svg" || {
+              echo "::notice::flamegraph.pl render failed for $f; folded text still uploaded"
+            }
+          done
+          ls -la "$GITHUB_WORKSPACE/profile-artifacts/"
+
+      - name: upload flame-graph artifacts (Task 12)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-validation-${{ matrix.os }}
+          path: profile-artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: no-HashMap grep check
         shell: bash
         run: |
