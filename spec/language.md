@@ -986,12 +986,13 @@ Two statement forms exist in v1:
 There is no shadowing: `let x = 1; let x = 2;` is a compile error
 (E0020 — "redefinition of `x`").
 
-**`_` is not a placeholder.** `_` is a regular identifier in Sigil,
-not the throwaway-binding-name convention from Rust or Python.
-Two `let _: Int = expr;` statements in the same block re-define
-`_` and fire E0020 the same as any duplicate name. To discard a
-perform's value, use the bare-statement form `perform Effect.op();`
-instead of `let _: Int = perform Effect.op();`.
+**`_` is the discard pattern.** Like Rust and Python, `_` is a name
+that binds and immediately discards the value. Multiple
+`let _: T = expr;` in the same scope are NOT shadowing — each is an
+independent discard. The bare-statement form `expr;` is also
+available for the same purpose; use whichever reads clearer in
+context. Lambda params and pattern positions also accept `_` as a
+non-binding wildcard (`fn(_, _) -> Int { 0 }`, `Pair(_, _)`).
 
 There is no `return` statement; the block's value flows out
 naturally.
