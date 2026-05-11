@@ -10950,25 +10950,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // (a NextStep::Call dispatching the
                             // matched arm with k = (closure_record,
                             // synth_cont_fn_addr)).
-                            //
-                            // 2026-05-04 return-arm-via-args lift Stage 3b —
-                            // load return_arm from the body fn's args_ptr
-                            // (Stage 2 wrote it at handle entry) and pass
-                            // to sigil_perform so it propagates into the
-                            // arm fn's args_ptr.
-                            let body_user_arg_count_perform = f.params.len();
-                            let ra_closure_perform = lowerer.builder.ins().load(
-                                pointer_ty,
-                                MemFlags::trusted(),
-                                args_ptr,
-                                return_arm_closure_offset(body_user_arg_count_perform),
-                            );
-                            let ra_fn_perform = lowerer.builder.ins().load(
-                                pointer_ty,
-                                MemFlags::trusted(),
-                                args_ptr,
-                                return_arm_fn_offset(body_user_arg_count_perform),
-                            );
+                            let (ra_closure_perform, ra_fn_perform) =
+                                lowerer.load_return_arm_pair();
                             let perform_call = lowerer.builder.ins().call(
                                 lowerer.perform_ref,
                                 &[
@@ -11844,9 +11827,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // in the user-fn body emit setup);
                             // `lowerer.perform_ref` shadows it but
                             // they're the same FuncRef.
-                            //
-                            // 2026-05-04 return-arm-via-args lift Stage 3b —
-                            // forward return_arm from body fn's args_ptr.
                             let ra_closure_perform = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -16339,51 +16319,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // return from this synth
                                                 // fn directly.
                                                 //
-                                                // 2026-05-04 return-arm-via-args
-                                                // lift Stage 3b — load
-                                                // return_arm from this
-                                                // synth-cont's closure
-                                                // record (extended at
-                                                // codegen.rs ~11300).
-                                                // Fallback `(null, null)`
-                                                // when the surrounding
-                                                // closure record doesn't
-                                                // carry return_arm
-                                                // (`synth_cont_return_arm_closure_off`
-                                                // is `None`); same as
-                                                // pre-lift TLS behavior
-                                                // when no handle is
-                                                // active.
                                                 let (ra_closure_perform, ra_fn_perform) =
-                                                    match lowerer.synth_cont_return_arm_closure_off
-                                                    {
-                                                        Some(off) => {
-                                                            let rc = lowerer.builder.ins().load(
-                                                                pointer_ty,
-                                                                MemFlags::trusted(),
-                                                                lowerer.closure_ptr,
-                                                                off,
-                                                            );
-                                                            let rf = lowerer.builder.ins().load(
-                                                                pointer_ty,
-                                                                MemFlags::trusted(),
-                                                                lowerer.closure_ptr,
-                                                                off + 8,
-                                                            );
-                                                            (rc, rf)
-                                                        }
-                                                        None => {
-                                                            let null_rc = lowerer
-                                                                .builder
-                                                                .ins()
-                                                                .iconst(pointer_ty, 0);
-                                                            let null_rf = lowerer
-                                                                .builder
-                                                                .ins()
-                                                                .iconst(pointer_ty, 0);
-                                                            (null_rc, null_rf)
-                                                        }
-                                                    };
+                                                    lowerer.load_return_arm_pair();
                                                 let perform_call = lowerer.builder.ins().call(
                                                     lowerer.perform_ref,
                                                     &[
@@ -16688,41 +16625,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // sigil_perform with
                                                 // branch_closure + step0
                                                 // as the continuation.
-                                                // 2026-05-04 return-arm-via-args
-                                                // lift Stage 3b — forward
-                                                // return_arm from this
-                                                // synth-cont's closure
-                                                // record.
-                                                let (ra_closure_pc, ra_fn_pc) = match lowerer
-                                                    .synth_cont_return_arm_closure_off
-                                                {
-                                                    Some(off) => {
-                                                        let rc = lowerer.builder.ins().load(
-                                                            pointer_ty,
-                                                            MemFlags::trusted(),
-                                                            lowerer.closure_ptr,
-                                                            off,
-                                                        );
-                                                        let rf = lowerer.builder.ins().load(
-                                                            pointer_ty,
-                                                            MemFlags::trusted(),
-                                                            lowerer.closure_ptr,
-                                                            off + 8,
-                                                        );
-                                                        (rc, rf)
-                                                    }
-                                                    None => {
-                                                        let null_rc = lowerer
-                                                            .builder
-                                                            .ins()
-                                                            .iconst(pointer_ty, 0);
-                                                        let null_rf = lowerer
-                                                            .builder
-                                                            .ins()
-                                                            .iconst(pointer_ty, 0);
-                                                        (null_rc, null_rf)
-                                                    }
-                                                };
+                                                let (ra_closure_pc, ra_fn_pc) =
+                                                    lowerer.load_return_arm_pair();
                                                 let perf_call = lowerer.builder.ins().call(
                                                     lowerer.perform_ref,
                                                     &[
@@ -17717,35 +17621,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         // `next_closure_ptr` it loaded
                                         // from.
                                         //
-                                        // 2026-05-04 return-arm-via-args
-                                        // lift Stage 3b — forward
-                                        // return_arm from this synth-
-                                        // cont's closure record.
                                         let (ra_closure_mid, ra_fn_mid) =
-                                            match lowerer.synth_cont_return_arm_closure_off {
-                                                Some(off) => {
-                                                    let rc = lowerer.builder.ins().load(
-                                                        pointer_ty,
-                                                        MemFlags::trusted(),
-                                                        lowerer.closure_ptr,
-                                                        off,
-                                                    );
-                                                    let rf = lowerer.builder.ins().load(
-                                                        pointer_ty,
-                                                        MemFlags::trusted(),
-                                                        lowerer.closure_ptr,
-                                                        off + 8,
-                                                    );
-                                                    (rc, rf)
-                                                }
-                                                None => {
-                                                    let null_rc =
-                                                        lowerer.builder.ins().iconst(pointer_ty, 0);
-                                                    let null_rf =
-                                                        lowerer.builder.ins().iconst(pointer_ty, 0);
-                                                    (null_rc, null_rf)
-                                                }
-                                            };
+                                            lowerer.load_return_arm_pair();
                                         let perform_call = lowerer.builder.ins().call(
                                             lowerer.perform_ref,
                                             &[
@@ -18264,35 +18141,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .iconst(types::I32, user_arg_count as i64),
                                             )
                                         };
-                                        // 2026-05-04 return-arm-via-args
-                                        // lift Stage 3b — forward
-                                        // return_arm from synth-cont's
-                                        // closure record.
                                         let (ra_closure_branch, ra_fn_branch) =
-                                            match lowerer.synth_cont_return_arm_closure_off {
-                                                Some(off) => {
-                                                    let rc = lowerer.builder.ins().load(
-                                                        pointer_ty,
-                                                        MemFlags::trusted(),
-                                                        lowerer.closure_ptr,
-                                                        off,
-                                                    );
-                                                    let rf = lowerer.builder.ins().load(
-                                                        pointer_ty,
-                                                        MemFlags::trusted(),
-                                                        lowerer.closure_ptr,
-                                                        off + 8,
-                                                    );
-                                                    (rc, rf)
-                                                }
-                                                None => {
-                                                    let null_rc =
-                                                        lowerer.builder.ins().iconst(pointer_ty, 0);
-                                                    let null_rf =
-                                                        lowerer.builder.ins().iconst(pointer_ty, 0);
-                                                    (null_rc, null_rf)
-                                                }
-                                            };
+                                            lowerer.load_return_arm_pair();
                                         let perf_call = lowerer.builder.ins().call(
                                             lowerer.perform_ref,
                                             &[
@@ -18816,30 +18666,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // deepest iterate(Nil)'s body fn natural-exit
                             // emit can read it from its args_ptr trailing
                             // slots.
-                            let (ra_closure_b3, ra_fn_b3) =
-                                match lowerer.synth_cont_return_arm_closure_off {
-                                    Some(ra_closure_off) => {
-                                        let surrounding_closure_ptr = lowerer.closure_ptr;
-                                        let rc = lowerer.builder.ins().load(
-                                            pointer_ty,
-                                            MemFlags::trusted(),
-                                            surrounding_closure_ptr,
-                                            ra_closure_off,
-                                        );
-                                        let rf = lowerer.builder.ins().load(
-                                            pointer_ty,
-                                            MemFlags::trusted(),
-                                            surrounding_closure_ptr,
-                                            ra_closure_off + 8,
-                                        );
-                                        (rc, rf)
-                                    }
-                                    None => {
-                                        let null_rc = lowerer.builder.ins().iconst(pointer_ty, 0);
-                                        let null_rf = lowerer.builder.ins().iconst(pointer_ty, 0);
-                                        (null_rc, null_rf)
-                                    }
-                                };
+                            let (ra_closure_b3, ra_fn_b3) = lowerer.load_return_arm_pair();
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_b3,

@@ -3519,8 +3519,8 @@ mod tests {
             // bumped from `N + 2` to `N + 4` to include the second
             // trailing pair (return_arm_closure, return_arm_fn).
             assert_eq!(args_len, 6); // 2 user args + (k_closure, k_fn) + (return_arm_closure, return_arm_fn)
-            // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
-            // non-GC arena buffer; reads are value loads, no GC retention).
+                                     // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
+                                     // non-GC arena buffer; reads are value loads, no GC retention).
             assert_eq!(*args_ptr, 100);
             // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(1), 200);
