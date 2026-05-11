@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# scripts/check-docs-sync.sh — CI gate. Runs `sync-docs.sh`, then
-# fails if it produced any uncommitted changes. The pair:
+# scripts/check-docs-sync.sh — local drift check. Runs `sync-docs.sh`,
+# then reports if it produced any uncommitted changes. The pair:
 #
 #   scripts/sync-docs.sh         — re-copy canonical → docs/ pages
-#   scripts/check-docs-sync.sh   — gate that the result is committed
+#   scripts/check-docs-sync.sh   — report whether docs/ is up to date
 #
-# CI runs this; contributors who edit `spec/language.md` (or the
-# other canonical sources) get a one-line failure pointing them at
-# the fix.
+# Docs sync is no longer a per-commit CI gate; the release workflow
+# runs sync-docs on every `v*` tag push and commits the result back
+# to main. This script remains for contributors who want to check
+# drift locally before cutting a tag.
 
 set -euo pipefail
 
