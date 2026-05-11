@@ -20072,23 +20072,30 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder
             .ins()
             .stack_store(identity_k_fn, slot, k_fn_offset(user_arg_count));
-        // 2026-05-04 return-arm-via-args lift Stage 1 — placeholder
-        // (null, null) for the return_arm pair. Stage 2 will write the
-        // active handle's `(ret_closure_ptr, ret_fn_ptr_v)` here so the
-        // body fn's natural-exit emit reads it from args_ptr instead of
-        // the TLS BODY_RETURN_ARM_STACK.
-        let null_ra_closure_stage1 = self.builder.ins().iconst(self.pointer_ty, 0);
-        let null_ra_fn_stage1 = self.builder.ins().iconst(self.pointer_ty, 0);
+        // 2026-05-04 return-arm-via-args lift Stage 2 — write the
+        // active handle's return-arm pair into the new trailing slots
+        // BEFORE the body call. Once Stage 3 flips
+        // `sigil_done_or_dispatch_return_arm`'s implementation to
+        // consume these slots (taking the pair as parameters), the
+        // body fn's natural-exit emit will dispatch through args_ptr
+        // instead of the TLS `BODY_RETURN_ARM_STACK`.
+        //
+        // Stage 2 co-existence: the TLS push immediately after the
+        // cps_call (`body_return_arm_push_ref`) is still authoritative;
+        // the args_ptr write here is parallel infrastructure. No
+        // separate sanity counter is wired up — both writes are
+        // emitted from the same codegen block, so divergence is a
+        // structural impossibility (cf. Plan D Task 111b's similar
+        // discipline; the cross-channel runtime assert there guarded
+        // a multi-PR sequence with multiple writers).
         self.builder.ins().stack_store(
-            null_ra_closure_stage1,
+            ret_closure_ptr,
             slot,
             return_arm_closure_offset(user_arg_count),
         );
-        self.builder.ins().stack_store(
-            null_ra_fn_stage1,
-            slot,
-            return_arm_fn_offset(user_arg_count),
-        );
+        self.builder
+            .ins()
+            .stack_store(ret_fn_ptr_v, slot, return_arm_fn_offset(user_arg_count));
 
         let args_ptr = self.builder.ins().stack_addr(self.pointer_ty, slot, 0);
         let args_len = self.builder.ins().iconst(types::I32, user_arg_count as i64);
