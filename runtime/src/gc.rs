@@ -138,6 +138,13 @@ pub extern "C" fn sigil_gc_init() {
         crate::handlers::register_outer_post_arm_k_stack_root_for_calling_thread();
         crate::arena::register_arena_root_for_calling_thread();
     }
+
+    // v2 profile-data surface — gated by env vars. When neither
+    // SIGIL_CPU_PROFILE nor SIGIL_ALLOC_PROFILE is set, each
+    // maybe_init is a single env::var_os lookup + early return
+    // (the zero-overhead path).
+    #[cfg(not(test))]
+    crate::profile::maybe_init();
 }
 
 /// Allocate `8 + payload_bytes` from Boehm, write the 8-byte header, and
@@ -161,6 +168,13 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     // (e.g. oom abort) still shows the intent in telemetry.
     counters::incr(CounterId::BoehmAllocCount);
     counters::add(CounterId::BoehmAllocBytes, total as u64);
+
+    // v2 profile-data surface — sampled allocation profile hook.
+    // Inlined; the fast path is a single relaxed atomic load + branch
+    // when SIGIL_ALLOC_PROFILE is unset.
+    #[cfg(not(test))]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    crate::profile::alloc::maybe_sample_alloc(total as u64);
 
     let h = Header(header);
     // The pointer bitmap selects between Boehm's atomic and conservative
