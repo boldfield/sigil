@@ -116,7 +116,7 @@ fn main() -> Int ![IO, ArithError] {
 
 Sum types are declared with `type T = | Variant1(Args) |
 Variant2(Args) | …` (see §6). `Option[A]` is shipped in
-[`std/option.sigil`](../std/option.sigil); `Some(x)` and `None` are
+[`std/option.sigil`](https://github.com/boldfield/sigil/blob/main/std/option.sigil); `Some(x)` and `None` are
 its constructors. Constructor names start with an uppercase letter
 by convention (the parser does not enforce this in v1, but every
 stdlib type follows it).
@@ -137,7 +137,7 @@ fn main() -> Int ![IO] {
 }
 ```
 
-`map`, `range`, and `length` are in [`std/list.sigil`](../std/list.sigil).
+`map`, `range`, and `length` are in [`std/list.sigil`](https://github.com/boldfield/sigil/blob/main/std/list.sigil).
 Lambdas have the syntax `fn (params) -> Ret ![Effects] => body` —
 parameter types, return type, and effect row are all required, just
 like top-level `fn`.
@@ -265,7 +265,7 @@ fn main() -> Int ![IO] {
 `initial` through every `perform State.get/set` site in `body`'s call
 tree, returning `(A, S)` — the body's result paired with the final
 state. The discharger is defined in pure Sigil over a runtime cell
-primitive (see [`std/state.sigil`](../std/state.sigil)). Both type
+primitive (see [`std/state.sigil`](https://github.com/boldfield/sigil/blob/main/std/state.sigil)). Both type
 parameters are inferred from the call site (e.g. `run_state(5, comp)`
 instantiates `A = Int`, `S = Int`).
 
@@ -359,7 +359,7 @@ rope; `sb_append` writes into the tail segment (allocating new
 single `String`. Avoids the O(n²) cost of repeated
 `string_concat`.
 
-For a fuller example see [`examples/json.sigil`](../examples/json.sigil).
+For a fuller example see [`examples/json.sigil`](https://github.com/boldfield/sigil/blob/main/examples/json.sigil).
 
 ### E13 — Tuples and pair destructuring
 
@@ -1474,7 +1474,7 @@ is a single global capability.
 
 ### §10 — Modules and imports
 
-Sigil's stdlib lives in [`std/`](../std/). User code imports a
+Sigil's stdlib lives in [`std/`](https://github.com/boldfield/sigil/blob/main/std/). User code imports a
 module by writing `import std.<name>` at the top of the file:
 
 ```sigil
@@ -1563,7 +1563,7 @@ Recent additions (Plan D + state-cell):
 | E0149 | perform inside statement position would silently miscompile in multi-shot context | PR #127 follow-up |
 | E0220 | one-shot continuation used more than once on a code path | Plan B Task 54 |
 
-Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/catalog.rs).
+Full catalog: see [`compiler/src/errors/catalog.rs`](https://github.com/boldfield/sigil/blob/main/compiler/src/errors/catalog.rs).
 
 ### §12 — Runtime model
 

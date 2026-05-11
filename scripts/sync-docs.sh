@@ -58,11 +58,20 @@ sync_pair() {
     tmp="$(mktemp)"
     # Pipe the canonical content through link-rewrites so the
     # published copy uses the site's URL hierarchy. Canonical files
-    # live in the repo root / `spec/` and use `./X.md` links between
-    # themselves; the published site serves these under
-    # `/capabilities/`, `/for-llms/`, `/language/`. Files that
-    # aren't published (e.g. `spec/validation-prompts.md`) are
-    # rewritten to absolute GitHub source URLs.
+    # live in the repo root / `spec/` and use a mix of `./X.md` and
+    # `../X` relative links. On the published site:
+    # - `./CAPABILITIES.md`, `./SIGIL_FOR_LLMS.md`, `./spec/language.md`
+    #   are published as `/capabilities/`, `/for-llms/`, `/language/`.
+    # - `../std/`, `../examples/`, `../compiler/`, etc. (used by
+    #   `spec/language.md` to reference repo-root paths) are NOT
+    #   published; rewrite to absolute GitHub blob URLs.
+    # - `validation-prompts.md` (sibling of language.md in spec/) is
+    #   also not published; rewrite to GitHub blob URL.
+    #
+    # The `../` rewrite is blanket-safe because every `../` in a
+    # canonical doc lives one level deep (in `spec/`) and means
+    # "from repo root". A future `spec/language.md` add of `../`
+    # links to anywhere in the tree will Just Work.
     {
         printf '%s\n\n' "$front"
         sed \
@@ -70,6 +79,7 @@ sync_pair() {
             -e 's|\](\./SIGIL_FOR_LLMS\.md)|](/for-llms/)|g' \
             -e 's|\](\./spec/language\.md)|](/language/)|g' \
             -e 's|\](validation-prompts\.md)|](https://github.com/boldfield/sigil/blob/main/spec/validation-prompts.md)|g' \
+            -e 's|\](\.\./|](https://github.com/boldfield/sigil/blob/main/|g' \
             "$canonical"
     } > "$tmp"
     mv "$tmp" "$published"
