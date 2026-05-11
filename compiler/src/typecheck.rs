@@ -4925,8 +4925,13 @@ impl Tc {
     /// the last insertion. No behaviour change in release builds.
     fn env_insert(&mut self, name: String, ty: Ty) {
         let prev = self.env.insert(name.clone(), ty);
+        // `_` is the discard binding — resolve.rs intentionally allows
+        // multiple `let _: T = expr` in the same scope, so the env may
+        // legitimately have a prior `_` entry. Treat as an
+        // overwrite-allowed name; every other binding still asserts
+        // resolve.rs caught the shadow.
         debug_assert!(
-            prev.is_none(),
+            prev.is_none() || name == "_",
             "typecheck env shadowing should have been caught by resolve.rs for '{name}'"
         );
         // `prev` is intentionally discarded in release builds; the debug

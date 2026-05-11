@@ -108,7 +108,17 @@ fn resolve_block(
                 // the outer `x` if any, not to the binding being
                 // defined. Aligns with non-recursive let semantics.
                 resolve_expr(&l.value, &scope, ctor_names, errors);
-                if !scope.insert(l.name.clone()) {
+                // `_` is a discard binding (sequential `let _: T = expr;`
+                // for side effect with the value thrown away). Multiple
+                // `let _` in the same scope are NOT shadowing — they're
+                // independent discards. Idiomatic in every other lang
+                // with this convention; suppressing E0020 here closes a
+                // documented Sigil-API friction point that LLMs hit
+                // when chaining discards (e.g. driving a state machine
+                // over multiple inputs).
+                if l.name == "_" {
+                    scope.insert(l.name.clone());
+                } else if !scope.insert(l.name.clone()) {
                     push_redef(errors, l.span.clone(), &l.name);
                 }
             }
@@ -194,7 +204,10 @@ fn resolve_expr(
             let mut inner = scope.clone();
             let mut lambda_param_seen: BTreeSet<String> = BTreeSet::new();
             for p in params {
-                if !lambda_param_seen.insert(p.name.clone()) {
+                // `_` is a discard param — `fn(_, _) -> ...` is legal
+                // (two unused params), mirroring patterns and let-
+                // bindings. The dup-check skips only `_`.
+                if p.name != "_" && !lambda_param_seen.insert(p.name.clone()) {
                     push_redef(errors, p.span.clone(), &p.name);
                 }
                 // The set's `insert` is idempotent on the second
@@ -339,6 +352,42 @@ mod tests {
         assert!(
             has_e0020(&errs),
             "expected E0020 redef error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn underscore_discard_let_is_legal() {
+        // `_` is the discard binding — multiple `let _: T = expr;`
+        // in the same scope are independent discards, not shadowing.
+        // Closes the LLM-authorship friction documented in H02 (haiku
+        // writes 7 sequential `let _: Int = check_and_print(...)` to
+        // drive a state machine over multiple inputs).
+        let src = "fn main() -> Int ![] { \
+                     let _: Int = 1; \
+                     let _: Int = 2; \
+                     let _: Int = 3; \
+                     0 \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "expected NO E0020 for multiple `let _`, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn underscore_discard_lambda_param_is_legal() {
+        // Lambda params accept `_` as a non-binding wildcard. Two `_`
+        // params should not fire E0020.
+        let src = "fn main() -> Int ![] { \
+                     let f: (Int, Int) -> Int ![] = \
+                         fn (_: Int, _: Int) -> Int ![] => 0; \
+                     f(1, 2) \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "expected NO E0020 for `fn (_, _) ...`, got: {errs:?}"
         );
     }
 
