@@ -3530,7 +3530,9 @@ mod tests {
             assert_eq!(*args_ptr.add(3) as usize, 0xDD);
             // Stage 3b — slots 4, 5 are (return_arm_closure, return_arm_fn);
             // the test passes nulls.
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(4) as usize, 0);
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(5) as usize, 0);
             sigil_next_step_done(0)
         }
