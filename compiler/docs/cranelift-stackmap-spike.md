@@ -254,22 +254,69 @@ The combined evidence is the minimum proof that:
 
 - **Task 3 (annotate safepoints).** No-op against the API. The task
   becomes: *audit that every call site Plan E2 cares about uses
-  `call` / `call_indirect` (not `return_call`)*. Sigil's
-  `lower_call_in_tail_pos` for the Sync CallConv uses `return_call`,
-  which is *not* a safepoint — but it also can't allocate (the callee
-  takes over). Cranelift's automatic safepoint coverage is sufficient.
-  **Audit performed 2026-05-11**: `grep -nE '\.ins\(\)\.return_call\(|\.ins\(\)\.return_call_indirect\(' compiler/src/codegen.rs`
-  returns exactly **one** site at codegen.rs:19987, inside
-  `lower_call_in_tail_pos`'s `UserFnAbi::Sync` arm. The args carried
-  across this tail call (`null_closure`, user-arg `Value`s,
-  `terminal_out`) transfer ownership to the callee — at the moment
-  `return_call` executes, the caller's frame is released, and any
-  heap-pointer args become roots in the callee's frame. The callee's
-  own safepoint pass (auto-inserted at its first non-tail call inside
-  the body) handles them. *No annotation is needed at the `return_call`
-  site itself.* Marking the callee's received block-params as
-  needs-stack-map is a separate concern handled by Task 2b's block-arg
-  sweep — Task 3 is closed here.
+  `call` / `call_indirect` (not `return_call*`)*. Cranelift treats
+  every non-tail `call` / `call_indirect` as an automatic safepoint;
+  `return_call` and `return_call_indirect` are *not* safepoints —
+  the caller's frame is released by the time the callee runs, so
+  any live GC refs flowing across become roots in the callee's
+  fresh frame, not roots at the tail-call instruction itself.
+
+  **Audit performed 2026-05-11.** Correct multi-line-safe scan:
+
+  ```
+  grep -nE 'return_call(_indirect)?\(' compiler/src/codegen.rs | grep -v '//'
+  ```
+
+  returns **two** sites:
+
+  | # | Line | Site | First-arg shape |
+  |---|---|---|---|
+  | 1 | 19987 | `lower_call_in_tail_pos`, Sync direct branch — emits `return_call` | `null_closure` (constant `iconst(pointer_ty, 0)` — NOT a heap pointer) |
+  | 2 | 20428 | `lower_call_in_tail_pos`'s indirect branch (PR #108) — emits `return_call_indirect` | `closure_value` — **the actual closure heap pointer being tail-invoked** |
+
+  At both sites: `arg_vals` (user-fn args, may be heap pointers)
+  and `terminal_out` (caller's terminal-out pointer param — a
+  pointer to caller-stack, not a heap ref) follow.
+
+  The non-annotation conclusion is the same for both sites but the
+  *reason* differs subtly:
+
+  - **Site 1 (direct).** The first arg is statically null; user
+    args + terminal_out are the only ones with non-trivial liveness,
+    and they become block-params in the callee's frame.
+  - **Site 2 (indirect).** The first arg `closure_value` IS a live
+    heap pointer — but the reason no stack-map entry is needed at
+    the `return_call_indirect` instruction is **not** that the
+    value is non-heap. It's that Cranelift's tail-call IR is
+    explicitly not a safepoint: at the moment the tail-call
+    executes, the caller's stack frame is released, and any live
+    heap refs (including `closure_value`) flow into the callee's
+    block-params via the call's ABI shape. The callee's safepoint
+    pass attaches stack-map entries to those block-params if they
+    are flagged needs-stack-map.
+
+  *No annotation is needed at either `return_call*` site itself.*
+  Marking the callee's received fn-entry block-params as
+  needs-stack-map is a separate concern, handled by **Task 2b**'s
+  block-arg sweep (categories 2-3 of Task 2 in the plan body). For
+  Plan E2's correctness, Task 2b's contract here is tighter than the
+  plan body's wording: *every fn-entry block-param of pointer type
+  for any fn callable via `return_call` / `return_call_indirect`*
+  must be flagged. **Re-audit this section after Task 2b lands** —
+  Task 3's closure depends on Task 2b's coverage of fn-entry
+  block-params for tail-callable fns.
+
+  Task 3's plan-body acceptance test ("stackmap section is
+  non-empty after a small program compile") is covered transitively:
+  PR #151's spike integration tests (`value_variant_flag_filters_
+  live_set_at_safepoint`, `var_variant_emits_stackmap_for_phi_
+  confluence`) verify Cranelift's automatic safepoint at each
+  non-tail `call`, and PR #156's Task 2a markings ensure
+  `code.buffer.user_stack_maps()` has real entries for any compiled
+  function with at least one alloc-bearing call. The stackmap
+  *section* (v0 placeholder today) is bumped to v1 with real
+  entries by **Task 4**, which is also where G1's end-to-end
+  verification test lands.
 
 - **Task 4 (v1 section writer).** Translate each `(pc_off_in_fn,
   frame_size, UserStackMap)` to the v1 record shape declared in
