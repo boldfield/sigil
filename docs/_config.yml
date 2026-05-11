@@ -1,0 +1,22 @@
+title: Sigil
+description: A statically-typed compiled language designed around LLM authorship. Effect rows, exhaustive matching, multi-shot handlers — built so models get it right the first time.
+theme: jekyll-theme-cayman
+url: https://sigillang.ai
+
+# Markdown processing
+markdown: kramdown
+kramdown:
+  input: GFM
+  syntax_highlighter: rouge
+
+# Files to exclude from the published site.
+exclude:
+  - README.md
+  - memory-profile.md
+
+# GitHub repo for cayman's "View on GitHub" button.
+repository: boldfield/sigil
+github:
+  repository_url: https://github.com/boldfield/sigil
+  zip_url: https://github.com/boldfield/sigil/archive/refs/heads/main.zip
+  tar_url: https://github.com/boldfield/sigil/archive/refs/heads/main.tar.gz
