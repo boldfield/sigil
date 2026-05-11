@@ -2312,15 +2312,25 @@ pub unsafe extern "C" fn sigil_perform(
     args_len: u32,
     k_closure_ptr: *mut u8,
     k_fn_ptr: *mut u8,
+    return_arm_closure_ptr: *mut u8,
+    return_arm_fn_ptr: *mut u8,
 ) -> *mut NextStep {
     // Bound-check at the perform site so the abort message names the
     // offending effect/op (a deeper check at `sigil_next_step_call` or
-    // in the trampoline obscures the source). The arm receives `args
-    // + (k_closure, k_fn)`, so the dispatched arg_count is `args_len + 2`
-    // — that's what must fit MAX_INLINE_ARGS, not args_len alone.
-    if args_len.saturating_add(2) > MAX_INLINE_ARGS {
+    // in the trampoline obscures the source). 2026-05-04 return-arm-via
+    // -args lift Stage 3b — the arm receives `args + (k_closure, k_fn,
+    // return_arm_closure, return_arm_fn)`, so the dispatched arg_count
+    // is `args_len + 4`. The trailing pair `(return_arm_closure,
+    // return_arm_fn)` carries the active handle's return arm forward
+    // into the arm fn's args_ptr, so the post-arm-k synth-cont's
+    // closure-record allocator (arm-fn body emit) can copy it into the
+    // synth-cont closure record. The synth-cont's natural-exit emit
+    // (Slice B/C post-arm-k Done, ConstantDone synth-cont dispatch)
+    // then loads return_arm from `closure_ptr` and passes it to the
+    // args-passing helper variant.
+    if args_len.saturating_add(4) > MAX_INLINE_ARGS {
         eprintln!(
-            "sigil_perform: args_len {args_len} + 2 (continuation) exceeds \
+            "sigil_perform: args_len {args_len} + 4 (continuation + return arm) exceeds \
              MAX_INLINE_ARGS ({MAX_INLINE_ARGS}) at effect_id={effect_id} op_id={op_id}"
         );
         std::process::abort();
@@ -2416,10 +2426,14 @@ pub unsafe extern "C" fn sigil_perform(
                 };
 
             // Build a NextStep::Call to the arm with the args followed
-            // by (k_closure_ptr, k_fn_ptr) packed as two u64s. The arm
-            // prologue (Task 55 codegen) reads the trailing two slots
-            // to reconstruct the continuation closure.
-            let total_args = args_len + 2;
+            // by (k_closure_ptr, k_fn_ptr, return_arm_closure_ptr,
+            // return_arm_fn_ptr) packed as four u64s. The arm prologue
+            // (Task 55 codegen) reads the first trailing pair to
+            // reconstruct the continuation closure; Stage 3b extends
+            // the layout with the second trailing pair (return_arm)
+            // so post-arm-k synth-cont allocators can capture it into
+            // their closure records.
+            let total_args = args_len + 4;
             let ns = sigil_next_step_call(arm_closure, arm_fn, total_args);
             let ns_args = sigil_next_step_args_ptr(ns);
             // Copy user args. ns_args points into the non-GC arena;
@@ -2429,11 +2443,18 @@ pub unsafe extern "C" fn sigil_perform(
                 // SAFETY: gc-heap-ptr arithmetic (see comment above).
                 ns_args.add(i).write(*args_ptr.add(i));
             }
-            // Append k_closure_ptr, k_fn_ptr.
+            // Append k_closure_ptr, k_fn_ptr, return_arm_closure,
+            // return_arm_fn at the four trailing slots.
             ns_args
                 .add(args_len as usize)
                 .write(actual_k_closure as u64);
             ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
+            ns_args
+                .add(args_len as usize + 2)
+                .write(return_arm_closure_ptr as u64);
+            ns_args
+                .add(args_len as usize + 3)
+                .write(return_arm_fn_ptr as u64);
             return ns;
         }
         frame = (*frame).prev;
