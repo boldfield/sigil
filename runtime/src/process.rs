@@ -128,8 +128,8 @@ pub unsafe extern "C" fn sigil_process_run_arm(
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
-        args_len == 6,
-        "sigil_process_run_arm: args_len {args_len} != 6"
+        args_len == 7,
+        "sigil_process_run_arm: args_len {args_len} != 7"
     );
     debug_assert!(!in_args.is_null());
     let cmd_ptr = *in_args as *const u8;

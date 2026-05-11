@@ -84,7 +84,6 @@ static ALLOW_REGISTER_ONCE: std::sync::Once = std::sync::Once::new();
 pub(crate) struct GcThreadEnrolment {
     handler_stack_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
     outer_post_arm_k_stack_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
-    body_return_arm_stack_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
     arena_root: (*mut std::ffi::c_void, *mut std::ffi::c_void),
 }
 
@@ -110,13 +109,10 @@ impl GcThreadEnrolment {
         let handler_stack_root = crate::handlers::register_handler_stack_root_for_calling_thread();
         let outer_post_arm_k_stack_root =
             crate::handlers::register_outer_post_arm_k_stack_root_for_calling_thread();
-        let body_return_arm_stack_root =
-            crate::handlers::register_body_return_arm_stack_root_for_calling_thread();
         let arena_root = crate::arena::register_arena_root_for_calling_thread();
         Self {
             handler_stack_root,
             outer_post_arm_k_stack_root,
-            body_return_arm_stack_root,
             arena_root,
         }
     }
@@ -131,10 +127,6 @@ impl Drop for GcThreadEnrolment {
         crate::handlers::unregister_outer_post_arm_k_stack_root_for_calling_thread(
             self.outer_post_arm_k_stack_root.0,
             self.outer_post_arm_k_stack_root.1,
-        );
-        crate::handlers::unregister_body_return_arm_stack_root_for_calling_thread(
-            self.body_return_arm_stack_root.0,
-            self.body_return_arm_stack_root.1,
         );
         crate::arena::unregister_arena_root_for_calling_thread(
             self.arena_root.0,
