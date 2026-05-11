@@ -10689,6 +10689,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 alloc_call,
                             ));
                             let closure_record = lowerer.builder.inst_results(alloc_call)[0];
+                            lowerer
+                                .builder
+                                .declare_value_needs_stack_map(closure_record);
 
                             // Null code_ptr at +8.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -11372,6 +11375,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
                         stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
                         let cp = builder.inst_results(alloc_call)[0];
+                        builder.declare_value_needs_stack_map(cp);
 
                         // Null code_ptr at offset 8.
                         let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -11534,6 +11538,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
                         stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
                         let cp = builder.inst_results(alloc_call)[0];
+                        builder.declare_value_needs_stack_map(cp);
 
                         let null_v = builder.ins().iconst(pointer_ty, 0);
                         builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
@@ -13067,6 +13072,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .stackmap
                         .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
                     let step_0_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                    lowerer
+                        .builder
+                        .declare_value_needs_stack_map(step_0_closure_ptr);
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                     lowerer
                         .builder
@@ -13348,6 +13356,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             .stackmap
                             .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
                         let cp = lowerer.builder.inst_results(alloc_call)[0];
+                        lowerer.builder.declare_value_needs_stack_map(cp);
                         // Null code_ptr at offset 8.
                         let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                         lowerer
@@ -14995,6 +15004,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 alloc_call,
                             ));
                             let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                            lowerer
+                                .builder
+                                .declare_value_needs_stack_map(next_closure_ptr);
                             // code_ptr at offset 8 = null.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                             lowerer.builder.ins().store(
@@ -17553,6 +17565,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     alloc_call,
                                 ));
                                 let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(next_closure_ptr);
 
                                 // Null code_ptr at +8.
                                 let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -23138,6 +23153,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, alloc_call));
                 let ptr = self.builder.inst_results(alloc_call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
                 for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
                     let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
                         val
@@ -23783,7 +23799,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     );
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    return self.builder.inst_results(alloc_call)[0];
+                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
+                    self.builder.declare_value_needs_stack_map(cont_ptr);
+                    return cont_ptr;
                 }
             }
             // Synth-arm fn (not k-pair-bearing) where k is the arm's
@@ -23812,7 +23830,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     );
                     self.stackmap
                         .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    return self.builder.inst_results(alloc_call)[0];
+                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
+                    self.builder.declare_value_needs_stack_map(cont_ptr);
+                    return cont_ptr;
                 }
             }
         }
@@ -25764,6 +25784,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
+        self.builder.declare_value_needs_stack_map(closure_ptr);
 
         // Store null at offset 8 (code_ptr slot — unused by arm fns;
         // the runtime dispatches via `HandlerFrame.arms[i].fn_ptr`).
@@ -25884,6 +25905,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let closure_ptr = self.builder.inst_results(alloc_call)[0];
+        self.builder.declare_value_needs_stack_map(closure_ptr);
 
         // Store code_ptr at offset 8 (past header).
         //
@@ -26046,6 +26068,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, alloc_call));
         let ptr = self.builder.inst_results(alloc_call)[0];
+        self.builder.declare_value_needs_stack_map(ptr);
 
         // Discriminant in payload word 0 (bytes 8..16 past header).
         // We store the full 8-byte word even though only the low
