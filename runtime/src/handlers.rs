@@ -2109,19 +2109,26 @@ pub unsafe extern "C" fn sigil_io_println_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
+    // 2026-05-04 return-arm-via-args lift Stage 3b — sigil_perform now
+    // packs `args_len + 4` (k_closure, k_fn, return_arm_closure,
+    // return_arm_fn) trailing slots, bumping this arm's args_len from
+    // 3 to 5. This arm doesn't consume the return_arm pair (built-in
+    // IO arms aren't part of a user handle expression); the trailing
+    // two slots are read past by the user-arg unpacking.
     debug_assert!(
-        args_len == 3,
-        "sigil_io_println_arm: args_len must be exactly 3 (in_args = \
-         [heap_string_ptr, k_closure, k_fn]); got {args_len}"
+        args_len == 5,
+        "sigil_io_println_arm: args_len must be exactly 5 (in_args = \
+         [heap_string_ptr, k_closure, k_fn, return_arm_closure, return_arm_fn]); got {args_len}"
     );
     debug_assert!(
         !in_args.is_null(),
-        "sigil_io_println_arm: in_args must be non-null when args_len == 3"
+        "sigil_io_println_arm: in_args must be non-null when args_len == 5"
     );
     // SAFETY: caller (sigil_perform via the dispatched NextStep::Call)
-    // guarantees in_args points to 3 readable u64. Slot 0 is the
+    // guarantees in_args points to 5 readable u64. Slot 0 is the
     // heap-string pointer the user passed to `IO.println`; slots 1..3
-    // are the trailing-pair continuation.
+    // are the trailing-pair continuation; slots 3..5 are the Stage-3b
+    // return_arm pair (unused here).
     let heap_ptr = *in_args as *const u8;
     debug_assert!(
         !heap_ptr.is_null(),
@@ -2149,7 +2156,7 @@ pub unsafe extern "C" fn sigil_io_print_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 3);
+    debug_assert!(args_len == 5);
     debug_assert!(!in_args.is_null());
     let heap_ptr = *in_args as *const u8;
     debug_assert!(!heap_ptr.is_null());
@@ -2174,7 +2181,7 @@ pub unsafe extern "C" fn sigil_io_read_line_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 2);
+    debug_assert!(args_len == 4);
     debug_assert!(!in_args.is_null());
     let k_closure = *in_args as *mut u8;
     let k_fn = *in_args.add(1) as *mut u8;
@@ -2255,13 +2262,15 @@ pub unsafe extern "C" fn sigil_arith_error_mod_by_zero_arm(
 /// `"sigil: arithmetic error: <reason>\n"` to stderr and calls
 /// `std::process::exit(2)`. Never returns.
 ///
-/// `args_len` is debug-asserted to be 2 (zero user args + trailing
-/// pair). Caller (`sigil_perform`) guarantees the invariant.
+/// `args_len` is debug-asserted to be 4 (zero user args + two trailing
+/// pairs: `(k_closure, k_fn)` and the 2026-05-04 return-arm-via-args
+/// lift Stage 3b `(return_arm_closure, return_arm_fn)`). Caller
+/// (`sigil_perform`) guarantees the invariant.
 fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
     debug_assert!(
-        args_len == 2,
-        "sigil_arith_error_*_arm: args_len must be exactly 2 (zero user args + \
-         trailing-pair `(k_closure, k_fn)`); got {args_len}"
+        args_len == 4,
+        "sigil_arith_error_*_arm: args_len must be exactly 4 (zero user args + \
+         (k_closure, k_fn) + (return_arm_closure, return_arm_fn)); got {args_len}"
     );
     use std::io::Write;
     let mut stderr = std::io::stderr().lock();
@@ -2312,15 +2321,25 @@ pub unsafe extern "C" fn sigil_perform(
     args_len: u32,
     k_closure_ptr: *mut u8,
     k_fn_ptr: *mut u8,
+    return_arm_closure_ptr: *mut u8,
+    return_arm_fn_ptr: *mut u8,
 ) -> *mut NextStep {
     // Bound-check at the perform site so the abort message names the
     // offending effect/op (a deeper check at `sigil_next_step_call` or
-    // in the trampoline obscures the source). The arm receives `args
-    // + (k_closure, k_fn)`, so the dispatched arg_count is `args_len + 2`
-    // — that's what must fit MAX_INLINE_ARGS, not args_len alone.
-    if args_len.saturating_add(2) > MAX_INLINE_ARGS {
+    // in the trampoline obscures the source). 2026-05-04 return-arm-via
+    // -args lift Stage 3b — the arm receives `args + (k_closure, k_fn,
+    // return_arm_closure, return_arm_fn)`, so the dispatched arg_count
+    // is `args_len + 4`. The trailing pair `(return_arm_closure,
+    // return_arm_fn)` carries the active handle's return arm forward
+    // into the arm fn's args_ptr, so the post-arm-k synth-cont's
+    // closure-record allocator (arm-fn body emit) can copy it into the
+    // synth-cont closure record. The synth-cont's natural-exit emit
+    // (Slice B/C post-arm-k Done, ConstantDone synth-cont dispatch)
+    // then loads return_arm from `closure_ptr` and passes it to the
+    // args-passing helper variant.
+    if args_len.saturating_add(4) > MAX_INLINE_ARGS {
         eprintln!(
-            "sigil_perform: args_len {args_len} + 2 (continuation) exceeds \
+            "sigil_perform: args_len {args_len} + 4 (continuation + return arm) exceeds \
              MAX_INLINE_ARGS ({MAX_INLINE_ARGS}) at effect_id={effect_id} op_id={op_id}"
         );
         std::process::abort();
@@ -2416,10 +2435,14 @@ pub unsafe extern "C" fn sigil_perform(
                 };
 
             // Build a NextStep::Call to the arm with the args followed
-            // by (k_closure_ptr, k_fn_ptr) packed as two u64s. The arm
-            // prologue (Task 55 codegen) reads the trailing two slots
-            // to reconstruct the continuation closure.
-            let total_args = args_len + 2;
+            // by (k_closure_ptr, k_fn_ptr, return_arm_closure_ptr,
+            // return_arm_fn_ptr) packed as four u64s. The arm prologue
+            // (Task 55 codegen) reads the first trailing pair to
+            // reconstruct the continuation closure; Stage 3b extends
+            // the layout with the second trailing pair (return_arm)
+            // so post-arm-k synth-cont allocators can capture it into
+            // their closure records.
+            let total_args = args_len + 4;
             let ns = sigil_next_step_call(arm_closure, arm_fn, total_args);
             let ns_args = sigil_next_step_args_ptr(ns);
             // Copy user args. ns_args points into the non-GC arena;
@@ -2429,11 +2452,18 @@ pub unsafe extern "C" fn sigil_perform(
                 // SAFETY: gc-heap-ptr arithmetic (see comment above).
                 ns_args.add(i).write(*args_ptr.add(i));
             }
-            // Append k_closure_ptr, k_fn_ptr.
+            // Append k_closure_ptr, k_fn_ptr, return_arm_closure,
+            // return_arm_fn at the four trailing slots.
             ns_args
                 .add(args_len as usize)
                 .write(actual_k_closure as u64);
             ns_args.add(args_len as usize + 1).write(actual_k_fn as u64);
+            ns_args
+                .add(args_len as usize + 2)
+                .write(return_arm_closure_ptr as u64);
+            ns_args
+                .add(args_len as usize + 3)
+                .write(return_arm_fn_ptr as u64);
             return ns;
         }
         frame = (*frame).prev;
@@ -3398,7 +3428,7 @@ mod tests {
         args_ptr: *const u64,
         args_len: u32,
     ) -> *mut NextStep {
-        assert_eq!(args_len, 3); // raised_value, k_closure, k_fn
+        assert_eq!(args_len, 5); // raised_value + (k_closure, k_fn) + (return_arm_closure, return_arm_fn) per Stage 3b
         let raised = *args_ptr;
         sigil_next_step_done(raised * 100)
     }
@@ -3429,6 +3459,8 @@ mod tests {
                 /* args_len */ 1,
                 /* k_closure_ptr */ 0xDEAD as *mut u8,
                 /* k_fn_ptr */ 0xBEEF as *mut u8,
+                /* return_arm_closure_ptr */ ptr::null_mut(),
+                /* return_arm_fn_ptr */ ptr::null_mut(),
             );
             let walk_count_after = counters::read(CounterId::HandlerWalkCount);
             let depth_sum_after = counters::read(CounterId::HandlerWalkDepthSum);
@@ -3465,6 +3497,8 @@ mod tests {
                 1,
                 ptr::null_mut(),
                 ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
             );
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
@@ -3490,7 +3524,10 @@ mod tests {
             args_ptr: *const u64,
             args_len: u32,
         ) -> *mut NextStep {
-            assert_eq!(args_len, 4); // 2 user args + k_closure + k_fn
+            // 2026-05-04 return-arm-via-args lift Stage 3b — args_len
+            // bumped from `N + 2` to `N + 4` to include the second
+            // trailing pair (return_arm_closure, return_arm_fn).
+            assert_eq!(args_len, 6); // 2 user args + (k_closure, k_fn) + (return_arm_closure, return_arm_fn)
                                      // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
                                      // non-GC arena buffer; reads are value loads, no GC retention).
             assert_eq!(*args_ptr, 100);
@@ -3500,6 +3537,12 @@ mod tests {
             assert_eq!(*args_ptr.add(2) as usize, 0xCC);
             // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(3) as usize, 0xDD);
+            // Stage 3b — slots 4, 5 are (return_arm_closure, return_arm_fn);
+            // the test passes nulls.
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
+            assert_eq!(*args_ptr.add(4) as usize, 0);
+            // SAFETY: gc-heap-ptr arithmetic (same as above).
+            assert_eq!(*args_ptr.add(5) as usize, 0);
             sigil_next_step_done(0)
         }
 
@@ -3511,7 +3554,16 @@ mod tests {
             // user_args is a stack local; the runtime copies bytes via the pointer.
             // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
-            let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
+            let ns = sigil_perform(
+                7,
+                0,
+                user_args_ptr,
+                2,
+                0xCC as *mut u8,
+                0xDD as *mut u8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let _ = sigil_run_loop(ns, std::ptr::null_mut());
             let _ = sigil_handle_pop();
         }
@@ -3595,7 +3647,16 @@ mod tests {
             let depth_before = counters::read(CounterId::HandlerWalkDepthSum);
             let arg = 4u64;
             let user_args_ptr = &arg as *const u64;
-            let ns = sigil_perform(100, 0, user_args_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                100,
+                0,
+                user_args_ptr,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             assert_eq!(
                 depth_after - depth_before,
@@ -3647,6 +3708,8 @@ mod tests {
                 MAX_HANDLER_ARMS - 1,
                 arg_ptr,
                 1,
+                ptr::null_mut(),
+                ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
@@ -3755,7 +3818,16 @@ mod tests {
             // perform succeeds iff the frame is still reachable.
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
-            let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                4242,
+                0,
+                arg_ptr,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
@@ -3815,7 +3887,16 @@ mod tests {
             // Dispatch through the arm. The trampoline invokes
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
-            let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                7777,
+                0,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
@@ -4132,6 +4213,11 @@ mod tests {
     /// Companion to the helper-level test — exercise `sigil_io_println_arm`
     /// directly with a real heap-string and verify the dispatched
     /// `NextStep::Call` matches the 3-slot Slice A convention.
+    ///
+    /// 2026-05-04 return-arm-via-args lift Stage 3b — `sigil_perform`
+    /// now packs `args_len = N + 4` (4 trailing slots: k_pair +
+    /// return_arm_pair). For IO.println: 1 user arg + 4 trailing = 5.
+    /// The arm doesn't consume the return_arm pair; it's read past.
     #[test]
     fn io_println_arm_emits_three_slot_trailing_pair() {
         let _guard = crate::test_support::gc_test_lock();
@@ -4146,12 +4232,14 @@ mod tests {
             // SAFETY: gc-heap-ptr arithmetic (transient byte-pointer into a static UTF-8 source slice).
             let s = crate::gc::sigil_string_new(b"x".as_ptr(), 1);
             // Build the in_args buffer the trampoline would pass to
-            // the arm: `[heap_string_ptr, k_closure, k_fn]`. We use
+            // the arm: `[heap_string_ptr, k_closure, k_fn,
+            // return_arm_closure, return_arm_fn]`. We use
             // distinguishable sentinel values for the k pair so the
-            // arm's read of slots 1/2 is observable.
-            let in_args: [u64; 3] = [s as u64, 0xC10C_u64, 0xF00F_u64];
-            // SAFETY: gc-heap-ptr arithmetic (transient stack-buffer address handed to the arm for the call duration; args_len=3 matches the local array).
-            let ns = sigil_io_println_arm(ptr::null(), in_args.as_ptr(), 3, std::ptr::null_mut());
+            // arm's read of slots 1/2 is observable. Return-arm slots
+            // 3/4 stay null (no active handle exercising this path).
+            let in_args: [u64; 5] = [s as u64, 0xC10C_u64, 0xF00F_u64, 0u64, 0u64];
+            // SAFETY: gc-heap-ptr arithmetic (transient stack-buffer address handed to the arm for the call duration; args_len=5 matches the local array per Stage 3b).
+            let ns = sigil_io_println_arm(ptr::null(), in_args.as_ptr(), 5, std::ptr::null_mut());
             assert_eq!((*ns).tag, NEXT_STEP_TAG_CALL);
             assert_eq!(
                 (*ns).arg_count,

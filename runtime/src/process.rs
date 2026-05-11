@@ -117,7 +117,7 @@ unsafe fn build_process_result_tuple(
 ///
 /// # Safety
 ///
-/// `args_len == 4` (2 user args + trailing pair). `in_args[0]` is
+/// `args_len == 6` (2 user args + trailing pair). `in_args[0]` is
 /// a non-null `TAG_STRING` pointer (cmd); `in_args[1]` is a non-
 /// null `TAG_ARRAY` pointer (args).
 #[no_mangle]
@@ -128,8 +128,8 @@ pub unsafe extern "C" fn sigil_process_run_arm(
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
-        args_len == 4,
-        "sigil_process_run_arm: args_len {args_len} != 4"
+        args_len == 6,
+        "sigil_process_run_arm: args_len {args_len} != 6"
     );
     debug_assert!(!in_args.is_null());
     let cmd_ptr = *in_args as *const u8;
