@@ -2109,19 +2109,26 @@ pub unsafe extern "C" fn sigil_io_println_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
+    // 2026-05-04 return-arm-via-args lift Stage 3b — sigil_perform now
+    // packs `args_len + 4` (k_closure, k_fn, return_arm_closure,
+    // return_arm_fn) trailing slots, bumping this arm's args_len from
+    // 3 to 5. This arm doesn't consume the return_arm pair (built-in
+    // IO arms aren't part of a user handle expression); the trailing
+    // two slots are read past by the user-arg unpacking.
     debug_assert!(
-        args_len == 3,
-        "sigil_io_println_arm: args_len must be exactly 3 (in_args = \
-         [heap_string_ptr, k_closure, k_fn]); got {args_len}"
+        args_len == 5,
+        "sigil_io_println_arm: args_len must be exactly 5 (in_args = \
+         [heap_string_ptr, k_closure, k_fn, return_arm_closure, return_arm_fn]); got {args_len}"
     );
     debug_assert!(
         !in_args.is_null(),
-        "sigil_io_println_arm: in_args must be non-null when args_len == 3"
+        "sigil_io_println_arm: in_args must be non-null when args_len == 5"
     );
     // SAFETY: caller (sigil_perform via the dispatched NextStep::Call)
-    // guarantees in_args points to 3 readable u64. Slot 0 is the
+    // guarantees in_args points to 5 readable u64. Slot 0 is the
     // heap-string pointer the user passed to `IO.println`; slots 1..3
-    // are the trailing-pair continuation.
+    // are the trailing-pair continuation; slots 3..5 are the Stage-3b
+    // return_arm pair (unused here).
     let heap_ptr = *in_args as *const u8;
     debug_assert!(
         !heap_ptr.is_null(),
@@ -2255,13 +2262,15 @@ pub unsafe extern "C" fn sigil_arith_error_mod_by_zero_arm(
 /// `"sigil: arithmetic error: <reason>\n"` to stderr and calls
 /// `std::process::exit(2)`. Never returns.
 ///
-/// `args_len` is debug-asserted to be 2 (zero user args + trailing
-/// pair). Caller (`sigil_perform`) guarantees the invariant.
+/// `args_len` is debug-asserted to be 4 (zero user args + two trailing
+/// pairs: `(k_closure, k_fn)` and the 2026-05-04 return-arm-via-args
+/// lift Stage 3b `(return_arm_closure, return_arm_fn)`). Caller
+/// (`sigil_perform`) guarantees the invariant.
 fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
     debug_assert!(
-        args_len == 2,
-        "sigil_arith_error_*_arm: args_len must be exactly 2 (zero user args + \
-         trailing-pair `(k_closure, k_fn)`); got {args_len}"
+        args_len == 4,
+        "sigil_arith_error_*_arm: args_len must be exactly 4 (zero user args + \
+         (k_closure, k_fn) + (return_arm_closure, return_arm_fn)); got {args_len}"
     );
     use std::io::Write;
     let mut stderr = std::io::stderr().lock();
