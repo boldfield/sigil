@@ -26,8 +26,14 @@ the repo:
 | Canonical source       | Published copy            | Site URL          |
 |------------------------|---------------------------|-------------------|
 | `spec/language.md`     | `docs/language.md`        | `/language/`      |
+| `spec/language.md`     | `docs/language.raw.md`    | `/language.raw.md` (no front matter — raw markdown for LLM ingestion) |
 | `CAPABILITIES.md`      | `docs/capabilities.md`    | `/capabilities/`  |
 | `SIGIL_FOR_LLMS.md`    | `docs/for-llms.md`        | `/for-llms/`      |
+
+Pages-specific callouts (like the "for LLM ingestion" note on
+`/language/`) live between the front matter and the
+`<!-- BEGIN SYNCED CONTENT -->` sentinel. `sync-docs.sh` preserves
+that region across syncs.
 
 `scripts/sync-docs.sh` regenerates the published copies from the
 canonical sources (preserving each page's front matter, rewriting
