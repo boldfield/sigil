@@ -312,3 +312,20 @@ Authoritative sources:
   [`PLAN_C_DEVIATIONS.md`](PLAN_C_DEVIATIONS.md)); interpreter +
   JSON pretty-printer demos shipped; Sudoku demo + spec
   validation gate pending.
+
+## License
+
+Apache 2.0 with the LLVM Runtime Library Exception. The compiler
+(`sigil-compiler`) is `Apache-2.0`; the three crates whose compiled
+artifacts ship inside every Sigil-compiled binary (`sigil-runtime`,
+`sigil-abi`, `sigil-header-constants`) are
+`Apache-2.0 WITH LLVM-exception`.
+
+The exception says: code produced by the Sigil compiler is NOT
+subject to the runtime's license terms. You can compile a Sigil
+program and ship the resulting binary under any license you choose,
+including closed-source commercial terms, with no obligation to
+preserve the runtime's copyright notices or comply with its
+attribution requirements.
+
+See [`LICENSE`](LICENSE) for the full text.

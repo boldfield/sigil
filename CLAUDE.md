@@ -13,6 +13,14 @@ v1.0.0 shipped. Currently working through the v2 architectural cluster
 - Spec: `spec/language.md` (canonical)
 - Published site: <https://sigillang.ai/> (sourced from `docs/`)
 - v1.0.0 release: <https://github.com/boldfield/sigil/releases/tag/v1.0.0>
+- License: Apache 2.0 with LLVM Runtime Library Exception. Compiler
+  is `Apache-2.0`; the three crates whose code ships inside every
+  Sigil-compiled binary (`sigil-runtime`, `sigil-abi`,
+  `sigil-header-constants`) are `Apache-2.0 WITH LLVM-exception` so
+  the exception covers user-compiled output. Don't drop the
+  exception on those three crates without thinking about it — it's
+  what makes Sigil-compiled binaries shippable without inheriting
+  Apache 2.0 notice obligations.
 
 ## Pre-commit sync discipline (load-bearing)
 
