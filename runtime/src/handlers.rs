@@ -1584,6 +1584,20 @@ pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm_via_args(
         if top.fired {
             return sigil_next_step_done(v);
         }
+    } else {
+        // PR #143 review observation 1 — structural invariant: the only
+        // codegen path that writes a non-null return_arm pair to a body
+        // fn's args_ptr is `lower_handle_body_direct_cps_call`, which
+        // also pushes to the TLS stack immediately before driving the
+        // body's nested `sigil_run_loop`. So `depth > 0` whenever
+        // `return_arm_fn != null` here. Catch violations during testing
+        // before Stage 4 retires the TLS push.
+        debug_assert!(
+            return_arm_fn.is_null(),
+            "sigil_done_or_dispatch_return_arm_via_args: return_arm_fn non-null at \
+             depth 0 — handle entry should have pushed TLS before driving the body's \
+             nested run_loop. Structural invariant violation."
+        );
     }
     if return_arm_fn.is_null() {
         return sigil_next_step_done(v);
@@ -2771,6 +2785,20 @@ pub unsafe extern "C" fn sigil_run_loop(
                     );
                     std::process::abort();
                 }
+                // PR #143 review observation 2 — `args_buf` zero-init is
+                // load-bearing for the 2026-05-04 return-arm-via-args
+                // convention. Codegen sites that pack `arg_count = N + 4`
+                // (Cps user-fn calls under Stage 1) populate the
+                // `(return_arm_closure, return_arm_fn)` trailing pair
+                // explicitly. Sites that pack `arg_count <= N + 2`
+                // (e.g., `sigil_perform`'s arm-fn dispatch with
+                // `args_len + 2`, and this helper's own
+                // `sigil_next_step_call(_, _, 3)` for the return arm's
+                // dispatch) DON'T write the new trailing pair — they
+                // rely on this zero-init so the callee's body-fn
+                // natural-exit reads `(null, null)` from args_ptr and
+                // emits Done. Stage 4 may revisit by making the
+                // convention explicit at every emit site.
                 let mut args_buf = [0u64; MAX_INLINE_ARGS as usize];
                 if arg_count > 0 {
                     let src = sigil_next_step_args_ptr(current);

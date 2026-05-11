@@ -15322,6 +15322,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // chain_length=1 layout my closure-record
                             // extension covers); other chain step shapes
                             // haven't been extended yet.
+                            //
+                            // **STAGE_3B_FIXME** — when Middle/Final
+                            // chain-step closure record layouts get
+                            // extended to carry `return_arm_pair` (after
+                            // `prior_bindings` + `caller_k_pair`), drop
+                            // the `prior_bindings.is_empty()` guard and
+                            // compute the offset as
+                            // `16 + 8 * (captures.len() + prior_bindings.len() + 2)`.
+                            // The closure-record allocator at codegen.rs
+                            // ~11300 needs the matching size + bitmap
+                            // bump + return_arm write. PR #143 review
+                            // observation 3.
                             synth_cont_return_arm_closure_off: if prior_bindings.is_empty() {
                                 Some(16 + 8 * (captures.len() + 2) as i32)
                             } else {
