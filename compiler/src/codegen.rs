@@ -19710,6 +19710,14 @@ enum TailResult {
 }
 
 impl<'a, 'b> Lowerer<'a, 'b> {
+    /// Thin wrapper over the module-level `lower_alloc_call` so Lowerer call
+    /// sites can use the funneled helper without threading `&mut self.builder`
+    /// and `&mut self.stackmap` explicitly. See the free `lower_alloc_call`
+    /// for the allocator contract.
+    fn lower_alloc_call(&mut self, callee: FuncRef, args: &[Value]) -> Value {
+        lower_alloc_call(&mut self.builder, self.stackmap, callee, args)
+    }
+
     /// 2026-05-04 return-arm-via-args lift Stage 3b/5 — load the active
     /// handle's `(return_arm_closure, return_arm_fn, return_arm_fired_-
     /// ptr)` triple for forward propagation into a sub-call's args_ptr
@@ -24345,7 +24353,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.array_set_ref, &[arr, idx, val]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             // Plan C Task 66 — runtime MutArray primitives. Same
             // dispatch shape as Array, except `mut_array_set` returns
@@ -24509,7 +24519,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.string_to_bytes_ref, &[s]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "string_from_bytes_validate" => {
                 assert_eq!(
@@ -24648,7 +24660,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_from_int_ref, &[v]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_add" => {
                 assert_eq!(args.len(), 2, "int64_add builtin arg count is not 2");
@@ -24660,7 +24674,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_add_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_sub" => {
                 assert_eq!(args.len(), 2, "int64_sub builtin arg count is not 2");
@@ -24672,7 +24688,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_sub_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_mul" => {
                 assert_eq!(args.len(), 2, "int64_mul builtin arg count is not 2");
@@ -24684,7 +24702,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_mul_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_div" => {
                 assert_eq!(args.len(), 2, "int64_div builtin arg count is not 2");
@@ -24696,7 +24716,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_div_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_mod" => {
                 assert_eq!(args.len(), 2, "int64_mod builtin arg count is not 2");
@@ -24708,7 +24730,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.int64_mod_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_neg" => {
                 assert_eq!(args.len(), 1, "int64_neg builtin arg count is not 1");
@@ -24716,7 +24740,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.int64_neg_ref, &[v]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int64_eq" => {
                 assert_eq!(args.len(), 2, "int64_eq builtin arg count is not 2");
@@ -24782,13 +24808,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "float_add builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_add_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let callee = self.builtins.float_add_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_sub" => {
                 assert_eq!(args.len(), 2, "float_sub builtin arg count is not 2");
@@ -24800,7 +24821,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.float_sub_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_mul" => {
                 assert_eq!(args.len(), 2, "float_mul builtin arg count is not 2");
@@ -24812,7 +24835,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.float_mul_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_div" => {
                 assert_eq!(args.len(), 2, "float_div builtin arg count is not 2");
@@ -24824,7 +24849,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.float_div_ref, &[a, b]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_neg" => {
                 assert_eq!(args.len(), 1, "float_neg builtin arg count is not 1");
@@ -24832,7 +24859,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.float_neg_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_abs" => {
                 assert_eq!(args.len(), 1, "float_abs builtin arg count is not 1");
@@ -24840,7 +24869,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.float_abs_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_floor" => {
                 assert_eq!(args.len(), 1, "float_floor builtin arg count is not 1");
@@ -24848,7 +24879,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.float_floor_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_ceil" => {
                 assert_eq!(args.len(), 1, "float_ceil builtin arg count is not 1");
@@ -24856,7 +24889,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.float_ceil_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_sqrt" => {
                 assert_eq!(args.len(), 1, "float_sqrt builtin arg count is not 1");
@@ -24864,7 +24899,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let call = self.builder.ins().call(self.builtins.float_sqrt_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_eq" => {
                 assert_eq!(args.len(), 2, "float_eq builtin arg count is not 2");
@@ -24910,7 +24947,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.float_from_int_ref, &[v]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "float_to_int" => {
                 assert_eq!(args.len(), 1, "float_to_int builtin arg count is not 1");
@@ -24960,7 +24999,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.string_to_float_parse_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             // Plan C addendum (Char) — dispatch to runtime char
             // primitives. Comparators / classifiers return I8 (Bool);
@@ -25088,7 +25129,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.char_to_lower_ascii_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "to_upper_ascii" => {
                 assert_eq!(args.len(), 1, "to_upper_ascii builtin arg count is not 1");
@@ -25099,7 +25142,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .call(self.builtins.char_to_upper_ascii_ref, &[a]);
                 self.stackmap
                     .push_placeholder(function_code_offset(&self.builder, call));
-                self.builder.inst_results(call)[0]
+                let ptr = self.builder.inst_results(call)[0];
+                self.builder.declare_value_needs_stack_map(ptr);
+                ptr
             }
             Expr::Ident(name, _) if name == "int_to_char" => {
                 assert_eq!(args.len(), 1, "int_to_char builtin arg count is not 1");
@@ -26229,6 +26274,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.stackmap
             .push_placeholder(function_code_offset(&self.builder, fetch_call));
         let char_ptr = self.builder.inst_results(fetch_call)[0];
+        self.builder.declare_value_needs_stack_map(char_ptr);
         let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
         self.builder.ins().jump(merge_blk, &[some_v.into()]);
 
@@ -27460,6 +27506,34 @@ fn function_code_offset(_b: &FunctionBuilder<'_>, call_inst: Inst) -> u32 {
     // CallSiteRelocInfo; for Stage 1 we keep it deterministic by using the
     // inst index.
     call_inst.as_u32()
+}
+
+/// Emit a call to a runtime allocator and return the resulting heap pointer,
+/// flagged for Cranelift's stack-map machinery. Funneling every allocator call
+/// site through this helper guarantees the
+/// `declare_value_needs_stack_map` flag and the stackmap placeholder entry —
+/// without it, "mark by convention at each site" has a demonstrable miss
+/// class (see PR #156 review-cycle history: three rounds of sweeping by
+/// hand kept missing more sites). Plan E2 Phase 1 Task 2.
+///
+/// **Allocator contract.** The callee MUST return a single value of pointer
+/// type that names a freshly-allocated GC-managed heap object (the result
+/// of `sigil_alloc`, `sigil_string_concat`, `sigil_float_add`, etc.). Free
+/// functions that return scalars (e.g. `sigil_array_get`, `sigil_string_length`)
+/// or `Unit` (e.g. `sigil_mut_array_set`) must NOT be routed through this
+/// helper — over-marking a non-pointer value would trip the Cranelift
+/// safepoint pass's size-and-power-of-two assertion.
+fn lower_alloc_call(
+    builder: &mut FunctionBuilder<'_>,
+    stackmap: &mut StackMapBuilder,
+    callee: FuncRef,
+    args: &[Value],
+) -> Value {
+    let call = builder.ins().call(callee, args);
+    stackmap.push_placeholder(function_code_offset(builder, call));
+    let ptr = builder.inst_results(call)[0];
+    builder.declare_value_needs_stack_map(ptr);
+    ptr
 }
 
 fn isa_call_conv(_m: &ObjectModule) -> isa::CallConv {
