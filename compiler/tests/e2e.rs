@@ -17558,3 +17558,68 @@ fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
          record. stderr={stderr:?}"
     );
 }
+
+/// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression
+/// gate. Nests two `handle` expressions whose body fns each have
+/// distinct return arms. The TLS approach masked outer with inner via
+/// stack push-on-top discipline (LIFO); the args_ptr-passing approach
+/// achieves the same via per-call args_ptr — each body fn's args_ptr
+/// trailing slots carry its own handle's return arm.
+///
+/// Invariant: the inner body's natural-exit fires the INNER return arm
+/// (+200), and the inner handle's overall value flows through the
+/// OUTER return arm (+100). The outer return arm must NOT fire on the
+/// inner body's natural-exit, and the inner return arm must NOT fire
+/// on the outer body's natural-exit.
+///
+/// Pre-lift: this test pinned the TLS push-on-top discipline. Post-
+/// lift (Stage 3a body-fn natural-exit reads from args_ptr): pins the
+/// per-call args_ptr propagation discipline for the body-fn dispatch
+/// site. Sites 2-4 (synth-cont natural exits) still consult TLS in the
+/// current PR — the test would catch any future regression where the
+/// per-call discipline diverges from the TLS push-on-top.
+#[test]
+fn return_arm_via_args_nested_handles_distinct_arms() {
+    let src = "import std.io\n\
+               \n\
+               effect Outer { signal: () -> Int }\n\
+               effect Inner { signal: () -> Int }\n\
+               \n\
+               fn inner_body() -> Int ![Inner] {\n  \
+                 perform Inner.signal()\n\
+               }\n\
+               \n\
+               fn outer_body() -> Int ![Outer] {\n  \
+                 let inner_wrapped: Int = handle inner_body() with {\n    \
+                   Inner.signal(k) => k(7),\n    \
+                   return(v) => v + 200,\n  \
+                 };\n  \
+                 let outer_signal: Int = perform Outer.signal();\n  \
+                 inner_wrapped + outer_signal\n\
+               }\n\
+               \n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle outer_body() with {\n    \
+                   Outer.signal(k) => k(11),\n    \
+                   return(v) => v + 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "return_arm_via_args_nested_handles");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // Trace:
+    //  inner_body() perform Inner.signal → arm k(7) → inner_body returns 7
+    //  inner return arm: 7 + 200 = 207  (inner_result)
+    //  outer_body's `perform Outer.signal` → arm k(11) → outer_result = 11
+    //  outer_body returns inner_result + outer_result = 207 + 11 = 218
+    //  outer return arm: 218 + 100 = 318  (result)
+    //  print_list "318\n"
+    assert_eq!(
+        stdout, "318\n",
+        "Nested handles with distinct return arms: inner return arm wraps \
+         inner body's tail (+200), outer return arm wraps outer body's \
+         tail (+100); cross-pollination would surface as a different \
+         value. stderr={stderr:?}"
+    );
+}
