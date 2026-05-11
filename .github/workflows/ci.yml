@@ -205,6 +205,9 @@ jobs:
       - name: smoke
         run: ./scripts/smoke.sh
 
+      - name: docs-sync (docs/ matches canonical sources)
+        run: ./scripts/check-docs-sync.sh
+
       # Plan B Task 4.5.4: the three charter invariants (deep-recursion
       # trampoline, multi-shot continuation, selective CPS). Each is
       # SKIPped until its driving example and e2e test land in Stage 5/6.
