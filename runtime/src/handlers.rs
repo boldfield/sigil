@@ -2156,7 +2156,7 @@ pub unsafe extern "C" fn sigil_io_print_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 3);
+    debug_assert!(args_len == 5);
     debug_assert!(!in_args.is_null());
     let heap_ptr = *in_args as *const u8;
     debug_assert!(!heap_ptr.is_null());
@@ -2181,7 +2181,7 @@ pub unsafe extern "C" fn sigil_io_read_line_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 2);
+    debug_assert!(args_len == 4);
     debug_assert!(!in_args.is_null());
     let k_closure = *in_args as *mut u8;
     let k_fn = *in_args.add(1) as *mut u8;

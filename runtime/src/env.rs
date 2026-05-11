@@ -28,7 +28,7 @@ use crate::handlers::{write_k_dispatch_value, NextStep, TerminalResult};
 ///
 /// # Safety
 ///
-/// Standard arm-fn ABI: `args_len == 2` (just the trailing
+/// Standard arm-fn ABI: `args_len == 4` (just the trailing
 /// `(k_closure, k_fn)` pair).
 #[no_mangle]
 pub unsafe extern "C" fn sigil_env_args_arm(
@@ -38,8 +38,8 @@ pub unsafe extern "C" fn sigil_env_args_arm(
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
-        args_len == 2,
-        "sigil_env_args_arm: args_len {args_len} != 2"
+        args_len == 4,
+        "sigil_env_args_arm: args_len {args_len} != 4"
     );
     debug_assert!(!in_args.is_null());
     let k_closure = *in_args as *mut u8;
@@ -70,7 +70,7 @@ pub unsafe extern "C" fn sigil_env_args_arm(
 ///
 /// # Safety
 ///
-/// `args_len == 3` (1 user arg + trailing pair). `in_args[0]` must
+/// `args_len == 5` (1 user arg + trailing pair). `in_args[0]` must
 /// be a non-null `TAG_STRING` pointer.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_env_var_arm(
@@ -79,7 +79,7 @@ pub unsafe extern "C" fn sigil_env_var_arm(
     args_len: u32,
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
-    debug_assert!(args_len == 3, "sigil_env_var_arm: args_len {args_len} != 3");
+    debug_assert!(args_len == 5, "sigil_env_var_arm: args_len {args_len} != 5");
     debug_assert!(!in_args.is_null());
     let name_ptr = *in_args as *const u8;
     debug_assert!(!name_ptr.is_null());
@@ -107,7 +107,7 @@ pub unsafe extern "C" fn sigil_env_var_arm(
 ///
 /// # Safety
 ///
-/// `args_len == 2`.
+/// `args_len == 4`.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_env_vars_arm(
     _closure_ptr: *const u8,
@@ -116,8 +116,8 @@ pub unsafe extern "C" fn sigil_env_vars_arm(
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
-        args_len == 2,
-        "sigil_env_vars_arm: args_len {args_len} != 2"
+        args_len == 4,
+        "sigil_env_vars_arm: args_len {args_len} != 4"
     );
     debug_assert!(!in_args.is_null());
     let k_closure = *in_args as *mut u8;
