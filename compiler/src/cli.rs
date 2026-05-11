@@ -38,6 +38,12 @@ pub struct CompileArgs {
     pub input: String,
     pub output: String,
     pub error_format: ErrorFormat,
+    /// When set, emit `<output>.symtab` next to the executable. The
+    /// sidecar maps text-section offsets to demangled function names so
+    /// the runtime profiler (`SIGIL_CPU_PROFILE`, `SIGIL_ALLOC_PROFILE`)
+    /// can resolve sampled PCs. Default off — symtab emission is a
+    /// profiling concern, not a default compile step.
+    pub emit_symbol_table: bool,
 }
 
 pub fn parse(args: &[String]) -> Command {
@@ -58,6 +64,7 @@ pub fn parse(args: &[String]) -> Command {
     //   sigil <input> --dump-color [--human-errors]
     let mut print_stats = false;
     let mut dump_color = false;
+    let mut emit_symbol_table = false;
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut error_format = ErrorFormat::JsonLines;
@@ -80,6 +87,9 @@ pub fn parse(args: &[String]) -> Command {
             }
             "--dump-color" => {
                 dump_color = true;
+            }
+            "--emit-symbol-table" => {
+                emit_symbol_table = true;
             }
             arg if arg.starts_with("--") => {
                 return Command::UsageError(format!("unknown flag `{arg}`"));
@@ -108,6 +118,11 @@ pub fn parse(args: &[String]) -> Command {
                 "--dump-color cannot be combined with --print-runtime-stats".into(),
             );
         }
+        if emit_symbol_table {
+            return Command::UsageError(
+                "--dump-color cannot be combined with --emit-symbol-table".into(),
+            );
+        }
         // `-o <path>` is accepted under --dump-color for shell-history
         // ergonomics, but color analysis emits no executable. The
         // driver in `main.rs` prints a stderr warning when this is
@@ -127,6 +142,7 @@ pub fn parse(args: &[String]) -> Command {
         input,
         output,
         error_format,
+        emit_symbol_table,
     };
     if print_stats {
         Command::PrintRuntimeStats(compile_args)
@@ -137,7 +153,7 @@ pub fn parse(args: &[String]) -> Command {
 
 pub const USAGE: &str = "\
 usage:
-    sigil <input.sigil> -o <output> [--human-errors]
+    sigil <input.sigil> -o <output> [--human-errors] [--emit-symbol-table]
     sigil --print-runtime-stats <input.sigil> -o <output>
     sigil <input.sigil> --dump-color [--human-errors]
     sigil explain <code>
@@ -148,6 +164,11 @@ flags:
     --print-runtime-stats    Compile, run, and print runtime counters at exit.
     --dump-color             Run color inference and print one line per monomorph
                              (`<name> native|cps <reason>`) to stdout. No codegen.
+    --emit-symbol-table      Write `<output>.symtab` next to the executable: one
+                             tab-separated line per function symbol
+                             (`<text_offset_hex>\\t<size_hex>\\t<demangled_name>`),
+                             sorted by ascending text offset. Consumed by the
+                             runtime profiler (SIGIL_CPU_PROFILE / SIGIL_ALLOC_PROFILE).
 ";
 
 #[cfg(test)]
@@ -169,6 +190,7 @@ mod tests {
                 input: "hello.sigil".into(),
                 output: "/tmp/hello".into(),
                 error_format: ErrorFormat::JsonLines,
+                emit_symbol_table: false,
             })
         );
     }
@@ -180,6 +202,7 @@ mod tests {
             input: "hello.sigil".into(),
             output: "/tmp/hello".into(),
             error_format: ErrorFormat::Human,
+            emit_symbol_table: false,
         });
         assert_eq!(c, expected);
     }
@@ -266,6 +289,30 @@ mod tests {
     #[test]
     fn dump_color_conflicts_with_print_runtime_stats() {
         let c = parse_argv(&["hello.sigil", "--dump-color", "--print-runtime-stats"]);
+        assert!(matches!(c, Command::UsageError(_)));
+    }
+
+    #[test]
+    fn emit_symbol_table_default_off() {
+        let c = parse_argv(&["hello.sigil", "-o", "/tmp/hello"]);
+        match c {
+            Command::Compile(args) => assert!(!args.emit_symbol_table),
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_symbol_table_flag_sets_field() {
+        let c = parse_argv(&["hello.sigil", "-o", "/tmp/hello", "--emit-symbol-table"]);
+        match c {
+            Command::Compile(args) => assert!(args.emit_symbol_table),
+            other => panic!("expected Compile, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emit_symbol_table_conflicts_with_dump_color() {
+        let c = parse_argv(&["hello.sigil", "--dump-color", "--emit-symbol-table"]);
         assert!(matches!(c, Command::UsageError(_)));
     }
 }

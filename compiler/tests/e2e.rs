@@ -17623,3 +17623,120 @@ fn return_arm_via_args_nested_handles_distinct_arms() {
          value. stderr={stderr:?}"
     );
 }
+
+/// 2026-05-08 v2 runtime profile-data, Phase 1 Task 2 — compile
+/// `examples/hello.sigil` with `--emit-symbol-table` and assert the
+/// sidecar:
+/// - exists at `<output>.symtab`
+/// - is non-empty
+/// - is sorted by ascending text offset (the writer's contract)
+/// - contains the user `main` symbol (demangled)
+/// - contains a runtime symbol (passed through verbatim)
+/// - every line matches `<16-hex>\t<16-hex>\t<name>`
+///
+/// Pins the wire format the runtime profile module reads.
+#[test]
+fn emit_symbol_table_writes_sorted_sidecar_with_main_and_runtime_symbols() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let source = root.join("examples/hello.sigil");
+
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_emit_symtab_{}", std::process::id()));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let symtab = std::fs::read_to_string(&symtab_path).expect("sidecar should exist");
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+
+    assert!(!symtab.is_empty(), "symtab must not be empty");
+
+    let mut prev_offset: Option<u64> = None;
+    let mut saw_main = false;
+    let mut saw_runtime = false;
+    for line in symtab.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            3,
+            "line `{line}` must have 3 tab-separated fields"
+        );
+        assert_eq!(fields[0].len(), 16, "offset column must be 16 hex chars");
+        assert_eq!(fields[1].len(), 16, "size column must be 16 hex chars");
+        let off = u64::from_str_radix(fields[0], 16).expect("offset hex");
+        let size = u64::from_str_radix(fields[1], 16).expect("size hex");
+        assert!(size > 0, "all rows have non-zero size by writer contract");
+        if let Some(prev) = prev_offset {
+            assert!(
+                off >= prev,
+                "rows must be sorted by ascending offset; got {off:x} after {prev:x}"
+            );
+        }
+        prev_offset = Some(off);
+        match fields[2] {
+            "main" => saw_main = true,
+            // Any of these is a runtime FFI symbol with the canonical
+            // `sigil_*` non-`sigil_user_` prefix that the demangler
+            // passes through verbatim.
+            "sigil_alloc"
+            | "sigil_gc_init"
+            | "sigil_string_new"
+            | "sigil_io_println_arm"
+            | "sigil_perform" => {
+                saw_runtime = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_main, "demangled `main` must appear in sidecar");
+    assert!(
+        saw_runtime,
+        "at least one runtime FFI symbol must appear in sidecar (sigil_alloc / sigil_gc_init / etc.)"
+    );
+}
+
+/// 2026-05-08 v2 runtime profile-data, Phase 1 Task 2 — compile
+/// without `--emit-symbol-table` and assert NO sidecar is written.
+/// Pins the gate so the default compile path stays zero-cost.
+#[test]
+fn no_symbol_table_when_flag_absent() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let source = root.join("examples/hello.sigil");
+
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_no_symtab_{}", std::process::id()));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+
+    // Pre-clean in case a prior run left an artefact behind.
+    let _ = std::fs::remove_file(&symtab_path);
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(compile.status.success(), "compile failed");
+
+    assert!(
+        !symtab_path.exists(),
+        "no sidecar should be written without --emit-symbol-table"
+    );
+    let _ = std::fs::remove_file(&bin_path);
+}
