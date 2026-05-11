@@ -1485,70 +1485,6 @@ pub unsafe extern "C" fn sigil_body_return_arm_pop() -> u8 {
     })
 }
 
-/// Body-fn natural-exit terminal helper. Codegen replaces the Done
-/// emit at four body-fn natural-exit sites with a call to this helper:
-///
-/// - **B.2 hand-rolled compound-match dispatcher's ConstantDone arm**
-///   (e.g., Generator `iterate`'s `Nil` arm).
-/// - **Slice B post-arm-k synth fn body Done emit** (e.g., Generator's
-///   `Cons(x, rest)` arm body during outer_post_arm_k_stack chain
-///   unwind).
-/// - **Slice C post-arm-k chain Final step Done emit**.
-/// - **`CpsContinuationKind::ConstantDone` synth-cont dispatch**.
-///
-/// **Behavior** (reads top of `BODY_RETURN_ARM_STACK`):
-///
-/// - If stack is empty OR top entry has null fn OR top entry's fired
-///   flag is set → emit `sigil_next_step_done(v)`. The fired-set case
-///   fires during chain-unwinding helper invocations after the body's
-///   deepest natural-exit already wrapped; the null-fn case fires
-///   under sub-Cps-fn-call masks pushed by `lower_call`'s Cps branch
-///   (Risk 3); the empty case fires when the body fn isn't running
-///   under any handle.
-/// - Otherwise: dispatch the return arm via
-///   `NextStep::Call(closure, fn, [v, null, identity])` per the
-///   Phase 4g return-arm-synth-fn dispatch contract. Marks the top
-///   entry's fired=true so subsequent invocations skip re-wrapping
-///   AND Phase 4g's pop-returned `fired` lets the handle expression
-///   skip the second nested `run_loop`.
-///
-/// # Safety
-///
-/// Safe to call. Reads/mutates the top of the thread-local stack.
-/// Returned NextStep pointer is owned by the per-dispatch arena.
-#[no_mangle]
-pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep {
-    let depth = BODY_RETURN_ARM_DEPTH.with(|c| c.get());
-    if depth == 0 {
-        return sigil_next_step_done(v);
-    }
-    let top = BODY_RETURN_ARM_STACK.with(|c| c.get()[depth - 1]);
-    if top.fired || top.fn_ptr.is_null() {
-        return sigil_next_step_done(v);
-    }
-    // Mark top.fired = true (read entry, modify, write back —
-    // Cell<[Entry; N]> doesn't allow direct interior mutation).
-    BODY_RETURN_ARM_STACK.with(|stack_cell| {
-        let mut stack = stack_cell.get();
-        stack[depth - 1].fired = true;
-        stack_cell.set(stack);
-    });
-    let ns = sigil_next_step_call(top.closure_ptr, top.fn_ptr, 3);
-    let args = sigil_next_step_args_ptr(ns);
-    // Trailing-pair slots match Phase 4g's return-arm-synth-fn
-    // dispatch contract: [v, null_post_handle_k_closure,
-    // identity_post_handle_k_fn]. The synth fn's body emits
-    // Call(post_handle_k_loaded, post_handle_k_fn_loaded,
-    // [tail_widened, null, identity]); identity → Done(tail).
-    ptr::write(args.add(0), v);
-    ptr::write(args.add(1), 0u64);
-    ptr::write(
-        args.add(2),
-        sigil_continuation_identity as *const () as usize as u64,
-    );
-    ns
-}
-
 /// 2026-05-04 return-arm-via-args lift Stage 3a — args-passing variant
 /// of [`sigil_done_or_dispatch_return_arm`]. Used at the body fn
 /// natural-exit emit (B.2 compound-match `ConstantDone` arm). The
@@ -1578,26 +1514,22 @@ pub unsafe extern "C" fn sigil_done_or_dispatch_return_arm_via_args(
     return_arm_closure: *mut u8,
     return_arm_fn: *mut u8,
 ) -> *mut NextStep {
+    // 2026-05-04 return-arm-via-args lift — return_arm pair comes
+    // from caller-provided args (loaded from args_ptr or closure_ptr).
+    // The TLS top entry's `fired` flag stays load-bearing: with all
+    // four emit sites reading from local contexts that each carry a
+    // copy of return_arm forward through chain unwind, the flag is
+    // what prevents the SAME return_arm from being dispatched twice
+    // when the trampoline unwinds outer_post_arm_k_stack through
+    // synth-conts that inherited the active handle's return_arm via
+    // forward-copy. Empirically validated: dropping the `fired` check
+    // regresses Generator multi-shot tests (Stage 4 attempt 2026-05-10).
     let depth = BODY_RETURN_ARM_DEPTH.with(|c| c.get());
     if depth > 0 {
         let top = BODY_RETURN_ARM_STACK.with(|c| c.get()[depth - 1]);
         if top.fired {
             return sigil_next_step_done(v);
         }
-    } else {
-        // PR #143 review observation 1 — structural invariant: the only
-        // codegen path that writes a non-null return_arm pair to a body
-        // fn's args_ptr is `lower_handle_body_direct_cps_call`, which
-        // also pushes to the TLS stack immediately before driving the
-        // body's nested `sigil_run_loop`. So `depth > 0` whenever
-        // `return_arm_fn != null` here. Catch violations during testing
-        // before Stage 4 retires the TLS push.
-        debug_assert!(
-            return_arm_fn.is_null(),
-            "sigil_done_or_dispatch_return_arm_via_args: return_arm_fn non-null at \
-             depth 0 — handle entry should have pushed TLS before driving the body's \
-             nested run_loop. Structural invariant violation."
-        );
     }
     if return_arm_fn.is_null() {
         return sigil_next_step_done(v);
