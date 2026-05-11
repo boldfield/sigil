@@ -296,11 +296,11 @@ fn compute_user_fn_abi(
                     let callee_name = match callee.as_ref() {
                         crate::ast::Expr::Ident(n, _) => n.clone(),
                         // Non-Ident callee → tail-prefix-let. The
-                        // matching `emit_object` site
-                        // (codegen.rs:~8136) materializes the
-                        // binding into `tail_prefix_lets` so the
-                        // FINAL synth-cont's emit lowers it; this
-                        // pass only counts chain_length and
+                        // matching `emit_object` site in the
+                        // chained-let-yield emit pass materializes
+                        // the binding into `tail_prefix_lets` so
+                        // the FINAL synth-cont's emit lowers it;
+                        // this pass only counts chain_length and
                         // collects captures, so skipping the stmt
                         // is correct here. PR #97 review iter 2 #7
                         // — the asymmetry between this `continue`
@@ -10698,7 +10698,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // 2 additional trailing slots after captures
                             // carry `(return_arm_closure, return_arm_fn)`
                             // so the synth-cont's B.3 recursive Cps→Cps
-                            // dispatch (codegen.rs ~18240) can forward
+                            // dispatch (CompoundMatchArmPostPerform's
+                            // recursive-Cps-call emit) can forward
                             // return_arm into the recursive callee's
                             // args_ptr trailing slots — bridging the
                             // body fn's args_ptr-based return_arm channel
@@ -13295,9 +13296,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // ALWAYS allocate a closure record (even when
                     // captures is empty) so it can carry return_arm at
                     // its trailing slots. The post-arm-k synth fn's
-                    // body Done emit (Slice B, codegen.rs ~14056) loads
-                    // return_arm from `closure_ptr[16 + 8 * captures.len()]`
-                    // and passes it to the args-passing helper. With the
+                    // body Done emit (Slice B's post-arm-k natural-
+                    // exit dispatch) loads return_arm from
+                    // `closure_ptr[16 + 8 * captures.len()]` and passes
+                    // it to the args-passing helper. With the
                     // pre-Stage-3b empty-captures shortcut (null
                     // closure_ptr), the synth fn couldn't carry
                     // return_arm; flipping site 2 to args required the
@@ -14307,10 +14309,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // synth fn body Done emit (Slice B). Load return_arm from
             // this synth fn's closure_ptr at the trailing slots the
             // arm-fn's body emit wrote at synth-cont allocation time
-            // (codegen.rs ~13370 area, offset `16 + 8 * captures.len()`).
-            // The helper's TLS `fired` short-circuit still applies for
-            // chain-unwind invocations after the body's deepest
-            // natural-exit has already dispatched.
+            // (post-arm-k synth-cont closure-record allocator,
+            // offset `16 + 8 * captures.len()`). The helper's TLS
+            // `fired` short-circuit still applies for chain-unwind
+            // invocations after the body's deepest natural-exit has
+            // already dispatched.
             let pak_ra_closure_off: i32 = 16 + 8 * post_arm_k.captures.len() as i32;
             let pak_ra_fn_off: i32 = pak_ra_closure_off + 8;
             let ra_closure_pak = lowerer.builder.ins().load(
@@ -15077,7 +15080,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 prior_offset_base + 8 * step.prior_bindings.len() as i32;
                             let this_ra_fn_off: i32 = this_ra_closure_off + 8;
                             let next_ra_closure_off: i32 =
-                                next_prior_offset_base + 8 * (prior_count_next) as i32;
+                                next_prior_offset_base + 8 * prior_count_next as i32;
                             let next_ra_fn_off: i32 = next_ra_closure_off + 8;
                             let ra_closure_v = lowerer.builder.ins().load(
                                 pointer_ty,
@@ -15328,16 +15331,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     CpsContinuationKind::ConstantDone { constant_value } => {
                         // 2026-05-04 return-arm-via-args lift Stage 4 —
                         // ConstantDone synth-cont natural-exit emit
-                        // flipped off TLS. The ConstantDone synth-cont
-                        // closure record is now always allocated (see
-                        // codegen.rs ~11510 area) so it can carry
-                        // `(return_arm_closure, return_arm_fn)` at
-                        // trailing slots `16` / `24` (ConstantDone
-                        // captures.len() == 0 in practice). Load and
-                        // pass to the args-passing helper variant.
+                        // flipped off TLS. The chained-let-yield synth-
+                        // cont closure-record allocator (the
+                        // ConstantDone branch) always allocates with
+                        // `captures = Vec::new()` (the pre-pass
+                        // structurally guarantees ConstantDone's tail
+                        // is an `IntLit` with no captures), so the
+                        // layout is fixed: `[header @ 0,
+                        // null_code_ptr @ 8, return_arm_closure @ 16,
+                        // return_arm_fn @ 24]`. Load and pass to the
+                        // args-passing helper variant.
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
-                        // ConstantDone has 0 captures so offsets are
-                        // fixed at 16 (closure) and 24 (fn).
                         let synth_closure_ptr = block_params[0];
                         let ra_closure = builder.ins().load(
                             pointer_ty,
@@ -18489,9 +18493,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let closure_ptr = block_params[0];
                         // 2026-05-04 return-arm-via-args lift Stage 3a —
                         // the B.2 synth-cont's closure record was
-                        // extended (codegen.rs ~10720) to carry
-                        // `(return_arm_closure, return_arm_fn)` at
-                        // offset `16 + 8 * total_capture_slots`. Expose
+                        // extended (CompoundMatchArmPostPerform alloc
+                        // site) to carry `(return_arm_closure,
+                        // return_arm_fn)` at offset
+                        // `16 + 8 * total_capture_slots`. Expose
                         // that offset to the Lowerer so B.3 recursive
                         // Cps→Cps dispatch (this fn's tail emit at
                         // `lower_call_in_tail_pos`) can forward
