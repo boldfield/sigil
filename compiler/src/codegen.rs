@@ -13249,14 +13249,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // with the structural precedent so any future
                     // reasoning about argp_v liveness through alloc
                     // applies uniformly.
-                    let post_arm_k_closure_v = if post_arm_k.captures.is_empty() {
-                        lowerer.builder.ins().iconst(pointer_ty, 0)
-                    } else {
+                    // 2026-05-04 return-arm-via-args lift Stage 3b —
+                    // ALWAYS allocate a closure record (even when
+                    // captures is empty) so it can carry return_arm at
+                    // its trailing slots. The post-arm-k synth fn's
+                    // body Done emit (Slice B, codegen.rs ~14056) loads
+                    // return_arm from `closure_ptr[16 + 8 * captures.len()]`
+                    // and passes it to the args-passing helper. With the
+                    // pre-Stage-3b empty-captures shortcut (null
+                    // closure_ptr), the synth fn couldn't carry
+                    // return_arm; flipping site 2 to args required the
+                    // unconditional alloc.
+                    let post_arm_k_closure_v = {
                         let captures = &post_arm_k.captures;
+                        let total_slots = captures.len() + 2;
                         assert!(
-                            captures.len() < MAX_CLOSURE_ENV_SLOTS,
-                            "Plan B Task 78.5 G1: post-arm-k closure env >= \
-                             {MAX_CLOSURE_ENV_SLOTS} slots exceeds bitmap layout"
+                            total_slots < MAX_CLOSURE_ENV_SLOTS,
+                            "Plan B Task 78.5 G1 + Stage 3b: post-arm-k closure env \
+                             {total_slots} (= {} captures + 2 return_arm) \
+                             >= {MAX_CLOSURE_ENV_SLOTS} slots exceeds bitmap layout",
+                            captures.len()
                         );
                         let mut bitmap: u32 = 0;
                         for (i, c) in captures.iter().enumerate() {
@@ -13264,9 +13276,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 bitmap |= 1u32 << (i + 1);
                             }
                         }
-                        let count: u8 = 1 + captures.len() as u8;
+                        // return_arm_closure at slot index captures.len();
+                        // bitmap bit (captures.len() + 1) marks it as a
+                        // pointer slot (heap-allocated closure record or
+                        // null). return_arm_fn is a code address —
+                        // unmarked.
+                        bitmap |= 1u32 << (captures.len() + 1);
+                        let count: u8 = 1 + total_slots as u8;
                         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-                        let payload_bytes: i64 = 8 + 8 * captures.len() as i64;
+                        let payload_bytes: i64 = 8 + 8 * total_slots as i64;
                         let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                         let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_call = lowerer
@@ -13357,6 +13375,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 .ins()
                                 .store(MemFlags::trusted(), slot_val, cp, offset);
                         }
+                        // 2026-05-04 return-arm-via-args lift Stage 3b —
+                        // load return_arm from the arm-fn's incoming
+                        // args_ptr (sigil_perform routed the active
+                        // handle's pair into the arm-fn's args_ptr
+                        // trailing slots) and store at the post-arm-k
+                        // closure record's trailing slots.
+                        let ra_closure_arm = lowerer.builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_closure_offset(n_user_args),
+                        );
+                        let ra_fn_arm = lowerer.builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_fn_offset(n_user_args),
+                        );
+                        let ra_closure_in_pak_off: i32 =
+                            16 + 8 * captures.len() as i32;
+                        let ra_fn_in_pak_off: i32 = ra_closure_in_pak_off + 8;
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            ra_closure_arm,
+                            cp,
+                            ra_closure_in_pak_off,
+                        );
+                        lowerer.builder.ins().store(
+                            MemFlags::trusted(),
+                            ra_fn_arm,
+                            cp,
+                            ra_fn_in_pak_off,
+                        );
                         cp
                     };
                     // Plan B Task 78.5 G1 iter 5 — bypass identity at
@@ -14106,8 +14157,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 body_return_arm_pop_ref,
                 body_return_arm_push_mask_if_needed_ref,
                 body_return_arm_pop_if_flag_ref,
-                done_or_dispatch_return_arm_ref,
-                done_or_dispatch_return_arm_via_args_ref: _,
+                done_or_dispatch_return_arm_ref: _,
+                done_or_dispatch_return_arm_via_args_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
                 user_fn_refs,
@@ -14213,21 +14264,32 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 );
                 tail_value
             };
-            // Task 78.5 G4 Approach 6 deep-redo — post-arm-k synth fn
-            // body Done emit (Slice B). Helper checks the top
-            // BODY_RETURN_ARM_STACK entry's `fired` flag — if set (the
-            // body's deepest natural-exit already wrapped via the same
-            // helper at the B.2 ConstantDone arm site), helper falls
-            // through to Done(widened_tail). post-arm-k synth fns run
-            // DURING outer_post_arm_k_stack chain unwind with
-            // already-wrapped `r` bindings; their Done emits must NOT
-            // re-wrap. If `fired` is false (the body hasn't wrapped yet
-            // — possible for body shapes that don't use compound-match),
-            // helper wraps via the active return arm.
-            let done_call = lowerer
-                .builder
-                .ins()
-                .call(done_or_dispatch_return_arm_ref, &[widened_tail]);
+            // 2026-05-04 return-arm-via-args lift Stage 3b — post-arm-k
+            // synth fn body Done emit (Slice B). Load return_arm from
+            // this synth fn's closure_ptr at the trailing slots the
+            // arm-fn's body emit wrote at synth-cont allocation time
+            // (codegen.rs ~13370 area, offset `16 + 8 * captures.len()`).
+            // The helper's TLS `fired` short-circuit still applies for
+            // chain-unwind invocations after the body's deepest
+            // natural-exit has already dispatched.
+            let pak_ra_closure_off: i32 = 16 + 8 * post_arm_k.captures.len() as i32;
+            let pak_ra_fn_off: i32 = pak_ra_closure_off + 8;
+            let ra_closure_pak = lowerer.builder.ins().load(
+                pointer_ty,
+                MemFlags::trusted(),
+                lowerer.closure_ptr,
+                pak_ra_closure_off,
+            );
+            let ra_fn_pak = lowerer.builder.ins().load(
+                pointer_ty,
+                MemFlags::trusted(),
+                lowerer.closure_ptr,
+                pak_ra_fn_off,
+            );
+            let done_call = lowerer.builder.ins().call(
+                done_or_dispatch_return_arm_via_args_ref,
+                &[widened_tail, ra_closure_pak, ra_fn_pak],
+            );
             lowerer
                 .stackmap
                 .push_placeholder(function_code_offset(&lowerer.builder, done_call));
