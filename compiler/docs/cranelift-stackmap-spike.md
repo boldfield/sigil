@@ -8,15 +8,22 @@ real stack-maps) will use. The repro lives at
 via `cargo test`. Two tests cover both API paths Phase 1 Task 2 will
 use:
 
-- `value_variant_emits_stackmap_at_call_safepoint` — the single-Value
-  path (one `declare_value_needs_stack_map` + one call safepoint + one
-  expected entry).
+- `value_variant_flag_filters_live_set_at_safepoint` — the
+  single-Value path. Two i64 values are live across the safepoint;
+  only one is flagged. The test asserts `entries.len() == 1`, proving
+  `declare_value_needs_stack_map` is the filter (not "every live
+  value gets a stack-map entry").
 - `var_variant_emits_stackmap_for_phi_confluence` — the Variable
   path (one `declare_var_needs_stack_map` + two `def_var`s in
   separate predecessor blocks + one `use_var` past the safepoint in
   the join block). This is the canonical phi-confluence shape the
-  Task 2 sweep will need; per-Value flagging at each phi input edge
-  is fragile, the Variable variant is not.
+  Task 2 sweep will need. The Variable path is the documented
+  frontend-supported route for values that flow through a phi; we
+  have NOT validated per-Value flagging across phi confluences
+  (would require flagging each predecessor's `iconst` separately and
+  observing whether the frontend's SSA-propagation produces an entry
+  at the merge-block safepoint). Use the Variable variant because
+  that's what's verified, not because per-Value provably fails.
 
 ## Plan E2 hypothesis vs reality
 
@@ -119,11 +126,20 @@ section writer owns the data). Ownership note for Task 4:
 `take_user_stack_maps` takes `&mut self` on the buffer, which means
 the section writer must grab the data before anything else borrows
 the buffer immutably (e.g. before `buffer.data()` is called for the
-relocations/byte emission). Sigil's existing `ObjectModule::
-define_function_with_control_plane` call sequence reads
-`ctx.compiled_code().unwrap().buffer` immutably for `relocs()` and
-`data()`; Task 4 should take the stack maps before that step (or
-clone the borrow), not after.
+byte emission inside `ObjectModule::define_function`). Concretely:
+sigil currently calls `module.define_function(entry.func_id, &mut
+ctx)` at `compiler/src/codegen.rs:11024`, `:12085`, `:12289`,
+`:12700` (and other sites — `grep -n "\.define_function(" compiler/src/codegen.rs`
+for the full list). Each is the integration point Task 4 amends:
+**after** `define_function` returns and **before** `ctx` is reused
+for the next function, read `ctx.compiled_code().unwrap().buffer.
+user_stack_maps()` (immutable borrow — sufficient for v1 emission)
+or `.take_user_stack_maps()` (mutable; needed only if you keep the
+data past `ctx.clear()`). Inside `define_function`, the
+`cranelift-object` backend already does its own immutable
+`buffer.relocs()` + `buffer.data()` walk to emit bytes, so the
+`take_*` mutable borrow is only safe **after** that call completes
+— which is also when we can first observe the buffer at all.
 
 Within Sigil's `ObjectModule` integration, the offset is *within the
 function*. The Task 4 section writer needs to translate this to a
@@ -185,26 +201,31 @@ regardless of which predecessor flowed.
 
 ### Verified output (run 2026-05-11, linux-x86_64, host CallConv)
 
-Value-variant test passes against `maps.len() == 1`, one entry of
-type `i64`. The first observed run (linux-x86_64, host CallConv) put
-the call site at PC offset `0x20` with a 16-byte frame and the spill
-slot at `sp+0x0`. The test asserts the *structural* shape — entry
-count and type — not the absolute offsets, since spill-slot layout is
-allowed to change across Cranelift updates.
+Value-variant test passes against `maps.len() == 1` *and*
+`entries.len() == 1`, with two i64 values live across the safepoint
+and only one flagged. The structural shape — one entry, type i64 —
+is what gets asserted; the absolute slot offset isn't, since
+spill-slot layout is allowed to change across Cranelift updates.
 
-Variable-variant test passes against `maps.len() == 1`, one entry of
-type `i64` at the call site in `merge_blk`. The phi result allocated
-by the frontend is whichever SSA value carries `gc_ref` at the safepoint;
+Variable-variant test passes against `maps.len() == 1`,
+`entries.len() == 1`, one entry of type `i64` at the call site in
+`merge_blk`. The phi result allocated by the frontend is whichever
+SSA value carries `gc_ref` at the safepoint;
 `declare_var_needs_stack_map` flags whichever it picks.
 
-Both tests dump the post-`finalize()` IR via `Function::display` when
-the stack-map list is empty — saves a debug session next time the
-spike fails after an upstream Cranelift change.
+Both tests dump the post-`finalize()` IR via `Function::display` to
+stderr *before* the asserts run, so any failed assertion (empty map
+list, wrong entry count, wrong entry type) lands with the IR
+already visible — saves a debug session next time the spike fails
+after an upstream Cranelift change.
 
 The combined evidence is the minimum proof that:
 
-- `declare_value_needs_stack_map` and `declare_var_needs_stack_map`
-  both actually cause spills + map entries.
+- `declare_value_needs_stack_map` actually *filters* the live set
+  (only the flagged value gets a stack-map entry — the second live
+  i64 in the value variant test does NOT appear in the map).
+- `declare_var_needs_stack_map` causes a spill + map entry for the
+  Variable's value at the safepoint.
 - The `call` instruction is treated as a safepoint without explicit
   annotation.
 - `code.buffer.user_stack_maps()` returns post-regalloc data with a
@@ -221,14 +242,15 @@ The combined evidence is the minimum proof that:
     `sigil_alloc` (constructors, closure records, Ref cells,
     NextStep allocations);
   - every heap-pointer load (record-field reads, closure-env loads);
-  - phi confluences whose inputs are heap pointers — needs care:
-    `declare_value_needs_stack_map` is per-value, so each predecessor
-    side has to declare. The frontend's safepoint pass already
-    propagates needs-stack-map across SSA values via
-    `func_ctx.ssa.values_for_var`, so the cleanest pattern is to use
-    `Variable`s for GC-ref locals and call
-    `declare_var_needs_stack_map(var)` — every value that flows into
-    that variable is automatically flagged.
+  - phi confluences whose inputs are heap pointers — use the
+    Variable path. `declare_var_needs_stack_map(var)` is the
+    documented frontend-supported route: the safepoint pass walks
+    `func_ctx.stack_map_vars` in `FunctionBuilder::finalize` and
+    propagates the needs-stack-map flag to every SSA value the SSA
+    builder produced for that variable via
+    `func_ctx.ssa.values_for_var`. The integration test verifies
+    this path; the per-Value path on a phi-result value has not been
+    validated and is not the documented contract.
 
 - **Task 3 (annotate safepoints).** No-op against the API. The task
   becomes: *audit that every call site Plan E2 cares about uses
@@ -264,8 +286,11 @@ The combined evidence is the minimum proof that:
   `declare_value_needs_stack_map` is documented and tested in
   `cranelift-frontend`; `MachBufferFinalized::user_stack_maps` is
   documented in `cranelift-codegen::machinst::buffer`.
-- The same API has been present and stable since 0.115 (introduction
-  of the "user stack maps" terminology). Risk of an API rename
+- The API is documented and tested in 0.131.0; the user-stack-maps
+  terminology has been present for several recent minor versions, but
+  we have NOT audited exact rename history across the 0.1x line
+  (`declare_value_needs_stack_map` specifically moved around as the
+  user-stack-maps work landed in stages). Risk of an API rename
   across a patch-version bump is low; risk across a minor-version
   bump is real and warrants the existing `=0.131.0` exact pin staying
   in place until Plan E2 lands.
