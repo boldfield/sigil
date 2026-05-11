@@ -8967,24 +8967,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_body_return_arm_pop_if_flag: {e}"))?;
 
-    // sigil_done_or_dispatch_return_arm(v: u64) -> *mut NextStep
-    let mut done_or_dispatch_return_arm_sig = Signature::new(isa_call_conv(&module));
-    done_or_dispatch_return_arm_sig
-        .params
-        .push(AbiParam::new(types::I64));
-    done_or_dispatch_return_arm_sig
-        .returns
-        .push(AbiParam::new(pointer_ty));
-    let done_or_dispatch_return_arm = module
-        .declare_function(
-            "sigil_done_or_dispatch_return_arm",
-            Linkage::Import,
-            &done_or_dispatch_return_arm_sig,
-        )
-        .map_err(|e| format!("declare sigil_done_or_dispatch_return_arm: {e}"))?;
-
-    // 2026-05-04 return-arm-via-args lift Stage 3a — args-passing
-    // variant of the natural-exit helper.
+    // 2026-05-04 return-arm-via-args lift Stage 4 — the TLS-reading
+    // helper `sigil_done_or_dispatch_return_arm` is retired; all four
+    // natural-exit emit sites use the args-passing variant below.
     let mut done_or_dispatch_return_arm_via_args_sig = Signature::new(isa_call_conv(&module));
     done_or_dispatch_return_arm_via_args_sig
         .params
@@ -10059,7 +10044,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         body_return_arm_pop,
         body_return_arm_push_mask_if_needed,
         body_return_arm_pop_if_flag,
-        done_or_dispatch_return_arm,
         done_or_dispatch_return_arm_via_args,
         repush_crossed_frames,
         pop_crossed_frames,
@@ -10118,7 +10102,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 body_return_arm_pop_ref,
                 body_return_arm_push_mask_if_needed_ref,
                 body_return_arm_pop_if_flag_ref,
-                done_or_dispatch_return_arm_ref: _,
                 done_or_dispatch_return_arm_via_args_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
@@ -12775,7 +12758,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     body_return_arm_pop_ref,
                     body_return_arm_push_mask_if_needed_ref,
                     body_return_arm_pop_if_flag_ref,
-                    done_or_dispatch_return_arm_ref: _,
                     done_or_dispatch_return_arm_via_args_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
@@ -13048,11 +13030,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // (return_fn, return_closure) at the pinned offsets
                     // to apply the return arm before binding.
                     let extra_for_return_arm: usize = if chain.has_return_arm { 1 } else { 0 };
-                    let total_capture_slots: usize = 2 + captures.len() + extra_for_return_arm;
+                    // 2026-05-04 return-arm-via-args lift Stage 4 —
+                    // 2 additional trailing slots carry `(return_arm_-
+                    // closure, return_arm_fn)` so the Slice C chain
+                    // Final step's Done emit (site 3) loads them from
+                    // its closure_ptr and dispatches via the args-
+                    // passing helper. Source: the arm-fn's args_ptr,
+                    // populated by sigil_perform (Stage 3b ABI).
+                    let total_capture_slots: usize = 2 + captures.len() + extra_for_return_arm + 2;
                     assert!(
                         total_capture_slots < MAX_CLOSURE_ENV_SLOTS,
-                        "Plan B' Stage 6.7 Task 100b: arm-fn step_0 closure capture \
-                         count {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
+                        "Plan B' Stage 6.7 Task 100b + Stage 4: arm-fn step_0 closure \
+                         capture count {total_capture_slots} >= {MAX_CLOSURE_ENV_SLOTS} \
                          exceeds bitmap layout"
                     );
                     let mut bitmap: u32 = 1u32 << 1;
@@ -13066,6 +13055,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // (3 + C); GC-managed pointer.
                         bitmap |= 1u32 << (3 + captures.len());
                     }
+                    // return_arm_closure at slot index
+                    // (2 + captures.len() + extra_for_return_arm).
+                    // GC-managed (heap closure or null).
+                    bitmap |= 1u32 << (2 + captures.len() + extra_for_return_arm + 1);
                     let count: u8 = 1 + total_capture_slots as u8;
                     let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
                     let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
@@ -13145,6 +13138,39 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             frame_ptr_offset,
                         );
                     }
+                    // 2026-05-04 return-arm-via-args lift Stage 4 —
+                    // store return_arm pair at end of step 0's closure
+                    // record. Source: this arm-fn's incoming args_ptr
+                    // (sigil_perform routed the active handle's pair
+                    // there per Stage 3b ABI). Offset:
+                    // 32 + 8 * (captures.len() + extra_for_return_arm).
+                    let arm_ra_closure = lowerer.builder.ins().load(
+                        pointer_ty,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        return_arm_closure_offset(n_user_args),
+                    );
+                    let arm_ra_fn = lowerer.builder.ins().load(
+                        pointer_ty,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        return_arm_fn_offset(n_user_args),
+                    );
+                    let ra_closure_off_step0: i32 =
+                        32 + 8 * (captures.len() + extra_for_return_arm) as i32;
+                    let ra_fn_off_step0: i32 = ra_closure_off_step0 + 8;
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        arm_ra_closure,
+                        step_0_closure_ptr,
+                        ra_closure_off_step0,
+                    );
+                    lowerer.builder.ins().store(
+                        MemFlags::trusted(),
+                        arm_ra_fn,
+                        step_0_closure_ptr,
+                        ra_fn_off_step0,
+                    );
 
                     let step_0_fn_ref =
                         module.declare_func_in_func(step_0.func_id, lowerer.builder.func);
@@ -13778,7 +13804,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     body_return_arm_pop_ref,
                     body_return_arm_push_mask_if_needed_ref,
                     body_return_arm_pop_if_flag_ref,
-                    done_or_dispatch_return_arm_ref: _,
                     done_or_dispatch_return_arm_via_args_ref: _,
                     handler_arm_refs_per_handle,
                     handler_return_arm_refs_per_handle,
@@ -14172,7 +14197,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 body_return_arm_pop_ref,
                 body_return_arm_push_mask_if_needed_ref,
                 body_return_arm_pop_if_flag_ref,
-                done_or_dispatch_return_arm_ref: _,
                 done_or_dispatch_return_arm_via_args_ref,
                 handler_arm_refs_per_handle,
                 handler_return_arm_refs_per_handle,
@@ -14594,8 +14618,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         body_return_arm_pop_ref,
                         body_return_arm_push_mask_if_needed_ref,
                         body_return_arm_pop_if_flag_ref,
-                        done_or_dispatch_return_arm_ref,
-                        done_or_dispatch_return_arm_via_args_ref: _,
+                        done_or_dispatch_return_arm_via_args_ref,
                         handler_arm_refs_per_handle,
                         handler_return_arm_refs_per_handle,
                         user_fn_refs,
@@ -14746,10 +14769,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let next_step = lowerer.builder.inst_results(disch_call)[0];
                                 lowerer.builder.ins().return_(&[next_step]);
                             } else {
-                                let done_call = lowerer
-                                    .builder
-                                    .ins()
-                                    .call(done_or_dispatch_return_arm_ref, &[widened_tail]);
+                                // 2026-05-04 return-arm-via-args lift
+                                // Stage 4 — Slice C chain Final Done
+                                // emit flipped off TLS. Load return_arm
+                                // from this synth-cont's closure record
+                                // at the end-of-layout offset (after
+                                // captures + frame_ptr? + prior_bindings).
+                                let ra_closure_off_slc: i32 =
+                                    prior_offset_base + 8 * step.prior_bindings.len() as i32;
+                                let ra_fn_off_slc: i32 = ra_closure_off_slc + 8;
+                                let ra_closure_slc = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    ra_closure_off_slc,
+                                );
+                                let ra_fn_slc = lowerer.builder.ins().load(
+                                    pointer_ty,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    ra_fn_off_slc,
+                                );
+                                let done_call = lowerer.builder.ins().call(
+                                    done_or_dispatch_return_arm_via_args_ref,
+                                    &[widened_tail, ra_closure_slc, ra_fn_slc],
+                                );
                                 lowerer.stackmap.push_placeholder(function_code_offset(
                                     &lowerer.builder,
                                     done_call,
@@ -14829,8 +14873,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let cap_off: i32 = 32;
                                 let frame_off: i32 = cap_off + 8 * c as i32;
                                 let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
+                                // 2026-05-04 return-arm-via-args lift
+                                // Stage 4 — +2 trailing slots for
+                                // return_arm pair.
                                 (
-                                    2 + c + extra_for_return_arm + p,
+                                    2 + c + extra_for_return_arm + p + 2,
                                     cap_off,
                                     frame_off,
                                     prior_off,
@@ -14841,7 +14888,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let cap_off: i32 = 16;
                                 let frame_off: i32 = cap_off + 8 * c as i32;
                                 let prior_off: i32 = frame_off + 8 * extra_for_return_arm as i32;
-                                (c + extra_for_return_arm + p, cap_off, frame_off, prior_off)
+                                (
+                                    c + extra_for_return_arm + p + 2,
+                                    cap_off,
+                                    frame_off,
+                                    prior_off,
+                                )
                             };
                             assert!(
                                 next_capture_count < MAX_CLOSURE_ENV_SLOTS,
@@ -14870,6 +14922,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             << (2 + captures.len() + extra_for_return_arm + j + 1);
                                     }
                                 }
+                                // 2026-05-04 return-arm-via-args Stage 4 —
+                                // return_arm_closure at slot
+                                // (2 + C + extra + p_next); GC. fn ptr
+                                // (next slot) is a code address — unmarked.
+                                bitmap |= 1u32
+                                    << (2
+                                        + captures.len()
+                                        + extra_for_return_arm
+                                        + prior_count_next
+                                        + 1);
                             } else {
                                 for (c, cap) in captures.iter().enumerate() {
                                     if cap.kind.is_pointer() {
@@ -14886,6 +14948,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             1u32 << (captures.len() + extra_for_return_arm + j + 1);
                                     }
                                 }
+                                // 2026-05-04 return-arm-via-args Stage 4 —
+                                // return_arm_closure at slot
+                                // (C + extra + p_next); GC.
+                                bitmap |= 1u32
+                                    << (captures.len()
+                                        + extra_for_return_arm
+                                        + prior_count_next
+                                        + 1);
                             }
                             let count: u8 = 1 + next_capture_count as u8;
                             let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
@@ -14992,6 +15062,46 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 bound_widened,
                                 next_closure_ptr,
                                 this_binding_offset,
+                            );
+
+                            // 2026-05-04 return-arm-via-args lift Stage 4 —
+                            // forward-copy return_arm pair from THIS
+                            // step's closure record to NEXT step's
+                            // closure record. THIS step's return_arm
+                            // sits at the end of its layout (after its
+                            // captures + frame_ptr? + prior_bindings).
+                            // NEXT step's return_arm sits at the end of
+                            // its layout (after captures + frame_ptr? +
+                            // prior_bindings + this_binding).
+                            let this_ra_closure_off: i32 =
+                                prior_offset_base + 8 * step.prior_bindings.len() as i32;
+                            let this_ra_fn_off: i32 = this_ra_closure_off + 8;
+                            let next_ra_closure_off: i32 =
+                                next_prior_offset_base + 8 * (prior_count_next) as i32;
+                            let next_ra_fn_off: i32 = next_ra_closure_off + 8;
+                            let ra_closure_v = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                this_ra_closure_off,
+                            );
+                            let ra_fn_v = lowerer.builder.ins().load(
+                                pointer_ty,
+                                MemFlags::trusted(),
+                                synth_closure_ptr,
+                                this_ra_fn_off,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                ra_closure_v,
+                                next_closure_ptr,
+                                next_ra_closure_off,
+                            );
+                            lowerer.builder.ins().store(
+                                MemFlags::trusted(),
+                                ra_fn_v,
+                                next_closure_ptr,
+                                next_ra_fn_off,
                             );
 
                             // func_addr for the next step's synth fn.
@@ -15119,19 +15229,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // emit declares the helper FuncRef directly (this
                 // emit pass uses bespoke FuncRef declarations rather
                 // than `prepare_per_fn_refs`).
-                //
-                // 2026-05-04 return-arm-via-args lift Stage 4 — the
-                // TLS variant is no longer called from this emit
-                // pass; the ConstantDone arm uses
-                // `done_or_dispatch_return_arm_via_args_ref` instead.
-                // The TLS FuncRef declaration is retained as `_` so
-                // the FuncId stays imported into the synth-cont's
-                // module (other emit passes still use the TLS
-                // variant at site 3 — Slice C chain Final Done — and
-                // sharing the FuncId import keeps the linker tables
-                // consistent).
-                let _done_or_dispatch_return_arm_ref =
-                    module.declare_func_in_func(done_or_dispatch_return_arm, builder.func);
                 let done_or_dispatch_return_arm_via_args_ref =
                     module.declare_func_in_func(done_or_dispatch_return_arm_via_args, builder.func);
                 // Plan D Task 112 — Risk 3 protection POP at chain
@@ -15441,7 +15538,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             body_return_arm_pop_ref,
                             body_return_arm_push_mask_if_needed_ref,
                             body_return_arm_pop_if_flag_ref,
-                            done_or_dispatch_return_arm_ref: _,
                             done_or_dispatch_return_arm_via_args_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
@@ -18380,7 +18476,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             body_return_arm_pop_ref,
                             body_return_arm_push_mask_if_needed_ref,
                             body_return_arm_pop_if_flag_ref,
-                            done_or_dispatch_return_arm_ref: _,
                             done_or_dispatch_return_arm_via_args_ref: _,
                             handler_arm_refs_per_handle,
                             handler_return_arm_refs_per_handle,
@@ -27915,9 +28010,9 @@ struct PerFnRefsCtx<'a> {
     /// helpers. See `runtime/src/handlers.rs` for rationale.
     body_return_arm_push_mask_if_needed: cranelift_module::FuncId,
     body_return_arm_pop_if_flag: cranelift_module::FuncId,
-    done_or_dispatch_return_arm: cranelift_module::FuncId,
-    /// 2026-05-04 return-arm-via-args lift Stage 3a — args-passing
-    /// variant.
+    /// 2026-05-04 return-arm-via-args lift — args-passing natural-exit
+    /// helper. The pre-lift TLS-reading variant was retired in Stage 4
+    /// (all four natural-exit emit sites now call this one).
     done_or_dispatch_return_arm_via_args: cranelift_module::FuncId,
     repush_crossed_frames: cranelift_module::FuncId,
     pop_crossed_frames: cranelift_module::FuncId,
@@ -27993,9 +28088,8 @@ struct PerFnRefs {
     /// rationale.
     body_return_arm_push_mask_if_needed_ref: FuncRef,
     body_return_arm_pop_if_flag_ref: FuncRef,
-    done_or_dispatch_return_arm_ref: FuncRef,
-    /// 2026-05-04 return-arm-via-args lift Stage 3a — args-passing
-    /// variant FuncRef.
+    /// 2026-05-04 return-arm-via-args lift — args-passing natural-exit
+    /// helper FuncRef.
     done_or_dispatch_return_arm_via_args_ref: FuncRef,
     repush_crossed_frames_ref: FuncRef,
     pop_crossed_frames_ref: FuncRef,
@@ -28188,8 +28282,6 @@ fn prepare_per_fn_refs(
         module.declare_func_in_func(ctx.body_return_arm_push_mask_if_needed, builder.func);
     let body_return_arm_pop_if_flag_ref =
         module.declare_func_in_func(ctx.body_return_arm_pop_if_flag, builder.func);
-    let done_or_dispatch_return_arm_ref =
-        module.declare_func_in_func(ctx.done_or_dispatch_return_arm, builder.func);
     let done_or_dispatch_return_arm_via_args_ref =
         module.declare_func_in_func(ctx.done_or_dispatch_return_arm_via_args, builder.func);
     let repush_crossed_frames_ref =
@@ -28285,7 +28377,6 @@ fn prepare_per_fn_refs(
         body_return_arm_pop_ref,
         body_return_arm_push_mask_if_needed_ref,
         body_return_arm_pop_if_flag_ref,
-        done_or_dispatch_return_arm_ref,
         done_or_dispatch_return_arm_via_args_ref,
         repush_crossed_frames_ref,
         pop_crossed_frames_ref,
