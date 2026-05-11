@@ -13393,8 +13393,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(n_user_args),
                         );
-                        let ra_closure_in_pak_off: i32 =
-                            16 + 8 * captures.len() as i32;
+                        let ra_closure_in_pak_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_in_pak_off: i32 = ra_closure_in_pak_off + 8;
                         lowerer.builder.ins().store(
                             MemFlags::trusted(),

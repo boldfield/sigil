@@ -3419,7 +3419,7 @@ mod tests {
         args_ptr: *const u64,
         args_len: u32,
     ) -> *mut NextStep {
-        assert_eq!(args_len, 3); // raised_value, k_closure, k_fn
+        assert_eq!(args_len, 5); // raised_value + (k_closure, k_fn) + (return_arm_closure, return_arm_fn) per Stage 3b
         let raised = *args_ptr;
         sigil_next_step_done(raised * 100)
     }
@@ -3450,6 +3450,8 @@ mod tests {
                 /* args_len */ 1,
                 /* k_closure_ptr */ 0xDEAD as *mut u8,
                 /* k_fn_ptr */ 0xBEEF as *mut u8,
+                /* return_arm_closure_ptr */ ptr::null_mut(),
+                /* return_arm_fn_ptr */ ptr::null_mut(),
             );
             let walk_count_after = counters::read(CounterId::HandlerWalkCount);
             let depth_sum_after = counters::read(CounterId::HandlerWalkDepthSum);
@@ -3486,6 +3488,8 @@ mod tests {
                 1,
                 ptr::null_mut(),
                 ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
             );
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             // Outer is on top, target is one below; walk depth = 2.
@@ -3511,9 +3515,12 @@ mod tests {
             args_ptr: *const u64,
             args_len: u32,
         ) -> *mut NextStep {
-            assert_eq!(args_len, 4); // 2 user args + k_closure + k_fn
-                                     // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
-                                     // non-GC arena buffer; reads are value loads, no GC retention).
+            // 2026-05-04 return-arm-via-args lift Stage 3b — args_len
+            // bumped from `N + 2` to `N + 4` to include the second
+            // trailing pair (return_arm_closure, return_arm_fn).
+            assert_eq!(args_len, 6); // 2 user args + (k_closure, k_fn) + (return_arm_closure, return_arm_fn)
+            // SAFETY: gc-heap-ptr arithmetic (args_ptr points at a
+            // non-GC arena buffer; reads are value loads, no GC retention).
             assert_eq!(*args_ptr, 100);
             // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(1), 200);
@@ -3521,6 +3528,10 @@ mod tests {
             assert_eq!(*args_ptr.add(2) as usize, 0xCC);
             // SAFETY: gc-heap-ptr arithmetic (same as above).
             assert_eq!(*args_ptr.add(3) as usize, 0xDD);
+            // Stage 3b — slots 4, 5 are (return_arm_closure, return_arm_fn);
+            // the test passes nulls.
+            assert_eq!(*args_ptr.add(4) as usize, 0);
+            assert_eq!(*args_ptr.add(5) as usize, 0);
             sigil_next_step_done(0)
         }
 
@@ -3532,7 +3543,16 @@ mod tests {
             // user_args is a stack local; the runtime copies bytes via the pointer.
             // SAFETY: gc-heap-ptr arithmetic (user_args is a stack local).
             let user_args_ptr = user_args.as_ptr();
-            let ns = sigil_perform(7, 0, user_args_ptr, 2, 0xCC as *mut u8, 0xDD as *mut u8);
+            let ns = sigil_perform(
+                7,
+                0,
+                user_args_ptr,
+                2,
+                0xCC as *mut u8,
+                0xDD as *mut u8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let _ = sigil_run_loop(ns, std::ptr::null_mut());
             let _ = sigil_handle_pop();
         }
@@ -3616,7 +3636,16 @@ mod tests {
             let depth_before = counters::read(CounterId::HandlerWalkDepthSum);
             let arg = 4u64;
             let user_args_ptr = &arg as *const u64;
-            let ns = sigil_perform(100, 0, user_args_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                100,
+                0,
+                user_args_ptr,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let depth_after = counters::read(CounterId::HandlerWalkDepthSum);
             assert_eq!(
                 depth_after - depth_before,
@@ -3668,6 +3697,8 @@ mod tests {
                 MAX_HANDLER_ARMS - 1,
                 arg_ptr,
                 1,
+                ptr::null_mut(),
+                ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
@@ -3776,7 +3807,16 @@ mod tests {
             // perform succeeds iff the frame is still reachable.
             let arg = 9u64;
             let arg_ptr = &arg as *const u64;
-            let ns = sigil_perform(4242, 0, arg_ptr, 1, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                4242,
+                0,
+                arg_ptr,
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, 900);
             let _ = sigil_handle_pop();
@@ -3836,7 +3876,16 @@ mod tests {
             // Dispatch through the arm. The trampoline invokes
             // arm_read_closure_sentinel with closure_ptr = the original
             // closure; it reads the sentinel and returns it.
-            let ns = sigil_perform(7777, 0, ptr::null(), 0, ptr::null_mut(), ptr::null_mut());
+            let ns = sigil_perform(
+                7777,
+                0,
+                ptr::null(),
+                0,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
             let result = sigil_run_loop(ns, std::ptr::null_mut());
             assert_eq!(result, STRESS_CLOSURE_SENTINEL);
             let _ = sigil_handle_pop();
