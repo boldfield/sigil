@@ -4,8 +4,19 @@
 
 This document pins the Cranelift API surface Plan E2 (precise GC +
 real stack-maps) will use. The repro lives at
-`compiler/examples/cranelift_stackmap_spike.rs`; running it emits one
-real stack-map entry from a synthetic two-instruction IR snippet.
+`compiler/tests/cranelift_stackmap_spike.rs` and runs on every push
+via `cargo test`. Two tests cover both API paths Phase 1 Task 2 will
+use:
+
+- `value_variant_emits_stackmap_at_call_safepoint` — the single-Value
+  path (one `declare_value_needs_stack_map` + one call safepoint + one
+  expected entry).
+- `var_variant_emits_stackmap_for_phi_confluence` — the Variable
+  path (one `declare_var_needs_stack_map` + two `def_var`s in
+  separate predecessor blocks + one `use_var` past the safepoint in
+  the join block). This is the canonical phi-confluence shape the
+  Task 2 sweep will need; per-Value flagging at each phi input edge
+  is fragile, the Variable variant is not.
 
 ## Plan E2 hypothesis vs reality
 
@@ -104,7 +115,15 @@ for (pc_off_in_fn, frame_size_bytes, sm) in maps {
 `code.buffer` is a `MachBufferFinalized`. `user_stack_maps()` returns
 a borrow; `take_user_stack_maps()` moves the data out if you need to
 hold it past the compile boundary (Phase 1 Task 4 will move; the
-section writer owns the data).
+section writer owns the data). Ownership note for Task 4:
+`take_user_stack_maps` takes `&mut self` on the buffer, which means
+the section writer must grab the data before anything else borrows
+the buffer immutably (e.g. before `buffer.data()` is called for the
+relocations/byte emission). Sigil's existing `ObjectModule::
+define_function_with_control_plane` call sequence reads
+`ctx.compiled_code().unwrap().buffer` immutably for `relocs()` and
+`data()`; Task 4 should take the stack maps before that step (or
+clone the borrow), not after.
 
 Within Sigil's `ObjectModule` integration, the offset is *within the
 function*. The Task 4 section writer needs to translate this to a
@@ -115,7 +134,16 @@ add the function's section base offset (tracked by `ObjectModule`).
 
 ## The minimal repro
 
-`compiler/examples/cranelift_stackmap_spike.rs` builds the function:
+`compiler/tests/cranelift_stackmap_spike.rs` is an integration test
+exercising both API paths on every push. Run locally with:
+
+```
+cargo test --test cranelift_stackmap_spike -p sigil-compiler
+```
+
+### Value-variant test
+
+Builds the function:
 
 ```text
 fn entry() -> i64:
@@ -129,22 +157,61 @@ index: 1 }`). The call site is the safepoint; `v0` is live across it
 (it's also the return value), and it's flagged as a GC ref, so
 Cranelift spills it.
 
+### Variable-variant test (phi confluence)
+
+Builds the function:
+
+```text
+fn entry(selector: i64) -> i64:
+  entry:
+    brif selector, then, else
+  then:
+    def_var gc_ref, 111
+    jump merge
+  else:
+    def_var gc_ref, 222
+    jump merge
+  merge:
+    live = use_var gc_ref
+    call tickle(live)       ; implicit safepoint
+    return use_var gc_ref
+```
+
+`gc_ref` is a frontend `Variable` declared via
+`declare_var_needs_stack_map`. The two `def_var`s converge at `merge`;
+the safepoint pass propagates needs-stack-map to whichever SSA value
+the frontend chooses as the phi result. One expected entry,
+regardless of which predecessor flowed.
+
 ### Verified output (run 2026-05-11, linux-x86_64, host CallConv)
 
-```
-user stack maps: 1
-  PC offset 0x20 | frame 16 bytes
-    entry: ty=i64, sp+0x0
-```
+Value-variant test passes against `maps.len() == 1`, one entry of
+type `i64`. The first observed run (linux-x86_64, host CallConv) put
+the call site at PC offset `0x20` with a 16-byte frame and the spill
+slot at `sp+0x0`. The test asserts the *structural* shape — entry
+count and type — not the absolute offsets, since spill-slot layout is
+allowed to change across Cranelift updates.
 
-One safepoint, one entry, frame holds exactly the spill slot plus
-stack alignment. This is the minimum proof that:
+Variable-variant test passes against `maps.len() == 1`, one entry of
+type `i64` at the call site in `merge_blk`. The phi result allocated
+by the frontend is whichever SSA value carries `gc_ref` at the safepoint;
+`declare_var_needs_stack_map` flags whichever it picks.
 
-- `declare_value_needs_stack_map` actually causes a spill + map entry.
+Both tests dump the post-`finalize()` IR via `Function::display` when
+the stack-map list is empty — saves a debug session next time the
+spike fails after an upstream Cranelift change.
+
+The combined evidence is the minimum proof that:
+
+- `declare_value_needs_stack_map` and `declare_var_needs_stack_map`
+  both actually cause spills + map entries.
 - The `call` instruction is treated as a safepoint without explicit
   annotation.
 - `code.buffer.user_stack_maps()` returns post-regalloc data with a
   real PC offset, not a placeholder IR-handle.
+- The Variable path handles phi confluence — Phase 1 Task 2 can
+  rely on it for heap-pointer-bearing locals defined in multiple
+  predecessor blocks.
 
 ## Implications for Phase 1's downstream tasks
 
