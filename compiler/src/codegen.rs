@@ -529,6 +529,34 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
 /// expecting I8 — exactly the verifier-error class Stage 6 cleanup's
 /// A.3 commit closed). Panic loudly so the bug surfaces at the
 /// codegen call site rather than as a downstream verifier error.
+/// Plan E2 Phase 1 Task 2b — return true iff the Sigil type `ty`'s codegen
+/// representation is a *heap-managed* pointer (a value that the GC should
+/// trace through). Used to decide whether a loaded value should be flagged
+/// `declare_value_needs_stack_map`.
+///
+/// **Heap-bearing types** — codegen representation is `pointer_ty` AND the
+/// value is a real heap pointer (not a raw scalar i64 that happens to be
+/// the same Cranelift width):
+///   - `Char` (boxed via `sigil_char_box`)
+///   - `String`
+///   - `Fn(_)` (closure pointer)
+///   - `User(_, _)` (record / variant alloc)
+///   - `Tuple(_)` (tuple alloc)
+///   - `Continuation(_)` (continuation closure pointer)
+///
+/// **NOT heap-bearing**:
+///   - `Int` — raw i64 in user code (per PLAN_B "raw i64 within user code,
+///     tag at the C-ABI boundary"); same Cranelift width as a pointer but
+///     not GC-traced.
+///   - `Bool` / `Byte` / `Unit` — narrower Cranelift types, not pointers.
+fn is_heap_pointer_ty(ty: &crate::typecheck::Ty) -> bool {
+    use crate::typecheck::Ty;
+    matches!(
+        ty,
+        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) | Ty::Continuation(_)
+    )
+}
+
 fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
     use crate::typecheck::Ty;
     match ty {
@@ -10770,6 +10798,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count_b2),
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_closure_b2);
                             let ra_fn_b2 = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -10782,6 +10811,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count_b2),
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_fired_b2);
                             let ra_closure_in_cp_b2: i32 = 16 + 8 * total_capture_slots as i32;
                             let ra_fn_in_cp_b2: i32 = ra_closure_in_cp_b2 + 8;
                             let ra_fired_in_cp_b2: i32 = ra_fn_in_cp_b2 + 8;
@@ -10939,6 +10969,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count),
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_closure);
                             let ra_fn = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -10956,6 +10987,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count),
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_fired_ptr);
                             let done_call = lowerer.builder.ins().call(
                                 done_or_dispatch_return_arm_via_args_ref,
                                 &[const_v, ra_closure, ra_fn, ra_fired_ptr],
@@ -11418,6 +11450,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             k_closure_offset(user_arg_count),
                         );
+                        builder.declare_value_needs_stack_map(caller_k_closure);
                         let caller_k_fn = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11450,6 +11483,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
+                        builder.declare_value_needs_stack_map(return_arm_closure_v);
                         let return_arm_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11462,6 +11496,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
+                        builder.declare_value_needs_stack_map(return_arm_fired_v);
                         let ra_closure_in_cp_off: i32 = 16 + 8 * (captures.len() + 2) as i32;
                         let ra_fn_in_cp_off: i32 = ra_closure_in_cp_off + 8;
                         let ra_fired_in_cp_off: i32 = ra_fn_in_cp_off + 8;
@@ -11574,6 +11609,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
+                        builder.declare_value_needs_stack_map(ra_closure_v);
                         let ra_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11586,6 +11622,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
+                        builder.declare_value_needs_stack_map(ra_fired_v);
                         let ra_closure_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_off: i32 = ra_closure_off + 8;
                         let ra_fired_off: i32 = ra_fn_off + 8;
@@ -11608,6 +11645,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         args_ptr,
                         k_closure_offset(user_arg_count),
                     );
+                    builder.declare_value_needs_stack_map(k_closure);
                     let k_fn = builder.ins().load(
                         pointer_ty,
                         MemFlags::trusted(),
@@ -11861,6 +11899,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_closure_offset(user_arg_count),
                             );
+                            lowerer
+                                .builder
+                                .declare_value_needs_stack_map(ra_closure_perform);
                             let ra_fn_perform = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -11873,6 +11914,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fired_offset(user_arg_count),
                             );
+                            lowerer
+                                .builder
+                                .declare_value_needs_stack_map(ra_fired_perform);
                             let perform_call = lowerer.builder.ins().call(
                                 lowerer.perform_ref,
                                 &[
@@ -12843,6 +12887,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     args_ptr,
                     (n_user_args * 8) as i32,
                 );
+                builder.declare_value_needs_stack_map(k_closure_v);
                 let k_fn_v = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -13441,6 +13486,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_closure_offset(n_user_args),
                         );
+                        lowerer
+                            .builder
+                            .declare_value_needs_stack_map(ra_closure_arm);
                         let ra_fn_arm = lowerer.builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -13453,6 +13501,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fired_offset(n_user_args),
                         );
+                        lowerer.builder.declare_value_needs_stack_map(ra_fired_arm);
                         let ra_closure_in_pak_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_in_pak_off: i32 = ra_closure_in_pak_off + 8;
                         let ra_fired_in_pak_off: i32 = ra_fn_in_pak_off + 8;
@@ -15108,6 +15157,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 synth_closure_ptr,
                                 this_ra_closure_off,
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_closure_v);
                             let ra_fn_v = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -15120,6 +15170,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 synth_closure_ptr,
                                 this_ra_fired_off,
                             );
+                            lowerer.builder.declare_value_needs_stack_map(ra_fired_v);
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_v,
@@ -15324,6 +15375,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     synth_cont_args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
+                builder.declare_value_needs_stack_map(post_arm_k_closure);
                 let post_arm_k_fn = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -15380,6 +15432,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             synth_closure_ptr,
                             16,
                         );
+                        builder.declare_value_needs_stack_map(ra_closure);
                         let ra_fn = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -15392,6 +15445,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             synth_closure_ptr,
                             32,
                         );
+                        builder.declare_value_needs_stack_map(ra_fired_ptr);
                         let done_call = builder.ins().call(
                             done_or_dispatch_return_arm_via_args_ref,
                             &[constant_v, ra_closure, ra_fn, ra_fired_ptr],
@@ -16270,6 +16324,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
+                                                lowerer.builder.declare_value_needs_stack_map(
+                                                    caller_k_closure,
+                                                );
                                                 let caller_k_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
                                                     MemFlags::trusted(),
@@ -16488,6 +16545,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
+                                                );
+                                                lowerer.builder.declare_value_needs_stack_map(
+                                                    caller_k_closure,
                                                 );
                                                 let caller_k_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
@@ -18038,6 +18098,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(caller_k_closure);
                                 let caller_k_fn = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -23187,6 +23250,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.closure_ptr,
             k_closure_offset,
         );
+        self.builder.declare_value_needs_stack_map(k_closure);
         let k_fn = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -25206,10 +25270,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .ins()
                     .call(self.builtins.sigil_ref_deref_ref, &[cell]);
                 let raw_i64 = self.builder.inst_results(call)[0];
+                // Plan E2 Phase 1 Task 2b — if the dereffed T is a
+                // heap-bearing Sigil type, flag the i64 result as a GC
+                // ref. Other T (Int, Bool, etc.) are raw scalars.
+                let callee_ty = self.lookup_call_callee_ty(call_span);
+                let is_heap_t = matches!(
+                    &callee_ty,
+                    Some(crate::typecheck::Ty::Fn(sig)) if is_heap_pointer_ty(&sig.ret)
+                );
+                if is_heap_t {
+                    self.builder.declare_value_needs_stack_map(raw_i64);
+                }
                 // Narrow the I64 result back to the source-level T's
                 // Cranelift type. T is recovered from `call_callee_tys`
                 // — the typecheck instantiation pinned T at this site.
-                let target_ty = match self.lookup_call_callee_ty(call_span) {
+                let target_ty = match callee_ty {
                     Some(crate::typecheck::Ty::Fn(sig)) => {
                         cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
                     }
@@ -26062,6 +26137,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// Load the `index`-th env slot from the current fn's closure_ptr.
     /// The load width matches the slot kind; i64 slot words are
     /// truncated on load for sub-word types.
+    ///
+    /// Plan E2 Phase 1 Task 2b — for heap-pointer-bearing slot kinds
+    /// (`Char` boxed, `String`, `Closure`, `User`), flag the loaded
+    /// value as `declare_value_needs_stack_map`. Scalar slot kinds
+    /// (`Int`, `Bool`, `Byte`, `Unit`) are NOT flagged: in sigil's
+    /// untagged user-code representation an `Int` slot holds a raw
+    /// i64 that the precise marker would mis-trace as a heap pointer
+    /// if flagged. Per-kind classification is the source of truth
+    /// here because the slot-kind discriminant is the precise
+    /// type-system signal we have at codegen time.
     fn lower_closure_env_load(&mut self, index: usize, kind: EnvSlotKind) -> Value {
         let offset: i32 = 16 + 8 * index as i32;
         let raw =
@@ -26076,13 +26161,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // Plan C addendum (Char) — boxed Char is pointer-typed; the
             // slot already holds a pointer_ty value, so no narrow.
             EnvSlotKind::Char | EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                if self.pointer_ty == types::I64 {
+                let ptr_val = if self.pointer_ty == types::I64 {
                     raw
                 } else {
                     // Plan A2 targets are 64-bit; the else branch is a
                     // defensive path for hypothetical 32-bit hosts.
                     self.builder.ins().ireduce(self.pointer_ty, raw)
-                }
+                };
+                self.builder.declare_value_needs_stack_map(ptr_val);
+                ptr_val
             }
         }
     }
