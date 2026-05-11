@@ -6,6 +6,25 @@
 # lld installed on the host. CI installs it; headless pods should
 # too (see runtime/README.md). If lld is unavailable, comment out
 # this block.
+#
+# `-C force-frame-pointers=yes` is required by the v2 runtime profile
+# data surface (`runtime/src/profile/unwind.rs`): the SIGPROF /
+# allocation samplers walk the `%rbp` chain to recover stack traces,
+# and Rust's x86_64-linux default `frame-pointer = non-leaf` skips
+# the prologue save for short / leaf-ish functions, which breaks the
+# walker mid-chain. The cranelift-emitted user code already pins
+# frame pointers on via `preserve_frame_pointers = true` at ISA
+# build time (`compiler/src/codegen.rs` around line 7415); this
+# extends the same invariant to the runtime crate, which is linked
+# into every Sigil program and routinely appears on sampled stacks.
+# On aarch64 frame pointers are mandated by AAPCS and forcing the
+# flag is a no-op.
 [target.x86_64-unknown-linux-gnu]
 linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+rustflags = [
+    "-C", "link-arg=-fuse-ld=lld",
+    "-C", "force-frame-pointers=yes",
+]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "force-frame-pointers=yes"]

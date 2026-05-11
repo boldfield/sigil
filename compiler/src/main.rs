@@ -27,7 +27,12 @@ fn main() -> ExitCode {
 }
 
 fn compile(cargs: CompileArgs) -> ExitCode {
-    match pipeline::compile(&cargs.input, &cargs.output, cargs.error_format) {
+    match pipeline::compile(
+        &cargs.input,
+        &cargs.output,
+        cargs.error_format,
+        cargs.emit_symbol_table,
+    ) {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(1),
     }

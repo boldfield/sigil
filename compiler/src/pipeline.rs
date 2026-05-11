@@ -19,12 +19,22 @@ use crate::link;
 use crate::monomorphize;
 use crate::parser;
 use crate::resolve;
+use crate::symtab;
 use crate::typecheck;
 
 /// Compile an input file to an executable at `output`. Returns `Ok` with
 /// the number of non-error diagnostics emitted, or `Err` with the error
 /// count. Diagnostics themselves are emitted to stderr during the call.
-pub fn compile(input: &str, output: &str, format: ErrorFormat) -> Result<usize, usize> {
+///
+/// When `emit_symbol_table` is true, also writes `<output>.symtab` next
+/// to the executable: a sorted, tab-separated mapping from text-section
+/// offsets to demangled function names, consumed by the runtime profiler.
+pub fn compile(
+    input: &str,
+    output: &str,
+    format: ErrorFormat,
+    emit_symbol_table: bool,
+) -> Result<usize, usize> {
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
@@ -79,6 +89,14 @@ pub fn compile(input: &str, output: &str, format: ErrorFormat) -> Result<usize, 
         return Err(1);
     }
     let _ = std::fs::remove_file(&obj_path);
+
+    if emit_symbol_table {
+        let sidecar = PathBuf::from(format!("{output}.symtab"));
+        if let Err(e) = symtab::write_for_binary(std::path::Path::new(output), &sidecar) {
+            eprintln!("sigil: --emit-symbol-table: {e}");
+            return Err(1);
+        }
+    }
 
     emit_errors(&all_errs, format);
     Ok(all_errs.len())

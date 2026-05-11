@@ -26,4 +26,5 @@ pub mod pipeline;
 pub mod resolve;
 pub mod stdlib_embed;
 pub mod stdlib_index;
+pub mod symtab;
 pub mod typecheck;

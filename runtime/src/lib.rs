@@ -74,6 +74,7 @@ pub mod io;
 pub mod mem;
 pub mod panic;
 pub mod process;
+pub mod profile;
 pub mod random;
 pub mod refs;
 pub mod stackmap;
