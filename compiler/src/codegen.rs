@@ -11507,20 +11507,27 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         );
 
                         cp
-                    } else if captures.is_empty() {
-                        // ConstantDone with no captures —
-                        // existing null-for-empty convention.
-                        builder.ins().iconst(pointer_ty, 0)
                     } else {
-                        // ConstantDone with captures (defensive —
-                        // ConstantDone bodies' tail is a literal
-                        // so captures should be empty in
-                        // practice; preserved for forward
-                        // compat).
+                        // ConstantDone synth-cont — always allocate
+                        // (even with empty captures) so the closure
+                        // record can carry `(return_arm_closure,
+                        // return_arm_fn)` at the trailing slots. The
+                        // synth-cont's body Done emit (codegen.rs
+                        // ~15206) loads return_arm from closure_ptr
+                        // and passes it to the args-passing helper.
+                        // Pre-Stage-4 the empty-captures path returned
+                        // a null closure_ptr — the always-alloc here
+                        // is the precondition for flipping site 4
+                        // (ConstantDone synth-cont dispatch) off TLS.
+                        let total_slots = captures.len() + 2;
                         assert!(
-                            captures.len() < MAX_CLOSURE_ENV_SLOTS,
-                            "synth-cont closure env >= {MAX_CLOSURE_ENV_SLOTS} \
-                                 slots exceeds the bitmap layout"
+                            total_slots < MAX_CLOSURE_ENV_SLOTS,
+                            "ConstantDone synth-cont closure env {} \
+                             (= {} captures + 2 return_arm) >= {} exceeds \
+                             the bitmap layout",
+                            total_slots,
+                            captures.len(),
+                            MAX_CLOSURE_ENV_SLOTS
                         );
                         let mut bitmap: u32 = 0;
                         for (i, c) in captures.iter().enumerate() {
@@ -11528,9 +11535,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 bitmap |= 1u32 << (i + 1);
                             }
                         }
-                        let count: u8 = 1 + captures.len() as u8;
+                        // return_arm_closure at slot index
+                        // captures.len(); bit (captures.len() + 1)
+                        // marks it as a GC pointer. return_arm_fn at
+                        // slot captures.len() + 1 (bit captures.len()
+                        // + 2) is a code address — unmarked.
+                        bitmap |= 1u32 << (captures.len() + 1);
+                        let count: u8 = 1 + total_slots as u8;
                         let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
-                        let payload_bytes: i64 = 8 + 8 * captures.len() as i64;
+                        let payload_bytes: i64 = 8 + 8 * total_slots as i64;
 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
@@ -11566,6 +11579,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 .ins()
                                 .store(MemFlags::trusted(), slot_val, cp, offset);
                         }
+                        // Copy return_arm from this body fn's
+                        // args_ptr (Stage 2 wrote it at handle entry)
+                        // into the synth-cont's closure record.
+                        let ra_closure_v = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_closure_offset(user_arg_count),
+                        );
+                        let ra_fn_v = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            return_arm_fn_offset(user_arg_count),
+                        );
+                        let ra_closure_off: i32 = 16 + 8 * captures.len() as i32;
+                        let ra_fn_off: i32 = ra_closure_off + 8;
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), ra_closure_v, cp, ra_closure_off);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), ra_fn_v, cp, ra_fn_off);
                         cp
                     };
                     (k_closure, synth_cont_addr)
@@ -15083,8 +15119,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // emit declares the helper FuncRef directly (this
                 // emit pass uses bespoke FuncRef declarations rather
                 // than `prepare_per_fn_refs`).
-                let done_or_dispatch_return_arm_ref =
+                //
+                // 2026-05-04 return-arm-via-args lift Stage 4 — the
+                // TLS variant is no longer called from this emit
+                // pass; the ConstantDone arm uses
+                // `done_or_dispatch_return_arm_via_args_ref` instead.
+                // The TLS FuncRef declaration is retained as `_` so
+                // the FuncId stays imported into the synth-cont's
+                // module (other emit passes still use the TLS
+                // variant at site 3 — Slice C chain Final Done — and
+                // sharing the FuncId import keeps the linker tables
+                // consistent).
+                let _done_or_dispatch_return_arm_ref =
                     module.declare_func_in_func(done_or_dispatch_return_arm, builder.func);
+                let done_or_dispatch_return_arm_via_args_ref =
+                    module.declare_func_in_func(done_or_dispatch_return_arm_via_args, builder.func);
                 // Plan D Task 112 — Risk 3 protection POP at chain
                 // step body entry (gated on `prior_was_call_cps`).
                 // PUSH at Middle-step CallCps emit uses
@@ -15180,30 +15229,35 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 match &synth.kind {
                     CpsContinuationKind::ConstantDone { constant_value } => {
-                        // ConstantDone shape: synth-cont's body is
-                        // just the parent helper's constant tail
-                        // expression. Pre-Approach-6: dispatch the
-                        // constant through post-arm-k chain via
-                        // emit_dispatch_to_post_arm_k.
-                        //
-                        // Task 78.5 G4 Approach 6 deep-redo: this is
-                        // the simple-yield-then-constant-tail body
-                        // shape's natural-exit emit. Helper wraps via
-                        // active return arm (deep semantic) when set;
-                        // when not set OR already fired, helper falls
-                        // through to Done(constant_v). The trampoline's
-                        // Done branch then pops `outer_post_arm_k_stack`
-                        // (TLS) and routes to the post-arm-k chain
-                        // unwind (equivalent net behavior to the
-                        // pre-Approach-6 dispatch_to_post_arm_k path
-                        // for the BODY_RETURN_ARM-null case, since the
-                        // perform site that allocated this synth-cont
-                        // also pushed its post_arm_k pair onto the TLS
-                        // stack).
+                        // 2026-05-04 return-arm-via-args lift Stage 4 —
+                        // ConstantDone synth-cont natural-exit emit
+                        // flipped off TLS. The ConstantDone synth-cont
+                        // closure record is now always allocated (see
+                        // codegen.rs ~11510 area) so it can carry
+                        // `(return_arm_closure, return_arm_fn)` at
+                        // trailing slots `16` / `24` (ConstantDone
+                        // captures.len() == 0 in practice). Load and
+                        // pass to the args-passing helper variant.
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
-                        let done_call = builder
-                            .ins()
-                            .call(done_or_dispatch_return_arm_ref, &[constant_v]);
+                        // ConstantDone has 0 captures so offsets are
+                        // fixed at 16 (closure) and 24 (fn).
+                        let synth_closure_ptr = block_params[0];
+                        let ra_closure = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            16,
+                        );
+                        let ra_fn = builder.ins().load(
+                            pointer_ty,
+                            MemFlags::trusted(),
+                            synth_closure_ptr,
+                            24,
+                        );
+                        let done_call = builder.ins().call(
+                            done_or_dispatch_return_arm_via_args_ref,
+                            &[constant_v, ra_closure, ra_fn],
+                        );
                         stackmap.push_placeholder(function_code_offset(&builder, done_call));
                         let next_step = builder.inst_results(done_call)[0];
                         builder.ins().return_(&[next_step]);
