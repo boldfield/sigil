@@ -20,7 +20,7 @@ linear reading.
 > **Authoring contract.** This spec is the LLM's only context for
 > Sigil's surface syntax and semantics. Code generated against this
 > spec should compile first try at ≥ 70 % of the validation prompt
-> bank ([`spec/validation-prompts.md`](validation-prompts.md)) and
+> bank ([`spec/validation-prompts.md`](https://github.com/boldfield/sigil/blob/main/spec/validation-prompts.md)) and
 > ≥ 90 % after a single error-feedback edit. If a generated program
 > fails to parse against this spec but works against the actual
 > compiler, that's a spec gap — file an issue.

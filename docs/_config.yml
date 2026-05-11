@@ -14,20 +14,6 @@ exclude:
   - README.md
   - memory-profile.md
 
-# Navigation surfaced on every page (cayman doesn't render nav by
-# default; templates pick it up via site.nav when extended).
-nav:
-  - title: Overview
-    url: /
-  - title: Language spec
-    url: /language/
-  - title: Capabilities
-    url: /capabilities/
-  - title: LLM authorship case
-    url: /for-llms/
-  - title: GitHub
-    url: https://github.com/boldfield/sigil
-
 # GitHub repo for cayman's "View on GitHub" button.
 repository: boldfield/sigil
 github:

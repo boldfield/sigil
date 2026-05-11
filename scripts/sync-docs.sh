@@ -56,9 +56,21 @@ sync_pair() {
 
     local tmp
     tmp="$(mktemp)"
+    # Pipe the canonical content through link-rewrites so the
+    # published copy uses the site's URL hierarchy. Canonical files
+    # live in the repo root / `spec/` and use `./X.md` links between
+    # themselves; the published site serves these under
+    # `/capabilities/`, `/for-llms/`, `/language/`. Files that
+    # aren't published (e.g. `spec/validation-prompts.md`) are
+    # rewritten to absolute GitHub source URLs.
     {
         printf '%s\n\n' "$front"
-        cat "$canonical"
+        sed \
+            -e 's|\](\./CAPABILITIES\.md)|](/capabilities/)|g' \
+            -e 's|\](\./SIGIL_FOR_LLMS\.md)|](/for-llms/)|g' \
+            -e 's|\](\./spec/language\.md)|](/language/)|g' \
+            -e 's|\](validation-prompts\.md)|](https://github.com/boldfield/sigil/blob/main/spec/validation-prompts.md)|g' \
+            "$canonical"
     } > "$tmp"
     mv "$tmp" "$published"
     echo "sync-docs: $canonical -> $published"

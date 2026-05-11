@@ -93,7 +93,7 @@ These aren't "nice to have" — they're the load-bearing structural choices that
 
 ## What the numbers don't say
 
-There are real gaps, documented honestly in [CAPABILITIES.md](./CAPABILITIES.md):
+There are real gaps, documented honestly in [CAPABILITIES.md](/capabilities/):
 
 - **P20 multi-shot Choose**: the hardest single construct. 1 final-pass miss across 1,240 runs.
 - **C12 parse invalid integer**: persistent 0/9 final-pass. Sigil's `Result[Int, ParseError]` API differs enough from `int(s)` that the LLM keeps reaching for the wrong shape.
@@ -141,6 +141,6 @@ PRs #135 through #142 in the last week of 2026-05 each closed a specific frictio
 
 ---
 
-If you want the raw cut: see [CAPABILITIES.md](./CAPABILITIES.md). If you want to challenge a number: every JSONL trace is in the repo. If you want to run your own harness against a different model or language: the scripts are in `comp/scripts/` and `scripts/`.
+If you want the raw cut: see [CAPABILITIES.md](/capabilities/). If you want to challenge a number: every JSONL trace is in the repo. If you want to run your own harness against a different model or language: the scripts are in `comp/scripts/` and `scripts/`.
 
 Sigil isn't trying to be the language humans want most. It's trying to be the language LLMs get right.

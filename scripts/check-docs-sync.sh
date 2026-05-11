@@ -15,17 +15,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# `shasum -a 256` works on both Linux (perl-backed) and macOS (native);
+# `sha256sum` is Linux-only and trips the script for contributors
+# running locally on darwin.
+hash_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+
 # Snapshot the current state of the published files. If sync-docs
 # rewrites them, the snapshots will diverge.
-before_lang="$(sha256sum docs/language.md | awk '{print $1}')"
-before_cap="$(sha256sum docs/capabilities.md | awk '{print $1}')"
-before_llm="$(sha256sum docs/for-llms.md | awk '{print $1}')"
+before_lang="$(hash_file docs/language.md)"
+before_cap="$(hash_file docs/capabilities.md)"
+before_llm="$(hash_file docs/for-llms.md)"
 
 ./scripts/sync-docs.sh > /dev/null
 
-after_lang="$(sha256sum docs/language.md | awk '{print $1}')"
-after_cap="$(sha256sum docs/capabilities.md | awk '{print $1}')"
-after_llm="$(sha256sum docs/for-llms.md | awk '{print $1}')"
+after_lang="$(hash_file docs/language.md)"
+after_cap="$(hash_file docs/capabilities.md)"
+after_llm="$(hash_file docs/for-llms.md)"
 
 drift=0
 [ "$before_lang" != "$after_lang" ] && { echo "check-docs-sync: docs/language.md drifted from spec/language.md"; drift=1; }
