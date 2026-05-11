@@ -24,6 +24,35 @@
 //! - The producer writes `Sample` bytes via an `UnsafeCell` pointer
 //!   *before* publishing the new `head`; the consumer's acquire load
 //!   of `head` establishes the happens-before so it sees the bytes.
+//!
+//! ## SPSC single-producer invariant
+//!
+//! Correctness depends on **exactly one producer** observing each
+//! ring at a time. The current Sigil runtime guarantees this two ways:
+//!
+//! 1. `ITIMER_PROF` delivers `SIGPROF` to one thread at a time per
+//!    process (the kernel chooses; on macOS this is documented as
+//!    "an arbitrary thread"; on Linux glibc, the main thread by
+//!    default unless a thread explicitly enables timer signals via
+//!    `pthread_sigmask`). Either way, a single signal-handler
+//!    invocation is the producer.
+//! 2. `sigil_alloc` is called only from the user program's main
+//!    thread today — Sigil has no user-facing `spawn` primitive.
+//!
+//! If a future plan adds concurrent producers (user thread spawn,
+//! per-thread allocators, multi-threaded SIGPROF delivery), the
+//! current `try_push`'s relaxed-load-of-head + write + release-store
+//! sequence will **race**: two producers can both observe the same
+//! `head`, both write to the same slot index, and corrupt samples.
+//!
+//! The mitigation in this case is to either (a) gate `try_push`
+//! behind a `compare_exchange` reservation on `head` (which loses
+//! the lock-free single-store property and adds ~30 ns), or (b)
+//! switch to per-thread rings so each thread is exclusively the
+//! producer of its own ring. Option (b) is the plan's eventual
+//! design ("per-thread ring buffer" in the original plan text);
+//! v1 ships single global rings because it's strictly simpler and
+//! the invariant holds today.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -79,6 +108,15 @@ impl Ring {
     ///
     /// **Signal-safe.** All atomics are `Relaxed` / `Release`; the
     /// slot write is an in-place byte copy with no allocation.
+    ///
+    /// **Single-producer contract.** Only one thread may invoke
+    /// `try_push` on a given ring at any time. See the module
+    /// header's "SPSC single-producer invariant" section for the
+    /// rationale and the mitigation path if Sigil ever gains
+    /// concurrent producers. The contract is enforced by the
+    /// caller's runtime architecture, not by `Ring` itself — a
+    /// concurrent producer would race the relaxed-load + store
+    /// sequence below.
     pub fn try_push(&self, sample: Sample) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
@@ -89,7 +127,8 @@ impl Ring {
         let idx = head % RING_SIZE;
         // SAFETY: the SPSC invariant guarantees this slot is not
         // being read by the consumer (the consumer reads only at
-        // indices `tail..head`; we're writing at `head`).
+        // indices `tail..head`; we're writing at `head`) and that
+        // no other producer is writing to this same slot index.
         unsafe {
             *self.slots[idx].get() = sample;
         }

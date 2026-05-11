@@ -30,8 +30,8 @@
 use std::path::Path;
 
 use cranelift_object::object;
-use object::read::{File as ObjectFile, Object, ObjectSymbol};
-use object::{BinaryFormat, SymbolKind};
+use object::read::{File as ObjectFile, Object, ObjectSection, ObjectSymbol};
+use object::{BinaryFormat, SectionKind, SymbolKind};
 
 /// One row of the sidecar: a single function symbol with its image-
 /// relative address, code size, and demangled name. Public for unit
@@ -50,12 +50,16 @@ pub struct SymtabEntry {
 /// of kind [`SymbolKind::Text`], demangles each, and writes the sorted
 /// result.
 ///
-/// **Size synthesis on Mach-O.** ELF carries explicit symbol sizes;
-/// Mach-O does not (the `object` crate returns `size() == 0` for most
-/// Mach-O symbols). Rather than discarding those entries (which would
-/// produce an empty sidecar on macOS), we sort by address and
-/// synthesize size as the gap to the next text symbol. The trailing
-/// symbol uses a conservative 4 KiB sentinel.
+/// **Size synthesis on Mach-O.** ELF carries explicit symbol sizes
+/// (`Elf64_Sym.st_size`, populated by the linker); Mach-O's `nlist`
+/// entries have no equivalent field, so the `object` crate returns
+/// `size() == 0` for every Mach-O text symbol. Rather than discarding
+/// those entries (which would produce an empty sidecar on macOS), we
+/// sort by address and synthesize size as the gap to the next text
+/// symbol. The trailing symbol uses `text_section_end - address` so
+/// the final function gets a precise bound rather than a fixed
+/// sentinel — falls back to a conservative 4 KiB if the binary has
+/// no recognisable text section.
 ///
 /// **Mach-O underscore prefix.** C-style external symbols on Mach-O
 /// pick up a leading `_` (Apple's traditional convention). We strip it
@@ -96,9 +100,22 @@ pub fn write_for_binary(binary_path: &Path, sidecar_path: &Path) -> Result<usize
     // output on ties).
     raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
 
-    // Second pass: fill in zero sizes from the gap to the next entry.
-    // Trailing entry gets a conservative 4 KiB sentinel.
+    // Resolve the trailing-bound for size synthesis: the highest
+    // text-section end-address we can find. Sigil binaries typically
+    // ship a single `.text` (ELF) or `__TEXT,__text` (Mach-O); if
+    // multiple text sections exist, take the maximum end so any
+    // trailing symbol's synthesised size still covers its actual
+    // function body. Fallback to a 4 KiB sentinel if no text section
+    // is identifiable (heavily stripped binary).
     const TRAILING_SIZE_SENTINEL: u64 = 4096;
+    let text_end: u64 = obj
+        .sections()
+        .filter(|s| s.kind() == SectionKind::Text)
+        .map(|s| s.address().saturating_add(s.size()))
+        .max()
+        .unwrap_or(0);
+
+    // Second pass: fill in zero sizes from the gap to the next entry.
     let mut entries: Vec<SymtabEntry> = Vec::with_capacity(raw.len());
     for i in 0..raw.len() {
         let (addr, size, name) = (raw[i].0, raw[i].1, raw[i].2.clone());
@@ -106,6 +123,8 @@ pub fn write_for_binary(binary_path: &Path, sidecar_path: &Path) -> Result<usize
             size
         } else if let Some(next) = raw.iter().skip(i + 1).find(|n| n.0 > addr) {
             next.0 - addr
+        } else if text_end > addr {
+            text_end - addr
         } else {
             TRAILING_SIZE_SENTINEL
         };
@@ -175,6 +194,30 @@ mod tests {
         // codegen::mangle_user_fn rewrites `$lambda_3` → `sigil_user___lambda_3`
         // (because `$` → `__`). The inverse restores `$`.
         assert_eq!(demangle("sigil_user___lambda_3"), "$lambda_3");
+    }
+
+    /// Audit for the PR #148 review's item #6 — demangler vs. stdlib
+    /// namespacing. The lexer (`compiler/src/lexer.rs:127`) admits
+    /// only `[a-zA-Z_][a-zA-Z0-9_]*` for identifiers, so a Sigil
+    /// source fn name can never contain `.`. After monomorphization
+    /// the mono-cloned fn carries a `$$<canon_ty>` suffix (e.g.
+    /// `map$$Int`); after `codegen::mangle_user_fn` that becomes
+    /// `sigil_user_map____Int`. This test pins the round-trip so a
+    /// future change to either mangler stays honest.
+    #[test]
+    fn demangle_round_trips_monomorphized_generic_user_fn() {
+        // `map` instantiated at `Int` -> mono name `map$$Int`.
+        // mangle_user_fn replaces every `$` with `__` so the symbol
+        // gets four underscores between `map` and `Int`.
+        assert_eq!(demangle("sigil_user_map____Int"), "map$$Int");
+
+        // Multi-arg generic: `Tuple$Int$Bool` -> three `$$` pairs
+        // after canon_ty + mangle.
+        assert_eq!(
+            demangle("sigil_user_pair____Tuple__Int__Bool"),
+            "pair$$Tuple$Int$Bool",
+            "monomorphized generic with tuple type-arg must round-trip"
+        );
     }
 
     #[test]

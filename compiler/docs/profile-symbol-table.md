@@ -147,6 +147,50 @@ Matches the link step's existing reproducibility commitments (`TZ=UTC`,
 `SOURCE_DATE_EPOCH=0`, `--build-id=none` on Linux, `-reproducible` on
 macOS — see `link.rs`).
 
+### Mach-O size semantics
+
+ELF carries explicit symbol sizes via `Elf64_Sym.st_size`, populated by
+the linker from `.size` directives or function-end labels. The
+`object` crate exposes these directly through `ObjectSymbol::size()`.
+
+Mach-O is different. The `nlist` entry that backs a Mach-O symbol has
+no size field — only an address (`n_value`). Tooling that wants a
+size has to either:
+
+- compute it from the gap to the next symbol in the same section, or
+- read a separate `LC_FUNCTION_STARTS` load command (a compact
+  per-function-start-address list, also without sizes), or
+- parse DWARF (only present in unstripped binaries).
+
+For v2's profile-data needs, the gap-to-next approach is sufficient.
+The Phase 1 writer collects every text symbol, sorts by address, and
+synthesises `size = next.address - this.address` for any entry whose
+`object::ObjectSymbol::size()` reports zero. The trailing symbol uses
+the text-section end (`text_section.address() + text_section.size()`)
+as its upper bound, with a 4 KiB conservative sentinel if no text
+section is identifiable.
+
+The synthesis is unconditional — ELF runs it too, but on ELF every
+entry already has a non-zero `size()` from the linker so the
+`if size > 0 { size } else { ... }` arm always picks the linker-
+populated value. The fallthrough only fires for Mach-O.
+
+### Mach-O underscore prefix
+
+Apple's traditional C-extern symbol convention prepends a leading `_`
+to every external C symbol on Mach-O: `void foo()` in a C source
+becomes `_foo` in the linked binary's symbol table. Rust's
+`#[no_mangle] pub extern "C" fn foo()` follows the same convention on
+`*-apple-darwin` targets.
+
+The Phase 1 writer detects the binary format via
+`obj.format() == BinaryFormat::MachO` and strips the leading `_` from
+each symbol name *before* invoking the demangler. So
+`_sigil_user_main` on macOS resolves to `main` the same way
+`sigil_user_main` on ELF does, and the sidecar's `<demangled_name>`
+column is platform-independent (the profile renderers consume it
+without needing to know the build host).
+
 ### Dependencies
 
 No new crate dependencies. The `object` crate is already a transitive
