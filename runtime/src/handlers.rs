@@ -4213,6 +4213,11 @@ mod tests {
     /// Companion to the helper-level test — exercise `sigil_io_println_arm`
     /// directly with a real heap-string and verify the dispatched
     /// `NextStep::Call` matches the 3-slot Slice A convention.
+    ///
+    /// 2026-05-04 return-arm-via-args lift Stage 3b — `sigil_perform`
+    /// now packs `args_len = N + 4` (4 trailing slots: k_pair +
+    /// return_arm_pair). For IO.println: 1 user arg + 4 trailing = 5.
+    /// The arm doesn't consume the return_arm pair; it's read past.
     #[test]
     fn io_println_arm_emits_three_slot_trailing_pair() {
         let _guard = crate::test_support::gc_test_lock();
@@ -4227,12 +4232,14 @@ mod tests {
             // SAFETY: gc-heap-ptr arithmetic (transient byte-pointer into a static UTF-8 source slice).
             let s = crate::gc::sigil_string_new(b"x".as_ptr(), 1);
             // Build the in_args buffer the trampoline would pass to
-            // the arm: `[heap_string_ptr, k_closure, k_fn]`. We use
+            // the arm: `[heap_string_ptr, k_closure, k_fn,
+            // return_arm_closure, return_arm_fn]`. We use
             // distinguishable sentinel values for the k pair so the
-            // arm's read of slots 1/2 is observable.
-            let in_args: [u64; 3] = [s as u64, 0xC10C_u64, 0xF00F_u64];
-            // SAFETY: gc-heap-ptr arithmetic (transient stack-buffer address handed to the arm for the call duration; args_len=3 matches the local array).
-            let ns = sigil_io_println_arm(ptr::null(), in_args.as_ptr(), 3, std::ptr::null_mut());
+            // arm's read of slots 1/2 is observable. Return-arm slots
+            // 3/4 stay null (no active handle exercising this path).
+            let in_args: [u64; 5] = [s as u64, 0xC10C_u64, 0xF00F_u64, 0u64, 0u64];
+            // SAFETY: gc-heap-ptr arithmetic (transient stack-buffer address handed to the arm for the call duration; args_len=5 matches the local array per Stage 3b).
+            let ns = sigil_io_println_arm(ptr::null(), in_args.as_ptr(), 5, std::ptr::null_mut());
             assert_eq!((*ns).tag, NEXT_STEP_TAG_CALL);
             assert_eq!(
                 (*ns).arg_count,
