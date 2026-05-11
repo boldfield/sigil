@@ -553,11 +553,11 @@ dependencies = [
 
 [[package]]
 name = "sigil-abi"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "sigil-compiler"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "cranelift",
  "cranelift-module",
@@ -572,11 +572,11 @@ dependencies = [
 
 [[package]]
 name = "sigil-header-constants"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "sigil-runtime"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "sigil-abi",
  "sigil-header-constants",
