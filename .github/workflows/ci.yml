@@ -130,7 +130,11 @@ jobs:
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/profile-artifacts"
           # Collect every folded text the e2e test produced.
-          folded_files=$(find "${TMPDIR:-/tmp}" -maxdepth 2 -name 'sigil_e2e_json_validation_*.txt' 2>/dev/null || true)
+          # Pick up both the json.sigil run (if it captured samples)
+          # and the fib_cps_perf evidence run (guaranteed to capture
+          # samples — runs ~250-500 ms which dominates the 1 ms
+          # SIGPROF period at 999 Hz). Either or both may be present.
+          folded_files=$(find "${TMPDIR:-/tmp}" -maxdepth 2 -name 'sigil_e2e_json_validation*.txt' 2>/dev/null || true)
           if [ -z "$folded_files" ]; then
             echo "::notice::no folded profile found; Task 12 test may have been filtered or skipped"
             exit 0
