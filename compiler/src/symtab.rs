@@ -31,7 +31,7 @@ use std::path::Path;
 
 use cranelift_object::object;
 use object::read::{File as ObjectFile, Object, ObjectSymbol};
-use object::SymbolKind;
+use object::{BinaryFormat, SymbolKind};
 
 /// One row of the sidecar: a single function symbol with its image-
 /// relative address, code size, and demangled name. Public for unit
@@ -47,8 +47,20 @@ pub struct SymtabEntry {
 /// `binary_path`. The sidecar path is `<output>.symtab`.
 ///
 /// Reads the binary back from disk, walks its symbol table for entries
-/// of kind [`SymbolKind::Text`] with non-zero size, demangles each, and
-/// writes the sorted result.
+/// of kind [`SymbolKind::Text`], demangles each, and writes the sorted
+/// result.
+///
+/// **Size synthesis on Mach-O.** ELF carries explicit symbol sizes;
+/// Mach-O does not (the `object` crate returns `size() == 0` for most
+/// Mach-O symbols). Rather than discarding those entries (which would
+/// produce an empty sidecar on macOS), we sort by address and
+/// synthesize size as the gap to the next text symbol. The trailing
+/// symbol uses a conservative 4 KiB sentinel.
+///
+/// **Mach-O underscore prefix.** C-style external symbols on Mach-O
+/// pick up a leading `_` (Apple's traditional convention). We strip it
+/// before demangling so `_sigil_user_main` resolves to `main` on macOS
+/// the same way `sigil_user_main` does on ELF.
 ///
 /// Returns the number of entries written on success.
 pub fn write_for_binary(binary_path: &Path, sidecar_path: &Path) -> Result<usize, String> {
@@ -57,28 +69,55 @@ pub fn write_for_binary(binary_path: &Path, sidecar_path: &Path) -> Result<usize
     let obj = ObjectFile::parse(&bytes[..])
         .map_err(|e| format!("parse {}: {e}", binary_path.display()))?;
 
-    let mut entries: Vec<SymtabEntry> = Vec::new();
+    let is_macho = obj.format() == BinaryFormat::MachO;
+
+    // First pass: collect every text symbol with a name, regardless of
+    // whether the reader reports a size.
+    let mut raw: Vec<(u64, u64, String)> = Vec::new();
     for sym in obj.symbols() {
         if sym.kind() != SymbolKind::Text {
-            continue;
-        }
-        if sym.size() == 0 {
             continue;
         }
         let raw_name = match sym.name() {
             Ok(n) if !n.is_empty() => n,
             _ => continue,
         };
-        entries.push(SymtabEntry {
-            address: sym.address(),
-            size: sym.size(),
-            name: demangle(raw_name),
-        });
+        // Mach-O: strip the leading underscore that `cc` prepends to
+        // every C-extern name.
+        let stripped = if is_macho {
+            raw_name.strip_prefix('_').unwrap_or(raw_name)
+        } else {
+            raw_name
+        };
+        raw.push((sym.address(), sym.size(), demangle(stripped)));
     }
 
-    // Sort by address ascending, then by name as a stable tiebreaker so
-    // the output is byte-deterministic.
-    entries.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.name.cmp(&b.name)));
+    // Sort by address ascending (secondary by name for byte-stable
+    // output on ties).
+    raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+
+    // Second pass: fill in zero sizes from the gap to the next entry.
+    // Trailing entry gets a conservative 4 KiB sentinel.
+    const TRAILING_SIZE_SENTINEL: u64 = 4096;
+    let mut entries: Vec<SymtabEntry> = Vec::with_capacity(raw.len());
+    for i in 0..raw.len() {
+        let (addr, size, name) = (raw[i].0, raw[i].1, raw[i].2.clone());
+        let final_size = if size > 0 {
+            size
+        } else if let Some(next) = raw.iter().skip(i + 1).find(|n| n.0 > addr) {
+            next.0 - addr
+        } else {
+            TRAILING_SIZE_SENTINEL
+        };
+        if final_size == 0 {
+            continue;
+        }
+        entries.push(SymtabEntry {
+            address: addr,
+            size: final_size,
+            name,
+        });
+    }
 
     let rendered = render(&entries);
     std::fs::write(sidecar_path, rendered)
@@ -192,6 +231,20 @@ mod tests {
         assert!(
             out.starts_with("0000000000abcdef\t0000000000000010\tx\n"),
             "got {out:?}"
+        );
+    }
+
+    #[test]
+    fn demangle_user_main_with_macho_leading_underscore_handled_by_caller() {
+        // The size-synthesis writer strips the Mach-O leading `_`
+        // BEFORE calling demangle; demangle itself doesn't touch the
+        // prefix. This test pins that contract: passing `_sigil_user_main`
+        // directly into demangle yields `_sigil_user_main` (no strip),
+        // not `main`.
+        assert_eq!(
+            demangle("_sigil_user_main"),
+            "_sigil_user_main",
+            "demangle must not strip the Mach-O `_` itself; that's the writer's job"
         );
     }
 
