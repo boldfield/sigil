@@ -529,6 +529,86 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
 /// expecting I8 — exactly the verifier-error class Stage 6 cleanup's
 /// A.3 commit closed). Panic loudly so the bug surfaces at the
 /// codegen call site rather than as a downstream verifier error.
+/// Plan E2 Phase 1 Task 2b — flag any pointer-typed block-param at the
+/// given block whose corresponding Sigil type (`sigil_tys[i]`) is
+/// heap-bearing. Use at fn-entry sites where the entry block's params
+/// reflect the function's user-arg list and we want the heap-pointer
+/// args rooted in the callee's frame so that Plan E2 Phase 3's precise
+/// stack-root walker treats them as live across any non-tail call inside
+/// the body.
+///
+/// The user's Sigil types are mapped onto the entry block's pointer-typed
+/// params *positionally* — caller is responsible for passing the slice
+/// in the same order the corresponding block-params appear (taking ABI
+/// shape into account: the caller knows which entry-block-params are
+/// `null_closure` / `terminal_out` infrastructure vs user args, and
+/// passes only the user-arg Sigil types here).
+///
+/// Soundness: Task 3's audit (PR #157) confirmed Cranelift's tail-call
+/// IR (`return_call` / `return_call_indirect`) is NOT a safepoint;
+/// heap-pointer args transferred across a tail call become roots in the
+/// callee's frame *only if* flagged here. Without this flagging, Phase 3
+/// loses precise tracking of those values once Boehm's conservative
+/// stack scan goes away.
+fn flag_heap_pointer_user_args(
+    builder: &mut FunctionBuilder<'_>,
+    entry_block: cranelift::codegen::ir::Block,
+    base_offset: usize,
+    is_heap_per_arg: &[bool],
+) {
+    let block_params = builder.block_params(entry_block).to_vec();
+    for (i, &is_heap) in is_heap_per_arg.iter().enumerate() {
+        if !is_heap {
+            continue;
+        }
+        let bp_idx = base_offset + i;
+        if bp_idx >= block_params.len() {
+            continue;
+        }
+        builder.declare_value_needs_stack_map(block_params[bp_idx]);
+    }
+}
+
+/// Plan E2 Phase 1 Task 2b — TypeExpr-level heap-bearing predicate
+/// (companion to `is_heap_pointer_ty` on `Ty`). Used at call sites
+/// where the AST `TypeExpr` is in scope but the resolved typecheck
+/// `Ty` isn't readily available. Mirrors `cranelift_ty_for_type_expr`'s
+/// head_name dispatch but inverted: returns `false` only for the named
+/// scalar types whose codegen representation is a sub-pointer-width
+/// scalar (`Int`, `Bool`, `Byte`, `Unit`); everything else (`Char`,
+/// `String`, `Fn`-shaped, user-defined type names) is heap-bearing.
+fn is_heap_pointer_type_expr(te: &TypeExpr) -> bool {
+    !matches!(te.head_name(), "Int" | "Bool" | "Byte" | "Unit")
+}
+
+/// Plan E2 Phase 1 Task 2b — return true iff the Sigil type `ty`'s codegen
+/// representation is a *heap-managed* pointer (a value that the GC should
+/// trace through). Used to decide whether a loaded value should be flagged
+/// `declare_value_needs_stack_map`.
+///
+/// **Heap-bearing types** — codegen representation is `pointer_ty` AND the
+/// value is a real heap pointer (not a raw scalar i64 that happens to be
+/// the same Cranelift width):
+///   - `Char` (boxed via `sigil_char_box`)
+///   - `String`
+///   - `Fn(_)` (closure pointer)
+///   - `User(_, _)` (record / variant alloc)
+///   - `Tuple(_)` (tuple alloc)
+///   - `Continuation(_)` (continuation closure pointer)
+///
+/// **NOT heap-bearing**:
+///   - `Int` — raw i64 in user code (per PLAN_B "raw i64 within user code,
+///     tag at the C-ABI boundary"); same Cranelift width as a pointer but
+///     not GC-traced.
+///   - `Bool` / `Byte` / `Unit` — narrower Cranelift types, not pointers.
+fn is_heap_pointer_ty(ty: &crate::typecheck::Ty) -> bool {
+    use crate::typecheck::Ty;
+    matches!(
+        ty,
+        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) | Ty::Continuation(_)
+    )
+}
+
 fn cranelift_ty_of_ty(ty: &crate::typecheck::Ty, pointer_ty: Type) -> Type {
     use crate::typecheck::Ty;
     match ty {
@@ -10014,6 +10094,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.switch_to_block(block);
             builder.seal_block(block);
 
+            // Plan E2 Phase 1 Task 2b cat 3 — flag heap-bearing user-arg
+            // block-params at fn-entry. For Sync ABI the entry block-params
+            // are `[null_closure, *user_args, terminal_out]`; user args
+            // start at index 1. For Cps ABI the entry block-params are
+            // `[closure_ptr, args_ptr, k_closure, k_fn]` — user args are
+            // not in block-params at all (they're loaded from args_ptr
+            // by the body), so this flagging is a no-op there. The
+            // user-fn-entry-params flagging is load-bearing for Task 3's
+            // soundness contract — without it, heap pointers passed
+            // across `return_call` / `return_call_indirect` lose precise
+            // tracking once Phase 3 drops the conservative stack scan.
+            if entry.abi == UserFnAbi::Sync {
+                let is_heap_per_arg: Vec<bool> = f
+                    .params
+                    .iter()
+                    .map(|p| is_heap_pointer_type_expr(&p.ty))
+                    .collect();
+                flag_heap_pointer_user_args(&mut builder, block, 1, &is_heap_per_arg);
+            }
+
             // Plan B Task 55, Phase 4e — per-fn FuncRefs + DataRefs +
             // side-table reflections. See `prepare_per_fn_refs` for
             // the layout. Some refs (`next_step_call_ref`,
@@ -10239,6 +10339,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // 4-positional Cps signature shape.
                     assert_cps_arity(&block_params, &format!("Phase B.2 Cps fn `{}`", f.name));
                     let closure_ptr = block_params[0];
+                    builder.declare_value_needs_stack_map(closure_ptr);
                     let args_ptr = block_params[1];
                     // block_params[2] = args_len (statically known
                     // from `f.params.len()`; same redundancy as the
@@ -10406,6 +10507,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let scrut_ty = lowerer.lookup_match_scrut_ty(&match_span);
                     let cont = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(cont, pointer_ty);
+                    // Plan E2 Phase 1 Task 2b cat 3 — every arm produces
+                    // a `*mut NextStep` (heap pointer) that flows through
+                    // this cont param. Always heap-bearing; flag.
+                    let cont_ns_ptr = lowerer.builder.block_params(cont)[0];
+                    lowerer.builder.declare_value_needs_stack_map(cont_ns_ptr);
 
                     // Phase 5 — per-arm dispatch. For each arm,
                     // emit pattern tests (jumping to `next` on miss),
@@ -10680,18 +10786,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                            let alloc_call = lowerer
-                                .builder
-                                .ins()
-                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                alloc_call,
-                            ));
-                            let closure_record = lowerer.builder.inst_results(alloc_call)[0];
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(closure_record);
+                            let closure_record = lower_alloc_call(
+                                &mut lowerer.builder,
+                                lowerer.stackmap,
+                                lowerer.builtins.alloc_ref,
+                                &[header_v, payload_v],
+                            );
 
                             // Null code_ptr at +8.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -10770,9 +10870,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // Stage 5 extension: also copy fired_ptr at
                             // the third trailing slot.
                             let body_user_arg_count_b2 = f.params.len();
-                            let ra_closure_b2 = lowerer.builder.ins().load(
+                            let ra_closure_b2 = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count_b2),
                             );
@@ -10782,9 +10882,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fn_offset(body_user_arg_count_b2),
                             );
-                            let ra_fired_b2 = lowerer.builder.ins().load(
+                            let ra_fired_b2 = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count_b2),
                             );
@@ -10939,9 +11039,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // TLS top's `fired` flag for chain-unwind
                             // short-circuit (Stage 4 will retire that).
                             let body_user_arg_count = f.params.len();
-                            let ra_closure = lowerer.builder.ins().load(
+                            let ra_closure = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count),
                             );
@@ -10956,9 +11056,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // slot (handle entry allocated the cell + stored
                             // its address). Helper gates dispatch on
                             // `*fired_ptr` instead of TLS.
-                            let ra_fired_ptr = lowerer.builder.ins().load(
+                            let ra_fired_ptr = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count),
                             );
@@ -11166,6 +11266,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 // block_params[2] = args_len; per `cps_signature`'s
                 // convention, this is the user-arg count packed
@@ -11372,10 +11473,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
-                        stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
-                        let cp = builder.inst_results(alloc_call)[0];
-                        builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            &mut stackmap,
+                            alloc_ref,
+                            &[header_v, payload_v],
+                        );
 
                         // Null code_ptr at offset 8.
                         let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -11416,9 +11519,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // trailing slots at the user-arg-count-
                         // shifted offsets (the same slots
                         // tail-perform wrappers read).
-                        let caller_k_closure = builder.ins().load(
+                        let caller_k_closure = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             k_closure_offset(user_arg_count),
                         );
@@ -11448,9 +11551,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         //
                         // Stage 5 extension: also copy fired_ptr from
                         // args_ptr's third trailing slot.
-                        let return_arm_closure_v = builder.ins().load(
+                        let return_arm_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
@@ -11460,9 +11563,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
-                        let return_arm_fired_v = builder.ins().load(
+                        let return_arm_fired_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
@@ -11535,10 +11638,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let alloc_call = builder.ins().call(alloc_ref, &[header_v, payload_v]);
-                        stackmap.push_placeholder(function_code_offset(&builder, alloc_call));
-                        let cp = builder.inst_results(alloc_call)[0];
-                        builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            &mut stackmap,
+                            alloc_ref,
+                            &[header_v, payload_v],
+                        );
 
                         let null_v = builder.ins().iconst(pointer_ty, 0);
                         builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
@@ -11570,9 +11675,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // Copy return_arm + fired_ptr from this body
                         // fn's args_ptr into the synth-cont's closure
                         // record.
-                        let ra_closure_v = builder.ins().load(
+                        let ra_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
@@ -11582,9 +11687,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
-                        let ra_fired_v = builder.ins().load(
+                        let ra_fired_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
@@ -11604,9 +11709,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     };
                     (k_closure, synth_cont_addr)
                 } else {
-                    let k_closure = builder.ins().load(
+                    let k_closure = lower_heap_pointer_load(
+                        &mut builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         k_closure_offset(user_arg_count),
                     );
@@ -11857,9 +11962,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // in the user-fn body emit setup);
                             // `lowerer.perform_ref` shadows it but
                             // they're the same FuncRef.
-                            let ra_closure_perform = lowerer.builder.ins().load(
+                            let ra_closure_perform = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(user_arg_count),
                             );
@@ -11869,9 +11974,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 args_ptr,
                                 return_arm_fn_offset(user_arg_count),
                             );
-                            let ra_fired_perform = lowerer.builder.ins().load(
+                            let ra_fired_perform = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(user_arg_count),
                             );
@@ -12111,6 +12216,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 f.params.len() + 2,
             );
             let closure_ptr = block_params[0];
+            builder.declare_value_needs_stack_map(closure_ptr);
             let mut env = BTreeMap::new();
             for (i, p) in f.params.iter().enumerate() {
                 env.insert(p.name.clone(), block_params[i + 1]);
@@ -12779,6 +12885,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, "synth-arm-fn");
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 let _args_len = block_params[2];
                 let terminal_out = block_params[3];
@@ -12839,9 +12946,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // args to `sigil_next_step_call` when the arm body's
                 // tail expression is `k(arg)`.
                 let n_user_args = synth.arg_names.len();
-                let k_closure_v = builder.ins().load(
+                let k_closure_v = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     args_ptr,
                     (n_user_args * 8) as i32,
                 );
@@ -13064,17 +13171,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
                     let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                    let alloc_call = lowerer
-                        .builder
-                        .ins()
-                        .call(builtins.alloc_ref, &[header_v, payload_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                    let step_0_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                    lowerer
-                        .builder
-                        .declare_value_needs_stack_map(step_0_closure_ptr);
+                    let step_0_closure_ptr = lower_alloc_call(
+                        &mut lowerer.builder,
+                        lowerer.stackmap,
+                        builtins.alloc_ref,
+                        &[header_v, payload_v],
+                    );
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                     lowerer
                         .builder
@@ -13147,9 +13249,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // arm-fn's incoming args_ptr (sigil_perform routed
                     // the active handle's triple there per Stage 3b/5
                     // ABI).
-                    let arm_ra_closure = lowerer.builder.ins().load(
+                    let arm_ra_closure = lower_heap_pointer_load(
+                        &mut lowerer.builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         return_arm_closure_offset(n_user_args),
                     );
@@ -13159,9 +13261,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         args_ptr,
                         return_arm_fn_offset(n_user_args),
                     );
-                    let arm_ra_fired = lowerer.builder.ins().load(
+                    let arm_ra_fired = lower_heap_pointer_load(
+                        &mut lowerer.builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         return_arm_fired_offset(n_user_args),
                     );
@@ -13348,15 +13450,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let payload_bytes: i64 = 8 + 8 * total_slots as i64;
                         let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                         let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                        let alloc_call = lowerer
-                            .builder
-                            .ins()
-                            .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                        lowerer
-                            .stackmap
-                            .push_placeholder(function_code_offset(&lowerer.builder, alloc_call));
-                        let cp = lowerer.builder.inst_results(alloc_call)[0];
-                        lowerer.builder.declare_value_needs_stack_map(cp);
+                        let cp = lower_alloc_call(
+                            &mut lowerer.builder,
+                            lowerer.stackmap,
+                            lowerer.builtins.alloc_ref,
+                            &[header_v, payload_v],
+                        );
                         // Null code_ptr at offset 8.
                         let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                         lowerer
@@ -13445,9 +13544,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // closure record's trailing slots.
                         //
                         // Stage 5 — also load + store fired_ptr.
-                        let ra_closure_arm = lowerer.builder.ins().load(
+                        let ra_closure_arm = lower_heap_pointer_load(
+                            &mut lowerer.builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(n_user_args),
                         );
@@ -13457,9 +13556,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             args_ptr,
                             return_arm_fn_offset(n_user_args),
                         );
-                        let ra_fired_arm = lowerer.builder.ins().load(
+                        let ra_fired_arm = lower_heap_pointer_load(
+                            &mut lowerer.builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(n_user_args),
                         );
@@ -13534,6 +13633,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let normal_block = lowerer.builder.create_block();
                     let merge_block = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(merge_block, pointer_ty);
+                    // Plan E2 Phase 1 Task 2b cat 3 — both branches
+                    // (identity + normal) jump to merge_block carrying
+                    // a NextStep heap pointer. Flag the merge param as
+                    // a GC ref.
+                    let merge_ns_ptr = lowerer.builder.block_params(merge_block)[0];
+                    lowerer.builder.declare_value_needs_stack_map(merge_ns_ptr);
                     lowerer.builder.ins().brif(
                         is_identity_v,
                         identity_block,
@@ -13855,6 +13960,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, "synth-return-arm-fn");
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 let args_len = block_params[2];
                 let terminal_out = block_params[3];
@@ -13925,9 +14031,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env.insert(synth.binding_name.clone(), v_value);
 
                 // Load post_handle_k trailing pair from args_ptr[1..3].
-                let post_handle_k_closure_v = builder.ins().load(
+                let post_handle_k_closure_v = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
@@ -14177,6 +14283,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // (current path, unchanged behaviour).
             {
                 let synth_closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(synth_closure_ptr);
                 for (i, capture) in post_arm_k.captures.iter().enumerate() {
                     let offset: i32 = 16 + 8 * i as i32;
                     let raw = builder.ins().load(
@@ -14231,6 +14338,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             let closure_ptr = block_params[0];
+            builder.declare_value_needs_stack_map(closure_ptr);
             let mut lowerer = Lowerer {
                 builder,
                 stackmap: &mut stackmap,
@@ -14335,9 +14443,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let pak_ra_closure_off: i32 = 16 + 8 * post_arm_k.captures.len() as i32;
             let pak_ra_fn_off: i32 = pak_ra_closure_off + 8;
             let pak_ra_fired_off: i32 = pak_ra_fn_off + 8;
-            let ra_closure_pak = lowerer.builder.ins().load(
+            let ra_closure_pak = lower_heap_pointer_load(
+                &mut lowerer.builder,
                 pointer_ty,
-                MemFlags::trusted(),
                 lowerer.closure_ptr,
                 pak_ra_closure_off,
             );
@@ -14347,9 +14455,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 lowerer.closure_ptr,
                 pak_ra_fn_off,
             );
-            let ra_fired_ptr_pak = lowerer.builder.ins().load(
+            let ra_fired_ptr_pak = lower_heap_pointer_load(
+                &mut lowerer.builder,
                 pointer_ty,
-                MemFlags::trusted(),
                 lowerer.closure_ptr,
                 pak_ra_fired_off,
             );
@@ -14420,6 +14528,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
                     assert_cps_arity(&block_params, "synth-cont body emit");
                     let synth_closure_ptr = block_params[0];
+                    builder.declare_value_needs_stack_map(synth_closure_ptr);
                     let args_ptr = block_params[1];
                     // Plan D Task 111c — block_params[3] = terminal_out.
                     let terminal_out = block_params[3];
@@ -14464,9 +14573,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // nested sigil_run_loop, and use the returned
                     // R-typed value as the binding.
                     let bound_widened = if chain.has_return_arm {
-                        let frame_ptr_v = builder.ins().load(
+                        let frame_ptr_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             frame_ptr_offset,
                         );
@@ -14476,9 +14585,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             frame_ptr_v,
                             sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
                         );
-                        let return_closure_v = builder.ins().load(
+                        let return_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             frame_ptr_v,
                             sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                         );
@@ -14555,11 +14664,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     };
 
                     // Load (k_closure, k_fn) IF Middle (Final doesn't
-                    // need them).
+                    // need them). kc is a heap pointer (closure record);
+                    // kf is a function pointer (not GC-traced).
                     let k_pair = if is_middle {
-                        let kc = builder.ins().load(
+                        let kc = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             16,
                         );
@@ -14804,9 +14914,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     prior_offset_base + 8 * step.prior_bindings.len() as i32;
                                 let ra_fn_off_slc: i32 = ra_closure_off_slc + 8;
                                 let ra_fired_off_slc: i32 = ra_fn_off_slc + 8;
-                                let ra_closure_slc = lowerer.builder.ins().load(
+                                let ra_closure_slc = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     ra_closure_off_slc,
                                 );
@@ -14816,9 +14926,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     ra_fn_off_slc,
                                 );
-                                let ra_fired_ptr_slc = lowerer.builder.ins().load(
+                                let ra_fired_ptr_slc = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     ra_fired_off_slc,
                                 );
@@ -14995,18 +15105,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let payload_bytes: i64 = 8 + 8 * next_capture_count as i64;
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                            let alloc_call = lowerer
-                                .builder
-                                .ins()
-                                .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                alloc_call,
-                            ));
-                            let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(next_closure_ptr);
+                            let next_closure_ptr = lower_alloc_call(
+                                &mut lowerer.builder,
+                                lowerer.stackmap,
+                                lowerer.builtins.alloc_ref,
+                                &[header_v, payload_v],
+                            );
                             // code_ptr at offset 8 = null.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                             lowerer.builder.ins().store(
@@ -15058,10 +15162,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 );
                             }
                             // Plotkin fix — forward-copy frame_ptr.
+                            // frame_ptr is a heap pointer (handler frame),
+                            // so route through lower_heap_pointer_load to
+                            // flag it for the GC if it stays live past a
+                            // safepoint between load and store.
                             if chain.has_return_arm {
-                                let raw = lowerer.builder.ins().load(
+                                let raw = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     frame_ptr_offset,
                                 );
@@ -15118,9 +15226,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 next_prior_offset_base + 8 * prior_count_next as i32;
                             let next_ra_fn_off: i32 = next_ra_closure_off + 8;
                             let next_ra_fired_off: i32 = next_ra_fn_off + 8;
-                            let ra_closure_v = lowerer.builder.ins().load(
+                            let ra_closure_v = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 synth_closure_ptr,
                                 this_ra_closure_off,
                             );
@@ -15130,9 +15238,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 synth_closure_ptr,
                                 this_ra_fn_off,
                             );
-                            let ra_fired_v = lowerer.builder.ins().load(
+                            let ra_fired_v = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 synth_closure_ptr,
                                 this_ra_fired_off,
                             );
@@ -15334,9 +15442,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // a GC sweep, trampoline dispatches into freed
                 // memory.
                 let synth_cont_args_ptr = block_params[1];
-                let post_arm_k_closure = builder.ins().load(
+                let post_arm_k_closure = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     synth_cont_args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
@@ -15390,9 +15498,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // dispatch on `*fired_ptr`.
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
                         let synth_closure_ptr = block_params[0];
-                        let ra_closure = builder.ins().load(
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
+                        let ra_closure = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             16,
                         );
@@ -15402,9 +15511,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             synth_closure_ptr,
                             24,
                         );
-                        let ra_fired_ptr = builder.ins().load(
+                        let ra_fired_ptr = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             32,
                         );
@@ -15460,6 +15569,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         assert_cps_arity(&block_params, "chained-let-bind synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
                         // Plan D Task 111c — block_params[3] = terminal_out.
                         let terminal_out = block_params[3];
 
@@ -15603,6 +15713,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(closure_ptr);
                         let mut lowerer = Lowerer {
                             builder,
                             stackmap: &mut stackmap,
@@ -16280,9 +16391,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                let caller_k_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
@@ -16499,9 +16610,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                let caller_k_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
@@ -16622,18 +16733,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .builder
                                                     .ins()
                                                     .iconst(pointer_ty, branch_payload);
-                                                let balloc = lowerer.builder.ins().call(
+                                                let branch_closure = lower_alloc_call(
+                                                    &mut lowerer.builder,
+                                                    lowerer.stackmap,
                                                     lowerer.builtins.alloc_ref,
                                                     &[bh_v, bp_v],
                                                 );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(&lowerer.builder, balloc),
-                                                );
-                                                let branch_closure =
-                                                    lowerer.builder.inst_results(balloc)[0];
-                                                lowerer
-                                                    .builder
-                                                    .declare_value_needs_stack_map(branch_closure);
 
                                                 // Null code_ptr at +8.
                                                 let null_v =
@@ -16701,9 +16806,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let ck_closure = lowerer.builder.ins().load(
+                                                let ck_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
@@ -17229,9 +17334,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                let caller_k_closure_loaded = lowerer.builder.ins().load(
+                                let caller_k_closure_loaded = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
@@ -17295,6 +17400,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let wrapper_forward_block = lowerer.builder.create_block();
                                 let merge_block = lowerer.builder.create_block();
                                 lowerer.builder.append_block_param(merge_block, pointer_ty);
+                                // Plan E2 Phase 1 Task 2b cat 3 — both
+                                // branches (top-level + wrapper-forward)
+                                // jump to merge_block carrying a heap
+                                // pointer (NextStep / closure). Flag.
+                                let merge_ptr = lowerer.builder.block_params(merge_block)[0];
+                                lowerer.builder.declare_value_needs_stack_map(merge_ptr);
                                 lowerer.builder.ins().brif(
                                     is_caller_identity,
                                     top_level_block,
@@ -17559,18 +17670,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.builder.ins().iconst(types::I64, header as i64);
                                 let payload_v =
                                     lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
-                                let alloc_call = lowerer
-                                    .builder
-                                    .ins()
-                                    .call(lowerer.builtins.alloc_ref, &[header_v, payload_v]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    alloc_call,
-                                ));
-                                let next_closure_ptr = lowerer.builder.inst_results(alloc_call)[0];
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(next_closure_ptr);
+                                let next_closure_ptr = lower_alloc_call(
+                                    &mut lowerer.builder,
+                                    lowerer.stackmap,
+                                    lowerer.builtins.alloc_ref,
+                                    &[header_v, payload_v],
+                                );
 
                                 // Null code_ptr at +8.
                                 let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -17649,9 +17754,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let this_caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let this_caller_k_fn_off: i32 = this_caller_k_closure_off + 8;
-                                let caller_k_closure_loaded = lowerer.builder.ins().load(
+                                let caller_k_closure_loaded = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     this_caller_k_closure_off,
                                 );
@@ -17706,9 +17811,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // branch pops this pushed pair and
                                 // routes Done's value through the outer
                                 // arm's chain.
-                                let outer_post_arm_k_closure = lowerer.builder.ins().load(
+                                let outer_post_arm_k_closure = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
@@ -18060,9 +18165,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let branch_cap_count = captures.len() + prior_bindings.len();
                                 let caller_k_closure_off: i32 = 16 + 8 * branch_cap_count as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                let caller_k_closure = lowerer.builder.ins().load(
+                                let caller_k_closure = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
@@ -18424,6 +18529,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         assert_cps_arity(&block_params, "Final synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
                         // Plan D Task 111c — block_params[3] = terminal_out.
                         let terminal_out = block_params[3];
 
@@ -18547,6 +18653,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(closure_ptr);
                         // 2026-05-04 return-arm-via-args lift Stage 3a —
                         // the B.2 synth-cont's closure record was
                         // extended (CompoundMatchArmPostPerform alloc
@@ -19058,6 +19165,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             block_params.len(),
         );
         let closure_ptr_v = block_params[0];
+        builder.declare_value_needs_stack_map(closure_ptr_v);
         let terminal_out_idx = block_params.len() - 1;
         let terminal_out_v = block_params[terminal_out_idx];
         let user_args: Vec<Value> = block_params[1..terminal_out_idx].to_vec();
@@ -19731,10 +19839,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// when neither source is set — the helper sees null fired_ptr
     /// and emits Done.
     fn load_return_arm_triple(&mut self) -> (Value, Value, Value) {
+        // rc / rfp are heap pointers (closure record + sigil_ref to fired
+        // flag), routed through lower_heap_pointer_load. rf is a function
+        // pointer (not GC-traced) — inline load.
         if let Some((args_ptr, user_arg_count)) = self.body_args_ptr_for_return_arm {
-            let rc = self.builder.ins().load(
+            let rc = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 args_ptr,
                 return_arm_closure_offset(user_arg_count),
             );
@@ -19744,29 +19855,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 args_ptr,
                 return_arm_fn_offset(user_arg_count),
             );
-            let rfp = self.builder.ins().load(
+            let rfp = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 args_ptr,
                 return_arm_fired_offset(user_arg_count),
             );
             (rc, rf, rfp)
         } else if let Some(off) = self.synth_cont_return_arm_closure_off {
-            let rc = self.builder.ins().load(
-                self.pointer_ty,
-                MemFlags::trusted(),
-                self.closure_ptr,
-                off,
-            );
+            let rc =
+                lower_heap_pointer_load(&mut self.builder, self.pointer_ty, self.closure_ptr, off);
             let rf = self.builder.ins().load(
                 self.pointer_ty,
                 MemFlags::trusted(),
                 self.closure_ptr,
                 off + 8,
             );
-            let rfp = self.builder.ins().load(
+            let rfp = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 self.closure_ptr,
                 off + 16,
             );
@@ -20104,9 +20211,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 };
                                 let surrounding_args_ptr =
                                     self.builder.func.dfg.block_params(surrounding_entry)[1];
-                                let forwarded_post_arm_k_closure = self.builder.ins().load(
+                                let forwarded_post_arm_k_closure = lower_heap_pointer_load(
+                                    &mut self.builder,
                                     self.pointer_ty,
-                                    MemFlags::trusted(),
                                     surrounding_args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
@@ -20173,9 +20280,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                         Some(ra_closure_off) => {
                                             let ra_fn_off = ra_closure_off + 8;
                                             let ra_fired_off = ra_fn_off + 8;
-                                            let rc = self.builder.ins().load(
+                                            // rc / rfp are heap pointers;
+                                            // rf is a function pointer.
+                                            let rc = lower_heap_pointer_load(
+                                                &mut self.builder,
                                                 self.pointer_ty,
-                                                MemFlags::trusted(),
                                                 surrounding_closure_ptr,
                                                 ra_closure_off,
                                             );
@@ -20185,9 +20294,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                                 surrounding_closure_ptr,
                                                 ra_fn_off,
                                             );
-                                            let rfp = self.builder.ins().load(
+                                            let rfp = lower_heap_pointer_load(
+                                                &mut self.builder,
                                                 self.pointer_ty,
-                                                MemFlags::trusted(),
                                                 surrounding_closure_ptr,
                                                 ra_fired_off,
                                             );
@@ -20459,8 +20568,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let mut preview: BTreeMap<String, Type> = BTreeMap::new();
         self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
         let result_ty = self.type_of_expr(&arms[0].body, &preview);
+        let result_is_heap =
+            result_ty == self.pointer_ty && self.expr_is_known_heap(&arms[0].body, &preview);
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, result_ty);
+        if result_is_heap {
+            // Plan E2 Phase 1 Task 2b cat 3 — arms[0].body is unambiguously
+            // heap-producing; the merge param carries heap pointers from
+            // every arm. Flag.
+            let cont_v = self.builder.block_params(cont)[0];
+            self.builder.declare_value_needs_stack_map(cont_v);
+        }
 
         let mut chain_terminated = false;
         let mut cont_has_preds = false;
@@ -20931,6 +21049,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let else_blk = self.builder.create_block();
                 let merge = self.builder.create_block();
                 self.builder.append_block_param(merge, pointer_ty);
+                // Plan E2 Phase 1 Task 2b cat 3 — `lower_arm_body_to_next_step`
+                // produces a `*mut NextStep` heap pointer at every recursive
+                // call site. Both branches feed merge through that helper,
+                // so the merge param is unambiguously heap-bearing.
+                let merge_ns = self.builder.block_params(merge)[0];
+                self.builder.declare_value_needs_stack_map(merge_ns);
                 self.builder
                     .ins()
                     .brif(cond_v, then_blk, &[], else_blk, &[]);
@@ -21251,6 +21375,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — every arm's body lowers through
+        // `lower_arm_body_to_next_step` and produces a `*mut NextStep`
+        // heap pointer. The cont merge param is unambiguously heap.
+        let cont_ns = self.builder.block_params(cont)[0];
+        self.builder.declare_value_needs_stack_map(cont_ns);
 
         let mut chain_terminated = false;
         for arm in arms.iter() {
@@ -21743,24 +21872,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::FloatLit(f, _span) => {
                 let bits = f.to_bits() as i64;
                 let raw = self.builder.ins().iconst(types::I64, bits);
-                let call = self.builder.ins().call(self.builtins.float_box_ref, &[raw]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_box_ref;
+                self.lower_alloc_call(callee, &[raw])
             }
             Expr::BoolLit(b, _) => self.builder.ins().iconst(types::I8, if *b { 1 } else { 0 }),
             Expr::CharLit(c, _) => {
                 // Plan C addendum (Char) — boxed Char literal: codepoint
                 // immediate as i64, then sigil_char_box → pointer_ty.
                 let cp = self.builder.ins().iconst(types::I64, *c as i64);
-                let call = self.builder.ins().call(self.builtins.char_box_ref, &[cp]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_box_ref;
+                self.lower_alloc_call(callee, &[cp])
             }
             Expr::UnitLit(_) => self.builder.ins().iconst(types::I8, 0),
             Expr::StringLit(_, span) => self.lower_string_literal(span),
@@ -22468,6 +22589,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let mut preview: BTreeMap<String, Type> = BTreeMap::new();
                     preview.insert(ra.binding.clone(), body_ty);
                     let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
+                    let handler_result_is_heap = handler_overall_ty == self.pointer_ty
+                        && self.expr_is_known_heap(&ra.body, &preview);
 
                     // Three blocks: discharge (skip return arm),
                     // normal (existing return arm dispatch), merge
@@ -22477,6 +22600,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let merge_block = self.builder.create_block();
                     self.builder
                         .append_block_param(merge_block, handler_overall_ty);
+                    if handler_result_is_heap {
+                        // Plan E2 Phase 1 Task 2b cat 3 — handler return-arm
+                        // body unambiguously heap-producing; flag merge param.
+                        let merge_v = self.builder.block_params(merge_block)[0];
+                        self.builder.declare_value_needs_stack_map(merge_v);
+                    }
 
                     // Task 78.5 G4 Approach 6 deep-redo — three-way
                     // branch (fired, discharged, normal). When the
@@ -22777,9 +22906,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         snap,
                         sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
                     );
-                    let return_closure_v = self.builder.ins().load(
+                    let return_closure_v = lower_heap_pointer_load(
+                        &mut self.builder,
                         self.pointer_ty,
-                        MemFlags::trusted(),
                         snap,
                         sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                     );
@@ -22967,12 +23096,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // For no-return-arm, handle's overall type = body's
                 // type B (no return arm to widen / change type).
                 let handler_overall_ty = body_ty;
+                let nra_result_is_heap = handler_overall_ty == self.pointer_ty
+                    && self.expr_is_known_heap(body, &BTreeMap::new());
 
                 let discharge_block_nra = self.builder.create_block();
                 let normal_block_nra = self.builder.create_block();
                 let merge_block_nra = self.builder.create_block();
                 self.builder
                     .append_block_param(merge_block_nra, handler_overall_ty);
+                if nra_result_is_heap {
+                    // Plan E2 Phase 1 Task 2b cat 3 — handle body is
+                    // unambiguously heap-producing; flag merge param.
+                    let merge_v = self.builder.block_params(merge_block_nra)[0];
+                    self.builder.declare_value_needs_stack_map(merge_v);
+                }
                 self.builder.ins().brif(
                     is_discharged,
                     discharge_block_nra,
@@ -23161,14 +23298,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let header_v = self.builder.ins().iconst(types::I64, header as i64);
                 let payload_bytes: i64 = (n as i64) * 8;
                 let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-                let alloc_call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.alloc_ref, &[header_v, size_v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                let ptr = self.builder.inst_results(alloc_call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
+                let callee = self.builtins.alloc_ref;
+                let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
                 for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
                     let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
                         val
@@ -23223,9 +23354,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
         let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
         let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
-        let k_closure = self.builder.ins().load(
+        let k_closure = lower_heap_pointer_load(
+            &mut self.builder,
             self.pointer_ty,
-            MemFlags::trusted(),
             self.closure_ptr,
             k_closure_offset,
         );
@@ -23239,9 +23370,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // third slot. Re-pushed onto the handler stack before driving
         // run_loop so synth-cont chains inside k(arg) can find the
         // originating handler when invoked outside the handle.
-        let frame_ptr_loaded = self.builder.ins().load(
+        let frame_ptr_loaded = lower_heap_pointer_load(
+            &mut self.builder,
             self.pointer_ty,
-            MemFlags::trusted(),
             self.closure_ptr,
             frame_ptr_offset,
         );
@@ -23492,9 +23623,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // with empty outer captures it's null, for non-empty
                 // it's the closure record allocated at handle
                 // codegen time. Both cases unify through this load.
-                let ret_closure = self.builder.ins().load(
+                let ret_closure = lower_heap_pointer_load(
+                    &mut self.builder,
                     self.pointer_ty,
-                    MemFlags::trusted(),
                     frame_ptr_loaded,
                     sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                 );
@@ -23808,14 +23939,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // `return(v) => ...`.
                     let (return_closure, return_fn) =
                         self.source_arm_return_pair_for_continuation_arg();
-                    let alloc_call = self.builder.ins().call(
-                        self.builtins.cont_alloc_ref,
-                        &[k_closure, k_fn, return_closure, return_fn],
-                    );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
-                    self.builder.declare_value_needs_stack_map(cont_ptr);
+
+                    let callee = self.builtins.cont_alloc_ref;
+                    let cont_ptr = self
+                        .lower_alloc_call(callee, &[k_closure, k_fn, return_closure, return_fn]);
                     return cont_ptr;
                 }
             }
@@ -23839,14 +23966,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 if name == arm_k_name {
                     let (return_closure, return_fn) =
                         self.source_arm_return_pair_for_continuation_arg();
-                    let alloc_call = self.builder.ins().call(
-                        self.builtins.cont_alloc_ref,
-                        &[k_closure, k_fn, return_closure, return_fn],
-                    );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, alloc_call));
-                    let cont_ptr = self.builder.inst_results(alloc_call)[0];
-                    self.builder.declare_value_needs_stack_map(cont_ptr);
+
+                    let callee = self.builtins.cont_alloc_ref;
+                    let cont_ptr = self
+                        .lower_alloc_call(callee, &[k_closure, k_fn, return_closure, return_fn]);
                     return cont_ptr;
                 }
             }
@@ -24283,15 +24406,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int_to_string" => {
                 assert_eq!(args.len(), 1, "int_to_string builtin arg count is not 1");
                 let arg_val = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int_to_string_ref, &[arg_val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int_to_string_ref;
+                self.lower_alloc_call(callee, &[arg_val])
             }
             // Plan C Task 65 — runtime Array primitives. Each lowers to
             // a single FFI invocation. `array_alloc` and `array_set`
@@ -24304,24 +24420,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "array_alloc builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.array_alloc_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_alloc_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "array_empty" => {
                 assert_eq!(args.len(), 0, "array_empty builtin arg count is not 0");
-                let call = self.builder.ins().call(self.builtins.array_empty_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_empty_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "array_length" => {
                 assert_eq!(args.len(), 1, "array_length builtin arg count is not 1");
@@ -24347,15 +24452,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let arr = self.lower_expr(&args[0]);
                 let idx = self.lower_expr(&args[1]);
                 let val = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.array_set_ref, &[arr, idx, val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.array_set_ref;
+                self.lower_alloc_call(callee, &[arr, idx, val])
             }
             // Plan C Task 66 — runtime MutArray primitives. Same
             // dispatch shape as Array, except `mut_array_set` returns
@@ -24379,15 +24477,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "mut_array_new builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.mut_array_new_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.mut_array_new_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "mut_array_length" => {
                 assert_eq!(args.len(), 1, "mut_array_length builtin arg count is not 1");
@@ -24432,27 +24523,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "byte_array_alloc builtin arg count is not 2");
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_alloc_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_alloc_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "byte_array_empty" => {
                 assert_eq!(args.len(), 0, "byte_array_empty builtin arg count is not 0");
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_empty_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_empty_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "byte_array_length" => {
                 assert_eq!(
@@ -24485,43 +24562,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_concat_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_concat_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "byte_array_slice" => {
                 assert_eq!(args.len(), 3, "byte_array_slice builtin arg count is not 3");
                 let arr = self.lower_expr(&args[0]);
                 let start = self.lower_expr(&args[1]);
                 let end = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.byte_array_slice_ref, &[arr, start, end]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.byte_array_slice_ref;
+                self.lower_alloc_call(callee, &[arr, start, end])
             }
             Expr::Ident(name, _) if name == "string_to_bytes" => {
                 assert_eq!(args.len(), 1, "string_to_bytes builtin arg count is not 1");
                 let s = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_to_bytes_ref, &[s]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_to_bytes_ref;
+                self.lower_alloc_call(callee, &[s])
             }
             Expr::Ident(name, _) if name == "string_from_bytes_validate" => {
                 assert_eq!(
@@ -24543,15 +24599,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     "string_from_bytes_alloc builtin arg count is not 1"
                 );
                 let arr = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_from_bytes_alloc_ref, &[arr]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_from_bytes_alloc_ref;
+                self.lower_alloc_call(callee, &[arr])
             }
             Expr::Ident(name, _) if name == "byte_in_range" => {
                 assert_eq!(args.len(), 1, "byte_in_range builtin arg count is not 1");
@@ -24590,15 +24639,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 );
                 let len = self.lower_expr(&args[0]);
                 let fill = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.mut_byte_array_new_ref, &[len, fill]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.mut_byte_array_new_ref;
+                self.lower_alloc_call(callee, &[len, fill])
             }
             Expr::Ident(name, _) if name == "mut_byte_array_length" => {
                 assert_eq!(
@@ -24654,95 +24696,49 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int64_from_int" => {
                 assert_eq!(args.len(), 1, "int64_from_int builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_from_int_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_from_int_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "int64_add" => {
                 assert_eq!(args.len(), 2, "int64_add builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_add_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_add_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_sub" => {
                 assert_eq!(args.len(), 2, "int64_sub builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_sub_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_sub_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_mul" => {
                 assert_eq!(args.len(), 2, "int64_mul builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_mul_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_mul_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_div" => {
                 assert_eq!(args.len(), 2, "int64_div builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_div_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_div_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_mod" => {
                 assert_eq!(args.len(), 2, "int64_mod builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_mod_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_mod_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "int64_neg" => {
                 assert_eq!(args.len(), 1, "int64_neg builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.int64_neg_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_neg_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "int64_eq" => {
                 assert_eq!(args.len(), 2, "int64_eq builtin arg count is not 2");
@@ -24791,15 +24787,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "int64_to_string" => {
                 assert_eq!(args.len(), 1, "int64_to_string builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.int64_to_string_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.int64_to_string_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             // Plan D — boxed Float primitives. Arithmetic / math /
             // construction ops allocate and emit stackmap placeholders.
@@ -24815,93 +24804,52 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "float_sub builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_sub_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_sub_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_mul" => {
                 assert_eq!(args.len(), 2, "float_mul builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_mul_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_mul_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_div" => {
                 assert_eq!(args.len(), 2, "float_div builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_div_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_div_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "float_neg" => {
                 assert_eq!(args.len(), 1, "float_neg builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_neg_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_neg_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_abs" => {
                 assert_eq!(args.len(), 1, "float_abs builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_abs_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_abs_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_floor" => {
                 assert_eq!(args.len(), 1, "float_floor builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_floor_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_floor_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_ceil" => {
                 assert_eq!(args.len(), 1, "float_ceil builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_ceil_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_ceil_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_sqrt" => {
                 assert_eq!(args.len(), 1, "float_sqrt builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.float_sqrt_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_sqrt_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "float_eq" => {
                 assert_eq!(args.len(), 2, "float_eq builtin arg count is not 2");
@@ -24941,15 +24889,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "float_from_int" => {
                 assert_eq!(args.len(), 1, "float_from_int builtin arg count is not 1");
                 let v = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_from_int_ref, &[v]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_from_int_ref;
+                self.lower_alloc_call(callee, &[v])
             }
             Expr::Ident(name, _) if name == "float_to_int" => {
                 assert_eq!(args.len(), 1, "float_to_int builtin arg count is not 1");
@@ -24963,15 +24904,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "float_to_string" => {
                 assert_eq!(args.len(), 1, "float_to_string builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.float_to_string_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.float_to_string_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "string_to_float_validate" => {
                 assert_eq!(
@@ -24993,15 +24927,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     "string_to_float_parse builtin arg count is not 1"
                 );
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_to_float_parse_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_to_float_parse_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             // Plan C addendum (Char) — dispatch to runtime char
             // primitives. Comparators / classifiers return I8 (Bool);
@@ -25057,15 +24984,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "char_to_string" => {
                 assert_eq!(args.len(), 1, "char_to_string builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_string_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_string_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "is_ascii" => {
                 assert_eq!(args.len(), 1, "is_ascii builtin arg count is not 1");
@@ -25123,28 +25043,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "to_lower_ascii" => {
                 assert_eq!(args.len(), 1, "to_lower_ascii builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_lower_ascii_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_lower_ascii_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "to_upper_ascii" => {
                 assert_eq!(args.len(), 1, "to_upper_ascii builtin arg count is not 1");
                 let a = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.char_to_upper_ascii_ref, &[a]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.char_to_upper_ascii_ref;
+                self.lower_alloc_call(callee, &[a])
             }
             Expr::Ident(name, _) if name == "int_to_char" => {
                 assert_eq!(args.len(), 1, "int_to_char builtin arg count is not 1");
@@ -25178,12 +25084,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // placeholder).
             Expr::Ident(name, _) if name == "sb_new" => {
                 assert_eq!(args.len(), 0, "sb_new builtin arg count is not 0");
-                let call = self.builder.ins().call(self.builtins.sb_new_ref, &[]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sb_new_ref;
+                self.lower_alloc_call(callee, &[])
             }
             Expr::Ident(name, _) if name == "sb_append" => {
                 assert_eq!(args.len(), 2, "sb_append builtin arg count is not 2");
@@ -25202,15 +25104,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "sb_finalize" => {
                 assert_eq!(args.len(), 1, "sb_finalize builtin arg count is not 1");
                 let sb = self.lower_expr(&args[0]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.sb_finalize_ref, &[sb]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sb_finalize_ref;
+                self.lower_alloc_call(callee, &[sb])
             }
             // Plan C Task 68 — extended String primitives. All
             // dispatch through `runtime/src/string.rs`.
@@ -25218,30 +25113,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "string_concat builtin arg count is not 2");
                 let a = self.lower_expr(&args[0]);
                 let b = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_concat_ref, &[a, b]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_concat_ref;
+                self.lower_alloc_call(callee, &[a, b])
             }
             Expr::Ident(name, _) if name == "string_substring" => {
                 assert_eq!(args.len(), 3, "string_substring builtin arg count is not 3");
                 let s = self.lower_expr(&args[0]);
                 let start = self.lower_expr(&args[1]);
                 let end = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.string_substring_ref, &[s, start, end]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_substring_ref;
+                self.lower_alloc_call(callee, &[s, start, end])
             }
             Expr::Ident(name, _) if name == "string_byte_at" => {
                 assert_eq!(args.len(), 2, "string_byte_at builtin arg count is not 2");
@@ -25300,12 +25181,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::Ident(name, _) if name == "string_trim" => {
                 assert_eq!(args.len(), 1, "string_trim builtin arg count is not 1");
                 let s = self.lower_expr(&args[0]);
-                let call = self.builder.ins().call(self.builtins.string_trim_ref, &[s]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.string_trim_ref;
+                self.lower_alloc_call(callee, &[s])
             }
             Expr::Ident(name, _) if name == "string_to_int_validate" => {
                 assert_eq!(
@@ -25491,15 +25368,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let v = self.lower_expr(&args[0]);
                 let widened =
                     widen_to_i64(&mut self.builder, v, self.pointer_ty, "sigil_ref_alloc");
-                let call = self
-                    .builder
-                    .ins()
-                    .call(self.builtins.sigil_ref_alloc_ref, &[widened]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
-                let ptr = self.builder.inst_results(call)[0];
-                self.builder.declare_value_needs_stack_map(ptr);
-                ptr
+                let callee = self.builtins.sigil_ref_alloc_ref;
+                self.lower_alloc_call(callee, &[widened])
             }
             Expr::Ident(name, _) if name == "sigil_ref_deref" => {
                 assert_eq!(args.len(), 1, "sigil_ref_deref builtin arg count is not 1");
@@ -25509,10 +25379,21 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .ins()
                     .call(self.builtins.sigil_ref_deref_ref, &[cell]);
                 let raw_i64 = self.builder.inst_results(call)[0];
+                // Plan E2 Phase 1 Task 2b — if the dereffed T is a
+                // heap-bearing Sigil type, flag the i64 result as a GC
+                // ref. Other T (Int, Bool, etc.) are raw scalars.
+                let callee_ty = self.lookup_call_callee_ty(call_span);
+                let is_heap_t = matches!(
+                    &callee_ty,
+                    Some(crate::typecheck::Ty::Fn(sig)) if is_heap_pointer_ty(&sig.ret)
+                );
+                if is_heap_t {
+                    self.builder.declare_value_needs_stack_map(raw_i64);
+                }
                 // Narrow the I64 result back to the source-level T's
                 // Cranelift type. T is recovered from `call_callee_tys`
                 // — the typecheck instantiation pinned T at this site.
-                let target_ty = match self.lookup_call_callee_ty(call_span) {
+                let target_ty = match callee_ty {
                     Some(crate::typecheck::Ty::Fn(sig)) => {
                         cranelift_ty_of_ty(&sig.ret, self.pointer_ty)
                     }
@@ -25867,14 +25748,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let closure_ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(closure_ptr);
+        let callee = self.builtins.alloc_ref;
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
 
         // Store null at offset 8 (code_ptr slot — unused by arm fns;
         // the runtime dispatches via `HandlerFrame.arms[i].fn_ptr`).
@@ -25988,14 +25863,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Call sigil_alloc(header, payload_bytes) -> *u8.
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, payload_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let closure_ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(closure_ptr);
+        let callee = self.builtins.alloc_ref;
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
 
         // Store code_ptr at offset 8 (past header).
         //
@@ -26151,14 +26020,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
-        let alloc_call = self
-            .builder
-            .ins()
-            .call(self.builtins.alloc_ref, &[header_v, size_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, alloc_call));
-        let ptr = self.builder.inst_results(alloc_call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
+        let callee = self.builtins.alloc_ref;
+        let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
 
         // Discriminant in payload word 0 (bytes 8..16 past header).
         // We store the full 8-byte word even though only the low
@@ -26216,20 +26079,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let none_blk = self.builder.create_block();
         let merge_blk = self.builder.create_block();
         self.builder.append_block_param(merge_blk, self.pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — both branches jump to
+        // merge_blk carrying an `Option[Char]` heap pointer (some_v
+        // is a ctor-alloc Some payload; none_v is a ctor-alloc None).
+        // Flag the merge param.
+        let merge_opt_ptr = self.builder.block_params(merge_blk)[0];
+        self.builder.declare_value_needs_stack_map(merge_opt_ptr);
 
         self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
 
         // Some(sigil_int_to_char_box(n))
         self.builder.switch_to_block(some_blk);
         self.builder.seal_block(some_blk);
-        let box_call = self
-            .builder
-            .ins()
-            .call(self.builtins.int_to_char_box_ref, &[n]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, box_call));
-        let char_ptr = self.builder.inst_results(box_call)[0];
-        self.builder.declare_value_needs_stack_map(char_ptr);
+        let callee = self.builtins.int_to_char_box_ref;
+        let char_ptr = self.lower_alloc_call(callee, &[n]);
         let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
         self.builder.ins().jump(merge_blk, &[some_v.into()]);
 
@@ -26262,19 +26125,19 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let none_blk = self.builder.create_block();
         let merge_blk = self.builder.create_block();
         self.builder.append_block_param(merge_blk, self.pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — both branches jump to
+        // merge_blk carrying an `Option[Char]` heap pointer (some_v
+        // is a ctor-alloc Some payload; none_v is a ctor-alloc None).
+        // Flag the merge param.
+        let merge_opt_ptr = self.builder.block_params(merge_blk)[0];
+        self.builder.declare_value_needs_stack_map(merge_opt_ptr);
 
         self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
 
         self.builder.switch_to_block(some_blk);
         self.builder.seal_block(some_blk);
-        let fetch_call = self
-            .builder
-            .ins()
-            .call(self.builtins.string_char_at_ref, &[s, idx]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, fetch_call));
-        let char_ptr = self.builder.inst_results(fetch_call)[0];
-        self.builder.declare_value_needs_stack_map(char_ptr);
+        let callee = self.builtins.string_char_at_ref;
+        let char_ptr = self.lower_alloc_call(callee, &[s, idx]);
         let some_v = self.lower_ctor_alloc(&option_name, some_idx, &[char_ptr]);
         self.builder.ins().jump(merge_blk, &[some_v.into()]);
 
@@ -26298,15 +26161,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
         let nil_h_v = self.builder.ins().iconst(types::I64, nil_h as i64);
         let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
-        let call = self.builder.ins().call(
-            self.builtins.string_chars_ref,
-            &[s, cons_h_v, cons_d_v, nil_h_v, nil_d_v],
-        );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_chars_ref;
+        self.lower_alloc_call(callee, &[s, cons_h_v, cons_d_v, nil_h_v, nil_d_v])
     }
 
     /// Plan C addendum (Char) — `string_from_chars(list)` lowering.
@@ -26317,15 +26173,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let (_cons_h, cons_d, _nil_h, nil_d) = self.list_char_layout_immediates();
         let cons_d_v = self.builder.ins().iconst(types::I64, cons_d);
         let nil_d_v = self.builder.ins().iconst(types::I64, nil_d);
-        let call = self.builder.ins().call(
-            self.builtins.string_from_chars_ref,
-            &[list, cons_d_v, nil_d_v],
-        );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_from_chars_ref;
+        self.lower_alloc_call(callee, &[list, cons_d_v, nil_d_v])
     }
 
     /// Plan C addendum (Char) helper — return `(option_type_name,
@@ -26407,14 +26256,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// Load the `index`-th env slot from the current fn's closure_ptr.
-    /// The load width matches the slot kind; i64 slot words are
-    /// truncated on load for sub-word types.
+    /// Delegates to `lower_closure_env_load_from`, defaulting the
+    /// source to `self.closure_ptr`. See that helper's doc-comment for
+    /// the type-classification rules.
     fn lower_closure_env_load(&mut self, index: usize, kind: EnvSlotKind) -> Value {
+        let cp = self.closure_ptr;
+        self.lower_closure_env_load_from(cp, index, kind)
+    }
+
+    /// Plan E2 Phase 1 Task 2b — load the `index`-th env slot from
+    /// `closure_ptr` (caller-supplied; either `self.closure_ptr` for
+    /// the body's own captures or a `synth_closure_ptr` for sites that
+    /// load captures from a nested closure record). PR #159 review N3
+    /// extends the previous `self.closure_ptr`-only variant to cover
+    /// all closure-env reads through one centralised helper, so the
+    /// type-aware flagging applies uniformly.
+    ///
+    /// For heap-pointer-bearing slot kinds (`Char` boxed, `String`,
+    /// `Closure`, `User`), flag the loaded value as
+    /// `declare_value_needs_stack_map`. Scalar slot kinds (`Int`,
+    /// `Bool`, `Byte`, `Unit`) are NOT flagged: in sigil's untagged
+    /// user-code representation an `Int` slot holds a raw i64 that
+    /// the precise marker would mis-trace as a heap pointer if
+    /// flagged. Per-kind classification is the source of truth here
+    /// because the slot-kind discriminant is the precise type-system
+    /// signal we have at codegen time.
+    fn lower_closure_env_load_from(
+        &mut self,
+        closure_ptr: Value,
+        index: usize,
+        kind: EnvSlotKind,
+    ) -> Value {
         let offset: i32 = 16 + 8 * index as i32;
-        let raw =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), self.closure_ptr, offset);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), closure_ptr, offset);
         match kind {
             EnvSlotKind::Int => raw,
             EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
@@ -26423,13 +26300,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             // Plan C addendum (Char) — boxed Char is pointer-typed; the
             // slot already holds a pointer_ty value, so no narrow.
             EnvSlotKind::Char | EnvSlotKind::String | EnvSlotKind::Closure | EnvSlotKind::User => {
-                if self.pointer_ty == types::I64 {
+                let ptr_val = if self.pointer_ty == types::I64 {
                     raw
                 } else {
                     // Plan A2 targets are 64-bit; the else branch is a
                     // defensive path for hypothetical 32-bit hosts.
                     self.builder.ins().ireduce(self.pointer_ty, raw)
-                }
+                };
+                self.builder.declare_value_needs_stack_map(ptr_val);
+                ptr_val
             }
         }
     }
@@ -26448,15 +26327,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             });
         let bytes_ptr = self.builder.ins().symbol_value(self.pointer_ty, gv);
         let len_v = self.builder.ins().iconst(self.pointer_ty, len as i64);
-        let call = self
-            .builder
-            .ins()
-            .call(self.builtins.string_new_ref, &[bytes_ptr, len_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call));
-        let ptr = self.builder.inst_results(call)[0];
-        self.builder.declare_value_needs_stack_map(ptr);
-        ptr
+        let callee = self.builtins.string_new_ref;
+        self.lower_alloc_call(callee, &[bytes_ptr, len_v])
     }
 
     fn emit_binop(&mut self, op: crate::ast::BinOp, l: Value, r: Value) -> Value {
@@ -26561,8 +26433,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let mut preview: BTreeMap<String, Type> = BTreeMap::new();
         self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
         let result_ty = self.type_of_expr(&arms[0].body, &preview);
+        let result_is_heap =
+            result_ty == self.pointer_ty && self.expr_is_known_heap(&arms[0].body, &preview);
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, result_ty);
+        if result_is_heap {
+            // Plan E2 Phase 1 Task 2b cat 3 — Sigil-Ty-aware flag at the
+            // merge param for heap-producing match arms.
+            let cont_v = self.builder.block_params(cont)[0];
+            self.builder.declare_value_needs_stack_map(cont_v);
+        }
 
         let mut chain_terminated = false;
         for arm in arms.iter() {
@@ -26762,7 +26642,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         Ty::Bool | Ty::Byte | Ty::Unit => {
                             self.builder.ins().ireduce(types::I8, raw)
                         }
-                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => {
+                            // Plan E2 Phase 1 Task 2b — heap-bearing
+                            // tuple element; flag the loaded raw i64
+                            // for the stack-map machinery.
+                            self.builder.declare_value_needs_stack_map(raw);
+                            raw
+                        }
                         // Plan D Task 117 — Continuation in a tuple
                         // element would require storing k in a heap-
                         // allocated tuple, which the E0145 escape
@@ -26823,7 +26709,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match field_ty {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
-            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => {
+                // Plan E2 Phase 1 Task 2b — heap-bearing field; flag
+                // the loaded raw i64 for the stack-map machinery.
+                self.builder.declare_value_needs_stack_map(raw);
+                raw
+            }
             // Plan D Task 117 — Continuation in a user-type field
             // would require storing k in a heap record, which the
             // E0145 escape barrier rejects at typecheck.
@@ -26991,6 +26882,81 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `Pattern::Var` bindings that are not yet installed in `self.env`
     /// — critical for nested matches whose first arm references a
     /// binding introduced by an outer match's arm.
+    /// Plan E2 Phase 1 Task 2b cat 3 — return `true` iff the expression
+    /// `e`'s result at runtime is unambiguously a heap-managed pointer.
+    /// Used to flag merge-block params downstream of `lower_match` /
+    /// `lower_match_to_next_step` / handler `(non-)return-arm`
+    /// continuations where each arm produces a value whose Sigil type
+    /// is the same as the result type but the Cranelift Type alone
+    /// (pointer_ty == I64 on 64-bit hosts) can't distinguish heap
+    /// pointer from `Int`.
+    ///
+    /// Returns `false` for: `IntLit`, `BoolLit`, `UnitLit`, `Binary`
+    /// (arithmetic / comparison / logic), `Unary`. Returns `true` for:
+    /// `FloatLit`, `CharLit`, `StringLit`, `RecordLit`, `Tuple` (heap-
+    /// allocates a fresh tuple via `tuple_alloc`), `ClosureRecord`
+    /// (heap-allocates a closure record), ctor `Ident`s, `Match` / `If`
+    /// / `Block` whose tail is heap-producing, and `Call` *only when*
+    /// its resolved Sigil return type is heap-bearing. For `Ident`
+    /// other than ctor-bare: we look it up in `env` (Value type) /
+    /// `preview` (cached binding type) — those are Cranelift types, so
+    /// we conservatively return `false` to avoid the "Int slot flagged
+    /// → precise marker crash" failure mode. That conservatism may
+    /// under-flag for heap-typed idents not declared in env yet (rare);
+    /// Phase 3 acceptance gates surface those.
+    ///
+    /// `Expr::Lambda` is unreachable here — `closure_convert` hoists
+    /// every lambda to a synthetic top-level fn before codegen, so
+    /// reaching it is a pass-order bug (see codegen.rs's `Expr::Lambda`
+    /// arm in `walk_unsupported_handle_*` for the explicit invariant).
+    fn expr_is_known_heap(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> bool {
+        use crate::ast::Expr;
+        match e {
+            Expr::IntLit(..) | Expr::BoolLit(..) | Expr::UnitLit(..) => false,
+            Expr::FloatLit(..)
+            | Expr::CharLit(..)
+            | Expr::StringLit(..)
+            | Expr::RecordLit { .. }
+            | Expr::Tuple { .. }
+            | Expr::ClosureRecord { .. } => true,
+            // BinOp / UnOp results are always scalar (Int or Bool).
+            Expr::Binary { .. } | Expr::Unary { .. } => false,
+            Expr::Ident(name, _) => {
+                // Ctor-bare ident allocates a heap nullary variant. Other
+                // idents are conservatively unknown — fall through to false.
+                !self.env.contains_key(name)
+                    && !preview.contains_key(name)
+                    && self.ctor_index.contains_key(name)
+            }
+            Expr::Match { arms, .. } => arms
+                .first()
+                .map(|a| self.expr_is_known_heap(&a.body, preview))
+                .unwrap_or(false),
+            Expr::If { then_block, .. } => then_block
+                .tail
+                .as_ref()
+                .map(|t| self.expr_is_known_heap(t, preview))
+                .unwrap_or(false),
+            Expr::Block(b) => b
+                .tail
+                .as_ref()
+                .map(|t| self.expr_is_known_heap(t, preview))
+                .unwrap_or(false),
+            Expr::Call { span, .. } => {
+                // Resolved callee return type is the source of truth.
+                matches!(
+                    self.lookup_call_callee_ty(span),
+                    Some(crate::typecheck::Ty::Fn(sig)) if is_heap_pointer_ty(&sig.ret)
+                )
+            }
+            // Conservatively unknown — Perform / Handle / ClosureEnvLoad
+            // / Cast / Try — depend on context-resolved return types;
+            // don't flag. Lambda is unreachable (see doc-comment).
+            // Phase 3 acceptance gates re-verify any under-flag.
+            _ => false,
+        }
+    }
+
     fn type_of_expr(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> Type {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {
@@ -27532,6 +27498,37 @@ fn lower_alloc_call(
     let call = builder.ins().call(callee, args);
     stackmap.push_placeholder(function_code_offset(builder, call));
     let ptr = builder.inst_results(call)[0];
+    builder.declare_value_needs_stack_map(ptr);
+    ptr
+}
+
+/// Plan E2 Phase 1 Task 2b — emit a heap-pointer load and flag the
+/// resulting value as a GC ref. Mirrors `lower_alloc_call`'s structural
+/// guarantee on the load surface: funneling every heap-pointer load
+/// through this helper makes the "by-convention marking" miss-class
+/// impossible at any future contributor's add site (PR #159 review N4).
+///
+/// **Contract.** The slot at `(base, offset)` MUST hold a heap-managed
+/// pointer at runtime — `*mut u8` with TAG_HEAP semantics, or an
+/// untagged closure pointer. Function pointers (`code_ptr` at offset 8
+/// of a closure, FFI fn_ptrs in handler frames) and raw scalars
+/// (`Int`, header words, discriminant bytes) MUST NOT route through
+/// this helper. Over-flagging a non-pointer slot would trip the
+/// precise marker on the raw bit pattern.
+///
+/// Always loads at `pointer_ty` width. For sub-pointer slot types
+/// (`Bool`, `Byte`, `Unit`) use the bare `builder.ins().load(types::I8, ...)`
+/// pattern; for `Int` slots use `builder.ins().load(types::I64, ...)`
+/// without flagging.
+fn lower_heap_pointer_load(
+    builder: &mut FunctionBuilder<'_>,
+    pointer_ty: Type,
+    base: Value,
+    offset: i32,
+) -> Value {
+    let ptr = builder
+        .ins()
+        .load(pointer_ty, MemFlags::trusted(), base, offset);
     builder.declare_value_needs_stack_map(ptr);
     ptr
 }

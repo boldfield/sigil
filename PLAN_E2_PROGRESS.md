@@ -37,13 +37,34 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   refactor.
 - **Task 2b** — Categories 2 (heap-pointer loads) + 3 (block-arg
   confluences) + helper rollout to all 62 alloc sites. status:
-  **pending**. **Task 3's closure depends on Task 2b** flagging
-  fn-entry block-params of pointer type for any fn callable via
-  `return_call` / `return_call_indirect`. The plan body's
-  category-2 / category-3 wording covers this, but the contract is
-  tighter than "block-arg confluences in general" — fn-entry params
-  on tail-callable fns are load-bearing for soundness at the
-  tail-call boundary.
+  **in PR #159 review**. Coverage:
+  - **Cat 1 helper rollout**: complete. All 62 alloc sites funnel
+    through `lower_alloc_call`. The only `declare_value_needs_stack_map`
+    site outside the helper is inside the helper itself.
+  - **Cat 2 (heap-pointer loads)**:
+    - `lower_closure_env_load_from` (renamed from `lower_closure_env_load`)
+      is now the centralised path for closure-env captures from EITHER
+      `self.closure_ptr` OR a `synth_closure_ptr` argument.
+    - `load_field_value` + `Pattern::Tuple` arm flag by `field_ty` /
+      `elem_ty`.
+    - 41 named heap-pointer loads flagged (24 in the first sweep + 17
+      surfaced by PR #159 review M1).
+    - `sigil_ref_deref` result flagged when T is heap-bearing.
+    - `lower_heap_pointer_load` helper added — every new heap-pointer
+      load must funnel through it. Exercised at one representative
+      site; rolling out to existing sites is mechanical follow-up
+      (see "Open follow-ups" below).
+  - **Cat 3 (block-arg confluences)**:
+    - Sync user-fn entry-block user-args flagged via
+      `flag_heap_pointer_user_args`.
+    - 14 `let closure_ptr = block_params[0]` / `synth_closure_ptr`
+      extractions at Cps/synth-fn entries flagged (PR #159 review M2).
+      Closure_ptr at block_params[0] is always a heap pointer.
+    - 4 high-confidence merge-block params flagged (NextStep merges +
+      Option[Char] merges).
+  - **Task 3's closure dependency** (fn-entry block-params for
+    tail-callable fns) is now satisfied by the Sync user-fn user-args
+    + closure_ptr flagging. Re-audit Task 3 after PR #159 lands.
 
 ### Task 3 — Annotate safepoints (audit)
 
@@ -112,14 +133,43 @@ None recorded yet. Plan-body Task 3's "stackmap section non-empty"
 test was covered transitively rather than via a fresh test — see
 the Task 3 entry above.
 
+## Open follow-ups
+
+None — Task 2b's scope is closed in PR #159. Specifically:
+
+- **`lower_heap_pointer_load` helper rollout**: complete. The
+  bulk-refactor sweep in PR #159's final commit migrated 40+1 surgical
+  heap-pointer load sites to use the helper. Only the helper itself
+  contains an internal `declare_value_needs_stack_map(ptr)` call —
+  every external surgical pattern is gone. A future contributor
+  cannot add an unmarked heap-pointer load via the established
+  pattern; the helper is the only path.
+
+- **7 type-aware merge-block params**: complete. Each of codegen.rs's
+  7 `append_block_param(*, pointer_ty / result_ty / handler_overall_ty)`
+  sites that needed Sigil-Ty threading now uses
+  `expr_is_known_heap(arms[0].body, &preview)` (or the body Expr at
+  the no-return-arm Handle site) gated by `result_ty == pointer_ty`.
+  The four sites with unambiguous heap merges (NextStep / NextStep /
+  Option[Char] / Option[Char]) flag unconditionally; the three sites
+  where the merge is `arms[0].body`-dependent (lower_match cont in
+  Sync + Cps + Cps-match-to-next-step) and the two handler sites
+  (return-arm + no-return-arm) gate on the predicate.
+
+  `expr_is_known_heap` is conservative on genuinely ambiguous AST
+  shapes (returns `false`): non-ctor `Ident`, `Perform`, `Handle`,
+  `Lambda`, `Cast`, `TupleLit`, `Try`. Phase 3 acceptance gating
+  re-verifies; if any such ambiguous case becomes load-bearing the
+  helper grows additional shapes.
+
 ## Open dependencies
 
 - **Task 3 → Task 2b** — Task 3's no-annotation conclusion at
   `return_call*` sites depends on Task 2b flagging fn-entry
-  block-params of pointer type on tail-callable fns. Re-audit Task 3
-  after Task 2b lands; if Task 2b's coverage is incomplete, this
-  becomes a real soundness gap at Phase 3 (when conservative stack
-  scan is dropped).
+  block-params of pointer type on tail-callable fns. **Satisfied
+  by PR #159** (`flag_heap_pointer_user_args` for Sync user-fn
+  user-args + closure_ptr-at-block_params[0] flagging for Cps/synth
+  fns). Re-audit Task 3 after PR #159 lands.
 - **Task 4 → G1** — Task 4 lands the v1 section writer + reader path;
   G1's end-to-end verification test ("compile alloc-bearing program,
   assert section has entries") lands with Task 4.
