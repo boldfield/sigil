@@ -13645,6 +13645,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let normal_block = lowerer.builder.create_block();
                     let merge_block = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(merge_block, pointer_ty);
+                    // Plan E2 Phase 1 Task 2b cat 3 — both branches
+                    // (identity + normal) jump to merge_block carrying
+                    // a NextStep heap pointer. Flag the merge param as
+                    // a GC ref.
+                    let merge_ns_ptr = lowerer.builder.block_params(merge_block)[0];
+                    lowerer.builder.declare_value_needs_stack_map(merge_ns_ptr);
                     lowerer.builder.ins().brif(
                         is_identity_v,
                         identity_block,
@@ -17405,6 +17411,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let wrapper_forward_block = lowerer.builder.create_block();
                                 let merge_block = lowerer.builder.create_block();
                                 lowerer.builder.append_block_param(merge_block, pointer_ty);
+                                // Plan E2 Phase 1 Task 2b cat 3 — both
+                                // branches (top-level + wrapper-forward)
+                                // jump to merge_block carrying a heap
+                                // pointer (NextStep / closure). Flag.
+                                let merge_ptr = lowerer.builder.block_params(merge_block)[0];
+                                lowerer.builder.declare_value_needs_stack_map(merge_ptr);
                                 lowerer.builder.ins().brif(
                                     is_caller_identity,
                                     top_level_block,
@@ -26042,6 +26054,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let none_blk = self.builder.create_block();
         let merge_blk = self.builder.create_block();
         self.builder.append_block_param(merge_blk, self.pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — both branches jump to
+        // merge_blk carrying an `Option[Char]` heap pointer (some_v
+        // is a ctor-alloc Some payload; none_v is a ctor-alloc None).
+        // Flag the merge param.
+        let merge_opt_ptr = self.builder.block_params(merge_blk)[0];
+        self.builder.declare_value_needs_stack_map(merge_opt_ptr);
 
         self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
 
@@ -26082,6 +26100,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let none_blk = self.builder.create_block();
         let merge_blk = self.builder.create_block();
         self.builder.append_block_param(merge_blk, self.pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — both branches jump to
+        // merge_blk carrying an `Option[Char]` heap pointer (some_v
+        // is a ctor-alloc Some payload; none_v is a ctor-alloc None).
+        // Flag the merge param.
+        let merge_opt_ptr = self.builder.block_params(merge_blk)[0];
+        self.builder.declare_value_needs_stack_map(merge_opt_ptr);
 
         self.builder.ins().brif(is_ok, some_blk, &[], none_blk, &[]);
 
