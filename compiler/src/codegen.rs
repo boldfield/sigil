@@ -10339,6 +10339,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // 4-positional Cps signature shape.
                     assert_cps_arity(&block_params, &format!("Phase B.2 Cps fn `{}`", f.name));
                     let closure_ptr = block_params[0];
+                    builder.declare_value_needs_stack_map(closure_ptr);
                     let args_ptr = block_params[1];
                     // block_params[2] = args_len (statically known
                     // from `f.params.len()`; same redundancy as the
@@ -11264,6 +11265,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, &format!("Cps body emit fn `{}`", f.name));
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 // block_params[2] = args_len; per `cps_signature`'s
                 // convention, this is the user-arg count packed
@@ -12225,6 +12227,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 f.params.len() + 2,
             );
             let closure_ptr = block_params[0];
+            builder.declare_value_needs_stack_map(closure_ptr);
             let mut env = BTreeMap::new();
             for (i, p) in f.params.iter().enumerate() {
                 env.insert(p.name.clone(), block_params[i + 1]);
@@ -12893,6 +12896,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, "synth-arm-fn");
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 let _args_len = block_params[2];
                 let terminal_out = block_params[3];
@@ -13263,6 +13267,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         args_ptr,
                         return_arm_closure_offset(n_user_args),
                     );
+                    lowerer
+                        .builder
+                        .declare_value_needs_stack_map(arm_ra_closure);
                     let arm_ra_fn = lowerer.builder.ins().load(
                         pointer_ty,
                         MemFlags::trusted(),
@@ -13275,6 +13282,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         args_ptr,
                         return_arm_fired_offset(n_user_args),
                     );
+                    lowerer.builder.declare_value_needs_stack_map(arm_ra_fired);
                     let ra_closure_off_step0: i32 =
                         32 + 8 * (captures.len() + extra_for_return_arm) as i32;
                     let ra_fn_off_step0: i32 = ra_closure_off_step0 + 8;
@@ -13972,6 +13980,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 let block_params: Vec<Value> = builder.block_params(block).to_vec();
                 assert_cps_arity(&block_params, "synth-return-arm-fn");
                 let closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(closure_ptr);
                 let args_ptr = block_params[1];
                 let args_len = block_params[2];
                 let terminal_out = block_params[3];
@@ -14048,6 +14057,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
+                builder.declare_value_needs_stack_map(post_handle_k_closure_v);
                 let post_handle_k_fn_v = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -14294,6 +14304,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // (current path, unchanged behaviour).
             {
                 let synth_closure_ptr = block_params[0];
+                builder.declare_value_needs_stack_map(synth_closure_ptr);
                 for (i, capture) in post_arm_k.captures.iter().enumerate() {
                     let offset: i32 = 16 + 8 * i as i32;
                     let raw = builder.ins().load(
@@ -14348,6 +14359,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
             let closure_ptr = block_params[0];
+            builder.declare_value_needs_stack_map(closure_ptr);
             let mut lowerer = Lowerer {
                 builder,
                 stackmap: &mut stackmap,
@@ -14458,6 +14470,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 lowerer.closure_ptr,
                 pak_ra_closure_off,
             );
+            lowerer
+                .builder
+                .declare_value_needs_stack_map(ra_closure_pak);
             let ra_fn_pak = lowerer.builder.ins().load(
                 pointer_ty,
                 MemFlags::trusted(),
@@ -14470,6 +14485,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 lowerer.closure_ptr,
                 pak_ra_fired_off,
             );
+            lowerer
+                .builder
+                .declare_value_needs_stack_map(ra_fired_ptr_pak);
             let done_call = lowerer.builder.ins().call(
                 done_or_dispatch_return_arm_via_args_ref,
                 &[widened_tail, ra_closure_pak, ra_fn_pak, ra_fired_ptr_pak],
@@ -14537,6 +14555,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
                     assert_cps_arity(&block_params, "synth-cont body emit");
                     let synth_closure_ptr = block_params[0];
+                    builder.declare_value_needs_stack_map(synth_closure_ptr);
                     let args_ptr = block_params[1];
                     // Plan D Task 111c — block_params[3] = terminal_out.
                     let terminal_out = block_params[3];
@@ -14587,6 +14606,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             synth_closure_ptr,
                             frame_ptr_offset,
                         );
+                        builder.declare_value_needs_stack_map(frame_ptr_v);
                         let return_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -14599,6 +14619,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             frame_ptr_v,
                             sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                         );
+                        builder.declare_value_needs_stack_map(return_closure_v);
 
                         let next_step_call_local = module
                             .declare_func_in_func(per_fn_refs_ctx.next_step_call, builder.func);
@@ -14927,6 +14948,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     ra_closure_off_slc,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(ra_closure_slc);
                                 let ra_fn_slc = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -14939,6 +14963,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     ra_fired_off_slc,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(ra_fired_ptr_slc);
                                 let done_call = lowerer.builder.ins().call(
                                     done_or_dispatch_return_arm_via_args_ref,
                                     &[widened_tail, ra_closure_slc, ra_fn_slc, ra_fired_ptr_slc],
@@ -15504,6 +15531,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // dispatch on `*fired_ptr`.
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
                         let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
                         let ra_closure = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -15576,6 +15604,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         assert_cps_arity(&block_params, "chained-let-bind synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
                         // Plan D Task 111c — block_params[3] = terminal_out.
                         let terminal_out = block_params[3];
 
@@ -15719,6 +15748,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(closure_ptr);
                         let mut lowerer = Lowerer {
                             builder,
                             stackmap: &mut stackmap,
@@ -16823,6 +16853,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
+                                                lowerer
+                                                    .builder
+                                                    .declare_value_needs_stack_map(ck_closure);
                                                 let ck_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
                                                     MemFlags::trusted(),
@@ -17351,6 +17384,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(caller_k_closure_loaded);
                                 let caller_k_fn_loaded = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -17771,6 +17807,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     synth_closure_ptr,
                                     this_caller_k_closure_off,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(caller_k_closure_loaded);
                                 let caller_k_fn_loaded = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -17828,6 +17867,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
+                                lowerer
+                                    .builder
+                                    .declare_value_needs_stack_map(outer_post_arm_k_closure);
                                 let outer_post_arm_k_fn = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -18543,6 +18585,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         assert_cps_arity(&block_params, "Final synth-cont");
                         let args_ptr = block_params[1];
                         let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
                         // Plan D Task 111c — block_params[3] = terminal_out.
                         let terminal_out = block_params[3];
 
@@ -18666,6 +18709,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         } = prepare_per_fn_refs(&mut module, &mut builder, &per_fn_refs_ctx);
 
                         let closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(closure_ptr);
                         // 2026-05-04 return-arm-via-args lift Stage 3a —
                         // the B.2 synth-cont's closure record was
                         // extended (CompoundMatchArmPostPerform alloc
@@ -19177,6 +19221,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             block_params.len(),
         );
         let closure_ptr_v = block_params[0];
+        builder.declare_value_needs_stack_map(closure_ptr_v);
         let terminal_out_idx = block_params.len() - 1;
         let terminal_out_v = block_params[terminal_out_idx];
         let user_args: Vec<Value> = block_params[1..terminal_out_idx].to_vec();
@@ -20229,6 +20274,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                     surrounding_args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
+                                self.builder
+                                    .declare_value_needs_stack_map(forwarded_post_arm_k_closure);
                                 let forwarded_post_arm_k_fn = self.builder.ins().load(
                                     self.pointer_ty,
                                     MemFlags::trusted(),
@@ -22894,6 +22941,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         snap,
                         sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                     );
+                    self.builder.declare_value_needs_stack_map(return_closure_v);
 
                     // Build NextStep::Call(return_closure, return_fn, 3)
                     // — the synth return fn unpacks v from
@@ -23328,13 +23376,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let k_closure_offset: i32 = 16 + 8 * info.k_closure_idx as i32;
         let k_fn_offset: i32 = 16 + 8 * info.k_fn_idx as i32;
         let frame_ptr_offset: i32 = 16 + 8 * info.frame_ptr_idx as i32;
-        let k_closure = self.builder.ins().load(
+        let k_closure = lower_heap_pointer_load(
+            &mut self.builder,
             self.pointer_ty,
-            MemFlags::trusted(),
             self.closure_ptr,
             k_closure_offset,
         );
-        self.builder.declare_value_needs_stack_map(k_closure);
         let k_fn = self.builder.ins().load(
             self.pointer_ty,
             MemFlags::trusted(),
@@ -23351,6 +23398,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.closure_ptr,
             frame_ptr_offset,
         );
+        self.builder.declare_value_needs_stack_map(frame_ptr_loaded);
 
         // Push the originating handler frame back onto the thread-local
         // handler stack. sigil_handle_pop didn't deallocate it; the
@@ -23604,6 +23652,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     frame_ptr_loaded,
                     sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                 );
+                self.builder.declare_value_needs_stack_map(ret_closure);
                 let three_v = self.builder.ins().iconst(types::I32, 3);
                 let call_ns = self.builder.ins().call(
                     self.next_step_call_ref,
@@ -26231,24 +26280,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     }
 
     /// Load the `index`-th env slot from the current fn's closure_ptr.
-    /// The load width matches the slot kind; i64 slot words are
-    /// truncated on load for sub-word types.
-    ///
-    /// Plan E2 Phase 1 Task 2b — for heap-pointer-bearing slot kinds
-    /// (`Char` boxed, `String`, `Closure`, `User`), flag the loaded
-    /// value as `declare_value_needs_stack_map`. Scalar slot kinds
-    /// (`Int`, `Bool`, `Byte`, `Unit`) are NOT flagged: in sigil's
-    /// untagged user-code representation an `Int` slot holds a raw
-    /// i64 that the precise marker would mis-trace as a heap pointer
-    /// if flagged. Per-kind classification is the source of truth
-    /// here because the slot-kind discriminant is the precise
-    /// type-system signal we have at codegen time.
+    /// Delegates to `lower_closure_env_load_from`, defaulting the
+    /// source to `self.closure_ptr`. See that helper's doc-comment for
+    /// the type-classification rules.
     fn lower_closure_env_load(&mut self, index: usize, kind: EnvSlotKind) -> Value {
+        let cp = self.closure_ptr;
+        self.lower_closure_env_load_from(cp, index, kind)
+    }
+
+    /// Plan E2 Phase 1 Task 2b — load the `index`-th env slot from
+    /// `closure_ptr` (caller-supplied; either `self.closure_ptr` for
+    /// the body's own captures or a `synth_closure_ptr` for sites that
+    /// load captures from a nested closure record). PR #159 review N3
+    /// extends the previous `self.closure_ptr`-only variant to cover
+    /// all closure-env reads through one centralised helper, so the
+    /// type-aware flagging applies uniformly.
+    ///
+    /// For heap-pointer-bearing slot kinds (`Char` boxed, `String`,
+    /// `Closure`, `User`), flag the loaded value as
+    /// `declare_value_needs_stack_map`. Scalar slot kinds (`Int`,
+    /// `Bool`, `Byte`, `Unit`) are NOT flagged: in sigil's untagged
+    /// user-code representation an `Int` slot holds a raw i64 that
+    /// the precise marker would mis-trace as a heap pointer if
+    /// flagged. Per-kind classification is the source of truth here
+    /// because the slot-kind discriminant is the precise type-system
+    /// signal we have at codegen time.
+    fn lower_closure_env_load_from(
+        &mut self,
+        closure_ptr: Value,
+        index: usize,
+        kind: EnvSlotKind,
+    ) -> Value {
         let offset: i32 = 16 + 8 * index as i32;
-        let raw =
-            self.builder
-                .ins()
-                .load(types::I64, MemFlags::trusted(), self.closure_ptr, offset);
+        let raw = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), closure_ptr, offset);
         match kind {
             EnvSlotKind::Int => raw,
             EnvSlotKind::Bool | EnvSlotKind::Byte | EnvSlotKind::Unit => {
@@ -27372,6 +27439,37 @@ fn lower_alloc_call(
     let call = builder.ins().call(callee, args);
     stackmap.push_placeholder(function_code_offset(builder, call));
     let ptr = builder.inst_results(call)[0];
+    builder.declare_value_needs_stack_map(ptr);
+    ptr
+}
+
+/// Plan E2 Phase 1 Task 2b — emit a heap-pointer load and flag the
+/// resulting value as a GC ref. Mirrors `lower_alloc_call`'s structural
+/// guarantee on the load surface: funneling every heap-pointer load
+/// through this helper makes the "by-convention marking" miss-class
+/// impossible at any future contributor's add site (PR #159 review N4).
+///
+/// **Contract.** The slot at `(base, offset)` MUST hold a heap-managed
+/// pointer at runtime — `*mut u8` with TAG_HEAP semantics, or an
+/// untagged closure pointer. Function pointers (`code_ptr` at offset 8
+/// of a closure, FFI fn_ptrs in handler frames) and raw scalars
+/// (`Int`, header words, discriminant bytes) MUST NOT route through
+/// this helper. Over-flagging a non-pointer slot would trip the
+/// precise marker on the raw bit pattern.
+///
+/// Always loads at `pointer_ty` width. For sub-pointer slot types
+/// (`Bool`, `Byte`, `Unit`) use the bare `builder.ins().load(types::I8, ...)`
+/// pattern; for `Int` slots use `builder.ins().load(types::I64, ...)`
+/// without flagging.
+fn lower_heap_pointer_load(
+    builder: &mut FunctionBuilder<'_>,
+    pointer_ty: Type,
+    base: Value,
+    offset: i32,
+) -> Value {
+    let ptr = builder
+        .ins()
+        .load(pointer_ty, MemFlags::trusted(), base, offset);
     builder.declare_value_needs_stack_map(ptr);
     ptr
 }
