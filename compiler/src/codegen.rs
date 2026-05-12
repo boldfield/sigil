@@ -529,6 +529,58 @@ fn cranelift_ty_for_type_expr(te: &TypeExpr, pointer_ty: Type) -> Type {
 /// expecting I8 — exactly the verifier-error class Stage 6 cleanup's
 /// A.3 commit closed). Panic loudly so the bug surfaces at the
 /// codegen call site rather than as a downstream verifier error.
+/// Plan E2 Phase 1 Task 2b — flag any pointer-typed block-param at the
+/// given block whose corresponding Sigil type (`sigil_tys[i]`) is
+/// heap-bearing. Use at fn-entry sites where the entry block's params
+/// reflect the function's user-arg list and we want the heap-pointer
+/// args rooted in the callee's frame so that Plan E2 Phase 3's precise
+/// stack-root walker treats them as live across any non-tail call inside
+/// the body.
+///
+/// The user's Sigil types are mapped onto the entry block's pointer-typed
+/// params *positionally* — caller is responsible for passing the slice
+/// in the same order the corresponding block-params appear (taking ABI
+/// shape into account: the caller knows which entry-block-params are
+/// `null_closure` / `terminal_out` infrastructure vs user args, and
+/// passes only the user-arg Sigil types here).
+///
+/// Soundness: Task 3's audit (PR #157) confirmed Cranelift's tail-call
+/// IR (`return_call` / `return_call_indirect`) is NOT a safepoint;
+/// heap-pointer args transferred across a tail call become roots in the
+/// callee's frame *only if* flagged here. Without this flagging, Phase 3
+/// loses precise tracking of those values once Boehm's conservative
+/// stack scan goes away.
+fn flag_heap_pointer_user_args(
+    builder: &mut FunctionBuilder<'_>,
+    entry_block: cranelift::codegen::ir::Block,
+    base_offset: usize,
+    is_heap_per_arg: &[bool],
+) {
+    let block_params = builder.block_params(entry_block).to_vec();
+    for (i, &is_heap) in is_heap_per_arg.iter().enumerate() {
+        if !is_heap {
+            continue;
+        }
+        let bp_idx = base_offset + i;
+        if bp_idx >= block_params.len() {
+            continue;
+        }
+        builder.declare_value_needs_stack_map(block_params[bp_idx]);
+    }
+}
+
+/// Plan E2 Phase 1 Task 2b — TypeExpr-level heap-bearing predicate
+/// (companion to `is_heap_pointer_ty` on `Ty`). Used at call sites
+/// where the AST `TypeExpr` is in scope but the resolved typecheck
+/// `Ty` isn't readily available. Mirrors `cranelift_ty_for_type_expr`'s
+/// head_name dispatch but inverted: returns `false` only for the named
+/// scalar types whose codegen representation is a sub-pointer-width
+/// scalar (`Int`, `Bool`, `Byte`, `Unit`); everything else (`Char`,
+/// `String`, `Fn`-shaped, user-defined type names) is heap-bearing.
+fn is_heap_pointer_type_expr(te: &TypeExpr) -> bool {
+    !matches!(te.head_name(), "Int" | "Bool" | "Byte" | "Unit")
+}
+
 /// Plan E2 Phase 1 Task 2b — return true iff the Sigil type `ty`'s codegen
 /// representation is a *heap-managed* pointer (a value that the GC should
 /// trace through). Used to decide whether a loaded value should be flagged
@@ -10041,6 +10093,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.append_block_params_for_function_params(block);
             builder.switch_to_block(block);
             builder.seal_block(block);
+
+            // Plan E2 Phase 1 Task 2b cat 3 — flag heap-bearing user-arg
+            // block-params at fn-entry. For Sync ABI the entry block-params
+            // are `[null_closure, *user_args, terminal_out]`; user args
+            // start at index 1. For Cps ABI the entry block-params are
+            // `[closure_ptr, args_ptr, k_closure, k_fn]` — user args are
+            // not in block-params at all (they're loaded from args_ptr
+            // by the body), so this flagging is a no-op there. The
+            // user-fn-entry-params flagging is load-bearing for Task 3's
+            // soundness contract — without it, heap pointers passed
+            // across `return_call` / `return_call_indirect` lose precise
+            // tracking once Phase 3 drops the conservative stack scan.
+            if entry.abi == UserFnAbi::Sync {
+                let is_heap_per_arg: Vec<bool> = f
+                    .params
+                    .iter()
+                    .map(|p| is_heap_pointer_type_expr(&p.ty))
+                    .collect();
+                flag_heap_pointer_user_args(&mut builder, block, 1, &is_heap_per_arg);
+            }
 
             // Plan B Task 55, Phase 4e — per-fn FuncRefs + DataRefs +
             // side-table reflections. See `prepare_per_fn_refs` for
@@ -26495,7 +26567,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         Ty::Bool | Ty::Byte | Ty::Unit => {
                             self.builder.ins().ireduce(types::I8, raw)
                         }
-                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+                        Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => {
+                            // Plan E2 Phase 1 Task 2b — heap-bearing
+                            // tuple element; flag the loaded raw i64
+                            // for the stack-map machinery.
+                            self.builder.declare_value_needs_stack_map(raw);
+                            raw
+                        }
                         // Plan D Task 117 — Continuation in a tuple
                         // element would require storing k in a heap-
                         // allocated tuple, which the E0145 escape
@@ -26556,7 +26634,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         match field_ty {
             Ty::Int => raw,
             Ty::Bool | Ty::Byte | Ty::Unit => self.builder.ins().ireduce(types::I8, raw),
-            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => raw,
+            Ty::Char | Ty::String | Ty::Fn(_) | Ty::User(_, _) | Ty::Tuple(_) => {
+                // Plan E2 Phase 1 Task 2b — heap-bearing field; flag
+                // the loaded raw i64 for the stack-map machinery.
+                self.builder.declare_value_needs_stack_map(raw);
+                raw
+            }
             // Plan D Task 117 — Continuation in a user-type field
             // would require storing k in a heap record, which the
             // E0145 escape barrier rejects at typecheck.
