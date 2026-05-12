@@ -4,10 +4,21 @@
 //! Sigil's "no shadowing, ever" tenet (`README.md` §"Design philosophy:
 //! fight the priors") is enforced here. The rule is:
 //!
-//! - **Let bindings cannot shadow** any name visible at the let site —
-//!   neither outer fn params, nor outer lets, nor outer construct-
+//! - **Let bindings and fn params are unique across the entire
+//!   function.** No two such bindings can share a name, regardless of
+//!   scope — disjoint match arms, disjoint if/else branches, and
+//!   nested lambda bodies cannot reuse a name a let or fn param has
+//!   already bound elsewhere in the same fn. This matches the
+//!   typechecker's `env_insert` invariant (a single flat per-fn env
+//!   that asserts uniqueness on insertion for lets and fn params);
+//!   without this pass, two lets sharing a name in disjoint scopes
+//!   slip through to typecheck and trip the assert in debug builds
+//!   (silent last-write-wins in release).
+//! - **Let bindings additionally cannot shadow** any name visible at
+//!   the let site — outer fn params, outer lets, or outer construct-
 //!   introduced bindings (lambda params, match patterns, handle arm
-//!   params, return-arm bindings).
+//!   params, return-arm bindings). This is the per-scope visibility
+//!   check; the per-fn uniqueness check above is the broader rule.
 //! - **Construct-introduced bindings** (lambda params, match arm
 //!   pattern bindings, handle op-arm params + `k`, handle return-arm
 //!   binding) introduce fresh scope: they MAY shadow outer names.
@@ -57,12 +68,26 @@ pub fn resolve(program: Program) -> (ResolvedProgram, Vec<CompilerError>) {
             // collision is checked here so a malformed signature
             // (`fn f(x: Int, x: Int)`) trips before the body walks.
             let mut scope: BTreeSet<String> = BTreeSet::new();
+            // `fn_lets` tracks every let / fn-param name bound anywhere
+            // in this function so disjoint-scope siblings (`Nil =>
+            // { let x = .. }` and `Cons(..) => { let x = .. }`) are
+            // rejected up-front rather than slipping into typecheck
+            // where `env_insert`'s debug-assert panics. Fn params seed
+            // it for symmetry with typecheck (which routes both lets
+            // and params through `env_insert`).
+            let mut fn_lets: BTreeSet<String> = BTreeSet::new();
             for p in &f.params {
                 if !scope.insert(p.name.clone()) {
                     push_redef(&mut errors, p.span.clone(), &p.name);
                 }
+                // `_` is the discard param — out-of-namespace, like
+                // `let _ = ...` discards. Multiple `_` params are
+                // independent placeholders, not shadowing.
+                if p.name != "_" {
+                    fn_lets.insert(p.name.clone());
+                }
             }
-            resolve_block(&f.body, &scope, &ctor_names, &mut errors);
+            resolve_block(&f.body, &scope, &ctor_names, &mut errors, &mut fn_lets);
         }
     }
     (ResolvedProgram { program }, errors)
@@ -92,12 +117,14 @@ fn push_redef(errors: &mut Vec<CompilerError>, span: Span, name: &str) {
 /// Walk a `Block`. Lets accumulate into a per-block scope (cloned from
 /// the outer scope so blocks are LIFO-fresh — a let inside an inner
 /// block doesn't survive past the block end). Within the block, lets
-/// check against the running scope for shadowing.
+/// check against the running scope for visibility-shadowing AND
+/// against `fn_lets` for the broader per-fn uniqueness rule.
 fn resolve_block(
     b: &Block,
     outer_scope: &BTreeSet<String>,
     ctor_names: &BTreeSet<String>,
     errors: &mut Vec<CompilerError>,
+    fn_lets: &mut BTreeSet<String>,
 ) {
     let mut scope = outer_scope.clone();
     for s in &b.stmts {
@@ -107,7 +134,7 @@ fn resolve_block(
                 // a self-referential RHS (`let x: Int = x`) refers to
                 // the outer `x` if any, not to the binding being
                 // defined. Aligns with non-recursive let semantics.
-                resolve_expr(&l.value, &scope, ctor_names, errors);
+                resolve_expr(&l.value, &scope, ctor_names, errors, fn_lets);
                 // `_` is a discard binding (sequential `let _: T = expr;`
                 // for side effect with the value thrown away). Multiple
                 // `let _` in the same scope are NOT shadowing — they're
@@ -118,20 +145,39 @@ fn resolve_block(
                 // over multiple inputs).
                 if l.name == "_" {
                     scope.insert(l.name.clone());
-                } else if !scope.insert(l.name.clone()) {
-                    push_redef(errors, l.span.clone(), &l.name);
+                } else {
+                    // Two checks fire E0020:
+                    //   1. `scope.insert` returns false → the name is
+                    //      visible at this let site (outer let, fn param,
+                    //      pattern binding, lambda param, etc.). The
+                    //      classic "no shadow visible binders" case.
+                    //   2. `fn_lets.insert` returns false → the name has
+                    //      already been bound by a let or fn-param
+                    //      somewhere else in this function. Catches
+                    //      disjoint-scope siblings (match arm A and arm
+                    //      B both `let completed_field_text = ...`)
+                    //      that the per-scope check misses because the
+                    //      sibling binding isn't visible here.
+                    // Fire E0020 at most once even when both checks
+                    // would trip (e.g. `let x = 1; let x = 2;` in one
+                    // block — scope and fn_lets both already have `x`).
+                    let scope_had = !scope.insert(l.name.clone());
+                    let fn_had = !fn_lets.insert(l.name.clone());
+                    if scope_had || fn_had {
+                        push_redef(errors, l.span.clone(), &l.name);
+                    }
                 }
             }
-            Stmt::Expr(e) => resolve_expr(e, &scope, ctor_names, errors),
+            Stmt::Expr(e) => resolve_expr(e, &scope, ctor_names, errors, fn_lets),
             Stmt::Perform(p) => {
                 for a in &p.args {
-                    resolve_expr(a, &scope, ctor_names, errors);
+                    resolve_expr(a, &scope, ctor_names, errors, fn_lets);
                 }
             }
         }
     }
     if let Some(t) = &b.tail {
-        resolve_expr(t, &scope, ctor_names, errors);
+        resolve_expr(t, &scope, ctor_names, errors, fn_lets);
     }
 }
 
@@ -143,6 +189,7 @@ fn resolve_expr(
     scope: &BTreeSet<String>,
     ctor_names: &BTreeSet<String>,
     errors: &mut Vec<CompilerError>,
+    fn_lets: &mut BTreeSet<String>,
 ) {
     match e {
         // Leaves and post-closure-conversion shapes (resolve runs pre-CC,
@@ -157,35 +204,35 @@ fn resolve_expr(
         | Expr::ClosureRecord { .. }
         | Expr::ClosureEnvLoad { .. } => {}
         Expr::Call { callee, args, .. } => {
-            resolve_expr(callee, scope, ctor_names, errors);
+            resolve_expr(callee, scope, ctor_names, errors, fn_lets);
             for a in args {
-                resolve_expr(a, scope, ctor_names, errors);
+                resolve_expr(a, scope, ctor_names, errors, fn_lets);
             }
         }
         Expr::Perform(p) => {
             for a in &p.args {
-                resolve_expr(a, scope, ctor_names, errors);
+                resolve_expr(a, scope, ctor_names, errors, fn_lets);
             }
         }
         Expr::Binary { lhs, rhs, .. } => {
-            resolve_expr(lhs, scope, ctor_names, errors);
-            resolve_expr(rhs, scope, ctor_names, errors);
+            resolve_expr(lhs, scope, ctor_names, errors, fn_lets);
+            resolve_expr(rhs, scope, ctor_names, errors, fn_lets);
         }
-        Expr::Unary { operand, .. } => resolve_expr(operand, scope, ctor_names, errors),
+        Expr::Unary { operand, .. } => resolve_expr(operand, scope, ctor_names, errors, fn_lets),
         Expr::If {
             cond,
             then_block,
             else_block,
             ..
         } => {
-            resolve_expr(cond, scope, ctor_names, errors);
-            resolve_block(then_block, scope, ctor_names, errors);
-            resolve_block(else_block, scope, ctor_names, errors);
+            resolve_expr(cond, scope, ctor_names, errors, fn_lets);
+            resolve_block(then_block, scope, ctor_names, errors, fn_lets);
+            resolve_block(else_block, scope, ctor_names, errors, fn_lets);
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            resolve_expr(scrutinee, scope, ctor_names, errors);
+            resolve_expr(scrutinee, scope, ctor_names, errors, fn_lets);
             for arm in arms {
                 let mut inner = scope.clone();
                 let mut arm_pattern_seen: BTreeSet<String> = BTreeSet::new();
@@ -196,10 +243,10 @@ fn resolve_expr(
                     errors,
                 );
                 inner.extend(arm_pattern_seen);
-                resolve_expr(&arm.body, &inner, ctor_names, errors);
+                resolve_expr(&arm.body, &inner, ctor_names, errors, fn_lets);
             }
         }
-        Expr::Block(b) => resolve_block(b, scope, ctor_names, errors),
+        Expr::Block(b) => resolve_block(b, scope, ctor_names, errors, fn_lets),
         Expr::Lambda { params, body, .. } => {
             let mut inner = scope.clone();
             let mut lambda_param_seen: BTreeSet<String> = BTreeSet::new();
@@ -216,16 +263,16 @@ fn resolve_expr(
                 // in scope regardless of whether the dup-check fired.
                 inner.insert(p.name.clone());
             }
-            resolve_expr(body, &inner, ctor_names, errors);
+            resolve_expr(body, &inner, ctor_names, errors, fn_lets);
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                resolve_expr(&f.value, scope, ctor_names, errors);
+                resolve_expr(&f.value, scope, ctor_names, errors, fn_lets);
             }
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                resolve_expr(el, scope, ctor_names, errors);
+                resolve_expr(el, scope, ctor_names, errors, fn_lets);
             }
         }
         Expr::Handle {
@@ -234,7 +281,7 @@ fn resolve_expr(
             op_arms,
             ..
         } => {
-            resolve_expr(body, scope, ctor_names, errors);
+            resolve_expr(body, scope, ctor_names, errors, fn_lets);
             for arm in op_arms {
                 let mut inner = scope.clone();
                 let mut arm_param_seen: BTreeSet<String> = BTreeSet::new();
@@ -248,12 +295,12 @@ fn resolve_expr(
                     push_redef(errors, arm.k_span.clone(), &arm.k_name);
                 }
                 inner.insert(arm.k_name.clone());
-                resolve_expr(&arm.body, &inner, ctor_names, errors);
+                resolve_expr(&arm.body, &inner, ctor_names, errors, fn_lets);
             }
             if let Some(ra) = return_arm {
                 let mut inner = scope.clone();
                 inner.insert(ra.binding.clone());
-                resolve_expr(&ra.body, &inner, ctor_names, errors);
+                resolve_expr(&ra.body, &inner, ctor_names, errors, fn_lets);
             }
         }
     }
@@ -721,6 +768,123 @@ mod tests {
         assert!(
             has_e0020(&errs),
             "let with self-referential RHS still fires E0020 on the rebind: {errs:?}"
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // Per-fn uniqueness: lets in disjoint scopes can't share a name
+    // (matches typecheck's flat env_insert invariant). Pre-fix, the
+    // per-visibility check missed disjoint siblings and they tripped
+    // typecheck's debug_assert at runtime instead.
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn let_in_disjoint_match_arms_same_name_fires_e0020() {
+        // Two `let x` in disjoint match arm bodies. Neither sees the
+        // other at its own let site, but both bind the same name in
+        // the same function — typecheck's flat env asserts on the
+        // second insert.
+        let src = "type Opt = | None | Some(Int)\n\
+                   fn main() -> Int ![] { \
+                     match Some(0) { \
+                       Some(_) => { let x: Int = 1; x }, \
+                       None => { let x: Int = 2; x } \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_e0020(&errs),
+            "lets in disjoint match arms cannot share a name: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn let_in_disjoint_if_branches_same_name_fires_e0020() {
+        // Two `let x` in if/else branches.
+        let src = "fn main() -> Int ![] { \
+                     if true { let x: Int = 1; x } else { let x: Int = 2; x } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_e0020(&errs),
+            "lets in disjoint if/else branches cannot share a name: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn let_in_disjoint_match_arms_different_names_resolves_clean() {
+        // Sanity check: disjoint arm lets with *different* names are
+        // legal. The per-fn tracker shouldn't over-fire.
+        let src = "type Opt = | None | Some(Int)\n\
+                   fn main() -> Int ![] { \
+                     match Some(0) { \
+                       Some(_) => { let a: Int = 1; a }, \
+                       None => { let b: Int = 2; b } \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "disjoint arm lets with different names are legal: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn match_pattern_bindings_in_disjoint_arms_can_share_name() {
+        // Patterns in disjoint arms still get fresh scope and can
+        // share names. Per-fn uniqueness applies to lets and fn
+        // params, not to construct-introduced bindings (matches
+        // typecheck's direct env.insert path for patterns).
+        let src = "type LR = | L(Int) | R(Int)\n\
+                   fn main() -> Int ![] { \
+                     match L(0) { \
+                       L(x) => x, \
+                       R(x) => x \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "patterns in disjoint match arms can share a name: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn let_in_nested_match_arms_same_name_fires_e0020() {
+        // Reproduces the user-surfaced shape — a nested match where
+        // the outer match's Nil arm and the inner match's then-branch
+        // (inside Cons) both declare `let completed_field_text`.
+        let src = "type LC = | LCNil | LCCons(Int, Int)\n\
+                   fn main() -> Int ![] { \
+                     match LCCons(1, 2) { \
+                       LCNil => { let v: Int = 0; v }, \
+                       LCCons(_, _) => { \
+                         if true { let v: Int = 1; v } else { 2 } \
+                       } \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_e0020(&errs),
+            "nested disjoint arms cannot share a let name: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn discard_let_in_disjoint_arms_does_not_fire_e0020() {
+        // Multiple `let _` in disjoint arms are independent discards,
+        // not shadowing — same carve-out as in the same scope.
+        let src = "type Opt = | None | Some(Int)\n\
+                   fn main() -> Int ![] { \
+                     match Some(0) { \
+                       Some(_) => { let _: Int = 1; 0 }, \
+                       None => { let _: Int = 2; 0 } \
+                     } \
+                   }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_e0020(&errs),
+            "discard `let _` in disjoint arms is not shadowing: {errs:?}"
         );
     }
 }

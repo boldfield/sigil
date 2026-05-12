@@ -59,6 +59,20 @@ pub fn compile(
     let (resolved, resolve_errs) = resolve::resolve(prog);
     all_errs.extend(resolve_errs);
 
+    // Short-circuit before typecheck if any prior phase (lex / parse /
+    // imports / resolve) errored. Typecheck's invariants assume a
+    // resolved program — running it on AST that resolve already
+    // rejected can trip debug_asserts (e.g. `env_insert`'s function-
+    // wide uniqueness check) and panic in debug builds. Surfacing the
+    // upstream errors first is both more useful and avoids the crash.
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
+        emit_errors(&all_errs, format);
+        return Err(all_errs.len());
+    }
+
     let (checked, tc_errs) = typecheck::typecheck(resolved.program);
     all_errs.extend(tc_errs);
 
@@ -154,6 +168,18 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
 
     let (resolved, resolve_errs) = resolve::resolve(prog);
     all_errs.extend(resolve_errs);
+
+    // Same guard as the main pipeline path — don't run typecheck on
+    // AST that resolve has already rejected; the function-wide
+    // uniqueness debug_assert in `env_insert` would panic.
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
+        let n = all_errs.len();
+        emit_errors(&all_errs, format);
+        return Err(DumpColorError::FrontEndErrors(n));
+    }
 
     let (checked, tc_errs) = typecheck::typecheck(resolved.program);
     all_errs.extend(tc_errs);
