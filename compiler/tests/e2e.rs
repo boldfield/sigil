@@ -18287,3 +18287,40 @@ fn validate_folded_against_workload(folded: &str, workload_label: &str) {
         folded.lines().take(5).collect::<Vec<_>>().join("\n")
     );
 }
+
+/// Regression — Mach-O caps section names at 16 bytes, so the prior
+/// per-literal `sigil_str_lit_{idx}` section name overflowed at
+/// idx >= 100 (`sigil_str_lit_100` is 17 chars), failing codegen with
+/// `section name `sigil_str_lit_100` is too long`. Sharing the
+/// section name across all literals (per-literal *symbol* names stay
+/// unique) keeps it within the cap regardless of literal count.
+///
+/// A program with 110 distinct string literals exercises the prior
+/// crash point and verifies the runtime can still resolve each
+/// literal symbol independently.
+#[test]
+fn many_string_literals_compile_and_run() {
+    let mut src = String::from("import std.io\nfn main() -> Int ![IO] {\n");
+    for i in 0..110 {
+        src.push_str(&format!("  perform IO.println(\"lit_{i}\");\n"));
+    }
+    src.push_str("  0\n}\n");
+    let (stdout, stderr, code) = compile_and_run(&src, "many_string_literals");
+    assert_eq!(code, 0, "exit code: stderr={stderr:?}");
+    // Spot-check: first, mid (covers the 100+ boundary), and last
+    // literal must each show up exactly once in stdout, in order.
+    assert!(
+        stdout.starts_with("lit_0\nlit_1\n"),
+        "stdout must start with the first two literals; got first 30 bytes: {:?}",
+        &stdout[..stdout.len().min(30)]
+    );
+    assert!(
+        stdout.contains("\nlit_100\nlit_101\n"),
+        "stdout must contain the boundary literals around idx 100"
+    );
+    assert!(
+        stdout.ends_with("lit_109\n"),
+        "stdout must end with the final literal; got last 20 bytes: {:?}",
+        &stdout[stdout.len().saturating_sub(20)..]
+    );
+}

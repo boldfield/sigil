@@ -9891,6 +9891,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // Define string-literal data objects: one DataId per literal, payload
     // is the raw UTF-8 bytes with no header.
+    //
+    // Section name is shared across every literal — Mach-O caps section
+    // names at 16 bytes (see the `sigil_arith_msg_*` comment below), and
+    // a per-index `sigil_str_lit_{idx}` shape overflows at idx >= 100
+    // (`sigil_str_lit_100` is 17 chars). Programs with 100+ distinct
+    // literals reproducibly tripped that ceiling with `section name
+    // `sigil_str_lit_100` is too long`. The per-literal *symbol* name
+    // stays unique for the linker symtab; the section name just groups
+    // them in the rodata segment — Mach-O / ELF both happily hold many
+    // symbols in one section.
     let mut lit_ids = Vec::new();
     for (idx, (_span, s)) in string_literals.iter().enumerate() {
         let name = format!("sigil_str_lit_{idx}");
@@ -9899,7 +9909,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .map_err(|e| format!("declare {name}: {e}"))?;
         let mut data = DataDescription::new();
         data.define(s.as_bytes().to_vec().into_boxed_slice());
-        data.set_segment_section(".rodata", &name);
+        data.set_segment_section(".rodata", "sigil_str_lit");
         module
             .define_data(id, &data)
             .map_err(|e| format!("define {name}: {e:#?}"))?;
