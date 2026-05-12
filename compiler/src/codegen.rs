@@ -10507,6 +10507,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let scrut_ty = lowerer.lookup_match_scrut_ty(&match_span);
                     let cont = lowerer.builder.create_block();
                     lowerer.builder.append_block_param(cont, pointer_ty);
+                    // Plan E2 Phase 1 Task 2b cat 3 — every arm produces
+                    // a `*mut NextStep` (heap pointer) that flows through
+                    // this cont param. Always heap-bearing; flag.
+                    let cont_ns_ptr = lowerer.builder.block_params(cont)[0];
+                    lowerer.builder.declare_value_needs_stack_map(cont_ns_ptr);
 
                     // Phase 5 — per-arm dispatch. For each arm,
                     // emit pattern tests (jumping to `next` on miss),
@@ -10865,26 +10870,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // Stage 5 extension: also copy fired_ptr at
                             // the third trailing slot.
                             let body_user_arg_count_b2 = f.params.len();
-                            let ra_closure_b2 = lowerer.builder.ins().load(
+                            let ra_closure_b2 = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count_b2),
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_closure_b2);
                             let ra_fn_b2 = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fn_offset(body_user_arg_count_b2),
                             );
-                            let ra_fired_b2 = lowerer.builder.ins().load(
+                            let ra_fired_b2 = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count_b2),
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_fired_b2);
                             let ra_closure_in_cp_b2: i32 = 16 + 8 * total_capture_slots as i32;
                             let ra_fn_in_cp_b2: i32 = ra_closure_in_cp_b2 + 8;
                             let ra_fired_in_cp_b2: i32 = ra_fn_in_cp_b2 + 8;
@@ -11036,13 +11039,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // TLS top's `fired` flag for chain-unwind
                             // short-circuit (Stage 4 will retire that).
                             let body_user_arg_count = f.params.len();
-                            let ra_closure = lowerer.builder.ins().load(
+                            let ra_closure = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(body_user_arg_count),
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_closure);
                             let ra_fn = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
@@ -11054,13 +11056,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // slot (handle entry allocated the cell + stored
                             // its address). Helper gates dispatch on
                             // `*fired_ptr` instead of TLS.
-                            let ra_fired_ptr = lowerer.builder.ins().load(
+                            let ra_fired_ptr = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(body_user_arg_count),
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_fired_ptr);
                             let done_call = lowerer.builder.ins().call(
                                 done_or_dispatch_return_arm_via_args_ref,
                                 &[const_v, ra_closure, ra_fn, ra_fired_ptr],
@@ -11518,13 +11519,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // trailing slots at the user-arg-count-
                         // shifted offsets (the same slots
                         // tail-perform wrappers read).
-                        let caller_k_closure = builder.ins().load(
+                        let caller_k_closure = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             k_closure_offset(user_arg_count),
                         );
-                        builder.declare_value_needs_stack_map(caller_k_closure);
                         let caller_k_fn = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
@@ -11551,26 +11551,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         //
                         // Stage 5 extension: also copy fired_ptr from
                         // args_ptr's third trailing slot.
-                        let return_arm_closure_v = builder.ins().load(
+                        let return_arm_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
-                        builder.declare_value_needs_stack_map(return_arm_closure_v);
                         let return_arm_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
-                        let return_arm_fired_v = builder.ins().load(
+                        let return_arm_fired_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
-                        builder.declare_value_needs_stack_map(return_arm_fired_v);
                         let ra_closure_in_cp_off: i32 = 16 + 8 * (captures.len() + 2) as i32;
                         let ra_fn_in_cp_off: i32 = ra_closure_in_cp_off + 8;
                         let ra_fired_in_cp_off: i32 = ra_fn_in_cp_off + 8;
@@ -11677,26 +11675,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // Copy return_arm + fired_ptr from this body
                         // fn's args_ptr into the synth-cont's closure
                         // record.
-                        let ra_closure_v = builder.ins().load(
+                        let ra_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(user_arg_count),
                         );
-                        builder.declare_value_needs_stack_map(ra_closure_v);
                         let ra_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
                             args_ptr,
                             return_arm_fn_offset(user_arg_count),
                         );
-                        let ra_fired_v = builder.ins().load(
+                        let ra_fired_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(user_arg_count),
                         );
-                        builder.declare_value_needs_stack_map(ra_fired_v);
                         let ra_closure_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_off: i32 = ra_closure_off + 8;
                         let ra_fired_off: i32 = ra_fn_off + 8;
@@ -11713,13 +11709,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     };
                     (k_closure, synth_cont_addr)
                 } else {
-                    let k_closure = builder.ins().load(
+                    let k_closure = lower_heap_pointer_load(
+                        &mut builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         k_closure_offset(user_arg_count),
                     );
-                    builder.declare_value_needs_stack_map(k_closure);
                     let k_fn = builder.ins().load(
                         pointer_ty,
                         MemFlags::trusted(),
@@ -11967,30 +11962,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // in the user-fn body emit setup);
                             // `lowerer.perform_ref` shadows it but
                             // they're the same FuncRef.
-                            let ra_closure_perform = lowerer.builder.ins().load(
+                            let ra_closure_perform = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_closure_offset(user_arg_count),
                             );
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(ra_closure_perform);
                             let ra_fn_perform = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fn_offset(user_arg_count),
                             );
-                            let ra_fired_perform = lowerer.builder.ins().load(
+                            let ra_fired_perform = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 args_ptr,
                                 return_arm_fired_offset(user_arg_count),
                             );
-                            lowerer
-                                .builder
-                                .declare_value_needs_stack_map(ra_fired_perform);
                             let perform_call = lowerer.builder.ins().call(
                                 lowerer.perform_ref,
                                 &[
@@ -12957,13 +12946,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // args to `sigil_next_step_call` when the arm body's
                 // tail expression is `k(arg)`.
                 let n_user_args = synth.arg_names.len();
-                let k_closure_v = builder.ins().load(
+                let k_closure_v = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     args_ptr,
                     (n_user_args * 8) as i32,
                 );
-                builder.declare_value_needs_stack_map(k_closure_v);
                 let k_fn_v = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -13261,28 +13249,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // arm-fn's incoming args_ptr (sigil_perform routed
                     // the active handle's triple there per Stage 3b/5
                     // ABI).
-                    let arm_ra_closure = lowerer.builder.ins().load(
+                    let arm_ra_closure = lower_heap_pointer_load(
+                        &mut lowerer.builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         return_arm_closure_offset(n_user_args),
                     );
-                    lowerer
-                        .builder
-                        .declare_value_needs_stack_map(arm_ra_closure);
                     let arm_ra_fn = lowerer.builder.ins().load(
                         pointer_ty,
                         MemFlags::trusted(),
                         args_ptr,
                         return_arm_fn_offset(n_user_args),
                     );
-                    let arm_ra_fired = lowerer.builder.ins().load(
+                    let arm_ra_fired = lower_heap_pointer_load(
+                        &mut lowerer.builder,
                         pointer_ty,
-                        MemFlags::trusted(),
                         args_ptr,
                         return_arm_fired_offset(n_user_args),
                     );
-                    lowerer.builder.declare_value_needs_stack_map(arm_ra_fired);
                     let ra_closure_off_step0: i32 =
                         32 + 8 * (captures.len() + extra_for_return_arm) as i32;
                     let ra_fn_off_step0: i32 = ra_closure_off_step0 + 8;
@@ -13560,28 +13544,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // closure record's trailing slots.
                         //
                         // Stage 5 — also load + store fired_ptr.
-                        let ra_closure_arm = lowerer.builder.ins().load(
+                        let ra_closure_arm = lower_heap_pointer_load(
+                            &mut lowerer.builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_closure_offset(n_user_args),
                         );
-                        lowerer
-                            .builder
-                            .declare_value_needs_stack_map(ra_closure_arm);
                         let ra_fn_arm = lowerer.builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
                             args_ptr,
                             return_arm_fn_offset(n_user_args),
                         );
-                        let ra_fired_arm = lowerer.builder.ins().load(
+                        let ra_fired_arm = lower_heap_pointer_load(
+                            &mut lowerer.builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             args_ptr,
                             return_arm_fired_offset(n_user_args),
                         );
-                        lowerer.builder.declare_value_needs_stack_map(ra_fired_arm);
                         let ra_closure_in_pak_off: i32 = 16 + 8 * captures.len() as i32;
                         let ra_fn_in_pak_off: i32 = ra_closure_in_pak_off + 8;
                         let ra_fired_in_pak_off: i32 = ra_fn_in_pak_off + 8;
@@ -14051,13 +14031,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 env.insert(synth.binding_name.clone(), v_value);
 
                 // Load post_handle_k trailing pair from args_ptr[1..3].
-                let post_handle_k_closure_v = builder.ins().load(
+                let post_handle_k_closure_v = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
-                builder.declare_value_needs_stack_map(post_handle_k_closure_v);
                 let post_handle_k_fn_v = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -14464,30 +14443,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let pak_ra_closure_off: i32 = 16 + 8 * post_arm_k.captures.len() as i32;
             let pak_ra_fn_off: i32 = pak_ra_closure_off + 8;
             let pak_ra_fired_off: i32 = pak_ra_fn_off + 8;
-            let ra_closure_pak = lowerer.builder.ins().load(
+            let ra_closure_pak = lower_heap_pointer_load(
+                &mut lowerer.builder,
                 pointer_ty,
-                MemFlags::trusted(),
                 lowerer.closure_ptr,
                 pak_ra_closure_off,
             );
-            lowerer
-                .builder
-                .declare_value_needs_stack_map(ra_closure_pak);
             let ra_fn_pak = lowerer.builder.ins().load(
                 pointer_ty,
                 MemFlags::trusted(),
                 lowerer.closure_ptr,
                 pak_ra_fn_off,
             );
-            let ra_fired_ptr_pak = lowerer.builder.ins().load(
+            let ra_fired_ptr_pak = lower_heap_pointer_load(
+                &mut lowerer.builder,
                 pointer_ty,
-                MemFlags::trusted(),
                 lowerer.closure_ptr,
                 pak_ra_fired_off,
             );
-            lowerer
-                .builder
-                .declare_value_needs_stack_map(ra_fired_ptr_pak);
             let done_call = lowerer.builder.ins().call(
                 done_or_dispatch_return_arm_via_args_ref,
                 &[widened_tail, ra_closure_pak, ra_fn_pak, ra_fired_ptr_pak],
@@ -14600,26 +14573,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // nested sigil_run_loop, and use the returned
                     // R-typed value as the binding.
                     let bound_widened = if chain.has_return_arm {
-                        let frame_ptr_v = builder.ins().load(
+                        let frame_ptr_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             frame_ptr_offset,
                         );
-                        builder.declare_value_needs_stack_map(frame_ptr_v);
                         let return_fn_v = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
                             frame_ptr_v,
                             sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
                         );
-                        let return_closure_v = builder.ins().load(
+                        let return_closure_v = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             frame_ptr_v,
                             sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                         );
-                        builder.declare_value_needs_stack_map(return_closure_v);
 
                         let next_step_call_local = module
                             .declare_func_in_func(per_fn_refs_ctx.next_step_call, builder.func);
@@ -14942,30 +14913,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     prior_offset_base + 8 * step.prior_bindings.len() as i32;
                                 let ra_fn_off_slc: i32 = ra_closure_off_slc + 8;
                                 let ra_fired_off_slc: i32 = ra_fn_off_slc + 8;
-                                let ra_closure_slc = lowerer.builder.ins().load(
+                                let ra_closure_slc = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     ra_closure_off_slc,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(ra_closure_slc);
                                 let ra_fn_slc = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
                                     synth_closure_ptr,
                                     ra_fn_off_slc,
                                 );
-                                let ra_fired_ptr_slc = lowerer.builder.ins().load(
+                                let ra_fired_ptr_slc = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     ra_fired_off_slc,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(ra_fired_ptr_slc);
                                 let done_call = lowerer.builder.ins().call(
                                     done_or_dispatch_return_arm_via_args_ref,
                                     &[widened_tail, ra_closure_slc, ra_fn_slc, ra_fired_ptr_slc],
@@ -15256,26 +15221,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 next_prior_offset_base + 8 * prior_count_next as i32;
                             let next_ra_fn_off: i32 = next_ra_closure_off + 8;
                             let next_ra_fired_off: i32 = next_ra_fn_off + 8;
-                            let ra_closure_v = lowerer.builder.ins().load(
+                            let ra_closure_v = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 synth_closure_ptr,
                                 this_ra_closure_off,
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_closure_v);
                             let ra_fn_v = lowerer.builder.ins().load(
                                 pointer_ty,
                                 MemFlags::trusted(),
                                 synth_closure_ptr,
                                 this_ra_fn_off,
                             );
-                            let ra_fired_v = lowerer.builder.ins().load(
+                            let ra_fired_v = lower_heap_pointer_load(
+                                &mut lowerer.builder,
                                 pointer_ty,
-                                MemFlags::trusted(),
                                 synth_closure_ptr,
                                 this_ra_fired_off,
                             );
-                            lowerer.builder.declare_value_needs_stack_map(ra_fired_v);
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
                                 ra_closure_v,
@@ -15474,13 +15437,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // a GC sweep, trampoline dispatches into freed
                 // memory.
                 let synth_cont_args_ptr = block_params[1];
-                let post_arm_k_closure = builder.ins().load(
+                let post_arm_k_closure = lower_heap_pointer_load(
+                    &mut builder,
                     pointer_ty,
-                    MemFlags::trusted(),
                     synth_cont_args_ptr,
                     POST_ARM_K_CLOSURE_OFF,
                 );
-                builder.declare_value_needs_stack_map(post_arm_k_closure);
                 let post_arm_k_fn = builder.ins().load(
                     pointer_ty,
                     MemFlags::trusted(),
@@ -15532,26 +15494,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let constant_v = builder.ins().iconst(types::I64, *constant_value);
                         let synth_closure_ptr = block_params[0];
                         builder.declare_value_needs_stack_map(synth_closure_ptr);
-                        let ra_closure = builder.ins().load(
+                        let ra_closure = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             16,
                         );
-                        builder.declare_value_needs_stack_map(ra_closure);
                         let ra_fn = builder.ins().load(
                             pointer_ty,
                             MemFlags::trusted(),
                             synth_closure_ptr,
                             24,
                         );
-                        let ra_fired_ptr = builder.ins().load(
+                        let ra_fired_ptr = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             32,
                         );
-                        builder.declare_value_needs_stack_map(ra_fired_ptr);
                         let done_call = builder.ins().call(
                             done_or_dispatch_return_arm_via_args_ref,
                             &[constant_v, ra_closure, ra_fn, ra_fired_ptr],
@@ -16426,14 +16386,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                let caller_k_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
-                                                );
-                                                lowerer.builder.declare_value_needs_stack_map(
-                                                    caller_k_closure,
                                                 );
                                                 let caller_k_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
@@ -16648,14 +16605,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let caller_k_closure = lowerer.builder.ins().load(
+                                                let caller_k_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
-                                                );
-                                                lowerer.builder.declare_value_needs_stack_map(
-                                                    caller_k_closure,
                                                 );
                                                 let caller_k_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
@@ -16847,15 +16801,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     + 8 * (captures.len() + prior_bindings.len())
                                                         as i32;
                                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                                let ck_closure = lowerer.builder.ins().load(
+                                                let ck_closure = lower_heap_pointer_load(
+                                                    &mut lowerer.builder,
                                                     pointer_ty,
-                                                    MemFlags::trusted(),
                                                     synth_closure_ptr,
                                                     caller_k_closure_off,
                                                 );
-                                                lowerer
-                                                    .builder
-                                                    .declare_value_needs_stack_map(ck_closure);
                                                 let ck_fn = lowerer.builder.ins().load(
                                                     pointer_ty,
                                                     MemFlags::trusted(),
@@ -17378,15 +17329,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                let caller_k_closure_loaded = lowerer.builder.ins().load(
+                                let caller_k_closure_loaded = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(caller_k_closure_loaded);
                                 let caller_k_fn_loaded = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -17801,15 +17749,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let this_caller_k_closure_off: i32 =
                                     16 + 8 * (captures.len() + prior_bindings.len()) as i32;
                                 let this_caller_k_fn_off: i32 = this_caller_k_closure_off + 8;
-                                let caller_k_closure_loaded = lowerer.builder.ins().load(
+                                let caller_k_closure_loaded = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     this_caller_k_closure_off,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(caller_k_closure_loaded);
                                 let caller_k_fn_loaded = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -17861,15 +17806,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // branch pops this pushed pair and
                                 // routes Done's value through the outer
                                 // arm's chain.
-                                let outer_post_arm_k_closure = lowerer.builder.ins().load(
+                                let outer_post_arm_k_closure = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(outer_post_arm_k_closure);
                                 let outer_post_arm_k_fn = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -18218,15 +18160,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let branch_cap_count = captures.len() + prior_bindings.len();
                                 let caller_k_closure_off: i32 = 16 + 8 * branch_cap_count as i32;
                                 let caller_k_fn_off: i32 = caller_k_closure_off + 8;
-                                let caller_k_closure = lowerer.builder.ins().load(
+                                let caller_k_closure = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     caller_k_closure_off,
                                 );
-                                lowerer
-                                    .builder
-                                    .declare_value_needs_stack_map(caller_k_closure);
                                 let caller_k_fn = lowerer.builder.ins().load(
                                     pointer_ty,
                                     MemFlags::trusted(),
@@ -20268,14 +20207,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                 };
                                 let surrounding_args_ptr =
                                     self.builder.func.dfg.block_params(surrounding_entry)[1];
-                                let forwarded_post_arm_k_closure = self.builder.ins().load(
+                                let forwarded_post_arm_k_closure = lower_heap_pointer_load(
+                                    &mut self.builder,
                                     self.pointer_ty,
-                                    MemFlags::trusted(),
                                     surrounding_args_ptr,
                                     POST_ARM_K_CLOSURE_OFF,
                                 );
-                                self.builder
-                                    .declare_value_needs_stack_map(forwarded_post_arm_k_closure);
                                 let forwarded_post_arm_k_fn = self.builder.ins().load(
                                     self.pointer_ty,
                                     MemFlags::trusted(),
@@ -20625,8 +20562,17 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let mut preview: BTreeMap<String, Type> = BTreeMap::new();
         self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
         let result_ty = self.type_of_expr(&arms[0].body, &preview);
+        let result_is_heap =
+            result_ty == self.pointer_ty && self.expr_is_known_heap(&arms[0].body, &preview);
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, result_ty);
+        if result_is_heap {
+            // Plan E2 Phase 1 Task 2b cat 3 — arms[0].body is unambiguously
+            // heap-producing; the merge param carries heap pointers from
+            // every arm. Flag.
+            let cont_v = self.builder.block_params(cont)[0];
+            self.builder.declare_value_needs_stack_map(cont_v);
+        }
 
         let mut chain_terminated = false;
         let mut cont_has_preds = false;
@@ -21097,6 +21043,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let else_blk = self.builder.create_block();
                 let merge = self.builder.create_block();
                 self.builder.append_block_param(merge, pointer_ty);
+                // Plan E2 Phase 1 Task 2b cat 3 — `lower_arm_body_to_next_step`
+                // produces a `*mut NextStep` heap pointer at every recursive
+                // call site. Both branches feed merge through that helper,
+                // so the merge param is unambiguously heap-bearing.
+                let merge_ns = self.builder.block_params(merge)[0];
+                self.builder.declare_value_needs_stack_map(merge_ns);
                 self.builder
                     .ins()
                     .brif(cond_v, then_blk, &[], else_blk, &[]);
@@ -21417,6 +21369,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, pointer_ty);
+        // Plan E2 Phase 1 Task 2b cat 3 — every arm's body lowers through
+        // `lower_arm_body_to_next_step` and produces a `*mut NextStep`
+        // heap pointer. The cont merge param is unambiguously heap.
+        let cont_ns = self.builder.block_params(cont)[0];
+        self.builder.declare_value_needs_stack_map(cont_ns);
 
         let mut chain_terminated = false;
         for arm in arms.iter() {
@@ -22626,6 +22583,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let mut preview: BTreeMap<String, Type> = BTreeMap::new();
                     preview.insert(ra.binding.clone(), body_ty);
                     let handler_overall_ty = self.type_of_expr(&ra.body, &preview);
+                    let handler_result_is_heap = handler_overall_ty == self.pointer_ty
+                        && self.expr_is_known_heap(&ra.body, &preview);
 
                     // Three blocks: discharge (skip return arm),
                     // normal (existing return arm dispatch), merge
@@ -22635,6 +22594,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     let merge_block = self.builder.create_block();
                     self.builder
                         .append_block_param(merge_block, handler_overall_ty);
+                    if handler_result_is_heap {
+                        // Plan E2 Phase 1 Task 2b cat 3 — handler return-arm
+                        // body unambiguously heap-producing; flag merge param.
+                        let merge_v = self.builder.block_params(merge_block)[0];
+                        self.builder.declare_value_needs_stack_map(merge_v);
+                    }
 
                     // Task 78.5 G4 Approach 6 deep-redo — three-way
                     // branch (fired, discharged, normal). When the
@@ -22935,13 +22900,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         snap,
                         sigil_abi::effect::HANDLER_FRAME_RETURN_FN_OFF,
                     );
-                    let return_closure_v = self.builder.ins().load(
+                    let return_closure_v = lower_heap_pointer_load(
+                        &mut self.builder,
                         self.pointer_ty,
-                        MemFlags::trusted(),
                         snap,
                         sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                     );
-                    self.builder.declare_value_needs_stack_map(return_closure_v);
 
                     // Build NextStep::Call(return_closure, return_fn, 3)
                     // — the synth return fn unpacks v from
@@ -23126,12 +23090,20 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // For no-return-arm, handle's overall type = body's
                 // type B (no return arm to widen / change type).
                 let handler_overall_ty = body_ty;
+                let nra_result_is_heap = handler_overall_ty == self.pointer_ty
+                    && self.expr_is_known_heap(body, &BTreeMap::new());
 
                 let discharge_block_nra = self.builder.create_block();
                 let normal_block_nra = self.builder.create_block();
                 let merge_block_nra = self.builder.create_block();
                 self.builder
                     .append_block_param(merge_block_nra, handler_overall_ty);
+                if nra_result_is_heap {
+                    // Plan E2 Phase 1 Task 2b cat 3 — handle body is
+                    // unambiguously heap-producing; flag merge param.
+                    let merge_v = self.builder.block_params(merge_block_nra)[0];
+                    self.builder.declare_value_needs_stack_map(merge_v);
+                }
                 self.builder.ins().brif(
                     is_discharged,
                     discharge_block_nra,
@@ -23392,13 +23364,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // third slot. Re-pushed onto the handler stack before driving
         // run_loop so synth-cont chains inside k(arg) can find the
         // originating handler when invoked outside the handle.
-        let frame_ptr_loaded = self.builder.ins().load(
+        let frame_ptr_loaded = lower_heap_pointer_load(
+            &mut self.builder,
             self.pointer_ty,
-            MemFlags::trusted(),
             self.closure_ptr,
             frame_ptr_offset,
         );
-        self.builder.declare_value_needs_stack_map(frame_ptr_loaded);
 
         // Push the originating handler frame back onto the thread-local
         // handler stack. sigil_handle_pop didn't deallocate it; the
@@ -23646,13 +23617,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 // with empty outer captures it's null, for non-empty
                 // it's the closure record allocated at handle
                 // codegen time. Both cases unify through this load.
-                let ret_closure = self.builder.ins().load(
+                let ret_closure = lower_heap_pointer_load(
+                    &mut self.builder,
                     self.pointer_ty,
-                    MemFlags::trusted(),
                     frame_ptr_loaded,
                     sigil_abi::effect::HANDLER_FRAME_RETURN_CLOSURE_OFF,
                 );
-                self.builder.declare_value_needs_stack_map(ret_closure);
                 let three_v = self.builder.ins().iconst(types::I32, 3);
                 let call_ns = self.builder.ins().call(
                     self.next_step_call_ref,
@@ -26457,8 +26427,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let mut preview: BTreeMap<String, Type> = BTreeMap::new();
         self.predict_pattern_bindings(&arms[0].pattern, scrut_ty.as_ref(), &mut preview);
         let result_ty = self.type_of_expr(&arms[0].body, &preview);
+        let result_is_heap =
+            result_ty == self.pointer_ty && self.expr_is_known_heap(&arms[0].body, &preview);
         let cont = self.builder.create_block();
         self.builder.append_block_param(cont, result_ty);
+        if result_is_heap {
+            // Plan E2 Phase 1 Task 2b cat 3 — Sigil-Ty-aware flag at the
+            // merge param for heap-producing match arms.
+            let cont_v = self.builder.block_params(cont)[0];
+            self.builder.declare_value_needs_stack_map(cont_v);
+        }
 
         let mut chain_terminated = false;
         for arm in arms.iter() {
@@ -26898,6 +26876,73 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// `Pattern::Var` bindings that are not yet installed in `self.env`
     /// — critical for nested matches whose first arm references a
     /// binding introduced by an outer match's arm.
+    /// Plan E2 Phase 1 Task 2b cat 3 — return `true` iff the expression
+    /// `e`'s result at runtime is unambiguously a heap-managed pointer.
+    /// Used to flag merge-block params downstream of `lower_match` /
+    /// `lower_match_to_next_step` / handler `(non-)return-arm`
+    /// continuations where each arm produces a value whose Sigil type
+    /// is the same as the result type but the Cranelift Type alone
+    /// (pointer_ty == I64 on 64-bit hosts) can't distinguish heap
+    /// pointer from `Int`.
+    ///
+    /// Returns `false` for: `IntLit`, `BoolLit`, `UnitLit`, `Binary`
+    /// (arithmetic / comparison / logic), `Unary`. Returns `true` for:
+    /// `FloatLit`, `CharLit`, `StringLit`, `RecordLit`, ctor `Ident`s,
+    /// `Match` / `If` / `Block` whose tail is heap-producing, and
+    /// `Call` / `Perform` / `Handle` *only when* their resolved Sigil
+    /// return type is heap-bearing (looked up via `call_callee_tys` /
+    /// effect-op return-type table). For `Ident` other than ctor-bare:
+    /// we look it up in `env` (Value type) / `preview` (cached binding
+    /// type) — those are Cranelift types, so we conservatively return
+    /// `false` to avoid the "Int slot flagged → precise marker crash"
+    /// failure mode. That conservatism may under-flag for heap-typed
+    /// idents not declared in env yet (rare); Phase 3 acceptance gates
+    /// surface those.
+    fn expr_is_known_heap(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> bool {
+        use crate::ast::Expr;
+        match e {
+            Expr::IntLit(..) | Expr::BoolLit(..) | Expr::UnitLit(..) => false,
+            Expr::FloatLit(..)
+            | Expr::CharLit(..)
+            | Expr::StringLit(..)
+            | Expr::RecordLit { .. } => true,
+            // BinOp / UnOp results are always scalar (Int or Bool).
+            Expr::Binary { .. } | Expr::Unary { .. } => false,
+            Expr::Ident(name, _) => {
+                // Ctor-bare ident allocates a heap nullary variant. Other
+                // idents are conservatively unknown — fall through to false.
+                !self.env.contains_key(name)
+                    && !preview.contains_key(name)
+                    && self.ctor_index.contains_key(name)
+            }
+            Expr::Match { arms, .. } => arms
+                .first()
+                .map(|a| self.expr_is_known_heap(&a.body, preview))
+                .unwrap_or(false),
+            Expr::If { then_block, .. } => then_block
+                .tail
+                .as_ref()
+                .map(|t| self.expr_is_known_heap(t, preview))
+                .unwrap_or(false),
+            Expr::Block(b) => b
+                .tail
+                .as_ref()
+                .map(|t| self.expr_is_known_heap(t, preview))
+                .unwrap_or(false),
+            Expr::Call { span, .. } => {
+                // Resolved callee return type is the source of truth.
+                matches!(
+                    self.lookup_call_callee_ty(span),
+                    Some(crate::typecheck::Ty::Fn(sig)) if is_heap_pointer_ty(&sig.ret)
+                )
+            }
+            // Conservatively unknown — Perform / Handle / ClosureRecord /
+            // ClosureEnvLoad / Lambda / Cast / TupleLit / Try — don't
+            // flag. Phase 3 acceptance gates re-verify.
+            _ => false,
+        }
+    }
+
     fn type_of_expr(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> Type {
         use crate::ast::{BinOp, Expr, UnOp};
         match e {

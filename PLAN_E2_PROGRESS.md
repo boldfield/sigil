@@ -135,32 +135,32 @@ the Task 3 entry above.
 
 ## Open follow-ups
 
-- **`lower_heap_pointer_load` helper rollout (mechanical).** PR #159
-  introduces the helper and exercises it at one representative site.
-  41 surgical heap-pointer-named loads remain in the original
-  `BUILDER.ins().load(...) + BUILDER.declare_value_needs_stack_map(...)`
-  shape. Refactoring those to use the helper closes the
-  "by-convention marking" miss class on the load surface (PR #159
-  review N4); the door is shut for any future *new* load site (must
-  use the helper), but existing sites are still hand-maintained. Land
-  as **Task 2c** or fold into Task 4.
-- **7 type-aware merge-block params** at codegen.rs lines
-  `append_block_param(*, pointer_ty)` / `(*, result_ty)` /
-  `(*, handler_overall_ty)` sites whose Sigil-level type can be
-  either heap-bearing OR `Int` need type-aware threading. Currently
-  these sites pass only the Cranelift `Type`; the Sigil `Ty` isn't
-  available at the append site. Per-site fixes need the Sigil type
-  threaded through.
+None — Task 2b's scope is closed in PR #159. Specifically:
 
-  Sites (post-PR-#159 line numbers): codegen.rs:10522, 20598, 21072,
-  21391, 22609, 23105, 26417. The 4 high-confidence merges (NextStep
-  + Option[Char]) are already covered in PR #159.
+- **`lower_heap_pointer_load` helper rollout**: complete. The
+  bulk-refactor sweep in PR #159's final commit migrated 40+1 surgical
+  heap-pointer load sites to use the helper. Only the helper itself
+  contains an internal `declare_value_needs_stack_map(ptr)` call —
+  every external surgical pattern is gone. A future contributor
+  cannot add an unmarked heap-pointer load via the established
+  pattern; the helper is the only path.
 
-  Soundness today: Boehm conservative scanning catches them. Must
-  land BEFORE Phase 3's Task 12 ("Drop conservative stack scan on
-  Sigil threads") — otherwise heap pointers stored through any of
-  these 7 merge-block params lose precise tracking. Land as
-  **Task 2c** or **Task 11.5**.
+- **7 type-aware merge-block params**: complete. Each of codegen.rs's
+  7 `append_block_param(*, pointer_ty / result_ty / handler_overall_ty)`
+  sites that needed Sigil-Ty threading now uses
+  `expr_is_known_heap(arms[0].body, &preview)` (or the body Expr at
+  the no-return-arm Handle site) gated by `result_ty == pointer_ty`.
+  The four sites with unambiguous heap merges (NextStep / NextStep /
+  Option[Char] / Option[Char]) flag unconditionally; the three sites
+  where the merge is `arms[0].body`-dependent (lower_match cont in
+  Sync + Cps + Cps-match-to-next-step) and the two handler sites
+  (return-arm + no-return-arm) gate on the predicate.
+
+  `expr_is_known_heap` is conservative on genuinely ambiguous AST
+  shapes (returns `false`): non-ctor `Ident`, `Perform`, `Handle`,
+  `Lambda`, `Cast`, `TupleLit`, `Try`. Phase 3 acceptance gating
+  re-verifies; if any such ambiguous case becomes load-bearing the
+  helper grows additional shapes.
 
 ## Open dependencies
 
