@@ -14664,11 +14664,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     };
 
                     // Load (k_closure, k_fn) IF Middle (Final doesn't
-                    // need them).
+                    // need them). kc is a heap pointer (closure record);
+                    // kf is a function pointer (not GC-traced).
                     let k_pair = if is_middle {
-                        let kc = builder.ins().load(
+                        let kc = lower_heap_pointer_load(
+                            &mut builder,
                             pointer_ty,
-                            MemFlags::trusted(),
                             synth_closure_ptr,
                             16,
                         );
@@ -15161,10 +15162,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 );
                             }
                             // Plotkin fix — forward-copy frame_ptr.
+                            // frame_ptr is a heap pointer (handler frame),
+                            // so route through lower_heap_pointer_load to
+                            // flag it for the GC if it stays live past a
+                            // safepoint between load and store.
                             if chain.has_return_arm {
-                                let raw = lowerer.builder.ins().load(
+                                let raw = lower_heap_pointer_load(
+                                    &mut lowerer.builder,
                                     pointer_ty,
-                                    MemFlags::trusted(),
                                     synth_closure_ptr,
                                     frame_ptr_offset,
                                 );
@@ -19834,10 +19839,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// when neither source is set — the helper sees null fired_ptr
     /// and emits Done.
     fn load_return_arm_triple(&mut self) -> (Value, Value, Value) {
+        // rc / rfp are heap pointers (closure record + sigil_ref to fired
+        // flag), routed through lower_heap_pointer_load. rf is a function
+        // pointer (not GC-traced) — inline load.
         if let Some((args_ptr, user_arg_count)) = self.body_args_ptr_for_return_arm {
-            let rc = self.builder.ins().load(
+            let rc = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 args_ptr,
                 return_arm_closure_offset(user_arg_count),
             );
@@ -19847,29 +19855,25 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 args_ptr,
                 return_arm_fn_offset(user_arg_count),
             );
-            let rfp = self.builder.ins().load(
+            let rfp = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 args_ptr,
                 return_arm_fired_offset(user_arg_count),
             );
             (rc, rf, rfp)
         } else if let Some(off) = self.synth_cont_return_arm_closure_off {
-            let rc = self.builder.ins().load(
-                self.pointer_ty,
-                MemFlags::trusted(),
-                self.closure_ptr,
-                off,
-            );
+            let rc =
+                lower_heap_pointer_load(&mut self.builder, self.pointer_ty, self.closure_ptr, off);
             let rf = self.builder.ins().load(
                 self.pointer_ty,
                 MemFlags::trusted(),
                 self.closure_ptr,
                 off + 8,
             );
-            let rfp = self.builder.ins().load(
+            let rfp = lower_heap_pointer_load(
+                &mut self.builder,
                 self.pointer_ty,
-                MemFlags::trusted(),
                 self.closure_ptr,
                 off + 16,
             );
@@ -20276,9 +20280,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                         Some(ra_closure_off) => {
                                             let ra_fn_off = ra_closure_off + 8;
                                             let ra_fired_off = ra_fn_off + 8;
-                                            let rc = self.builder.ins().load(
+                                            // rc / rfp are heap pointers;
+                                            // rf is a function pointer.
+                                            let rc = lower_heap_pointer_load(
+                                                &mut self.builder,
                                                 self.pointer_ty,
-                                                MemFlags::trusted(),
                                                 surrounding_closure_ptr,
                                                 ra_closure_off,
                                             );
@@ -20288,9 +20294,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                                 surrounding_closure_ptr,
                                                 ra_fn_off,
                                             );
-                                            let rfp = self.builder.ins().load(
+                                            let rfp = lower_heap_pointer_load(
+                                                &mut self.builder,
                                                 self.pointer_ty,
-                                                MemFlags::trusted(),
                                                 surrounding_closure_ptr,
                                                 ra_fired_off,
                                             );
@@ -26887,17 +26893,22 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     ///
     /// Returns `false` for: `IntLit`, `BoolLit`, `UnitLit`, `Binary`
     /// (arithmetic / comparison / logic), `Unary`. Returns `true` for:
-    /// `FloatLit`, `CharLit`, `StringLit`, `RecordLit`, ctor `Ident`s,
-    /// `Match` / `If` / `Block` whose tail is heap-producing, and
-    /// `Call` / `Perform` / `Handle` *only when* their resolved Sigil
-    /// return type is heap-bearing (looked up via `call_callee_tys` /
-    /// effect-op return-type table). For `Ident` other than ctor-bare:
-    /// we look it up in `env` (Value type) / `preview` (cached binding
-    /// type) — those are Cranelift types, so we conservatively return
-    /// `false` to avoid the "Int slot flagged → precise marker crash"
-    /// failure mode. That conservatism may under-flag for heap-typed
-    /// idents not declared in env yet (rare); Phase 3 acceptance gates
-    /// surface those.
+    /// `FloatLit`, `CharLit`, `StringLit`, `RecordLit`, `Tuple` (heap-
+    /// allocates a fresh tuple via `tuple_alloc`), `ClosureRecord`
+    /// (heap-allocates a closure record), ctor `Ident`s, `Match` / `If`
+    /// / `Block` whose tail is heap-producing, and `Call` *only when*
+    /// its resolved Sigil return type is heap-bearing. For `Ident`
+    /// other than ctor-bare: we look it up in `env` (Value type) /
+    /// `preview` (cached binding type) — those are Cranelift types, so
+    /// we conservatively return `false` to avoid the "Int slot flagged
+    /// → precise marker crash" failure mode. That conservatism may
+    /// under-flag for heap-typed idents not declared in env yet (rare);
+    /// Phase 3 acceptance gates surface those.
+    ///
+    /// `Expr::Lambda` is unreachable here — `closure_convert` hoists
+    /// every lambda to a synthetic top-level fn before codegen, so
+    /// reaching it is a pass-order bug (see codegen.rs's `Expr::Lambda`
+    /// arm in `walk_unsupported_handle_*` for the explicit invariant).
     fn expr_is_known_heap(&self, e: &crate::ast::Expr, preview: &BTreeMap<String, Type>) -> bool {
         use crate::ast::Expr;
         match e {
@@ -26905,7 +26916,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             Expr::FloatLit(..)
             | Expr::CharLit(..)
             | Expr::StringLit(..)
-            | Expr::RecordLit { .. } => true,
+            | Expr::RecordLit { .. }
+            | Expr::Tuple { .. }
+            | Expr::ClosureRecord { .. } => true,
             // BinOp / UnOp results are always scalar (Int or Bool).
             Expr::Binary { .. } | Expr::Unary { .. } => false,
             Expr::Ident(name, _) => {
@@ -26936,9 +26949,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     Some(crate::typecheck::Ty::Fn(sig)) if is_heap_pointer_ty(&sig.ret)
                 )
             }
-            // Conservatively unknown — Perform / Handle / ClosureRecord /
-            // ClosureEnvLoad / Lambda / Cast / TupleLit / Try — don't
-            // flag. Phase 3 acceptance gates re-verify.
+            // Conservatively unknown — Perform / Handle / ClosureEnvLoad
+            // / Cast / Try — depend on context-resolved return types;
+            // don't flag. Lambda is unreachable (see doc-comment).
+            // Phase 3 acceptance gates re-verify any under-flag.
             _ => false,
         }
     }
