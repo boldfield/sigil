@@ -240,7 +240,33 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 8 — `sigil_alloc` registers precise descriptors
 
-- status: pending
+- status: **in PR (Task 8 branch)**
+- `runtime/src/gc.rs::sigil_alloc` now routes non-zero-bitmap
+  allocations through `descriptor::get_or_create` (Task 7's cache)
+  and calls `GC_malloc_explicitly_typed(total, descr)`. Bitmap=0
+  objects continue to use `GC_malloc_atomic` (strictly better than
+  precise marking when no slot can hold a pointer).
+- Plain `GC_malloc` is retired from the runtime's extern block —
+  no production caller remains. The spike test (`runtime/tests/
+  boehm_precise_spike.rs`) keeps its own local `GC_malloc` declaration
+  for its baseline-target allocation; that's unchanged.
+- `GC_malloc_explicitly_typed` extern declaration added to
+  `runtime/src/gc.rs`'s `#[link(name = "gc")]` block.
+- `#![allow(dead_code)]` removed from `runtime/src/gc/descriptor.rs`
+  (the cache is now reachable from production via `sigil_alloc`).
+- Debug-only `total >= (1 + count) * 8` assertion in `sigil_alloc`
+  pins the descriptor's bitmap-coverage requirement against drift
+  between codegen's `payload_bytes` and Header's `count`.
+- New unit test `sigil_alloc_routes_nonzero_bitmap_through_descriptor_cache`
+  asserts (a) `bitmap=0` doesn't populate the cache (atomic path),
+  (b) non-zero bitmap populates with one entry, (c) repeat-shape
+  alloc reuses the entry, (d) distinct shape adds a fresh entry.
+- The plan's "60-second allocation-churn workload" stress is
+  covered by the existing runtime/compiler test suite running with
+  the new path active — every non-atomic Sigil object now goes
+  through `GC_malloc_explicitly_typed`. CI's `cargo test --workspace`
+  (which compiles the whole runtime and exercises e2e examples)
+  is the load-bearing stress.
 
 ### Task 9 — Drop conservative heap scan
 

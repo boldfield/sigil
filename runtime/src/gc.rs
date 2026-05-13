@@ -24,10 +24,13 @@ use crate::header::{self, Header};
 #[link(name = "gc")]
 extern "C" {
     fn GC_init();
-    fn GC_malloc(size: usize) -> *mut c_void;
-    // `GC_malloc_atomic` is used for strings (no GC-managed pointers in the
-    // payload) so Boehm can skip scanning them during mark phases. Safe on
-    // all supported hosts.
+    // `GC_malloc_atomic` is used for objects whose pointer_bitmap is 0
+    // (no GC-managed pointers in the payload — strings, byte arrays,
+    // primitive scalar wrappers) so Boehm can skip scanning them
+    // during mark phases. Plan E2 Task 8 retired the plain
+    // `GC_malloc` extern in favour of `GC_malloc_explicitly_typed`
+    // for the precise-marking path; this stays as the atomic
+    // fast-path for bitmap=0 objects.
     fn GC_malloc_atomic(size: usize) -> *mut c_void;
     // Register `[start, end)` as a GC root. Boehm scans the range
     // conservatively for pointer-shaped values on every mark phase.
@@ -78,6 +81,15 @@ extern "C" {
     // once per type, not once per allocation." — Task 7's descriptor
     // cache is the structural enforcement of that contract.
     pub(crate) fn GC_make_descriptor(bitmap: *const usize, len_bits: usize) -> usize;
+
+    // Boehm typed allocator — Plan E2 Phase 2 Task 8. Allocates
+    // `size_in_bytes` bytes from Boehm's heap and tags the block
+    // with `descr` so the mark phase scans payload words precisely
+    // per the descriptor's pointer bitmap. The returned block is
+    // zero-initialised and 8-byte aligned (same as `GC_malloc`).
+    // `size_in_bytes` must be `>= len_bits * sizeof(GC_word)` —
+    // the descriptor's bitmap must cover the entire allocation.
+    fn GC_malloc_explicitly_typed(size_in_bytes: usize, descr: usize) -> *mut c_void;
 }
 
 pub(crate) mod descriptor;
@@ -202,19 +214,49 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     crate::profile::alloc::maybe_sample_alloc(total as u64);
 
     let h = Header(header);
-    // The pointer bitmap selects between Boehm's atomic and conservative
-    // allocators. v1's bitmap is a binary signal (zero vs non-zero) at
-    // this layer — it does NOT inform precise per-slot scanning. The
-    // per-bit precision is v2-forward-compat metadata for a typed-walker
-    // GC; today, when `pointer_bitmap() != 0`, Boehm conservatively
-    // scans the entire allocated block and follows anything pointer-shaped.
-    // False-positive pinning is bounded by the block's size.
+    // Pointer-bitmap-driven allocator selection. Plan E2 Phase 2
+    // Task 8: replaced the prior conservative-`GC_malloc` path with
+    // a precise-descriptor `GC_malloc_explicitly_typed` path so
+    // Boehm's mark phase scans only the payload words the Header
+    // names as GC pointers. The bitmap=0 case still routes to
+    // `GC_malloc_atomic` (Boehm skips scanning entirely — strictly
+    // better than precise marking when no slot can hold a pointer).
     let raw = if h.pointer_bitmap() == 0 {
         // No GC pointers in the payload — Boehm can skip scanning the
         // bytes (saves mark-phase cost). Atomic in Boehm's vocabulary.
         unsafe { GC_malloc_atomic(total) as *mut u8 }
     } else {
-        unsafe { GC_malloc(total) as *mut u8 }
+        // Precise marking via Boehm's typed-malloc. The descriptor
+        // cache (Task 7) hands out one `GC_descr` per shape; first
+        // observation of a `(bitmap, count)` shape builds the
+        // descriptor via `GC_make_descriptor`, subsequent calls reuse
+        // the cached handle.
+        //
+        // Constraint check (debug only): `GC_malloc_explicitly_typed`
+        // requires `size_in_bytes >= (1 + payload_count) * 8` so the
+        // descriptor's bitmap covers the full allocation. For
+        // bitmap-bearing objects, codegen always emits
+        // `payload_bytes = payload_count * 8` (word-aligned payload),
+        // so `total = 8 + payload_count * 8 = (1 + count) * 8`
+        // exactly meets the floor. A drift between codegen's
+        // `payload_bytes` and the Header's `count` would surface as a
+        // Boehm scan beyond the allocation — the debug_assert pins
+        // the discipline at the boundary.
+        let count = h.payload_count();
+        debug_assert!(
+            total >= (1 + count as usize).saturating_mul(8),
+            "sigil_alloc: total bytes {} < precise-descriptor minimum {} (count={}, bitmap=0b{:b})",
+            total,
+            (1 + count as usize) * 8,
+            count,
+            h.pointer_bitmap(),
+        );
+        let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
+        // SAFETY: `descr` was built by `GC_make_descriptor` and is
+        // alive for the process lifetime (the cache never evicts).
+        // `total` meets the descriptor's `len_bits * sizeof(GC_word)`
+        // floor (debug_asserted above for non-release builds).
+        unsafe { GC_malloc_explicitly_typed(total, descr) as *mut u8 }
     };
 
     if raw.is_null() {
@@ -386,6 +428,60 @@ mod tests {
         let obj = unsafe { sigil_string_new(std::ptr::null(), 0) };
         assert!(!obj.is_null());
         assert_eq!(unsafe { sigil_string_len(obj) }, 0);
+    }
+
+    #[test]
+    fn sigil_alloc_routes_nonzero_bitmap_through_descriptor_cache() {
+        // Plan E2 Phase 2 Task 8 wiring proof. `sigil_alloc` with a
+        // non-zero `pointer_bitmap` must reach the descriptor cache;
+        // `sigil_alloc` with `pointer_bitmap == 0` must skip it
+        // (routed to `GC_malloc_atomic`). Clearing the cache first
+        // isolates this test from earlier cache hits.
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        descriptor::clear_cache();
+        assert_eq!(descriptor::cache_size(), 0, "cache must start empty");
+
+        // Bitmap=0 path: should NOT touch the cache.
+        let zero_bitmap_header = Header::new(header::TAG_INT64, 1, 0).raw();
+        let obj_atomic = sigil_alloc(zero_bitmap_header, 8);
+        assert!(!obj_atomic.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            0,
+            "bitmap=0 alloc must not populate the descriptor cache"
+        );
+
+        // Bitmap=0b1 path: should populate the cache with one entry.
+        let one_ptr_header = Header::new(header::TAG_REF, 1, 0b1).raw();
+        let obj_precise = sigil_alloc(one_ptr_header, 8);
+        assert!(!obj_precise.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            1,
+            "non-zero bitmap alloc must populate the descriptor cache"
+        );
+
+        // Second alloc of the same shape: cache size unchanged.
+        let obj_precise_2 = sigil_alloc(one_ptr_header, 8);
+        assert!(!obj_precise_2.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            1,
+            "repeat-shape alloc must reuse the cached descriptor"
+        );
+
+        // Distinct shape: cache size grows to 2. A closure with one
+        // env slot — `count=2` (code_ptr at word 0 + env_slot_0 at
+        // word 1), `bitmap=0b10` (only env_slot_0 is a pointer).
+        let closure_header = Header::new(header::TAG_CLOSURE, 2, 0b10).raw();
+        let obj_closure = sigil_alloc(closure_header, 16);
+        assert!(!obj_closure.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            2,
+            "distinct-shape alloc must add a fresh cache entry"
+        );
     }
 
     #[test]
