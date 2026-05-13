@@ -1,12 +1,42 @@
 # Plan E2 Phase 2 throughput report
 
-**Status:** scaffolding (waiting for measurement data — see
-`Methodology → Reproducing` below). Once the
-`throughput-report.yml` GitHub Actions workflow has been run on
-both lanes (ubuntu-24.04 + macos-14), this file's
-"Pre-Phase-2 measurements" / "Post-Phase-2 measurements" /
-"Deltas" sections will be filled in from the artifact JSON +
-the rendered `deltas-<os>.md` summary the workflow produces.
+**Status:** measured. Data captured from
+`throughput-report.yml` run 25826188199 (commit `2871742`).
+The workflow ran end-to-end on both CI lanes (ubuntu-24.04 +
+macos-14) at the pre-Phase-2 SHA (`4f7ec86`) and the branch
+HEAD (`2871742`); the per-workload JSON + per-OS deltas
+summary live in the run's artifact upload.
+
+## TL;DR
+
+Phase 2 makes the descriptor-cache hot path measurably slower
+under sustained alloc pressure:
+
+- **`descriptor_cache_stress`** (5M allocs across 10 shapes):
+  +21% wall-clock on ubuntu-24.04 (140ms → 170ms);
+  +86% on macos-14 (70ms → 130ms).
+  Per-alloc cost increase: ~6ns (ubuntu) / ~12ns (macos).
+  Attributable to the new path: `descriptor::get_or_create`
+  (`BTreeMap` lookup under `RwLock` read) + the descriptor
+  passed through `GC_malloc_explicitly_typed` instead of plain
+  `GC_malloc`.
+- **`tree_stress_repeat_large`** (983k allocs): wall-clock
+  flat-to-+50% at the precision floor (20–30ms range). Noise
+  bounds the signal at this scale.
+- **Existing perf-floor workloads** (`fib_perf`, `fib_cps_perf`,
+  `tree`, `tree_stress_repeat`): all 0ms on both pre and post;
+  below `/usr/bin/time`'s ~10ms precision floor by design.
+- **Allocation counts**: identical pre/post on every workload
+  (expected — same source, same code path).
+- **GC time (`boehm_gc_time_ms`)**: 0 on every post-Phase-2 run.
+  None of the workloads triggered a full GC cycle. The cost
+  delta is therefore *entirely* alloc-path, not mark-phase.
+
+This matches the plan body's hypothesis: the descriptor cache
+adds per-alloc cost on the order of nanoseconds (the lookup is
+not free); the mark-phase savings the precise marker should
+deliver are not visible on these workloads because none of them
+sustain enough heap pressure to trigger a full collection.
 
 **Spec:** [`designs/docs/plans/2026-05-13-sigil-plan-e2-throughput-reports-design.md`](https://github.com/boldfield/designs/blob/main/docs/plans/2026-05-13-sigil-plan-e2-throughput-reports-design.md)
 **Implementation plan:** [`designs/in-progress/2026-05-13-sigil-plan-e2-phase-2-throughput-report.md`](https://github.com/boldfield/designs/blob/main/in-progress/2026-05-13-sigil-plan-e2-phase-2-throughput-report.md)
@@ -134,38 +164,222 @@ New. 10 distinct sum-type shapes × 500,000 allocations each =
 pointer_bitmap)` pair, so the descriptor cache builds 10 entries
 (one cache miss per shape) and serves 4,999,990 hits.
 
-## Pre-Phase-2 measurements
+## Deltas — ubuntu-24.04
 
-_Pending — fill from `throughput-data/pre/*.json` once the
-workflow has run._
+Source: `throughput-data-ubuntu-24.04/deltas-ubuntu-24.04.md`
+artifact from `throughput-report.yml` run 25826188199. Pre SHA
+`4f7ec86`, post SHA `2871742`, 5 runs per workload.
 
-## Post-Phase-2 measurements
+### `fib_perf`
 
-_Pending — fill from `throughput-data/post/*.json` once the
-workflow has run._
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 3344 ± 52 | 3300 ± 52 | -44 kB | -1.3% |
+| alloc_count | 6 | 6 | +0 | +0.0% |
+| alloc_bytes (bytes) | 528 | 528 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
 
-## Deltas
+### `fib_cps_perf`
 
-_Pending — paste the per-OS `deltas-<os>.md` artifact below this
-heading once the workflow has run._
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 3400 ± 76 | 3404 ± 76 | +4 kB | +0.1% |
+| alloc_count | 21898 | 21898 | +0 | +0.0% |
+| alloc_bytes (bytes) | 1401624 | 1401624 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 6124 ± 24 | 6192 ± 24 | +68 kB | +1.1% |
+| alloc_count | 65541 | 65541 | +0 | +0.0% |
+| alloc_bytes (bytes) | 1835496 | 1835496 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree_stress_repeat`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 4008 ± 80 | 3936 ± 16 | -72 kB | -1.8% |
+| alloc_count | 81916 | 81916 | +0 | +0.0% |
+| alloc_bytes (bytes) | 2293888 | 2293888 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree_stress_repeat_large`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 30 ± 0 | 30 ± 0 | +0 ms | +0.0% |
+| peak_rss_kb (kB) | 4856 ± 8 | 6108 ± 16 | +1252 kB | +25.8% |
+| alloc_count | 983016 | 983016 | +0 | +0.0% |
+| alloc_bytes (bytes) | 27524448 | 27524448 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `descriptor_cache_stress`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 140 ± 0 | 170 ± 10 | +30 ms | +21.4% |
+| peak_rss_kb (kB) | 3480 ± 44 | 3428 ± 20 | -52 kB | -1.5% |
+| alloc_count | 5000007 | 5000007 | +0 | +0.0% |
+| alloc_bytes (bytes) | 192000544 | 192000544 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+## Deltas — macos-14
+
+Source: `throughput-data-macos-14/deltas-macos-14.md`. Same pre/post
+SHAs as ubuntu, 5 runs per workload.
+
+### `fib_perf`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 2704 ± 0 | 2752 ± 0 | +48 kB | +1.8% |
+| alloc_count | 6 | 6 | +0 | +0.0% |
+| alloc_bytes (bytes) | 528 | 528 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `fib_cps_perf`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 3456 ± 0 | 3504 ± 0 | +48 kB | +1.4% |
+| alloc_count | 21898 | 21898 | +0 | +0.0% |
+| alloc_bytes (bytes) | 1401624 | 1401624 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 5680 ± 0 | 5728 ± 64 | +48 kB | +0.8% |
+| alloc_count | 65541 | 65541 | +0 | +0.0% |
+| alloc_bytes (bytes) | 1835496 | 1835496 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree_stress_repeat`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 0 ± 0 | 0 ± 0 | +0 ms | n/a |
+| peak_rss_kb (kB) | 4000 ± 0 | 4048 ± 0 | +48 kB | +1.2% |
+| alloc_count | 81916 | 81916 | +0 | +0.0% |
+| alloc_bytes (bytes) | 2293888 | 2293888 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `tree_stress_repeat_large`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 20 ± 0 | 30 ± 0 | +10 ms | +50.0% |
+| peak_rss_kb (kB) | 6528 ± 0 | 5648 ± 64 | -880 kB | -13.5% |
+| alloc_count | 983016 | 983016 | +0 | +0.0% |
+| alloc_bytes (bytes) | 27524448 | 27524448 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
+
+### `descriptor_cache_stress`
+
+| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |
+|---|---|---|---|---|
+| wall_clock_ms (ms) | 70 ± 0 | 130 ± 10 | +60 ms | +85.7% |
+| peak_rss_kb (kB) | 3456 ± 0 | 3488 ± 0 | +32 kB | +0.9% |
+| alloc_count | 5000007 | 5000007 | +0 | +0.0% |
+| alloc_bytes (bytes) | 192000544 | 192000544 | +0 | +0.0% |
+| boehm_gc_time_ms (ms) | n/a | 0 | n/a | n/a |
 
 ## Discussion
 
-_Pending — once the data lands, answer per the spec doc's section 6:_
+### What the plan body hypothesised vs what we measured
 
-- Did the descriptor-cache lookup add the expected ~ns/alloc?
-- Did mark-phase time decrease as expected (precise vs conservative)?
-- Did `descriptor_cache_stress` and `tree_stress_repeat` agree on the
-  cache-hit-path cost?
-- Did the alloc-light workloads (`fib_perf`) show flat / regressed
-  perf? (Either is fine; the report just names what happened.)
-- Surprises — calls out anything the plan body's hypothesis missed.
+| Hypothesis | Result |
+|---|---|
+| Descriptor cache adds ~ns per alloc on hot path | **Confirmed.** ~6ns/alloc on ubuntu, ~12ns/alloc on macos. |
+| Mark-phase time decreases (precise vs conservative scan) | **Not observable in this report.** No workload triggered a full GC. `boehm_gc_time_ms` is 0 on every post-Phase-2 run. Need a higher-pressure workload that forces collection to characterise this. |
+| Alloc-light workloads see flat perf | **Confirmed in shape, unmeasurable in magnitude.** All four existing perf-floor workloads measure at 0 ± 0 ms on both lanes; that's the time-precision floor talking, not a guarantee of zero delta. RSS deltas are noise-level (1-2%). |
+
+### The +21% / +86% asymmetry between ubuntu and macos
+
+ubuntu-24.04 (x86_64 / GitHub Actions free runner): +30ms (+21%).
+macos-14 (aarch64 / GitHub Actions Apple Silicon): +60ms (+86%).
+
+Pre-Phase-2 macos already ran the same 5M allocs in **70ms** — half
+the ubuntu time. The pre-Phase-2 path was plain `GC_malloc` plus
+header construction; macos's M-series cores allocate from libgc
+faster than the EC2 x86 lane.
+
+Post-Phase-2, ubuntu pays 30ms for the descriptor path; macos
+pays 60ms. Hypotheses for the 2× macos cost (not pinned in this
+report):
+
+- **RwLock contention shape.** macos's `pthread_rwlock` vs Linux's
+  futex-backed implementation may differ at high read frequency.
+  The cache is read-locked once per alloc, write-locked once
+  per shape (10 times total in this workload).
+- **`BTreeMap::get` cache behaviour.** macos M-series has a
+  different L1/L2 layout than EC2 x86; tree-traversal latencies
+  may diverge.
+- **`GC_make_descriptor` first-call cost.** Each shape's first
+  alloc triggers `GC_make_descriptor`. With 10 shapes and 500k
+  allocs per shape, the warmup cost is amortised — but if Boehm's
+  typed-malloc path itself is slower on macos than on Linux, the
+  steady-state delta is dominated by per-alloc lookup + typed-
+  malloc cost.
+
+A pinned root-cause analysis is **out of scope for this report**
+(the report's job is documenting the delta; chasing the asymmetry
+is a separate plan if the macos cost becomes a blocker).
+
+### Allocation counts are identical, as expected
+
+Every workload shows pre = post on `alloc_count` and `alloc_bytes`.
+The code paths allocate the same objects in the same order;
+Phase 2 changes *how* Boehm tracks them, not *what* gets allocated.
+This is the cross-check that the measurements are comparing apples
+to apples.
+
+### GC time is zero everywhere
+
+`boehm_gc_time_ms` = 0 on every post-Phase-2 run. Boehm only counts
+**full** GC cycles in `GC_get_full_gc_total_time`; none of the
+6 workloads sustain enough heap pressure to trigger one. The
+descriptor_cache_stress workload allocates 192 MB total but most
+of those objects are unreachable immediately after construction,
+so Boehm reclaims them via the normal allocator pacing without
+escalating to a full mark-sweep.
+
+**Implication for the Phase 2 "precise marking should reduce GC
+time" hypothesis:** unmeasured. To test it, a follow-up plan
+should add a workload that:
+1. Allocates enough live objects to force a full collection.
+2. Has at least one non-zero-bitmap pointer slot per object so
+   the precise-marker path is exercised.
+3. Calls `sigil_gc_collect()` explicitly (which needs an FFI
+   wrapper exposed to Sigil code).
+
+This is the v2 Phase 3 + Plan-E2-follow-up territory — out of
+scope for this report.
 
 ## CI implications
 
-_Pending — does `fib_cps_perf` still pass the 500ms (aarch64) /
-50ms (x86_64) Plan B Task 60 gate? If not, file a follow-up plan to
-adjust the gate (don't adjust here)._
+The existing perf-floor gates (Plan B Task 60: 50ms x86 / 500ms
+aarch64 on `fib_cps_perf`; Plan A3 Task 44: 500ms aarch64 on
+`tree.sigil`) all pass on the post-Phase-2 checkpoint. Wall-clock
+on both lanes is at the 0-precision-floor for these workloads —
+they didn't slow down enough to even appear measurably.
+
+**No follow-up plan to widen / tighten any perf gate.** The
++21–86% cost on `descriptor_cache_stress` is at the 5M-alloc
+scale; the existing perf-floor workloads operate at 6–80k allocs,
+where the absolute cost increase is ~0.5–5ms — well within the
+gates' headroom.
 
 ## Stability / caveats
 

@@ -309,15 +309,17 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   GC stress tests' `SIGIL_GC_STRESS_INNER` discipline).
 - 309 runtime lib tests pass (was 307 + new differential test +
   atomic sanity test).
-- Throughput delta — ⏳ scaffolding shipped, measurement data
-  pending. See
-  [`compiler/docs/plan-e2-phase-2-throughput.md`](compiler/docs/plan-e2-phase-2-throughput.md)
-  for the methodology, workload definitions, and the report
-  shell. Trigger
+- Throughput delta — ✅ documented in
+  [`compiler/docs/plan-e2-phase-2-throughput.md`](compiler/docs/plan-e2-phase-2-throughput.md).
+  TL;DR: descriptor_cache_stress (5M allocs) +21% wall-clock on
+  ubuntu / +86% on macos (≈ 6–12ns/alloc from the descriptor
+  cache + typed-malloc path). Mark-phase delta unmeasured —
+  no workload triggered a full GC. Existing perf-floor
+  workloads stay below `/usr/bin/time`'s ~10ms precision floor
+  and pass their CI gates with the same headroom as pre-Phase-2.
+  Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml)
-  manually to populate the "Pre-Phase-2 measurements",
-  "Post-Phase-2 measurements", and "Deltas" sections; flip this
-  bullet to ✅ once the data + Discussion are filled in.
+  (manual `workflow_dispatch`).
 
 ## Phase 3 — Precise stack roots
 

@@ -30,12 +30,6 @@ on:
         description: "Measurement runs per workload"
         required: true
         default: "5"
-  # TEMPORARY: validate end-to-end on this branch before merging.
-  # workflow_dispatch can't trigger from a non-default branch, so
-  # this push trigger is the only way to exercise the workflow
-  # while the PR is open. REMOVE before merging to main.
-  push:
-    branches: [plan-e2-phase-2-throughput-report]
 
 env:
   CARGO_TERM_COLOR: always
