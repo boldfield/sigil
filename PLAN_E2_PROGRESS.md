@@ -286,31 +286,29 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   - Conservative stack scan — Phase 3 lifts this for Sigil
     program threads (Tasks 10–12).
 - **False-retention reproducer** (plan body's "single most
-  important Phase 2 verification") landed as
-  `runtime/src/gc.rs::tests::
-  false_retention_reproducer_precise_marker_drops_aliased_address`.
-  The test:
-  1. Allocates an atomic alias object (bitmap=0, count=1) whose
-     payload Boehm doesn't scan.
-  2. In a `#[inline(never)] unsafe fn`, allocates a target
-     String, registers a `GC_register_finalizer` callback on it,
-     and writes the target's address as a bit-pattern alias
-     into the atomic object's payload. When the fn returns, the
-     target's typed pointer + the helper's stack frame are
-     dropped, so Boehm cannot reach the target via either the
-     typed marker (atomic payload is not scanned) or the
-     conservative stack scan (the fn's stack frame is reclaimed
-     before the GC call).
-  3. Allocation-spams 128 INT64 wrappers to overwrite stack
-     remnants.
-  4. Forces two `GC_gcollect` + `GC_invoke_finalizers` cycles
-     (Boehm's documented pattern to drive a finalizer to fire
-     in the caller's thread).
-  5. Asserts the finalizer fired exactly once — proving the
-     precise marker correctly dropped the aliased value.
-- Subprocess-pattern wrapped (matches the runtime's other GC
-  stress tests' `SIGIL_GC_STRESS_INNER` discipline).
-- 308 runtime lib tests pass (was 307 + new false-retention test).
+  important Phase 2 verification") landed as two paired tests
+  in `runtime/src/gc.rs::tests`:
+  - `false_retention_reproducer_precise_marker_drops_aliased_address`
+    — the actual ship-gate test. Uses a typed-malloc shape
+    (`TAG_CLOSURE, count=2, bitmap=0b10`). Writes the target's
+    address into payload word 0 (the bitmap-bit-CLEAR slot) and
+    null into word 1 (the bitmap-bit-SET slot). Asserts that
+    Boehm's precise marker skips word 0 per the descriptor and
+    target is collected. **Verified by temporarily reverting
+    the typed-malloc dispatch to plain `GC_malloc` (conservative
+    full-payload scan) — under that regression the test fails
+    with `FINALIZER_FIRED = 0`, proving the test discriminates
+    pre-Task-8 from post-Task-8 dispatch.**
+  - `atomic_payload_not_scanned_by_conservative_marker` — the
+    sanity check (PR #167 review M1 split). Uses `bitmap=0`
+    (atomic alloc). Pre- AND post-Task-8 both pass this test;
+    it pins `GC_malloc_atomic`'s payload-non-scanning property
+    + the `#[inline(never)] unsafe fn` stack-frame-pop
+    discipline + the two-GC-cycle + invoke_finalizers pattern.
+  Both tests run in a subprocess (matches the runtime's other
+  GC stress tests' `SIGIL_GC_STRESS_INNER` discipline).
+- 309 runtime lib tests pass (was 307 + new differential test +
+  atomic sanity test).
 - Throughput delta deferred to the Phase 2 closeout PR (separate
   measurement workload; this PR's deliverable is the precision
   proof itself).
