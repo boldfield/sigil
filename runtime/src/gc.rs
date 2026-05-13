@@ -680,13 +680,9 @@ mod tests {
     /// Track finalizer firings across the false-retention test's
     /// lifetime. Only one test in this module registers finalizers,
     /// so a single static counter is sufficient.
-    static FINALIZER_FIRED: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
+    static FINALIZER_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    extern "C" fn target_finalizer_cb(
-        _obj: *mut std::ffi::c_void,
-        _cd: *mut std::ffi::c_void,
-    ) {
+    extern "C" fn target_finalizer_cb(_obj: *mut std::ffi::c_void, _cd: *mut std::ffi::c_void) {
         FINALIZER_FIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
