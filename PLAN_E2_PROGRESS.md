@@ -204,7 +204,39 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 7 — Descriptor cache
 
-- status: pending
+- status: **in PR (Task 7 branch)**
+- Module: `runtime/src/gc/descriptor.rs` (new, wired via
+  `pub(crate) mod descriptor;` in `runtime/src/gc.rs`).
+- API: `get_or_create(sigil_bitmap: u32, payload_word_count: u8)
+  -> usize` (the Boehm `GC_descr` handle). Cache is process-wide
+  `LazyLock<RwLock<BTreeMap<DescriptorKey, GC_descr>>>`; cache
+  hits take an `RwLock` read, misses upgrade to write + re-check
+  inside the lock so each `(bitmap, count)` enters Boehm's
+  descriptor builder at most once across threads.
+- Sigil-bitmap → Boehm-bitmap conversion is centralised here:
+  `boehm_bitmap = (sigil_bitmap as usize) << 1`,
+  `len_bits = 1 + payload_word_count`. Bit 0 of Boehm's bitmap
+  is always 0 (header word is never a pointer).
+- Deviation from plan: key is `(bitmap, payload_word_count)`,
+  not `bitmap` alone. Two objects with the same bitmap but
+  different payload counts produce different descriptors —
+  Boehm encodes object size in the descriptor word, so the
+  handle differs even though the bitmap bits do not. The unit
+  test `same_bitmap_different_count_are_distinct_keys`
+  documents and pins this.
+- `GC_make_descriptor` extern declaration promoted from the
+  spike's local `#[link]` block into the production
+  `runtime/src/gc.rs` extern block (still `pub(crate)`).
+- Tests (`runtime/src/gc/descriptor.rs::tests`): 6 cases —
+  identical bitmaps return identical handles; distinct
+  bitmaps return distinct handles; same bitmap + different
+  count are distinct keys; 10k identical lookups yield 1 cache
+  entry (the plan's stress assertion); `bitmap=0` caches
+  separately from `bitmap=0b1`; max payload count doesn't
+  overflow the single-word bitmap buffer.
+- `get_or_create` is `#![allow(dead_code)]`-suppressed at
+  module level — caller (`sigil_alloc`) lands in Task 8, which
+  removes the suppression.
 
 ### Task 8 — `sigil_alloc` registers precise descriptors
 
