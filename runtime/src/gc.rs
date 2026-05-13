@@ -65,7 +65,22 @@ extern "C" {
     pub(crate) fn GC_register_my_thread(stack_base: *const c_void) -> i32;
     #[cfg(test)]
     pub(crate) fn GC_unregister_my_thread() -> i32;
+
+    // Boehm typed-malloc descriptor constructor — Plan E2 Phase 2.
+    // `bitmap` is a slice of `GC_word` (== usize on 64-bit targets);
+    // bit `i` (LSB-first within each word) is `1` iff word `i` of
+    // the to-be-described object is a GC pointer. `len_bits` is the
+    // number of meaningful bits in the bitmap. Returns an opaque
+    // `GC_descr` handle; on insufficient memory Boehm returns a
+    // conservative-trace fallback (still safe, just less precise).
+    // Per gc_typed.h: "Calls to GC_make_descriptor may consume some
+    // amount of a finite resource. This is intended to be called
+    // once per type, not once per allocation." — Task 7's descriptor
+    // cache is the structural enforcement of that contract.
+    pub(crate) fn GC_make_descriptor(bitmap: *const usize, len_bits: usize) -> usize;
 }
+
+pub(crate) mod descriptor;
 
 // `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
 // dump counters when the compiled program exits. We avoid depending on
