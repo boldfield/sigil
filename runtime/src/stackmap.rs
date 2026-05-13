@@ -375,30 +375,37 @@ fn pac_strip(pc: usize) -> usize {
 
 /// Locate the stackmap section bytes via platform-specific linker
 /// symbols / OS APIs. Returns `None` when the section is not present
-/// (e.g., unit-test binaries that don't link compiler-emitted code).
+/// (the binary was linked without compiler-emitted records).
 ///
-/// On ELF, the section bounds are resolved via `dlsym` rather than
-/// extern statics. The runtime is built as a staticlib and a separate
-/// rlib; rlibs are used as link-time dependencies of unit-test
-/// binaries that DON'T contain the `sigil_stackmaps` section, so
-/// declaring the linker auto-symbols as `extern "C" static` would
-/// produce an undefined-reference link error at test time. `dlsym`
-/// returns NULL when the symbol is absent, which is the right
-/// not-present behaviour without nightly-only weak-linkage attributes.
+/// On ELF, the section bounds are resolved via `extern "C" static`
+/// references to the GNU linker's auto-generated
+/// `__start_sigil_stackmaps` / `__stop_sigil_stackmaps` encapsulation
+/// symbols. Encapsulation symbols are auto-generated for sections
+/// whose name is a C identifier; `sigil_stackmaps` qualifies. The
+/// runtime crate's `#[link_section] static EMPTY_*` below forces the
+/// section to ALWAYS exist (zero bytes contributed) so the
+/// encapsulation symbols are defined even in unit-test binaries that
+/// don't link any compiler-emitted records. This bypasses dlsym
+/// (PR #163 review M1 diagnosis: `-rdynamic` was not effective on
+/// Ubuntu's toolchain at putting encapsulation symbols into
+/// `.dynsym`).
 fn locate_section_bytes() -> Option<&'static [u8]> {
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: dlsym returns NULL for absent symbols; otherwise
-        // returns the section bounds the GNU linker auto-generated.
-        // Section is in a non-writable ALLOC area; bytes are valid
-        // for the program's lifetime.
+        // SAFETY: __start_/__stop_ are linker-auto encapsulation
+        // symbols pointing at the section's first / one-past-last
+        // bytes. The section is in a non-writable ALLOC area; bytes
+        // are valid for the program's lifetime.
         unsafe {
-            let start = dlsym_resolve("__start_sigil_stackmaps")? as *const u8;
-            let end = dlsym_resolve("__stop_sigil_stackmaps")? as *const u8;
+            let start = &__start_sigil_stackmaps as *const u8;
+            let end = &__stop_sigil_stackmaps as *const u8;
             if end <= start {
                 return None;
             }
             let len = end.offset_from(start) as usize;
+            if len == 0 {
+                return None;
+            }
             Some(std::slice::from_raw_parts(start, len))
         }
     }
@@ -444,6 +451,27 @@ extern "C" {
         sectname: *const std::os::raw::c_char,
         size: *mut u64,
     ) -> *const u8;
+}
+
+// On Linux, force the `sigil_stackmaps` section to always exist by
+// contributing zero bytes to it from the runtime crate. This makes
+// the GNU linker auto-generate the encapsulation symbols
+// (`__start_sigil_stackmaps` / `__stop_sigil_stackmaps`) even when
+// no compiler-emitted records are present (e.g., unit-test binaries
+// linked against the runtime rlib but without invoking the Sigil
+// compiler). Without this sentinel, `extern "C" static
+// __start_sigil_stackmaps` would produce undefined-reference link
+// errors in those test binaries (PR #163's first attempt at the
+// extern-static approach hit exactly this).
+#[cfg(target_os = "linux")]
+#[link_section = "sigil_stackmaps"]
+#[used]
+static EMPTY_STACKMAPS_SENTINEL: [u8; 0] = [];
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    static __start_sigil_stackmaps: u8;
+    static __stop_sigil_stackmaps: u8;
 }
 
 /// Build the sorted IndexedFunction list used by `StackmapIndex::lookup`.
