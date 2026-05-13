@@ -624,8 +624,10 @@ mod tests {
             let elems_ptr = array_obj.add(16) as *mut *mut u8;
             for i in 0..8u8 {
                 let s_bytes = [0xA0u8 + i, 0xA1u8 + i, 0xA2u8 + i];
+                // SAFETY: gc-heap-ptr arithmetic (s_bytes is a stack-local array; sigil_string_new copies the bytes).
                 let s_obj = sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
                 assert!(!s_obj.is_null());
+                // SAFETY: gc-heap-ptr arithmetic (i-th element slot of a freshly-allocated 8-slot array we own).
                 *elems_ptr.add(i as usize) = s_obj;
             }
 
@@ -638,6 +640,7 @@ mod tests {
             // Re-read every element; each string must still be
             // alive and report its original 3-byte payload.
             for i in 0..8u8 {
+                // SAFETY: gc-heap-ptr arithmetic (re-reads the i-th element slot written above; array storage still live).
                 let s_obj = *elems_ptr.add(i as usize);
                 assert!(!s_obj.is_null(), "string slot {i} cleared after GC");
                 let len = sigil_string_len(s_obj);
