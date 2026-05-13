@@ -6,26 +6,43 @@
 //! - ELF (Linux):   `.sigil_stackmaps`
 //! - Mach-O:        `__SIGIL,__stackmaps`
 //!
-//! Plan A1 ships **version 0 (placeholder)** records: `live_count = 0`,
-//! `pc_offset` is a Cranelift `Inst` handle (not a real post-regalloc
-//! offset), and the placeholder flag bit is set on every record so a
-//! v2 reader can detect stale placeholder data per-record as well as
-//! via the version field. Plan B replaces this with real safepoint
-//! data (version = 1, live-value list per record, real pc_offset).
+//! Plan A1 shipped **version 0 (placeholder)** records: `live_count = 0`,
+//! `pc_offset` was a Cranelift `Inst` handle (not a real post-regalloc
+//! offset), and every record had a placeholder flag bit set. Plan E2
+//! Phase 1 Task 4 replaces this with **version 1 — real safepoint data
+//! grouped per function**. The compiler is the v1-only writer from this
+//! task forward; the runtime parser accepts v1 only and rejects v0 as a
+//! stale build artifact.
 //!
 //! Binary format (little-endian on the host; the section is not
 //! relocated, so emitter endianness == consumer endianness):
 //!
 //! ```text
-//! header  = magic:4 "SGST" | version:4 | record_count:4    // 12 bytes
-//! v0 rec  = pc_offset:4    | live_count:2 | flags:2        //  8 bytes
+//! section header (12 bytes):
+//!   magic:4 "SGST" | version:4 | fn_count:4
+//!
+//! per-function block (variable size):
+//!   fn_header:12 = name_len:4 | record_count:4 | text_offset:4 (reserved=0)
+//!   name: name_len bytes (UTF-8 linker symbol, no NUL terminator)
+//!   records[record_count]:
+//!     record_header:12 = pc_offset:4 (function-local) | frame_size:4 |
+//!                        entry_count:2 | flags:2
+//!     entries[entry_count]:
+//!       entry:5 = kind:1 | sp_offset:4
 //! ```
 //!
-//! Plan B's v1 record format reuses the same header. The record gains
-//! a live-value list and `pc_offset` becomes a real post-regalloc code
-//! offset via Cranelift's safepoint API. The v1 record-layout struct
-//! is added when the v1 work lands; this module reserves the version
-//! number and flag bit ahead of time so there is no drift window.
+//! `pc_offset` is the offset in bytes from the function's first byte
+//! (function-local). The runtime reader resolves the function's base
+//! via `dlsym(name)` and adds `pc_offset` to obtain the absolute
+//! safepoint PC.
+//!
+//! `sp_offset` is the offset from the safepoint's SP, growing toward
+//! higher addresses (per Cranelift's `UserStackMapEntry::offset` —
+//! pointer to the live ref is `sp + sp_offset`).
+//!
+//! `text_offset` is reserved as zero in v1. A future version may use
+//! it to record the function's `.text`-relative offset so the runtime
+//! does not need `dlsym` at lookup time.
 
 /// ELF section name used on `x86_64-unknown-linux-gnu`.
 pub const ELF_SECTION_NAME: &str = ".sigil_stackmaps";
@@ -38,36 +55,37 @@ pub const MACHO_SECTION_NAME: &str = "__stackmaps";
 /// reader regardless of the enclosing object format.
 pub const STACKMAP_MAGIC: &[u8; 4] = b"SGST";
 
-/// Version 0: Plan A1 placeholder format.
+/// Version 0: Plan A1 placeholder format. Retired; the compiler no
+/// longer emits v0 sections from Plan E2 Phase 1 Task 4 forward.
 pub const STACKMAP_VERSION_PLACEHOLDER: u32 = 0;
 
-/// Version 1: Plan B real-safepoint format. Reserved here so
-/// version-aware readers can be written before v1 ships.
+/// Version 1: Plan E2 real-safepoint format. Per-function blocks with
+/// real post-regalloc PC offsets, frame sizes, and entry lists.
 pub const STACKMAP_VERSION_V1: u32 = 1;
 
-/// Header width in bytes: 4 magic + 4 version + 4 record_count.
+/// Section-header size in bytes: 4 magic + 4 version + 4 fn_count.
 pub const STACKMAP_HEADER_SIZE: usize = 12;
 
-/// V0 record width in bytes: 4 pc_offset + 2 live_count + 2 flags.
-pub const STACKMAP_RECORD_SIZE: usize = 8;
+/// Per-function block header size in bytes:
+/// 4 name_len + 4 record_count + 4 text_offset.
+pub const STACKMAP_FN_HEADER_SIZE: usize = 12;
 
-/// Flag bit: record is a placeholder (Plan A1 v0 invariant — every
-/// record has this bit set; v1 records clear it).
-pub const STACKMAP_FLAG_PLACEHOLDER: u16 = 0x0001;
+/// Per-record header size in bytes:
+/// 4 pc_offset + 4 frame_size + 2 entry_count + 2 flags.
+pub const STACKMAP_RECORD_HEADER_SIZE_V1: usize = 12;
 
-/// V0 record layout. Mirrors the on-disk shape: 4 + 2 + 2 = 8 bytes.
-///
-/// In v0, `live_count` is always 0 and `flags` always carries the
-/// placeholder bit. The struct is defined here so consumers (compiler
-/// emitter, runtime parser, future precise-GC reader) share one
-/// description; serialisation / deserialisation logic stays in the
-/// consumer crate that performs IO.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StackMapRecordV0 {
-    pub pc_offset: u32,
-    pub live_count: u16,
-    pub flags: u16,
-}
+/// Per-entry size in bytes: 1 kind + 4 sp_offset.
+pub const STACKMAP_ENTRY_SIZE_V1: usize = 5;
+
+/// Entry kind: heap-managed pointer. The only kind v1 emits — every
+/// `declare_value_needs_stack_map` / `declare_var_needs_stack_map`
+/// site in codegen flags a heap pointer. Phase 2 may add kinds for
+/// boxed scalars if precise marking needs to distinguish them.
+pub const STACKMAP_ENTRY_KIND_HEAP_POINTER: u8 = 0x01;
+
+/// Reserved entry kind sentinel. Never written; readers that encounter
+/// it should treat the record as malformed.
+pub const STACKMAP_ENTRY_KIND_RESERVED: u8 = 0x00;
 
 #[cfg(test)]
 mod tests {
@@ -86,18 +104,33 @@ mod tests {
         assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
         assert_eq!(STACKMAP_VERSION_V1, 1);
         assert_eq!(STACKMAP_HEADER_SIZE, 12);
-        assert_eq!(STACKMAP_RECORD_SIZE, 8);
-        assert_eq!(STACKMAP_FLAG_PLACEHOLDER, 0x0001);
+        assert_eq!(STACKMAP_FN_HEADER_SIZE, 12);
+        assert_eq!(STACKMAP_RECORD_HEADER_SIZE_V1, 12);
+        assert_eq!(STACKMAP_ENTRY_SIZE_V1, 5);
+        assert_eq!(STACKMAP_ENTRY_KIND_HEAP_POINTER, 0x01);
+        assert_eq!(STACKMAP_ENTRY_KIND_RESERVED, 0x00);
     }
 
     #[test]
-    fn v0_record_size_matches_constant() {
-        // No #[repr] — the struct is a logical model, not an FFI shape.
-        // Field-width sum (u32 + u16 + u16 = 8 bytes) must still match
-        // the wire-format constant.
+    fn header_widths_sum_to_constants() {
+        // Section header: 4 + 4 + 4 = 12.
         assert_eq!(
-            core::mem::size_of::<u32>() + core::mem::size_of::<u16>() * 2,
-            STACKMAP_RECORD_SIZE
+            core::mem::size_of::<[u8; 4]>()
+                + core::mem::size_of::<u32>()
+                + core::mem::size_of::<u32>(),
+            STACKMAP_HEADER_SIZE
+        );
+        // Fn header: 4 + 4 + 4 = 12.
+        assert_eq!(core::mem::size_of::<u32>() * 3, STACKMAP_FN_HEADER_SIZE);
+        // Record header: 4 + 4 + 2 + 2 = 12.
+        assert_eq!(
+            core::mem::size_of::<u32>() * 2 + core::mem::size_of::<u16>() * 2,
+            STACKMAP_RECORD_HEADER_SIZE_V1
+        );
+        // Entry: 1 + 4 = 5.
+        assert_eq!(
+            core::mem::size_of::<u8>() + core::mem::size_of::<u32>(),
+            STACKMAP_ENTRY_SIZE_V1
         );
     }
 }
