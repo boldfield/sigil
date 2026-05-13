@@ -355,19 +355,23 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
 
     let bytes = std::fs::read(&obj_path).expect("read object file");
 
-    // The object-file section we wrote is tagged `__SIGIL,__stackmaps`
-    // (Mach-O) or `.sigil_stackmaps` (ELF). Rather than re-parse the
-    // enclosing object format here, locate the section by searching for
-    // the magic bytes — which are anchored inside the section we wrote,
-    // and collision with generated code is vanishingly unlikely for a
-    // 4-byte ASCII pattern ("SGST") followed by a v1 version word.
-    let needle: &[u8] = &[b'S', b'G', b'S', b'T', 1, 0, 0, 0];
-    let pos = bytes
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("v1 stackmap magic+version not found in object file");
-    let section = &bytes[pos..];
-    let parsed = parse_section(section).unwrap_or_else(|e: ParseError| {
+    // Walk the object file via the `object` crate (re-exported by
+    // cranelift-object) and locate the stackmap section by name —
+    // `.sigil_stackmaps` (ELF) or `__stackmaps` (Mach-O). The earlier
+    // bring-up of this test used a byte-pattern locator
+    // (`bytes.windows(8).position(|w| w == b"SGST\x01\x00\x00\x00")`),
+    // which has a structural false-positive risk: a string literal,
+    // static-data integer, or coincidental code byte sequence could
+    // match the 8-byte pattern earlier in the file and the test would
+    // parse garbage. The proper section walk is robust against that.
+    use cranelift_object::object::{Object, ObjectSection};
+    let obj = cranelift_object::object::File::parse(&bytes[..]).expect("parse object file");
+    let section = obj
+        .section_by_name(".sigil_stackmaps")
+        .or_else(|| obj.section_by_name("__stackmaps"))
+        .expect("stackmap section not found in object file");
+    let section_data = section.data().expect("read section data");
+    let parsed = parse_section(section_data).unwrap_or_else(|e: ParseError| {
         panic!("stackmap parse failed: {e:?}");
     });
     assert_eq!(parsed.version, STACKMAP_VERSION_V1);

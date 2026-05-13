@@ -90,7 +90,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   entirely (120 dead call sites + `Lowerer.stackmap` field removed).
 - Writer integration: post-`define_function` reads
   `ctx.compiled_code().unwrap().buffer.user_stack_maps()` via a single
-  helper `define_fn_and_capture_stackmap` used at all 12 codegen sites.
+  helper `define_fn_and_capture_stackmap` used at all 10 codegen sites.
 - Per-entry type byte: `STACKMAP_ENTRY_KIND_HEAP_POINTER = 0x01`
   (the only kind v1 emits — Phase 2 may add scalar kinds for the
   cross-check). Cranelift's `(ir::Type, sp_offset)` discarded in favour

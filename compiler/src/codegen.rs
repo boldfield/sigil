@@ -26,15 +26,16 @@
 //!   calls `sigil_panic_arith_error("division by zero")` /
 //!   `("remainder by zero")`, whose C-string payloads live in
 //!   `.rodata` / `__TEXT,__cstring`.
-//! - Safepoint metadata at every call site is accumulated through
-//!   `StackMapBuilder` and written to `.sigil_stackmaps` (ELF) /
-//!   `__SIGIL,__stackmaps` (Mach-O). The section carries a versioned
-//!   header so a v2 precise-GC reader can recognise Stage 1's
-//!   placeholder entries and bail / resynthesise from relocations rather
-//!   than consuming them as real safepoint data. See PLAN_A1_DEVIATIONS
-//!   (`[DEVIATION Task 0.11]`) for the rationale and the v0 → v1
-//!   migration plan. Plan A2's new call sites (`sigil_panic_arith_error`
-//!   per div/mod site) are added to the same placeholder stream.
+//! - Safepoint metadata is captured per-function through
+//!   `StackMapV1Builder` and written to `.sigil_stackmaps` (ELF) /
+//!   `__SIGIL,__stackmaps` (Mach-O) as v1 records. Each
+//!   `module.define_function(...)` site funnels through
+//!   `define_fn_and_capture_stackmap`, which reads
+//!   `ctx.compiled_code().buffer.user_stack_maps()` after the function
+//!   is defined and pushes a per-function block (symbol name +
+//!   per-record `(pc_offset, frame_size, entries)`) into the builder.
+//!   Plan E2 Phase 1 Task 4 retired Plan A1's v0 placeholder format;
+//!   the v1 wire format is documented at `sigil-abi::stackmap`.
 //! - No interior pointers. Generated code never computes a pointer into
 //!   the middle of a heap object; it calls runtime helpers that work with
 //!   header pointers and extract transient payload views internally.
@@ -9975,8 +9976,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
-    // Accumulate safepoint records. Stage 1 writes placeholder records
-    // (see StackMapBuilder's doc comment).
+    // Accumulate v1 safepoint records, one per-function block per
+    // `module.define_function(...)` (via `define_fn_and_capture_stackmap`).
+    // See `StackMapV1Builder`'s doc comment for the wire format.
     let mut stackmap = StackMapV1Builder::new();
 
     // Define string-literal data objects: one DataId per literal, payload
@@ -15390,45 +15392,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // dispatch their result through the post-arm-k
                 // continuation.
                 //
-                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                // This marker covers FOUR sites where heap pointers
-                // live across arena allocations:
-                //   1. THIS site (Slice A's helper synth-cont load
-                //      of `post_arm_k_closure` — null for tail-`k`
-                //      arms, but a real heap-allocated TAG_CLOSURE
-                //      record under Slice B / C non-tail-`k` paths).
-                //   2. Slice C arm-fn body emit: `widened_arg1` +
-                //      `post_arm_k_1_closure_ptr` live across
-                //      `next_step_call` after the closure-record alloc.
-                //   3. Slice C `post_arm_k_1` body: `widened_arg2`
-                //      lives across `post_arm_k_2`'s closure-record
-                //      alloc.
-                //   4. (Slice D, future): surrounding-lambda capture
-                //      pointers live across arm-closure-record alloc.
-                //
-                // Today the closure_ptr-load path here is the only
-                // one with a load that an explicit stackmap-root
-                // annotation could attach to. The other three sites
-                // construct heap pointers via `sigil_alloc` calls
-                // and the resulting SSA values are live across
-                // subsequent allocations — relying on Cranelift /
-                // StackMapBuilder auto-tracking to root them.
-                //
-                // Closeout commit: either document the auto-tracking
-                // guarantee end-to-end (StackMapBuilder/Lowerer
-                // contract: "any SSA value of pointer type live
-                // across an instruction marked via push_placeholder
-                // is recorded as a root") OR add explicit root
-                // annotations at the four sites and remove this TODO.
-                // End-to-end verification with fresh-heap-String
-                // allocations is gated on Stage 6 stdlib growth
-                // (when `String.concat` / `String.from_int` etc.
-                // expose runtime string allocation that would force
-                // GC pressure through these sites).
-                //
-                // Failure mode if missed: heap pointer dangles after
-                // a GC sweep, trampoline dispatches into freed
-                // memory.
+                // Heap-pointer rooting at these sites is handled by
+                // Plan E2 Phase 1: the post-arm-k closure load funnels
+                // through `lower_heap_pointer_load` (Task 2b), and
+                // alloc-then-call patterns funnel through
+                // `lower_alloc_call` (Task 2a) — both flag the SSA
+                // value via `declare_value_needs_stack_map`. Cranelift's
+                // safepoint pass then propagates the flag and
+                // `define_fn_and_capture_stackmap` (Task 4) records the
+                // resulting v1 stack-map entries at every safepoint
+                // call inside this synth-cont.
                 let synth_cont_args_ptr = block_params[1];
                 let post_arm_k_closure = lower_heap_pointer_load(
                     &mut builder,
@@ -22727,12 +22700,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // frame allocation persists until no live
                     // reference remains (codegen's `snap` hold
                     // continues that liveness through this dispatch
-                    // path). No `stackmap.push_placeholder` is
-                    // required here because (a) `load.i64` is not
-                    // a safepoint under Boehm and (b) a future
-                    // precise-GC pass would need to add stackmap
-                    // entries at every call site live across this
-                    // load anyway, not at the load itself.
+                    // path). No explicit safepoint is required at
+                    // this load — Cranelift's safepoint pass attaches
+                    // v1 stackmap entries at every non-tail `call`
+                    // live across the SSA value the load produces,
+                    // not at the load itself. The `lower_heap_pointer_load`
+                    // helper (Plan E2 Phase 1 Task 2b) flags the
+                    // resulting value via `declare_value_needs_stack_map`.
                     let return_fn_v = self.builder.ins().load(
                         self.pointer_ty,
                         MemFlags::trusted(),

@@ -16,9 +16,8 @@
 
 pub use sigil_abi::stackmap::{
     ELF_SECTION_NAME, MACHO_SECTION_NAME, MACHO_SEGMENT_NAME, STACKMAP_ENTRY_KIND_HEAP_POINTER,
-    STACKMAP_ENTRY_KIND_RESERVED, STACKMAP_ENTRY_SIZE_V1, STACKMAP_FN_HEADER_SIZE,
-    STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_HEADER_SIZE_V1,
-    STACKMAP_VERSION_PLACEHOLDER, STACKMAP_VERSION_V1,
+    STACKMAP_ENTRY_SIZE_V1, STACKMAP_FN_HEADER_SIZE, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC,
+    STACKMAP_RECORD_HEADER_SIZE_V1, STACKMAP_VERSION_PLACEHOLDER, STACKMAP_VERSION_V1,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,6 +268,26 @@ mod tests {
         assert_eq!(r.entries.len(), 1);
         assert_eq!(r.entries[0].kind, STACKMAP_ENTRY_KIND_HEAP_POINTER);
         assert_eq!(r.entries[0].sp_offset, 0x18);
+    }
+
+    #[test]
+    fn parse_function_with_nonzero_text_offset_round_trips() {
+        // v1 writers commit to text_offset = 0 today (the runtime
+        // resolves bases via dlsym), but the field is part of the wire
+        // format and a future writer might populate it. Pin
+        // round-trip preservation so a regression — e.g. shifting the
+        // 4-byte field by an alignment fix — surfaces here rather
+        // than silently producing zero on the read side.
+        let input = vec![(
+            "sigil_user_offset_test".to_string(),
+            0xDEAD_BEEFu32,
+            vec![(0x40, 16u32, 0u16, Vec::new())],
+        )];
+        let bytes = build_v1_section(&input);
+        let s = parse_section(&bytes).expect("parse");
+        assert_eq!(s.functions.len(), 1);
+        assert_eq!(s.functions[0].text_offset, 0xDEAD_BEEF);
+        assert_eq!(s.functions[0].symbol_name, "sigil_user_offset_test");
     }
 
     #[test]

@@ -14,8 +14,14 @@
 //! task forward; the runtime parser accepts v1 only and rejects v0 as a
 //! stale build artifact.
 //!
-//! Binary format (little-endian on the host; the section is not
-//! relocated, so emitter endianness == consumer endianness):
+//! Binary format. **The wire is little-endian regardless of host
+//! endianness** — the writer commits to LE via `to_le_bytes()`
+//! unconditionally; the reader uses `from_le_bytes()` unconditionally.
+//! Both currently-supported targets (aarch64-darwin, x86_64-linux)
+//! are LE, so this matches host endianness in practice. A future
+//! port to a BE host would still produce/consume LE bytes — port-
+//! time work is verifying the runtime reader correctness, not
+//! changing the wire format.
 //!
 //! ```text
 //! section header (12 bytes):
@@ -80,12 +86,9 @@ pub const STACKMAP_ENTRY_SIZE_V1: usize = 5;
 /// Entry kind: heap-managed pointer. The only kind v1 emits — every
 /// `declare_value_needs_stack_map` / `declare_var_needs_stack_map`
 /// site in codegen flags a heap pointer. Phase 2 may add kinds for
-/// boxed scalars if precise marking needs to distinguish them.
+/// boxed scalars if precise marking needs to distinguish them; the
+/// runtime parser rejects any unknown kind via `UnknownEntryKind(k)`.
 pub const STACKMAP_ENTRY_KIND_HEAP_POINTER: u8 = 0x01;
-
-/// Reserved entry kind sentinel. Never written; readers that encounter
-/// it should treat the record as malformed.
-pub const STACKMAP_ENTRY_KIND_RESERVED: u8 = 0x00;
 
 #[cfg(test)]
 mod tests {
@@ -108,7 +111,6 @@ mod tests {
         assert_eq!(STACKMAP_RECORD_HEADER_SIZE_V1, 12);
         assert_eq!(STACKMAP_ENTRY_SIZE_V1, 5);
         assert_eq!(STACKMAP_ENTRY_KIND_HEAP_POINTER, 0x01);
-        assert_eq!(STACKMAP_ENTRY_KIND_RESERVED, 0x00);
     }
 
     #[test]
