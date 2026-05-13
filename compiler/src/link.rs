@@ -54,6 +54,16 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         // does not autolink libgcc_s when driving ld directly for a
         // non-Rust object. Add it explicitly.
         cmd.arg("-lgcc_s");
+        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
+        // exports defined symbols into `.dynsym` so the runtime's
+        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
+        // them at safepoint-cross-check time. Without it,
+        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
+        // function, the stackmap index has zero resolved records, and
+        // the cross-check goes silently vacuous on Linux (PR #163
+        // review M1). macOS doesn't need an equivalent — all global
+        // symbols in Mach-O binaries are dlsym-able by default.
+        cmd.arg("-rdynamic");
     }
 
     #[cfg(target_os = "macos")]
