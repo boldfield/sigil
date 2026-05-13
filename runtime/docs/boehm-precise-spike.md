@@ -18,9 +18,11 @@ will need:
   into its precise slot, forces a full GC cycle, and re-reads.
   The read-back value must equal what was written.
 
-Both tests pass on `x86_64-unknown-linux-gnu` (the pod's Debian
-12 / libgc 8.x). CI runs them on ubuntu-24.04 + macos-14
-unchanged.
+Both tests pass on ubuntu-24.04 + macos-14 via the project's CI
+matrix (the authoritative verification environment). The spike
+binary is also exercised locally on the pod's Debian 12 / libgc
+8.x as a smoke check before pushing, but **the pod is not a
+shipping target** — CI is.
 
 ## Plan E2 hypothesis vs reality
 
@@ -101,22 +103,63 @@ bits fits comfortably in a single word).
 
 ## Spike test design
 
-Both tests share a single GC enrolment helper:
+### Subprocess-per-test (the cross-test-thread workaround)
+
+Cargo-test spawns a fresh OS thread per `#[test]` (even under
+`--test-threads=1`) and tears it down between tests. Boehm's
+per-thread mark state survives the OS thread's destruction: a
+second test's `GC_gcollect` then walks a freed thread record,
+surfacing as `signal: 11, SIGSEGV` on Linux or `thread_suspend
+failed` / SIGABRT on Darwin. Symmetric `GC_unregister_my_thread`
+does **not** fully clean up the per-thread record in libgc 8.x
+under rapid register / unregister / re-register cycles (verified
+empirically: both with-unregister and without-unregister
+SIGSEGV on the second test).
+
+The runtime crate's own GC stress tests sidestep this with a
+**subprocess-per-test trick**
+(`runtime/src/handlers.rs::run_stress_in_subprocess`, gated on
+the `SIGIL_GC_STRESS_INNER` env var). The spike replicates that
+pattern with its own `SIGIL_BOEHM_SPIKE_INNER` env var:
+
+- **Outer mode** (env var unset). The `#[test]` body re-execs
+  the current test binary with `--exact <test_name> --nocapture
+  --env SIGIL_BOEHM_SPIKE_INNER=1`. Asserts the child exited
+  zero.
+- **Inner mode** (env var set). The `#[test]` body runs the
+  actual Boehm calls. Only one test executes per subprocess.
+
+Result: each Boehm thread registration lives in a fresh process,
+no cross-test pollution. The pod's libgc 8.x and the CI hosts'
+libgc 8.x all agree the API works as long as the registration
+churn is bounded to one test per process.
+
+### GC enrolment (inner mode only)
 
 ```rust
 fn enrol_gc() {
     unsafe {
         GC_INIT.call_once(|| GC_init());
         GC_ALLOW_REGISTER.call_once(|| GC_allow_register_threads());
-        let _ = GC_register_my_thread(std::ptr::null());
     }
+    let rc = unsafe { GC_register_my_thread(std::ptr::null()) };
+    assert!(rc == GC_SUCCESS || rc == GC_DUPLICATE, /* … */);
 }
 ```
 
-Cargo-test spawns a fresh OS thread per `#[test]` (even under
-`--test-threads=1`); the thread must register with Boehm before
-calling `GC_gcollect` or Boehm aborts with "Collecting from
-unknown thread."
+- The explicit `GC_init()` is technically redundant on libgc 7.x+
+  (auto-init on first `GC_malloc`), but matches the production
+  `sigil_gc_init` pattern in `runtime/src/gc.rs` — a divergence
+  on any host would surface in the spike too.
+- `GC_register_my_thread(NULL)` asks Boehm to auto-detect the
+  calling thread's stack base, the documented form for threads
+  not created via `GC_pthread_create`.
+- The return code is asserted (`GC_SUCCESS` or `GC_DUPLICATE`);
+  `GC_UNIMPLEMENTED` aborts with a diagnostic rather than
+  silently SIGSEGV on the first `GC_gcollect`.
+- No `GC_unregister_my_thread` — only one test runs per
+  subprocess and the process exits when the test returns,
+  letting the OS reap the thread.
 
 ### Test 1: `make_descriptor_returns_nonzero_handle`
 

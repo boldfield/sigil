@@ -26,10 +26,33 @@
 // false-retention reproducer per the plan body. This spike's
 // acceptance is "the API works without crashing on the host."
 //
-// Runs on both `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`.
+// Runs on `x86_64-unknown-linux-gnu` (ubuntu-24.04 CI) and
+// `aarch64-apple-darwin` (macos-14 CI).
+//
+// # Why each test runs in its own subprocess
+//
+// Cargo-test spawns a fresh OS thread per `#[test]` (even under
+// `--test-threads=1`) and tears it down before the next test
+// starts. Boehm's per-thread mark state survives that thread's
+// destruction — the next test's `GC_gcollect` then walks a freed
+// thread record, surfacing as `signal: 11, SIGSEGV` on Linux or
+// `thread_suspend failed` / SIGABRT on Darwin. Symmetric
+// `GC_unregister_my_thread` does not fully clean up the per-thread
+// record in libgc 8.x under rapid register / unregister / re-register
+// cycles (reproduced both on the pod and on CI, both with and
+// without the symmetric unregister).
+//
+// The runtime's own GC stress tests already work around this with a
+// subprocess-per-test trick (`runtime/src/handlers.rs::run_stress_in_subprocess`,
+// gated on the `SIGIL_GC_STRESS_INNER` env var). The spike applies
+// the same pattern: outer-mode invocations re-exec the test binary
+// filtered to `--exact <test_name>` with `SIGIL_BOEHM_SPIKE_INNER=1`
+// set; the child runs exactly one test in its own fresh process and
+// exits. Result: only one Boehm thread registration per process, no
+// cross-test pollution.
 
 use std::ffi::c_void;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::Once;
 
 // Boehm typed-malloc FFI surface — declared inline in the spike
 // test rather than in `runtime/src/gc.rs` because Tasks 7 + 8 will
@@ -62,49 +85,107 @@ extern "C" {
     /// bitmap to cover the object.
     fn GC_malloc_explicitly_typed(size_in_bytes: usize, descr: usize) -> *mut c_void;
 
-    /// Force a full mark-sweep cycle. Tests use this to make
-    /// liveness questions deterministic — without it, low-pressure
-    /// programs may not trip a collection during the test.
+    /// Per-thread Boehm enrolment. `GC_allow_register_threads` must
+    /// be called once on the program at large before any thread that
+    /// will register itself is created (in practice, before the
+    /// first `GC_register_my_thread`). `GC_register_my_thread(NULL)`
+    /// asks Boehm to auto-detect the calling thread's stack base —
+    /// the documented form for threads not created via
+    /// `GC_pthread_create` (which `std::thread::spawn` does not call).
     fn GC_allow_register_threads();
     fn GC_register_my_thread(stack_base: *const c_void) -> i32;
+}
+
+// Boehm return-code constants (from `gc.h`). We pin the values we
+// care about as `const`s so the assertion below is self-documenting.
+const GC_SUCCESS: i32 = 0;
+const GC_DUPLICATE: i32 = 1;
+
+/// Env-var marker that switches a spike test into "inner" mode
+/// (run the actual body) instead of "outer" mode (spawn a child
+/// subprocess that runs only this one test). Mirrors the runtime
+/// crate's `SIGIL_GC_STRESS_INNER` pattern in
+/// `runtime/src/handlers.rs`.
+const SPIKE_INNER_VAR: &str = "SIGIL_BOEHM_SPIKE_INNER";
+
+fn in_spike_subprocess() -> bool {
+    std::env::var(SPIKE_INNER_VAR).is_ok()
+}
+
+/// Outer-mode helper: re-exec this integration-test binary, filtered
+/// to the given `--exact` test name with the inner-mode env var set.
+/// Asserts the child exited zero. Integration-test binaries do NOT
+/// carry a module prefix (test functions live at the top level of
+/// the file), so the test name passed in is the bare function name.
+fn run_spike_in_subprocess(test_name: &str) {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("run_spike_in_subprocess: current_exe failed: {e}");
+            std::process::abort();
+        }
+    };
+    let status = match std::process::Command::new(&exe)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(SPIKE_INNER_VAR, "1")
+        .status()
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("run_spike_in_subprocess: spawn for `{test_name}` failed: {e}");
+            std::process::abort();
+        }
+    };
+    assert!(
+        status.success(),
+        "Boehm-spike subprocess for `{test_name}` failed: {status}"
+    );
 }
 
 static GC_INIT: Once = Once::new();
 static GC_ALLOW_REGISTER: Once = Once::new();
 
-/// Serialize the two tests within this binary. Cargo test runs them
-/// in the same process; concurrent GC_gcollect from racy threads is
-/// poorly-defined under Boehm and would mask real spike failures
-/// behind heisenbugs.
-fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
-
-/// Register the calling thread with Boehm. Cargo-test spawns a
-/// fresh OS thread per `#[test]` (even under `--test-threads=1`);
-/// each thread that calls `GC_gcollect` must register first or
-/// Boehm aborts with "Collecting from unknown thread."
+/// One-shot per-process Boehm enrolment for the inner subprocess.
+/// Only one test ever runs in each subprocess (see module doc), so
+/// there is no register / unregister / re-register churn to defend
+/// against. We keep the explicit `GC_init` to match the production
+/// `sigil_gc_init` pattern in `runtime/src/gc.rs` — if init ever
+/// diverges between the spike and production on a host, the spike
+/// surfaces it as an attributable failure rather than as a confused
+/// later-allocation error.
 ///
-/// We don't unregister: cargo's test runner destroys the thread
-/// when the test returns, and the registration is freed with it.
-/// Symmetric `GC_unregister_my_thread` would be cleaner but in
-/// practice (a) Boehm's per-thread state lives in TLS and dies
-/// with the thread, (b) attempting to unregister + re-register
-/// across cargo test workers surfaces a SIGSEGV on this host —
-/// likely a Boehm bug with rapid register/unregister cycles, but
-/// not our spike to chase.
+/// `GC_allow_register_threads` ordering: libgc docs say it must
+/// precede any thread that will register itself. The cargo-test
+/// runner's worker thread has already been created by the time
+/// this fires, but it hasn't yet attempted registration — the
+/// Once enforces ordering with respect to the call site, not the
+/// thread's creation, which is what libgc actually cares about.
+/// The runtime's `test_support` module uses the same pattern with
+/// no observed issues.
+///
+/// We don't unregister: only one test runs per subprocess and the
+/// process exits cleanly when the test returns, at which point the
+/// OS reaps the thread + libgc's state with it.
 fn enrol_gc() {
     // SAFETY: each Once.call_once fires at most once per process.
-    // GC_register_my_thread returns GC_DUPLICATE on a
-    // already-registered thread; we ignore the return code.
     unsafe {
         GC_INIT.call_once(|| GC_init());
         GC_ALLOW_REGISTER.call_once(|| GC_allow_register_threads());
-        let _ = GC_register_my_thread(std::ptr::null());
     }
+    // SAFETY: NULL stack base = Boehm auto-detects the calling
+    // thread's stack bottom (documented form for non-Boehm-created
+    // threads). Return code:
+    //   GC_SUCCESS (0)    — first registration on this thread; good.
+    //   GC_DUPLICATE (1)  — thread already registered; also good (idempotent).
+    //   GC_UNIMPLEMENTED (3) or other — registration unavailable on
+    //                      this host. Abort with diagnostic rather than
+    //                      silently SIGSEGV on the first GC_gcollect.
+    let rc = unsafe { GC_register_my_thread(std::ptr::null()) };
+    assert!(
+        rc == GC_SUCCESS || rc == GC_DUPLICATE,
+        "GC_register_my_thread returned rc={rc} \
+         (expected GC_SUCCESS=0 or GC_DUPLICATE=1)"
+    );
 }
 
 /// Single-pointer-slot bitmap: word 0 IS a pointer (bit 0 set).
@@ -115,7 +196,10 @@ const SINGLE_PTR_SLOT_BITMAP: [usize; 1] = [0b1];
 
 #[test]
 fn make_descriptor_returns_nonzero_handle() {
-    let _guard = test_lock();
+    if !in_spike_subprocess() {
+        run_spike_in_subprocess("make_descriptor_returns_nonzero_handle");
+        return;
+    }
     enrol_gc();
     // SAFETY: bitmap lives for the call's duration; len_bits = 1.
     let descr = unsafe { GC_make_descriptor(SINGLE_PTR_SLOT_BITMAP.as_ptr(), 1) };
@@ -132,7 +216,10 @@ fn make_descriptor_returns_nonzero_handle() {
 
 #[test]
 fn malloc_explicitly_typed_round_trip() {
-    let _guard = test_lock();
+    if !in_spike_subprocess() {
+        run_spike_in_subprocess("malloc_explicitly_typed_round_trip");
+        return;
+    }
     enrol_gc();
     // SAFETY: see SAFETY comments inline.
     unsafe {

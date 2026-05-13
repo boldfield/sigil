@@ -186,19 +186,21 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   `malloc_explicitly_typed_round_trip` allocates a 2-word object
   via the typed allocator, stores a pointer into its precise
   slot, forces a full `GC_gcollect`, and asserts the slot
-  survives unchanged. Both pass on pod's Debian 12 / libgc 8.x.
+  survives unchanged. CI matrix (ubuntu-24.04 + macos-14) is the
+  authoritative verification environment.
 - Doc: `runtime/docs/boehm-precise-spike.md` documents the chosen
   API, the constraints on `size_in_bytes` (>=
   `len_bits * sizeof(GC_word)`), and the Sigil-pointer-bitmap →
   Boehm-descriptor-bitmap mapping (Sigil's bit-`k` is per-payload-
   word; Boehm's bit-0 is the header word → shift by 1).
-- Per-test infra note: cargo-test spawns a fresh OS thread per
-  `#[test]`; each must `GC_register_my_thread(NULL)` before
-  `GC_gcollect` or Boehm aborts. The spike's `enrol_gc()` helper
-  is the matching production-grade pattern from
-  `runtime/src/test_support.rs::GcThreadEnrolment` minus the
-  HANDLER_STACK/ARENA registrations (the spike doesn't allocate
-  through those).
+- Per-test infra: each spike test runs in its own subprocess via
+  the same pattern the runtime's GC stress tests use
+  (`SIGIL_BOEHM_SPIKE_INNER` env var, mirrors
+  `SIGIL_GC_STRESS_INNER` in `runtime/src/handlers.rs`). This is
+  required because libgc 8.x retains stale per-thread mark state
+  across cargo-test thread tear-downs — both with and without
+  symmetric `GC_unregister_my_thread`, both on the pod and on
+  the CI matrix.
 
 ### Task 7 — Descriptor cache
 
