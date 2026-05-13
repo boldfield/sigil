@@ -38,6 +38,16 @@
 //! Boehm's descriptor word encodes the object's size, so the
 //! handles differ even though the bitmap bits do not. Recorded as
 //! a Task 7 deviation in `PLAN_E2_PROGRESS.md`.
+//!
+//! # No eviction
+//!
+//! The cache grows monotonically. Sigil's distinct-shape count is
+//! bounded by static codegen analysis (the closure-convert pass
+//! enumerates all closure-env shapes; the type system enumerates
+//! all record / variant / tuple shapes). A future change that
+//! introduces dynamically-created shapes (reflection, runtime
+//! record types, etc.) would turn this cache into an unbounded
+//! growth point — revisit eviction then.
 
 // `get_or_create` (and its private callees) are this PR's deliverable
 // but its caller — `sigil_alloc` — does not land until Task 8. Suppress
@@ -47,6 +57,8 @@
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, RwLock};
+
+use sigil_header_constants::MAX_CLOSURE_ENV_SLOTS;
 
 use super::GC_make_descriptor;
 
@@ -75,11 +87,28 @@ static CACHE: LazyLock<RwLock<BTreeMap<DescriptorKey, usize>>> =
 /// most once across all threads.
 ///
 /// `sigil_bitmap` is the value of `Header::pointer_bitmap()`.
-/// `payload_word_count` is `Header::payload_count()` (0..=63).
+/// `payload_word_count` is `Header::payload_count()` — bounded by
+/// `MAX_CLOSURE_ENV_SLOTS = 31` (the actual Sigil codegen upper
+/// bound for precise-descriptor objects; Header's 6-bit count
+/// field representable max is 63, but Sigil's allocators never
+/// emit values above 31 for any descriptor-using shape).
 ///
 /// The returned `usize` is Boehm's opaque `GC_descr` handle; callers
 /// pass it through to `GC_malloc_explicitly_typed` (Task 8).
 pub(crate) fn get_or_create(sigil_bitmap: u32, payload_word_count: u8) -> usize {
+    // The argument is `u8` (0..=255), but Sigil's codegen never
+    // emits values above `MAX_CLOSURE_ENV_SLOTS = 31` for any
+    // precise-descriptor-using shape. The `debug_assert!` catches
+    // callers that drift past the codegen upper bound; release
+    // builds elide the check, so the steady-state cost stays at
+    // a single map lookup.
+    debug_assert!(
+        (payload_word_count as usize) <= MAX_CLOSURE_ENV_SLOTS,
+        "payload_word_count {} exceeds Sigil's MAX_CLOSURE_ENV_SLOTS = {}",
+        payload_word_count,
+        MAX_CLOSURE_ENV_SLOTS,
+    );
+
     let key = DescriptorKey {
         sigil_bitmap,
         payload_word_count,
@@ -109,16 +138,33 @@ fn read_cache(key: &DescriptorKey) -> Option<usize> {
     cache.get(key).copied()
 }
 
+/// Build a fresh Boehm descriptor for the given Sigil shape via
+/// `GC_make_descriptor`. Called at most once per `(bitmap, count)`
+/// per process by the cache's slow path.
+///
+/// **Precision-fallback gap.** Per `gc_typed.h`: *"Returns a
+/// conservative approximation in the (unlikely) case of insufficient
+/// memory to build the descriptor."* `GC_make_descriptor` returns
+/// non-zero on both the success path AND the conservative-fallback
+/// path. Boehm exposes no runtime predicate to distinguish the two,
+/// so the cache stores the fallback transparently and Task 8
+/// allocations of that shape would lose precise marking silently —
+/// though they remain memory-safe (the fallback is a conservative
+/// over-approximation, never under). Task 9's false-retention
+/// reproducer is the load-bearing detector for unexpected precision
+/// loss; a known-failing shape that suddenly stops detecting
+/// unreachability there points to this fallback as the first suspect.
 fn build_descriptor(sigil_bitmap: u32, payload_word_count: u8) -> usize {
     let boehm_bitmap: usize = (sigil_bitmap as usize) << 1;
     let len_bits: usize = 1 + payload_word_count as usize;
     // SAFETY: `GC_make_descriptor` reads `len_bits` bits from
     // `&boehm_bitmap`. One `usize` covers up to 64 bits on our
-    // 64-bit targets; `len_bits = 1 + payload_word_count` and
-    // `payload_word_count ≤ 63` (Header's 6-bit count field), so
-    // `len_bits ≤ 64` — within the single-word backing buffer.
-    // `&boehm_bitmap` is valid for the call's duration; Boehm
-    // doesn't retain the pointer.
+    // 64-bit targets. The `get_or_create` debug_assert pins
+    // `payload_word_count ≤ MAX_CLOSURE_ENV_SLOTS = 31` (actual
+    // Sigil codegen upper bound), so `len_bits = 1 +
+    // payload_word_count ≤ 32` — well within the single-word
+    // backing buffer. `&boehm_bitmap` is valid for the call's
+    // duration; Boehm doesn't retain the pointer.
     unsafe { GC_make_descriptor(&boehm_bitmap, len_bits) }
 }
 
@@ -133,6 +179,7 @@ pub(crate) fn clear_cache() {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
     use crate::gc::sigil_gc_init;
@@ -239,17 +286,62 @@ mod tests {
 
     #[test]
     fn max_payload_count_does_not_overflow() {
-        // Header's count field is 6 bits → max 63. With the +1
-        // shift for the header, `len_bits` reaches 64 — the edge
-        // of a single `usize` bitmap on 64-bit hosts. Verify the
-        // cache handles this without panic or descriptor failure.
+        // Sigil's actual codegen upper bound is
+        // `MAX_CLOSURE_ENV_SLOTS = 31` (not Header's 6-bit
+        // representable max of 63). With the +1 shift for the
+        // header word, `len_bits = 1 + 31 = 32`, comfortably
+        // within the single-word `usize` bitmap on 64-bit hosts.
+        // Pulling the bound from `sigil_header_constants` keeps
+        // the test self-updating if the limit ever moves.
         let _guard = crate::test_support::gc_test_lock();
         setup();
 
-        let descr = get_or_create(u32::MAX, 31);
+        let descr = get_or_create(u32::MAX, MAX_CLOSURE_ENV_SLOTS as u8);
         assert_ne!(
             descr, 0,
             "max-payload descriptor must succeed (or return Boehm's conservative fallback, also non-zero)"
+        );
+    }
+
+    #[test]
+    fn concurrent_miss_for_same_shape_yields_one_descriptor() {
+        // Pins the double-checked-locking invariant in
+        // `get_or_create`: when two threads race on a fresh shape,
+        // one wins the write lock + calls `GC_make_descriptor`;
+        // the other re-checks inside the write lock and returns
+        // the cached handle. Result: cache_size == 1, both threads
+        // agree on the handle. The exact interleaving depends on
+        // the OS scheduler — the *invariant* is deterministic
+        // regardless of who wins.
+        use std::sync::{Arc, Barrier};
+
+        let _guard = crate::test_support::gc_test_lock();
+        setup();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        // Two threads race on a shape neither has cached yet.
+        // The barrier aligns them at the cache-miss point.
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            get_or_create(0b11, 2)
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            get_or_create(0b11, 2)
+        });
+        let d1 = t1.join().unwrap();
+        let d2 = t2.join().unwrap();
+
+        assert_eq!(d1, d2, "racing threads must converge on one descriptor");
+        assert_ne!(d1, 0, "descriptor must not be zero");
+        assert_eq!(
+            cache_size(),
+            1,
+            "race must not double-insert: cache_size = {}",
+            cache_size()
         );
     }
 }
