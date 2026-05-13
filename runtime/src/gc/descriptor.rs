@@ -49,16 +49,10 @@
 //! record types, etc.) would turn this cache into an unbounded
 //! growth point — revisit eviction then.
 
-// `get_or_create` (and its private callees) are this PR's deliverable
-// but its caller — `sigil_alloc` — does not land until Task 8. Suppress
-// the dead-code lint at module level rather than per-item; the next
-// PR will call into this module and the warning will resolve itself.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, RwLock};
 
-use sigil_header_constants::MAX_CLOSURE_ENV_SLOTS;
+use sigil_header_constants::COUNT_MASK;
 
 use super::GC_make_descriptor;
 
@@ -88,25 +82,26 @@ static CACHE: LazyLock<RwLock<BTreeMap<DescriptorKey, usize>>> =
 ///
 /// `sigil_bitmap` is the value of `Header::pointer_bitmap()`.
 /// `payload_word_count` is `Header::payload_count()` — bounded by
-/// `MAX_CLOSURE_ENV_SLOTS = 31` (the actual Sigil codegen upper
-/// bound for precise-descriptor objects; Header's 6-bit count
-/// field representable max is 63, but Sigil's allocators never
-/// emit values above 31 for any descriptor-using shape).
+/// Header's 6-bit count field (`COUNT_MASK = 63`). Sigil's
+/// pointer bitmap covers payload words 0..31; payload words 32..63
+/// (when count > 31) are implicitly non-pointers — only handler
+/// frames hit this regime today (`MAX_HANDLER_ARMS = 14` → up to
+/// 32 payload words). Larger objects use
+/// `TAG_EXTERNAL_DESCRIPTOR`, which is out of scope for v1.
 ///
 /// The returned `usize` is Boehm's opaque `GC_descr` handle; callers
 /// pass it through to `GC_malloc_explicitly_typed` (Task 8).
 pub(crate) fn get_or_create(sigil_bitmap: u32, payload_word_count: u8) -> usize {
-    // The argument is `u8` (0..=255), but Sigil's codegen never
-    // emits values above `MAX_CLOSURE_ENV_SLOTS = 31` for any
-    // precise-descriptor-using shape. The `debug_assert!` catches
-    // callers that drift past the codegen upper bound; release
+    // The argument is `u8` (0..=255); Header's 6-bit count field
+    // caps the meaningful value at `COUNT_MASK = 63`. Catches
+    // callers that drift past the Header representation. Release
     // builds elide the check, so the steady-state cost stays at
     // a single map lookup.
     debug_assert!(
-        (payload_word_count as usize) <= MAX_CLOSURE_ENV_SLOTS,
-        "payload_word_count {} exceeds Sigil's MAX_CLOSURE_ENV_SLOTS = {}",
+        (payload_word_count as u64) <= COUNT_MASK,
+        "payload_word_count {} exceeds Header's 6-bit count field max = {}",
         payload_word_count,
-        MAX_CLOSURE_ENV_SLOTS,
+        COUNT_MASK,
     );
 
     let key = DescriptorKey {
@@ -160,11 +155,26 @@ fn build_descriptor(sigil_bitmap: u32, payload_word_count: u8) -> usize {
     // SAFETY: `GC_make_descriptor` reads `len_bits` bits from
     // `&boehm_bitmap`. One `usize` covers up to 64 bits on our
     // 64-bit targets. The `get_or_create` debug_assert pins
-    // `payload_word_count ≤ MAX_CLOSURE_ENV_SLOTS = 31` (actual
-    // Sigil codegen upper bound), so `len_bits = 1 +
-    // payload_word_count ≤ 32` — well within the single-word
-    // backing buffer. `&boehm_bitmap` is valid for the call's
-    // duration; Boehm doesn't retain the pointer.
+    // `payload_word_count ≤ COUNT_MASK = 63` (Header's 6-bit
+    // representable max), so `len_bits = 1 + payload_word_count
+    // ≤ 64` — exactly within the single-word backing buffer.
+    //
+    // Bitmap-coverage argument when `payload_word_count > 31`:
+    // Sigil's `pointer_bitmap` is `u32` and covers payload words
+    // 0..31. The `u32 → usize` cast zero-extends, so
+    // `boehm_bitmap = (sigil_bitmap as usize) << 1` has bits
+    // 33..63 set to 0. Boehm reads those as "payload words 32..62
+    // are NOT pointers." This is correct by construction: Sigil's
+    // bitmap encoding has no representation for pointers in those
+    // words, so they cannot hold GC refs. Handler frames at
+    // `MAX_HANDLER_ARMS = 14` are the only currently-emitted case
+    // that even reaches `count = 32` — every "implicit non-pointer"
+    // bit in that descriptor is a non-pointer field by codegen
+    // contract (handler frame's `prev` / `return_closure` /
+    // `arm[i].closure_ptr` slots all live at indices ≤ 31).
+    //
+    // `&boehm_bitmap` is valid for the call's duration; Boehm
+    // doesn't retain the pointer.
     unsafe { GC_make_descriptor(&boehm_bitmap, len_bits) }
 }
 
@@ -286,17 +296,17 @@ mod tests {
 
     #[test]
     fn max_payload_count_does_not_overflow() {
-        // Sigil's actual codegen upper bound is
-        // `MAX_CLOSURE_ENV_SLOTS = 31` (not Header's 6-bit
-        // representable max of 63). With the +1 shift for the
-        // header word, `len_bits = 1 + 31 = 32`, comfortably
-        // within the single-word `usize` bitmap on 64-bit hosts.
-        // Pulling the bound from `sigil_header_constants` keeps
-        // the test self-updating if the limit ever moves.
+        // Header's 6-bit count field caps at `COUNT_MASK = 63`.
+        // With the +1 shift for the header word, `len_bits = 1 + 63 =
+        // 64` — exactly the width of a single `usize` bitmap on
+        // 64-bit hosts. Verify the cache handles this edge without
+        // panic or descriptor failure. Pulling the bound from
+        // `sigil_header_constants` keeps the test self-updating if
+        // the count field ever widens.
         let _guard = crate::test_support::gc_test_lock();
         setup();
 
-        let descr = get_or_create(u32::MAX, MAX_CLOSURE_ENV_SLOTS as u8);
+        let descr = get_or_create(u32::MAX, COUNT_MASK as u8);
         assert_ne!(
             descr, 0,
             "max-payload descriptor must succeed (or return Boehm's conservative fallback, also non-zero)"

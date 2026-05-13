@@ -1,9 +1,13 @@
-//! Boehm GC integration — plan A1 Stage 1 task 2.
+//! Boehm GC integration — plan A1 Stage 1 task 2; Plan E2 Task 8
+//! switched the per-object allocator to Boehm's typed-malloc path.
 //!
-//! The runtime wraps Boehm's `GC_init` + `GC_malloc` in the FFI surface
-//! the compiler emits calls to. Header construction happens on the caller
-//! side (through `header::Header::new`); `sigil_alloc` writes the header
-//! to the first 8 bytes of the Boehm block and returns a pointer to that
+//! The runtime wraps Boehm's `GC_init` + the typed/atomic allocator
+//! pair (`GC_malloc_atomic` for non-pointer payloads,
+//! `GC_malloc_explicitly_typed` for pointer-bearing payloads via
+//! Task 7's descriptor cache) in the FFI surface the compiler emits
+//! calls to. Header construction happens on the caller side (through
+//! `header::Header::new`); `sigil_alloc` writes the header to the
+//! first 8 bytes of the Boehm block and returns a pointer to that
 //! header.
 //!
 //! **Allocations always return a pointer to the header**, never to the
@@ -24,11 +28,24 @@ use crate::header::{self, Header};
 #[link(name = "gc")]
 extern "C" {
     fn GC_init();
-    fn GC_malloc(size: usize) -> *mut c_void;
-    // `GC_malloc_atomic` is used for strings (no GC-managed pointers in the
-    // payload) so Boehm can skip scanning them during mark phases. Safe on
-    // all supported hosts.
+    // `GC_malloc_atomic` is used for objects whose pointer_bitmap is 0
+    // (no GC-managed pointers in the payload — strings, byte arrays,
+    // primitive scalar wrappers) so Boehm can skip scanning them
+    // during mark phases.
     fn GC_malloc_atomic(size: usize) -> *mut c_void;
+    // `GC_malloc` (conservative-scan allocator) is retained for
+    // objects whose payload is too large for the Header's 6-bit
+    // count field to describe precisely — arrays, mut-arrays, the
+    // string-builder segments table. These sites encode their
+    // "scan conservatively" intent as `(count = 0, bitmap != 0)`:
+    // count = 0 because the 6-bit field caps at 63 payload words
+    // (arrays / segments tables can exceed that), bitmap != 0 to
+    // route OUT of the atomic path. Without this fallback, Plan
+    // E2 Task 8's typed-malloc path would build a `len_bits = 1`
+    // descriptor for these objects and Boehm's tile-replication
+    // would treat the whole payload as non-pointer — silently
+    // dropping every heap reference in the array.
+    fn GC_malloc(size: usize) -> *mut c_void;
     // Register `[start, end)` as a GC root. Boehm scans the range
     // conservatively for pointer-shaped values on every mark phase.
     // Plan B Task 56 uses this to root `HANDLER_STACK` (the thread-local
@@ -78,6 +95,15 @@ extern "C" {
     // once per type, not once per allocation." — Task 7's descriptor
     // cache is the structural enforcement of that contract.
     pub(crate) fn GC_make_descriptor(bitmap: *const usize, len_bits: usize) -> usize;
+
+    // Boehm typed allocator — Plan E2 Phase 2 Task 8. Allocates
+    // `size_in_bytes` bytes from Boehm's heap and tags the block
+    // with `descr` so the mark phase scans payload words precisely
+    // per the descriptor's pointer bitmap. The returned block is
+    // zero-initialised and 8-byte aligned (same as `GC_malloc_atomic`).
+    // `size_in_bytes` must be `>= len_bits * sizeof(GC_word)` —
+    // the descriptor's bitmap must cover the entire allocation.
+    fn GC_malloc_explicitly_typed(size_in_bytes: usize, descr: usize) -> *mut c_void;
 }
 
 pub(crate) mod descriptor;
@@ -162,6 +188,37 @@ pub extern "C" fn sigil_gc_init() {
     crate::profile::maybe_init();
 }
 
+/// Debug-only precondition check for the precise-marking path in
+/// `sigil_alloc`: the requested allocation size must be large enough
+/// that `GC_malloc_explicitly_typed`'s descriptor bitmap covers the
+/// full block. `GC_malloc_explicitly_typed` requires
+/// `size_in_bytes >= (1 + payload_count) * 8` — one word for the
+/// Sigil header plus `payload_count` payload words.
+///
+/// Extracted from `sigil_alloc` as a regular Rust fn (not `extern "C"`)
+/// so the `debug_assert!` panics unwind cleanly under `#[should_panic]`
+/// tests. Through the C ABI the panic would convert to an abort and
+/// `cargo test` would treat it as a process crash, not a passing
+/// `#[should_panic]`.
+///
+/// For bitmap-bearing objects, codegen emits `payload_bytes =
+/// payload_count * 8` (word-aligned payload), so `total = 8 +
+/// payload_count * 8 = (1 + count) * 8` exactly meets the floor.
+/// A drift between codegen's `payload_bytes` and the Header's `count`
+/// would surface as a Boehm scan beyond the allocation — this check
+/// pins the discipline at the boundary.
+#[inline]
+fn assert_precise_alloc_size(total: usize, count: u8, bitmap: u32) {
+    debug_assert!(
+        total >= (1 + count as usize).saturating_mul(8),
+        "sigil_alloc: total bytes {} < precise-descriptor minimum {} (count={}, bitmap=0b{:b})",
+        total,
+        (1 + count as usize) * 8,
+        count,
+        bitmap,
+    );
+}
+
 /// Allocate `8 + payload_bytes` from Boehm, write the 8-byte header, and
 /// return a pointer to the header (never to the payload). Callers hold a
 /// header pointer as their canonical reference to the object.
@@ -202,19 +259,51 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     crate::profile::alloc::maybe_sample_alloc(total as u64);
 
     let h = Header(header);
-    // The pointer bitmap selects between Boehm's atomic and conservative
-    // allocators. v1's bitmap is a binary signal (zero vs non-zero) at
-    // this layer — it does NOT inform precise per-slot scanning. The
-    // per-bit precision is v2-forward-compat metadata for a typed-walker
-    // GC; today, when `pointer_bitmap() != 0`, Boehm conservatively
-    // scans the entire allocated block and follows anything pointer-shaped.
-    // False-positive pinning is bounded by the block's size.
+    // Allocator selection. Plan E2 Phase 2 Task 8 splits the bitmap
+    // dispatch into three branches based on what the Header's
+    // `(count, bitmap)` pair encodes:
+    //
+    //   - `bitmap == 0`                 → `GC_malloc_atomic`
+    //     No GC pointers anywhere in the payload. Boehm skips
+    //     scanning entirely — strictly better than precise marking.
+    //
+    //   - `bitmap != 0 && count == 0`   → `GC_malloc` (conservative)
+    //     The Sigil convention for "object too large for the
+    //     header's 6-bit count field to describe precisely" — arrays,
+    //     mut-arrays, the string-builder segments table. Count=0 is
+    //     the structural signal; bitmap=non-zero routes out of the
+    //     atomic path. These payloads are scanned conservatively;
+    //     element pointers survive GC because Boehm's mark phase
+    //     walks the whole block looking for pointer-shaped values.
+    //
+    //   - `bitmap != 0 && count >  0`   → `GC_malloc_explicitly_typed`
+    //     Precise marking via Boehm's typed-malloc. The descriptor
+    //     cache (Task 7) hands out one `GC_descr` per shape; first
+    //     observation of a `(bitmap, count)` shape builds the
+    //     descriptor via `GC_make_descriptor`, subsequent calls
+    //     reuse the cached handle. The precondition check lives in
+    //     `assert_precise_alloc_size` — see its doc-comment.
+    //
+    // The count==0 branch closes a silent correctness regression
+    // introduced by Task 8's initial drop of `GC_malloc`: a typed
+    // descriptor built from `(bitmap=1, count=0)` would have
+    // `len_bits = 1` describing only the header word; Boehm's
+    // tile-replication would then treat every element slot as a
+    // non-pointer, silently collecting any heap-bearing array
+    // elements that lacked an independent stack root.
     let raw = if h.pointer_bitmap() == 0 {
-        // No GC pointers in the payload — Boehm can skip scanning the
-        // bytes (saves mark-phase cost). Atomic in Boehm's vocabulary.
         unsafe { GC_malloc_atomic(total) as *mut u8 }
-    } else {
+    } else if h.payload_count() == 0 {
         unsafe { GC_malloc(total) as *mut u8 }
+    } else {
+        let count = h.payload_count();
+        assert_precise_alloc_size(total, count, h.pointer_bitmap());
+        let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
+        // SAFETY: `descr` was built by `GC_make_descriptor` and is
+        // alive for the process lifetime (the cache never evicts).
+        // `total` meets the descriptor's `len_bits * sizeof(GC_word)`
+        // floor (debug_asserted above for non-release builds).
+        unsafe { GC_malloc_explicitly_typed(total, descr) as *mut u8 }
     };
 
     if raw.is_null() {
@@ -225,10 +314,13 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
         std::process::abort();
     }
 
-    // SAFETY: `raw` points to at least `total` bytes obtained from GC_malloc
-    // (or GC_malloc_atomic), and `total >= 8`. Writing the header word is
-    // an aligned u64 write at the start of a freshly-returned block. This
-    // is not an interior pointer (the header IS the object's header).
+    // SAFETY: `raw` points to at least `total` bytes obtained from one
+    // of `GC_malloc_atomic` (bitmap=0 path), `GC_malloc` (count=0
+    // conservative-scan path), or `GC_malloc_explicitly_typed`
+    // (precise-marking path), and `total >= 8`. Writing the header
+    // word is an aligned u64 write at the start of a freshly-returned
+    // block. This is not an interior pointer (the header IS the
+    // object's header).
     unsafe {
         let hdr_ptr: *mut u64 = raw.cast();
         hdr_ptr.write(header);
@@ -386,6 +478,198 @@ mod tests {
         let obj = unsafe { sigil_string_new(std::ptr::null(), 0) };
         assert!(!obj.is_null());
         assert_eq!(unsafe { sigil_string_len(obj) }, 0);
+    }
+
+    #[test]
+    fn sigil_alloc_routes_nonzero_bitmap_through_descriptor_cache() {
+        // Plan E2 Phase 2 Task 8 three-branch wiring proof.
+        //   - bitmap=0           → GC_malloc_atomic (cache untouched)
+        //   - bitmap!=0, count=0 → GC_malloc        (cache untouched)
+        //   - bitmap!=0, count>0 → GC_malloc_explicitly_typed (cache+1)
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        descriptor::clear_cache();
+        assert_eq!(descriptor::cache_size(), 0, "cache must start empty");
+
+        // Bitmap=0 path: should NOT touch the cache.
+        let zero_bitmap_header = Header::new(header::TAG_INT64, 1, 0).raw();
+        let obj_atomic = sigil_alloc(zero_bitmap_header, 8);
+        assert!(!obj_atomic.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            0,
+            "bitmap=0 alloc must not populate the descriptor cache"
+        );
+
+        // count=0, bitmap!=0 path (arrays / mut-arrays / segments
+        // table): should route to plain GC_malloc, NOT the typed
+        // path. Cache untouched.
+        let array_header = Header::new(header::TAG_ARRAY, 0, 1).raw();
+        let obj_array = sigil_alloc(array_header, 32); // length word + 3 elements
+        assert!(!obj_array.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            0,
+            "count=0 + bitmap!=0 alloc must route to conservative GC_malloc, not typed path"
+        );
+
+        // Bitmap=0b1 path: should populate the cache with one entry.
+        let one_ptr_header = Header::new(header::TAG_REF, 1, 0b1).raw();
+        let obj_precise = sigil_alloc(one_ptr_header, 8);
+        assert!(!obj_precise.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            1,
+            "non-zero bitmap + count>0 alloc must populate the descriptor cache"
+        );
+
+        // Second alloc of the same shape: cache size unchanged.
+        let obj_precise_2 = sigil_alloc(one_ptr_header, 8);
+        assert!(!obj_precise_2.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            1,
+            "repeat-shape alloc must reuse the cached descriptor"
+        );
+
+        // Distinct shape: cache size grows to 2. A closure with one
+        // env slot — `count=2` (code_ptr at word 0 + env_slot_0 at
+        // word 1), `bitmap=0b10` (only env_slot_0 is a pointer).
+        let closure_header = Header::new(header::TAG_CLOSURE, 2, 0b10).raw();
+        let obj_closure = sigil_alloc(closure_header, 16);
+        assert!(!obj_closure.is_null());
+        assert_eq!(
+            descriptor::cache_size(),
+            2,
+            "distinct-shape alloc must add a fresh cache entry"
+        );
+    }
+
+    /// Subprocess-mode env var for the GC-forcing tests in this
+    /// module. Mirrors `SIGIL_GC_STRESS_INNER` in `handlers.rs::tests`:
+    /// the outer-mode `#[test]` re-execs the binary filtered to one
+    /// test with this env var set; the inner-mode body runs the
+    /// actual GC calls. Each test gets its own fresh process so
+    /// Boehm's per-thread mark state isn't shared across tests.
+    const GC_STRESS_INNER_VAR: &str = "SIGIL_GC_STRESS_INNER";
+
+    fn in_gc_stress_subprocess() -> bool {
+        std::env::var(GC_STRESS_INNER_VAR).is_ok()
+    }
+
+    fn run_gc_stress_in_subprocess(test_name: &str) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("run_gc_stress_in_subprocess: current_exe failed: {e}");
+                std::process::abort();
+            }
+        };
+        let full_name = format!("gc::tests::{test_name}");
+        let status = match std::process::Command::new(&exe)
+            .args(["--exact", &full_name, "--nocapture"])
+            .env(GC_STRESS_INNER_VAR, "1")
+            .status()
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("run_gc_stress_in_subprocess: spawn `{full_name}` failed: {e}");
+                std::process::abort();
+            }
+        };
+        assert!(
+            status.success(),
+            "GC-stress subprocess for `{full_name}` failed: {status}"
+        );
+    }
+
+    #[test]
+    fn array_of_heap_pointers_survives_forced_gc() {
+        // Regression test for the silent precision-loss bug Task 8's
+        // first cut introduced. Arrays use `(count=0, bitmap=1)` as
+        // a "scan conservatively" signal; the initial Task 8 patch
+        // routed them through `GC_malloc_explicitly_typed` with
+        // `len_bits=1`, which tile-replicated "not a pointer" across
+        // the whole block — every element was silently invisible to
+        // the mark phase. This test pins the fix: an array
+        // populated with String pointers whose only stack root is
+        // the array itself must retain the strings across
+        // GC_gcollect.
+        //
+        // Runs in a subprocess (matches `handlers::tests::*` GC
+        // stress tests) so Boehm's per-thread state doesn't bleed
+        // across parallel cargo test runs.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess("array_of_heap_pointers_survives_forced_gc");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+        // Allocate an array of 8 String pointers. Use sigil_string_new
+        // to populate each slot with a fresh heap-allocated string,
+        // keep only the array root, then force GC and verify each
+        // string survives by reading its bytes back.
+        let array_header = Header::new(header::TAG_ARRAY, 0, 1);
+        let payload_bytes = 8 + 8 * 8; // length word + 8 element slots
+        let array_obj = sigil_alloc(array_header.raw(), payload_bytes);
+        assert!(!array_obj.is_null());
+
+        // SAFETY: array_obj is a fresh allocation; we own the full
+        // payload range for initialisation.
+        unsafe {
+            let len_ptr: *mut u64 = array_obj.add(8).cast();
+            len_ptr.write(8);
+            let elems_ptr = array_obj.add(16) as *mut *mut u8;
+            for i in 0..8u8 {
+                let s_bytes = [0xA0u8 + i, 0xA1u8 + i, 0xA2u8 + i];
+                // SAFETY: gc-heap-ptr arithmetic (s_bytes is a stack-local array; sigil_string_new copies the bytes).
+                let s_obj = sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
+                assert!(!s_obj.is_null());
+                // SAFETY: gc-heap-ptr arithmetic (i-th element slot of a freshly-allocated 8-slot array we own).
+                *elems_ptr.add(i as usize) = s_obj;
+            }
+
+            // Force a full collection. With conservative scan on
+            // count=0 objects, Boehm walks the array block looking
+            // for pointer-shaped values and follows them into the
+            // strings.
+            GC_gcollect();
+
+            // Re-read every element; each string must still be
+            // alive and report its original 3-byte payload.
+            for i in 0..8u8 {
+                // SAFETY: gc-heap-ptr arithmetic (re-reads the i-th element slot written above; array storage still live).
+                let s_obj = *elems_ptr.add(i as usize);
+                assert!(!s_obj.is_null(), "string slot {i} cleared after GC");
+                let len = sigil_string_len(s_obj);
+                assert_eq!(len, 3, "string {i} length corrupted after GC");
+                let (bytes, len) = string_bytes(s_obj);
+                let slice = std::slice::from_raw_parts(bytes, len);
+                assert_eq!(
+                    slice,
+                    &[0xA0u8 + i, 0xA1u8 + i, 0xA2u8 + i],
+                    "string {i} payload corrupted after GC"
+                );
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "precise-descriptor minimum")]
+    fn assert_precise_alloc_size_panics_when_total_underflows_count() {
+        // Structural defense for the precise-marking path: a drift
+        // between codegen's `payload_bytes` and the Header's `count`
+        // would let `GC_malloc_explicitly_typed`'s mark phase walk
+        // beyond the allocation. The `assert_precise_alloc_size`
+        // helper catches the drift; this test pins that the helper
+        // actually trips.
+        //
+        // count=2, total=8 → minimum required is (1+2)*8 = 24,
+        // total of 8 is well below the floor.
+        assert_precise_alloc_size(8, 2, 0b1);
     }
 
     #[test]

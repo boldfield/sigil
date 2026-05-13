@@ -79,14 +79,13 @@
 //! triggered from `sigil_gc_init`.
 //!
 //! Each subsequent `prev` pointer in the chain is reachable through
-//! the previous frame's payload; Boehm scans those conservatively
-//! because `sigil_alloc` allocates HandlerFrames via `GC_malloc` (the
-//! per-bit precision of the pointer bitmap is v2-forward-compat
-//! metadata; v1 Boehm consumes it as a binary signal selecting between
-//! `GC_malloc` and `GC_malloc_atomic`). The `arms[i].closure_ptr`
-//! slots and `return_closure` slot become reachable through the
-//! HandlerFrame allocation and are scanned conservatively along with
-//! the rest of the block.
+//! the previous frame's payload. Plan E2 Task 8 switched `sigil_alloc`
+//! to allocate HandlerFrames via `GC_malloc_explicitly_typed` with a
+//! descriptor built from the Header's pointer bitmap, so Boehm's mark
+//! phase scans only the payload words the bitmap names as GC pointers
+//! (`prev`, `return_closure`, every `arms[i].closure_ptr`). Atomic
+//! payloads — no GC pointers in any payload word — continue to use
+//! `GC_malloc_atomic` (Boehm skips scanning entirely).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -917,10 +916,13 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     });
     let bitmap = handler_frame_pointer_bitmap(arm_count as usize);
 
-    // INVARIANT: Boehm consumes only the pointer bitmap (binary signal
-    // selecting GC_malloc vs GC_malloc_atomic), not the type tag. Reusing
-    // TAG_CLOSURE as "heap object with closure-shaped pointer fields" is
-    // functionally inert today. If a v2 type-aware GC walker is
+    // INVARIANT: Boehm consumes the pointer bitmap two ways post-
+    // Plan E2 Task 8: (a) bitmap=0 selects `GC_malloc_atomic` (no
+    // scan); (b) bitmap!=0 selects `GC_malloc_explicitly_typed` and
+    // the per-bit pattern drives precise marking via the descriptor
+    // cache. The type tag is still inert at the GC layer. Reusing
+    // TAG_CLOSURE as "heap object with closure-shaped pointer fields"
+    // is functionally fine; if a v2 type-aware GC walker is
     // introduced, add TAG_HANDLER_FRAME alongside in
     // `sigil-header-constants` and revise this site.
     let header = Header::new(TAG_CLOSURE, payload_words, bitmap);
@@ -945,12 +947,13 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     (*frame_ptr).prev = ptr::null_mut();
 
     // Explicitly zero-init the variable-length arms region rather than
-    // depending on the Boehm allocator-zeroing contract. `GC_malloc` /
-    // `GC_malloc_atomic` zero today, but that's a libgc-version
-    // contract, not a Rust contract. Future Boehm flag flips (e.g. a
-    // switch to `GC_malloc_atomic_uncollectable`) would silently flip
-    // arm-slot reads from null to garbage. The cost is one
-    // `write_bytes` over ≤ 224 bytes (`16 * 14` for the arms region).
+    // depending on the Boehm allocator-zeroing contract.
+    // `GC_malloc_atomic` / `GC_malloc_explicitly_typed` both zero
+    // today, but that's a libgc-version contract, not a Rust contract.
+    // Future Boehm flag flips (e.g. a switch to
+    // `GC_malloc_atomic_uncollectable`) would silently flip arm-slot
+    // reads from null to garbage. The cost is one `write_bytes` over
+    // ≤ 224 bytes (`16 * 14` for the arms region).
     let arms_region_start = (frame_ptr as *mut u8).add(core::mem::size_of::<HandlerFrame>());
     let arms_region_bytes = (arm_count as usize) * 16;
     // SAFETY: gc-heap-ptr arithmetic (the destination pointer addresses
