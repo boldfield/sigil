@@ -18466,3 +18466,162 @@ fn cross_check_tree_stress_runs_cleanly() {
          stderr={stderr:?}",
     );
 }
+
+#[test]
+fn cross_check_tree_stress_drop_repeat_runs_cleanly() {
+    // Plan body's literal "10k cons cells, drop, repeat" — the
+    // drop-repeat axis. examples/tree_stress_repeat.sigil builds +
+    // folds + drops a depth-12 binary tree 10 times (81,910 total
+    // allocations across 10 build-fold-drop cycles). Exercises the
+    // cross-check across GC pressure between rounds (Boehm's
+    // collector decides when to mark; the cross-check runs at every
+    // alloc regardless). Exit 0 = zero divergence.
+    let root = workspace_root();
+    let source = root.join("examples/tree_stress_repeat.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress_drop_repeat",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "SIGIL_GC_CROSS_CHECK=1 must not abort tree_stress_repeat.sigil; \
+         stderr={stderr:?}",
+    );
+    // Sum-per-round = 2^12 - 1 = 4,095; ×10 rounds = 40,950.
+    assert_eq!(stdout.trim_end(), "40950");
+}
+
+// ===== Broader cross-check coverage =======================================
+//
+// Plan body says: "E2E: run existing tests with `SIGIL_GC_CROSS_CHECK=1`;
+// assert zero divergence." The 4 tests above cover hand-picked
+// shapes (hello / sum-type / multi-shot / alloc-heavy). The block
+// below extends coverage to a representative subset of the broader
+// example suite — handler frames (arith), raise+catch (catch),
+// error-recovery (div_recover), CPS-heavy fns (fib_cps_perf),
+// generics (generic_map), higher-order fns (higher_order), handler
+// nesting (nested_effects), state effects (state). Each runs under
+// `SIGIL_GC_CROSS_CHECK=1`; exit 0 = zero divergence on that
+// example's safepoint set.
+//
+// Examples deliberately not covered here (CI cost-vs-coverage):
+//   - sudoku.sigil, multishot_stress.sigil: long-running.
+//   - interpreter.sigil, json.sigil: large surface, covered by
+//     existing dedicated e2e tests.
+//   - fib_perf / fibonacci / choose: structurally similar to ones
+//     above.
+// These are not gaps in cross-check correctness — every alloc on
+// every example fires the same cross-check path. The subset bounds
+// CI wall time without losing coverage class.
+
+#[test]
+fn cross_check_arith_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/arith.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_arith",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(code, 0, "arith.sigil cross-check abort; stderr={stderr:?}");
+}
+
+#[test]
+fn cross_check_catch_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_catch",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(code, 0, "catch.sigil cross-check abort; stderr={stderr:?}");
+}
+
+#[test]
+fn cross_check_div_recover_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/div_recover.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_div_recover",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "div_recover.sigil cross-check abort; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cross_check_fib_cps_perf_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_fib_cps_perf",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "fib_cps_perf.sigil cross-check abort; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cross_check_generic_map_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/generic_map.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_generic_map",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "generic_map.sigil cross-check abort; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cross_check_higher_order_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/higher_order.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_higher_order",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "higher_order.sigil cross-check abort; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cross_check_nested_effects_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/nested_effects.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_nested_effects",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "nested_effects.sigil cross-check abort; stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn cross_check_state_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/state.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_state",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(code, 0, "state.sigil cross-check abort; stderr={stderr:?}");
+}

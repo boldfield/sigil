@@ -1,0 +1,50 @@
+// examples/tree_stress_repeat.sigil
+//
+// Plan E2 Phase 1 Task 5 — drop-repeat stress test for the stackmap
+// cross-check harness. Builds a depth-12 binary tree (2^13 - 1 =
+// 8,191 nodes), folds, drops, and repeats 10 times — total 81,910
+// allocations across 10 build-fold-drop rounds. Satisfies the plan
+// body's "10k cons cells, drop, repeat" stress requirement at the
+// cons-cell-equivalent count (node allocations) and the iteration
+// axis (10 build+drop cycles).
+//
+// Used by `compiler/tests/e2e.rs::cross_check_tree_stress_drop_repeat_runs_cleanly`
+// — under `SIGIL_GC_CROSS_CHECK=1` every alloc fires the precise-
+// vs-conservative cross-check; exit 0 = zero divergence across all
+// 81,910 safepoints.
+//
+// Per-round sum: 2^12 - 1 = 4,095. Total across 10 rounds: 40,950.
+
+import std.io
+
+type Tree = | Leaf | Node(Int, Tree, Tree)
+
+fn sum_tree(t: Tree) -> Int ![] {
+  match t {
+    Leaf => 0,
+    Node(v, l, r) => v + sum_tree(l) + sum_tree(r),
+  }
+}
+
+fn build(depth: Int) -> Tree ![] {
+  match depth {
+    0 => Leaf,
+    _ => Node(1, build(depth - 1), build(depth - 1)),
+  }
+}
+
+fn iter(rounds: Int, depth: Int, total: Int) -> Int ![] {
+  match rounds {
+    0 => total,
+    _ => {
+      let s: Int = sum_tree(build(depth));
+      iter(rounds - 1, depth, total + s)
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = iter(10, 12, 0);
+  perform IO.println(int_to_string(total));
+  0
+}

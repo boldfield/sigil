@@ -147,14 +147,25 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   Divergence aborts via `std::process::abort` with a stderr
   diagnostic. Production paths skip via cached env-var atomic; cost
   on the fast path is a single relaxed load + branch.
-- E2E cross-check tests in `compiler/tests/e2e.rs`:
-  `cross_check_hello_runs_cleanly`,
-  `cross_check_option_demo_runs_cleanly`,
-  `cross_check_choose_demo_runs_cleanly`, and
-  `cross_check_tree_stress_runs_cleanly` (the last is the plan-body
-  stress test — `tree.sigil` allocates 65,535 nodes, so every alloc
-  fires the cross-check; exit 0 = zero divergence across all 65,535
-  safepoints).
+- E2E cross-check tests in `compiler/tests/e2e.rs` (13 total):
+  - Hand-picked shapes: `cross_check_hello_runs_cleanly`,
+    `cross_check_option_demo_runs_cleanly`,
+    `cross_check_choose_demo_runs_cleanly` (multi-shot),
+    `cross_check_tree_stress_runs_cleanly` (65,535-node single
+    build).
+  - Drop-repeat stress (plan body's literal "10k cons cells, drop,
+    repeat"): `cross_check_tree_stress_drop_repeat_runs_cleanly`
+    runs a new `examples/tree_stress_repeat.sigil` that builds +
+    folds + drops a depth-12 tree 10 times (81,910 total
+    allocations across 10 build-fold-drop cycles).
+  - Broader coverage: `cross_check_arith_runs_cleanly`,
+    `cross_check_catch_runs_cleanly`,
+    `cross_check_div_recover_runs_cleanly`,
+    `cross_check_fib_cps_perf_runs_cleanly`,
+    `cross_check_generic_map_runs_cleanly`,
+    `cross_check_higher_order_runs_cleanly`,
+    `cross_check_nested_effects_runs_cleanly`,
+    `cross_check_state_runs_cleanly`.
 - Documented in `compiler/docs/stackmap-v1.md`.
 
 ## Phase 2 — Precise heap marking
@@ -221,6 +232,60 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   covers the same wire-format contract through the full
   `emit_object` + object-file path on a real Sigil program
   (`choose_demo.sigil`). Two layers of coverage on the same shape.
+
+- **Task 5 cross-check hook point** — plan body says "at every GC";
+  shipped as "at every `sigil_alloc`". Rationale: walking Sigil
+  thread stacks from inside Boehm's mark callback (`GC_set_start_-
+  callback`) requires synchronisation with Boehm's stopped-world
+  state that v1 doesn't expose; hooking `sigil_alloc` is strictly
+  more frequent than per-GC and exercises the precise walker
+  against every alloc-bearing safepoint. The cost is the env-var
+  cached relaxed-atomic load + branch when disabled (production
+  default); enabled, it runs the walker at every alloc inside the
+  cross-check tests. The literal "at every GC" semantic is
+  achievable once Phase 3 lands an in-runtime GC trigger (Task 11);
+  Phase 1's "B ⊆ A + value-shape check" assertion is the same
+  either way.
+
+- **Task 5 type-match assertion** — plan body point 4: "Assert
+  types match expected GC-ref types per typecheck." Shipped as a
+  value-shape check (8-byte-aligned, ≥ 0x1000) — the runtime has
+  no typecheck information. The shape check is what Boehm itself
+  uses for conservative pointer recognition, so it's the runtime
+  equivalent of "this address contains something the conservative
+  scanner would also follow." Per-entry kind information is
+  reserved by the v1 wire format (`STACKMAP_ENTRY_KIND_HEAP_POINTER`
+  vs future kinds) — when Phase 2 adds boxed-scalar kinds and a
+  cross-check mode that resolves them against typecheck-derived
+  expectations, the assertion at point 4 of the plan can become
+  the type-match check the plan body originally specified.
+
+- **Task 5 API signatures** — plan body declares
+  `pub fn lookup(pc: usize) -> Option<StackMapEntry>;` and
+  `pub fn walk_for_gc(thread: &Thread) -> Vec<RootLocation>;` —
+  free functions taking a `Thread` value. Sigil v1 has no `Thread`
+  newtype (per-thread state lives in TLS); `StackMapEntry` is not a
+  defined type. Shipped:
+  `StackmapIndex::lookup(&self, pc) -> Option<&ParsedRecord>` (a
+  method on the index) and `walk_for_gc() -> Vec<RootLocation>`
+  (no `Thread` arg; implicitly walks the calling thread). The
+  semantic surface area is identical; a future Phase 2 or Phase 3
+  may introduce `Thread` + `StackMapEntry` newtypes to match the
+  plan-body shape literally.
+
+- **Task 5 cross-check breadth** — plan body's "run existing tests
+  with `SIGIL_GC_CROSS_CHECK=1`; assert zero divergence" lands as
+  12 dedicated `cross_check_*` tests covering: hello, option_demo,
+  choose_demo (multi-shot), tree (single-build stress), arith
+  (handler frames), catch (raise+catch), div_recover (error
+  recovery), fib_cps_perf (CPS-heavy), generic_map (generics),
+  higher_order, nested_effects (handler nesting), state, plus
+  tree_stress_repeat (10-round drop-repeat). Not every existing
+  e2e test runs with the env var set — sudoku / multishot_stress
+  are skipped for CI wall-time; interpreter / json have their own
+  dedicated tests. Every alloc on every example fires the same
+  cross-check path, so the representative subset bounds CI cost
+  without losing coverage class.
 
 ## Open follow-ups
 

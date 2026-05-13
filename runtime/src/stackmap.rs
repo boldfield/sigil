@@ -315,17 +315,9 @@ fn locate_section_bytes() -> Option<&'static [u8]> {
 }
 
 #[cfg(target_os = "macos")]
-const MACHO_SEGMENT_NAME_CSTR: &std::ffi::CStr =
-    match std::ffi::CStr::from_bytes_with_nul(b"__SIGIL\0") {
-        Ok(s) => s,
-        Err(_) => panic!("MACHO_SEGMENT_NAME_CSTR must be a valid NUL-terminated C string"),
-    };
+const MACHO_SEGMENT_NAME_CSTR: &std::ffi::CStr = c"__SIGIL";
 #[cfg(target_os = "macos")]
-const MACHO_SECTION_NAME_CSTR: &std::ffi::CStr =
-    match std::ffi::CStr::from_bytes_with_nul(b"__stackmaps\0") {
-        Ok(s) => s,
-        Err(_) => panic!("MACHO_SECTION_NAME_CSTR must be a valid NUL-terminated C string"),
-    };
+const MACHO_SECTION_NAME_CSTR: &std::ffi::CStr = c"__stackmaps";
 
 #[cfg(target_os = "macos")]
 extern "C" {
