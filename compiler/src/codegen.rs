@@ -27,7 +27,7 @@
 //!   `("remainder by zero")`, whose C-string payloads live in
 //!   `.rodata` / `__TEXT,__cstring`.
 //! - Safepoint metadata is captured per-function through
-//!   `StackMapV1Builder` and written to `.sigil_stackmaps` (ELF) /
+//!   `StackMapV1Builder` and written to `sigil_stackmaps` (ELF) /
 //!   `__SIGIL,__stackmaps` (Mach-O) as v1 records. Each
 //!   `module.define_function(...)` site funnels through
 //!   `define_fn_and_capture_stackmap`, which reads
@@ -19138,7 +19138,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         (b"__SIGIL", b"__stackmaps")
     } else {
         // ELF: segment ignored, section name is the .section directive.
-        (b"", b".sigil_stackmaps")
+        // ELF: no segment; section name has no leading dot so the
+        // GNU linker auto-generates `__start_sigil_stackmaps` /
+        // `__stop_sigil_stackmaps` symbols the runtime reads.
+        (b"", b"sigil_stackmaps")
     };
     let section_id = product.object.add_section(
         segment_bytes.to_vec(),

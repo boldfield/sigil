@@ -123,9 +123,39 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 5 — Runtime stackmap reader + cross-check
 
-- status: pending
-- `runtime/src/stackmap.rs` v1 reader + `SIGIL_GC_CROSS_CHECK=1`
-  harness in `runtime/src/gc.rs`. Phase 1 ship gate.
+- status: **in PR** (Task 5 branch)
+- `runtime/src/stackmap.rs` v1 reader. Section locator: ELF uses
+  `dlsym("__start_sigil_stackmaps")` / `dlsym("__stop_sigil_stackmaps")`
+  (no extern statics — avoids undef-symbol link error in unit-test
+  binaries that don't link compiler-emitted code); Mach-O uses
+  `getsectiondata(_dyld_get_image_header(0), "__SIGIL", "__stackmaps",
+  ...)`. Per-fn symbol bases resolved via `dlsym(symbol_name)`.
+- ELF section name renamed from `.sigil_stackmaps` to `sigil_stackmaps`
+  (no leading dot) so the GNU linker auto-generates the start/stop
+  symbols (requires valid C-identifier section name).
+- Public API: `init_index() -> Option<&'static StackmapIndex>`,
+  `StackmapIndex::lookup(pc) -> Option<&ParsedRecord>`, `walk_for_gc()
+  -> Vec<RootLocation>`.
+- fp-chain walker (`walk_for_gc`) reads x86_64 `rbp` / aarch64 `x29`
+  via inline asm, walks the chain to frames whose return-PC matches a
+  known safepoint, yields absolute addresses `(fp - frame_size +
+  entry.sp_offset)` for every entry.
+- Cross-check harness in `runtime/src/stackmap_xcheck.rs`. Activated
+  by `SIGIL_GC_CROSS_CHECK=1`; called from `sigil_alloc`. Asserts
+  every precise root address lies in `[sp, stack_base)` (B ⊆ A) AND
+  the value at the address is heap-pointer-shaped (aligned, ≥ 0x1000).
+  Divergence aborts via `std::process::abort` with a stderr
+  diagnostic. Production paths skip via cached env-var atomic; cost
+  on the fast path is a single relaxed load + branch.
+- E2E cross-check tests in `compiler/tests/e2e.rs`:
+  `cross_check_hello_runs_cleanly`,
+  `cross_check_option_demo_runs_cleanly`,
+  `cross_check_choose_demo_runs_cleanly`, and
+  `cross_check_tree_stress_runs_cleanly` (the last is the plan-body
+  stress test — `tree.sigil` allocates 65,535 nodes, so every alloc
+  fires the cross-check; exit 0 = zero divergence across all 65,535
+  safepoints).
+- Documented in `compiler/docs/stackmap-v1.md`.
 
 ## Phase 2 — Precise heap marking
 

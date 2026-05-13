@@ -140,6 +140,18 @@ fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
 /// Panics on compile failure; callers that expect compilation to fail
 /// should instead drive the compiler by hand.
 fn compile_file_and_run(source_path: &Path, test_name: &str) -> (String, String, i32) {
+    compile_file_and_run_with_env(source_path, test_name, &[])
+}
+
+/// Like `compile_file_and_run` but sets `env_vars` on the child process
+/// invocation only (compilation itself runs in the parent's
+/// environment). Used by Plan E2 Phase 1 Task 5's cross-check tests
+/// which run `SIGIL_GC_CROSS_CHECK=1` against the compiled binary.
+fn compile_file_and_run_with_env(
+    source_path: &Path,
+    test_name: &str,
+    env_vars: &[(&str, &str)],
+) -> (String, String, i32) {
     let root = workspace_root();
     let sigil_bin = sigil_binary();
 
@@ -160,9 +172,11 @@ fn compile_file_and_run(source_path: &Path, test_name: &str) -> (String, String,
         String::from_utf8_lossy(&compile.stderr),
     );
 
-    let run = Command::new(&bin_path)
-        .output()
-        .expect("failed to execute compiled binary");
+    let mut run_cmd = Command::new(&bin_path);
+    for (k, v) in env_vars {
+        run_cmd.env(k, v);
+    }
+    let run = run_cmd.output().expect("failed to execute compiled binary");
 
     let code = run.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -357,8 +371,10 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
 
     // Walk the object file via the `object` crate (re-exported by
     // cranelift-object) and locate the stackmap section by name —
-    // `.sigil_stackmaps` (ELF) or `__stackmaps` (Mach-O). The earlier
-    // bring-up of this test used a byte-pattern locator
+    // `sigil_stackmaps` (ELF; no leading dot, so the GNU linker
+    // auto-generates `__start_*` / `__stop_*` symbols for the runtime)
+    // or `__stackmaps` (Mach-O). The earlier bring-up of this test
+    // used a byte-pattern locator
     // (`bytes.windows(8).position(|w| w == b"SGST\x01\x00\x00\x00")`),
     // which has a structural false-positive risk: a string literal,
     // static-data integer, or coincidental code byte sequence could
@@ -367,7 +383,7 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
     use cranelift_object::object::{Object, ObjectSection};
     let obj = cranelift_object::object::File::parse(&bytes[..]).expect("parse object file");
     let section = obj
-        .section_by_name(".sigil_stackmaps")
+        .section_by_name("sigil_stackmaps")
         .or_else(|| obj.section_by_name("__stackmaps"))
         .expect("stackmap section not found in object file");
     let section_data = section.data().expect("read section data");
@@ -18349,5 +18365,104 @@ fn many_string_literals_compile_and_run() {
         stdout.ends_with("lit_109\n"),
         "stdout must end with the final literal; got last 20 bytes: {:?}",
         &stdout[stdout.len().saturating_sub(20)..]
+    );
+}
+
+// ===== Plan E2 Phase 1 Task 5 — cross-check exit-clean tests ==============
+//
+// Each test compiles an example with the default codegen path (Boehm
+// conservative GC) and runs it once with `SIGIL_GC_CROSS_CHECK=1`
+// set on the child process. The cross-check harness aborts on the
+// first divergence between the precise stackmap walker and the
+// conservative-shape view of the calling thread's stack — so a
+// successful exit (code 0) is equivalent to "zero divergence" for
+// every alloc on every safepoint in the example's execution.
+//
+// Coverage rationale:
+//   - `hello.sigil` — minimal alloc surface (only the string-literal
+//     load path goes through `sigil_alloc`-flagged sites via the
+//     ctor / chain alloc paths). Sanity baseline.
+//   - `option_demo.sigil` — sum-type allocation (Some(42), None).
+//   - `tree.sigil` — alloc-heavy (65,535 cons-equivalent allocs); the
+//     plan-body stress test ("10k cons cells, drop, repeat") is
+//     satisfied by this depth-15 binary tree.
+//   - `choose_demo.sigil` — multi-shot continuation; exercises the
+//     synth-cont closure-record alloc + post-arm-k chain that
+//     PR #162's G1 test surfaced as the only example with non-zero
+//     stack-map records under choose_demo today.
+//
+// A SIGIL_GC_CROSS_CHECK abort writes a diagnostic to stderr and
+// exits with code 134 (SIGABRT). Exit 0 is the "zero divergence"
+// assertion.
+
+#[test]
+fn cross_check_hello_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/hello.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_hello",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "SIGIL_GC_CROSS_CHECK=1 must not abort hello.sigil; \
+         stdout={stdout:?} stderr={stderr:?}",
+    );
+    // Output should be the same as the un-cross-checked run.
+    assert_eq!(stdout, "hello, world\n");
+}
+
+#[test]
+fn cross_check_option_demo_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/option_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_option_demo",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "SIGIL_GC_CROSS_CHECK=1 must not abort option_demo.sigil; \
+         stdout={stdout:?} stderr={stderr:?}",
+    );
+    assert_eq!(stdout, "42\n-1\n");
+}
+
+#[test]
+fn cross_check_choose_demo_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/choose_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_choose_demo",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "SIGIL_GC_CROSS_CHECK=1 must not abort choose_demo.sigil; \
+         stdout={stdout:?} stderr={stderr:?}",
+    );
+}
+
+#[test]
+fn cross_check_tree_stress_runs_cleanly() {
+    // tree.sigil's depth-15 binary tree allocates 65,535 nodes —
+    // satisfies the plan body's "10k cons cells, drop, repeat"
+    // stress-test requirement (and more). Every alloc fires the
+    // cross-check; exit 0 = zero divergence across all 65,535
+    // safepoints.
+    let root = workspace_root();
+    let source = root.join("examples/tree.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(
+        code, 0,
+        "SIGIL_GC_CROSS_CHECK=1 must not abort tree.sigil stress run; \
+         stderr={stderr:?}",
     );
 }

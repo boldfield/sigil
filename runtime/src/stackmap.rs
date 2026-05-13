@@ -9,10 +9,16 @@
 //! the v0 placeholder format is retired and a v0 section is rejected
 //! as a stale build artifact (recompile against this runtime).
 //!
-//! Phase 1 ships the writer + reader + parser shape; the runtime
-//! lookup-by-PC + GC walker integration land with **Task 5**
-//! (`SIGIL_GC_CROSS_CHECK=1` harness in `runtime/src/gc.rs`). Boehm
-//! conservative scanning remains authoritative through Phase 1.
+//! Plan E2 Phase 1 Task 5 adds the runtime reader: a one-time
+//! section-locator + parse at startup (via linker-defined
+//! `__start_sigil_stackmaps` / `__stop_sigil_stackmaps` on ELF or
+//! `getsectiondata("__SIGIL", "__stackmaps", ...)` on Mach-O), an
+//! indexed `lookup(pc)` API keyed on `dlsym`'d symbol bases, and the
+//! `walk_for_gc` fp-chain walker that collects precise root addresses
+//! from the current thread's stack. The `SIGIL_GC_CROSS_CHECK=1`
+//! harness in `runtime/src/gc.rs` calls these and cross-checks
+//! against Boehm's conservative scan. Boehm conservative scanning
+//! remains authoritative through Phase 1.
 
 pub use sigil_abi::stackmap::{
     ELF_SECTION_NAME, MACHO_SECTION_NAME, MACHO_SEGMENT_NAME, STACKMAP_ENTRY_KIND_HEAP_POINTER,
@@ -170,6 +176,373 @@ pub fn parse_section(bytes: &[u8]) -> Result<ParsedSection, ParseError> {
     }
 
     Ok(ParsedSection { version, functions })
+}
+
+// ===== Plan E2 Phase 1 Task 5 — runtime reader =============================
+//
+// The compiler's emitted binary carries a `sigil_stackmaps` (ELF) /
+// `__SIGIL,__stackmaps` (Mach-O) section with the v1 wire format.
+// At startup the runtime locates the section, parses it, and builds
+// an indexed view keyed by per-function `dlsym`'d symbol base. The
+// indexed view is consulted at every safepoint that the cross-check
+// harness visits (see `gc.rs`).
+
+use std::collections::BTreeMap;
+use std::sync::OnceLock;
+
+/// Indexed view of the parsed stackmap section. For every function
+/// block, the symbol's runtime address (via `dlsym(symbol_name)`) keys
+/// a `Vec` of `(pc_offset, &ParsedRecord)` pairs. PC lookups compute
+/// `pc - symbol_base` and binary-search the per-fn vector.
+pub struct StackmapIndex {
+    parsed: ParsedSection,
+    /// For each function block: (symbol_base_addr, Vec<(absolute_pc, record_idx)>).
+    /// `record_idx` indexes into `parsed.functions[i].records`.
+    by_base: BTreeMap<usize, Vec<(usize, usize, usize)>>,
+}
+
+impl StackmapIndex {
+    /// Resolve a runtime PC to a record by binary-searching the
+    /// per-fn absolute-PC list. Returns the matching record on exact
+    /// pc match (i.e., PC = fn_base + record.pc_offset), or `None`
+    /// when the PC is not at a known safepoint.
+    pub fn lookup(&self, pc: usize) -> Option<&ParsedRecord> {
+        // Walk every function block. We don't have fn-size data so a
+        // base-relative range check would be incorrect; instead we
+        // exact-match on absolute PCs. This is O(N) over all
+        // safepoints in the program — Phase 1's cross-check fires at
+        // sample points, not on hot paths, so the simplicity is worth
+        // the cycles. Phase 2's precise marker will need a faster
+        // structure (e.g., interval map keyed on fn_base + fn_size).
+        for entries in self.by_base.values() {
+            for &(abs_pc, fn_idx, rec_idx) in entries {
+                if abs_pc == pc {
+                    return Some(&self.parsed.functions[fn_idx].records[rec_idx]);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn parsed(&self) -> &ParsedSection {
+        &self.parsed
+    }
+
+    /// Number of (function-name, record) pairs the index resolved a
+    /// non-zero base address for. Functions whose symbol failed to
+    /// resolve via `dlsym` are silently skipped (the symbol may have
+    /// been stripped or renamed); cross-check assertions rely on
+    /// `lookup(pc)` returning `None` rather than panicking.
+    pub fn resolved_record_count(&self) -> usize {
+        self.by_base.values().map(|v| v.len()).sum()
+    }
+}
+
+static INDEX: OnceLock<Option<StackmapIndex>> = OnceLock::new();
+
+/// Initialise the runtime stackmap index. Idempotent. Returns `Some`
+/// when the section was located + parsed + at least one function
+/// block's symbol resolved via `dlsym`; returns `None` when the
+/// section is missing (e.g., the binary was linked without the
+/// stackmap section, or the runtime is being exercised via a unit test
+/// that doesn't link a real binary).
+pub fn init_index() -> Option<&'static StackmapIndex> {
+    INDEX
+        .get_or_init(|| {
+            let bytes = locate_section_bytes()?;
+            let parsed = parse_section(bytes).ok()?;
+            let by_base = resolve_function_bases(&parsed);
+            Some(StackmapIndex { parsed, by_base })
+        })
+        .as_ref()
+}
+
+/// Locate the stackmap section bytes via platform-specific linker
+/// symbols / OS APIs. Returns `None` when the section is not present
+/// (e.g., unit-test binaries that don't link compiler-emitted code).
+///
+/// On ELF, the section bounds are resolved via `dlsym` rather than
+/// extern statics. The runtime is built as a staticlib and a separate
+/// rlib; rlibs are used as link-time dependencies of unit-test
+/// binaries that DON'T contain the `sigil_stackmaps` section, so
+/// declaring the linker auto-symbols as `extern "C" static` would
+/// produce an undefined-reference link error at test time. `dlsym`
+/// returns NULL when the symbol is absent, which is the right
+/// not-present behaviour without nightly-only weak-linkage attributes.
+fn locate_section_bytes() -> Option<&'static [u8]> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: dlsym returns NULL for absent symbols; otherwise
+        // returns the section bounds the GNU linker auto-generated.
+        // Section is in a non-writable ALLOC area; bytes are valid
+        // for the program's lifetime.
+        unsafe {
+            let start = dlsym_resolve("__start_sigil_stackmaps")? as *const u8;
+            let end = dlsym_resolve("__stop_sigil_stackmaps")? as *const u8;
+            if end <= start {
+                return None;
+            }
+            let len = end.offset_from(start) as usize;
+            Some(std::slice::from_raw_parts(start, len))
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `_dyld_get_image_header(0)` is the main executable's
+        // Mach-O header; `getsectiondata` validates the (segment,
+        // section) pair and returns null if not present.
+        unsafe {
+            let mh = _dyld_get_image_header(0);
+            if mh.is_null() {
+                return None;
+            }
+            let mut size: u64 = 0;
+            // SAFETY: gc-heap-ptr arithmetic (CStr ptr into static rodata).
+            let seg_name = MACHO_SEGMENT_NAME_CSTR.as_ptr();
+            // SAFETY: gc-heap-ptr arithmetic (CStr ptr into static rodata).
+            let sec_name = MACHO_SECTION_NAME_CSTR.as_ptr();
+            let ptr = getsectiondata(mh, seg_name, sec_name, &mut size);
+            if ptr.is_null() || size == 0 {
+                return None;
+            }
+            Some(std::slice::from_raw_parts(ptr, size as usize))
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+const MACHO_SEGMENT_NAME_CSTR: &std::ffi::CStr =
+    match std::ffi::CStr::from_bytes_with_nul(b"__SIGIL\0") {
+        Ok(s) => s,
+        Err(_) => panic!("MACHO_SEGMENT_NAME_CSTR must be a valid NUL-terminated C string"),
+    };
+#[cfg(target_os = "macos")]
+const MACHO_SECTION_NAME_CSTR: &std::ffi::CStr =
+    match std::ffi::CStr::from_bytes_with_nul(b"__stackmaps\0") {
+        Ok(s) => s,
+        Err(_) => panic!("MACHO_SECTION_NAME_CSTR must be a valid NUL-terminated C string"),
+    };
+
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn _dyld_get_image_header(image_index: u32) -> *const std::ffi::c_void;
+    fn getsectiondata(
+        mhp: *const std::ffi::c_void,
+        segname: *const std::os::raw::c_char,
+        sectname: *const std::os::raw::c_char,
+        size: *mut u64,
+    ) -> *const u8;
+}
+
+/// Resolve each function-block's `symbol_name` to a runtime address
+/// via `dlsym(RTLD_DEFAULT, ...)`. Returns a per-base-address map of
+/// absolute safepoint PCs. Unresolved symbols are skipped silently
+/// (see `StackmapIndex::resolved_record_count`).
+fn resolve_function_bases(parsed: &ParsedSection) -> BTreeMap<usize, Vec<(usize, usize, usize)>> {
+    let mut by_base: BTreeMap<usize, Vec<(usize, usize, usize)>> = BTreeMap::new();
+    for (fn_idx, f) in parsed.functions.iter().enumerate() {
+        let base = match dlsym_resolve(&f.symbol_name) {
+            Some(b) => b,
+            None => continue,
+        };
+        let entries = by_base.entry(base).or_default();
+        for (rec_idx, r) in f.records.iter().enumerate() {
+            let abs_pc = base.wrapping_add(r.pc_offset as usize);
+            entries.push((abs_pc, fn_idx, rec_idx));
+        }
+    }
+    by_base
+}
+
+fn dlsym_resolve(symbol: &str) -> Option<usize> {
+    use std::ffi::CString;
+    let cs = CString::new(symbol).ok()?;
+    // SAFETY: dlsym(RTLD_DEFAULT, NUL-terminated cstr) -> ptr or null.
+    // RTLD_DEFAULT is platform-specific; we use the standard values.
+    unsafe {
+        // SAFETY: gc-heap-ptr arithmetic (CString-owned NUL-terminated ptr; dlsym arg only).
+        let addr = dlsym(RTLD_DEFAULT, cs.as_ptr());
+        if addr.is_null() {
+            None
+        } else {
+            Some(addr as usize)
+        }
+    }
+}
+
+extern "C" {
+    fn dlsym(
+        handle: *mut std::ffi::c_void,
+        symbol: *const std::os::raw::c_char,
+    ) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "linux")]
+const RTLD_DEFAULT: *mut std::ffi::c_void = std::ptr::null_mut();
+#[cfg(target_os = "macos")]
+const RTLD_DEFAULT: *mut std::ffi::c_void = -2isize as *mut std::ffi::c_void;
+
+// ===== fp-chain walker + walk_for_gc =====================================
+//
+// Walks the calling thread's frame-pointer chain and yields, for each
+// frame whose return-PC lands at a known safepoint, the absolute
+// addresses of live GC refs in that frame.
+//
+// Frame layout (both x86_64 Linux and aarch64 macOS use a saved-FP +
+// saved-LR/RA pair at the top of every Cranelift-emitted frame):
+//
+// ```text
+//   higher addresses
+//     ↑
+//   [ frame N-1 locals + spill slots ]
+//   [ return address into frame N-1 ]    ← *(fp + 8)
+//   [ saved frame pointer (frame N-1) ]  ← *fp
+//   [ frame N locals + spill slots ]
+//     ↓
+//   lower addresses
+// ```
+//
+// Given current frame's FP, walking is:
+//   loop:
+//     return_pc = *(fp + 8)
+//     saved_fp  = *fp
+//     // safepoint pc is the call-instruction PC, which is one of:
+//     //   (a) return_pc - 5 on x86_64 (5-byte call)
+//     //   (b) return_pc - 4 on aarch64 (4-byte BL)
+//     // The stackmap's `pc_offset` field is what Cranelift's
+//     // `code.buffer.user_stack_maps()` returned for the call —
+//     // typically the byte after the call (= return_pc - fn_base).
+//     // We try both `return_pc - fn_base` and `(return_pc - call_size) - fn_base`
+//     // to be robust.
+//     if let Some(record) = lookup_safepoint_for_return_pc(return_pc):
+//        for entry in record.entries:
+//           // frame_sp = fp - record.frame_size; addr = frame_sp + entry.sp_offset
+//           yield (frame_sp + entry.sp_offset, entry.kind)
+//     fp = saved_fp
+
+/// A precise root location surfaced by `walk_for_gc`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootLocation {
+    /// Address on the stack where the live GC ref currently sits.
+    pub addr: usize,
+    /// Entry kind copied from the stackmap record (v1: always
+    /// `STACKMAP_ENTRY_KIND_HEAP_POINTER`).
+    pub kind: u8,
+    /// The return-PC the walker matched against. Diagnostic; not
+    /// load-bearing for callers.
+    pub return_pc: usize,
+}
+
+/// Walk the current frame-pointer chain and return precise root
+/// locations for every frame whose return-PC matches a known
+/// safepoint. Returns an empty Vec when the stackmap index is not
+/// initialised, when no FP can be obtained on the current host, or
+/// when no frame matches a safepoint.
+///
+/// **Caller-frame walk.** The walker reads the FP of the immediate
+/// caller (one frame above this function) via inline asm; that frame
+/// itself is excluded from the walk (its return-PC is back into Rust
+/// code, never a safepoint). Frames *above* the caller — i.e., the
+/// Sigil call chain — are inspected.
+#[inline(never)]
+pub fn walk_for_gc() -> Vec<RootLocation> {
+    let index = match init_index() {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+    let mut roots = Vec::new();
+    let mut fp = current_caller_fp();
+    while !fp.is_null() {
+        let frame = unsafe { walk_frame(fp) };
+        if let Some(record) = index
+            .lookup(frame.return_pc)
+            .or_else(|| index.lookup(frame.return_pc.wrapping_sub(SAFE_CALL_PC_BACKOFF)))
+        {
+            let frame_sp = (fp as usize).wrapping_sub(record.frame_size as usize);
+            for entry in &record.entries {
+                roots.push(RootLocation {
+                    addr: frame_sp.wrapping_add(entry.sp_offset as usize),
+                    kind: entry.kind,
+                    return_pc: frame.return_pc,
+                });
+            }
+        }
+        if frame.saved_fp.is_null() || frame.saved_fp as usize <= fp as usize {
+            // Bottom of chain (or corruption); stop walking.
+            break;
+        }
+        fp = frame.saved_fp;
+    }
+    roots
+}
+
+#[cfg(target_arch = "x86_64")]
+const SAFE_CALL_PC_BACKOFF: usize = 5; // typical x86_64 call insn is 5 bytes (call rel32)
+
+#[cfg(target_arch = "aarch64")]
+const SAFE_CALL_PC_BACKOFF: usize = 4; // aarch64 BL is 4 bytes
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const SAFE_CALL_PC_BACKOFF: usize = 0;
+
+struct Frame {
+    saved_fp: *const usize,
+    return_pc: usize,
+}
+
+unsafe fn walk_frame(fp: *const usize) -> Frame {
+    Frame {
+        saved_fp: *fp as *const usize,
+        return_pc: *fp.add(1),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn current_caller_fp() -> *const usize {
+    let fp: *const usize;
+    // SAFETY: reading the current frame's saved rbp. With
+    // `#[inline(never)]` on the caller (`walk_for_gc`), this fn has a
+    // standard prologue and `rbp` is the saved-rbp of the caller.
+    // We then return *rbp = the caller's saved rbp = the caller-of-
+    // caller's frame pointer, which is the first frame we want to
+    // inspect (the safepoint that called into Sigil code).
+    unsafe {
+        std::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack, preserves_flags));
+        if fp.is_null() {
+            std::ptr::null()
+        } else {
+            *fp as *const usize
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn current_caller_fp() -> *const usize {
+    let fp: *const usize;
+    // SAFETY: reading the current frame's saved x29 (FP). Same shape
+    // as the x86_64 path; aarch64 uses x29 as the frame pointer by
+    // convention and Cranelift's prologue saves it at the top of the
+    // frame.
+    unsafe {
+        std::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack, preserves_flags));
+        if fp.is_null() {
+            std::ptr::null()
+        } else {
+            *fp as *const usize
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn current_caller_fp() -> *const usize {
+    std::ptr::null()
 }
 
 #[cfg(test)]
