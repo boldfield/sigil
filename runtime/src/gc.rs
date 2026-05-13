@@ -624,8 +624,7 @@ mod tests {
             let elems_ptr = array_obj.add(16) as *mut *mut u8;
             for i in 0..8u8 {
                 let s_bytes = [0xA0u8 + i, 0xA1u8 + i, 0xA2u8 + i];
-                let s_obj =
-                    sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
+                let s_obj = sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
                 assert!(!s_obj.is_null());
                 *elems_ptr.add(i as usize) = s_obj;
             }
