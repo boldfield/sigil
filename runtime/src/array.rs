@@ -23,8 +23,10 @@
 //! payload words) would overflow. v1 sidesteps this by writing
 //! `count = 0` and relying on Boehm's allocator-tracked size for
 //! scanning. The pointer bitmap is set to a non-zero value (`1`) so
-//! Boehm uses `GC_malloc` (conservative scan over the whole block)
-//! rather than `GC_malloc_atomic`. The runtime cannot distinguish
+//! `sigil_alloc`'s `(bitmap != 0, count == 0)` dispatch routes the
+//! object through `GC_malloc` (conservative scan over the whole
+//! block) rather than `GC_malloc_atomic` or
+//! `GC_malloc_explicitly_typed`. The runtime cannot distinguish
 //! per-element pointer-ness at allocation time — that information
 //! lives in the codegen-monomorphized type — so conservative scan is
 //! the correct v1 default. The v2 typed-walker work shipped via

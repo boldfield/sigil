@@ -916,10 +916,13 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     });
     let bitmap = handler_frame_pointer_bitmap(arm_count as usize);
 
-    // INVARIANT: Boehm consumes only the pointer bitmap (binary signal
-    // selecting GC_malloc vs GC_malloc_atomic), not the type tag. Reusing
-    // TAG_CLOSURE as "heap object with closure-shaped pointer fields" is
-    // functionally inert today. If a v2 type-aware GC walker is
+    // INVARIANT: Boehm consumes the pointer bitmap two ways post-
+    // Plan E2 Task 8: (a) bitmap=0 selects `GC_malloc_atomic` (no
+    // scan); (b) bitmap!=0 selects `GC_malloc_explicitly_typed` and
+    // the per-bit pattern drives precise marking via the descriptor
+    // cache. The type tag is still inert at the GC layer. Reusing
+    // TAG_CLOSURE as "heap object with closure-shaped pointer fields"
+    // is functionally fine; if a v2 type-aware GC walker is
     // introduced, add TAG_HANDLER_FRAME alongside in
     // `sigil-header-constants` and revise this site.
     let header = Header::new(TAG_CLOSURE, payload_words, bitmap);
@@ -944,8 +947,8 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     (*frame_ptr).prev = ptr::null_mut();
 
     // Explicitly zero-init the variable-length arms region rather than
-    // depending on the Boehm allocator-zeroing contract. `GC_malloc` /
-    // `GC_malloc_atomic` / `GC_malloc_explicitly_typed` all zero
+    // depending on the Boehm allocator-zeroing contract.
+    // `GC_malloc_atomic` / `GC_malloc_explicitly_typed` both zero
     // today, but that's a libgc-version contract, not a Rust contract.
     // Future Boehm flag flips (e.g. a switch to
     // `GC_malloc_atomic_uncollectable`) would silently flip arm-slot
