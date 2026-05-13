@@ -187,41 +187,86 @@ pub fn parse_section(bytes: &[u8]) -> Result<ParsedSection, ParseError> {
 // indexed view is consulted at every safepoint that the cross-check
 // harness visits (see `gc.rs`).
 
-use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-/// Indexed view of the parsed stackmap section. For every function
-/// block, the symbol's runtime address (via `dlsym(symbol_name)`) keys
-/// a `Vec` of `(pc_offset, &ParsedRecord)` pairs. PC lookups compute
-/// `pc - symbol_base` and binary-search the per-fn vector.
+/// Indexed view of the parsed stackmap section. For every resolved
+/// function block, the symbol's runtime address (via `dlsym(symbol_name)`)
+/// keys an `IndexedFunction` containing every safepoint's absolute PC
+/// pre-computed for the M2 fast-path lookup.
 pub struct StackmapIndex {
     parsed: ParsedSection,
-    /// For each function block: (symbol_base_addr, Vec<(absolute_pc, record_idx)>).
-    /// `record_idx` indexes into `parsed.functions[i].records`.
-    by_base: BTreeMap<usize, Vec<(usize, usize, usize)>>,
+    /// Sorted by `base` ascending. Each entry has an `abs_pcs` Vec
+    /// sorted by absolute PC (ascending) so `binary_search` on the PC
+    /// returns the record index inside this function.
+    functions: Vec<IndexedFunction>,
 }
 
+struct IndexedFunction {
+    base: usize,
+    /// Inclusive upper bound on absolute PCs we'll match against. v1
+    /// has no `fn_size` wire field; we use the max safepoint PC plus
+    /// a small pad (see `FN_RANGE_PAD`) as a heuristic.
+    range_end: usize,
+    /// Sorted ascending by `.0`; `binary_search_by_key(&pc, |e| e.0)`
+    /// gives the record index in `parsed.functions[fn_idx].records`.
+    abs_pcs: Vec<(usize, usize)>, // (absolute_pc, record_idx_in_fn)
+    fn_idx: usize,
+}
+
+/// Safety pad for the fn-range upper bound. The wire format reserves
+/// `text_offset` for a future writer to record `fn_size`; until that
+/// lands, we use `max_pc_offset + FN_RANGE_PAD` as the upper bound.
+/// 64 KiB is comfortable headroom past any safepoint we observe in
+/// practice (`choose_demo`'s max-offset record is < 4 KiB into a
+/// fn).
+const FN_RANGE_PAD: usize = 65536;
+
 impl StackmapIndex {
-    /// Resolve a runtime PC to a record by binary-searching the
-    /// per-fn absolute-PC list. Returns the matching record on exact
-    /// pc match (i.e., PC = fn_base + record.pc_offset), or `None`
-    /// when the PC is not at a known safepoint.
+    /// Resolve a runtime PC to a record. Tries direct match against
+    /// the recorded safepoint PCs (which Cranelift records as the
+    /// post-call return address per `aarch64/inst/emit.rs:2948`);
+    /// also tries `pc - call_size` to be robust against Cranelift
+    /// convention changes / x86_64 vs aarch64 differences.
+    ///
+    /// Aarch64 macOS pointer-authentication: callers must strip the
+    /// PAC tag from the raw return-PC bits before calling `lookup`.
+    /// See `pac_strip` in this module.
     pub fn lookup(&self, pc: usize) -> Option<&ParsedRecord> {
-        // Walk every function block. We don't have fn-size data so a
-        // base-relative range check would be incorrect; instead we
-        // exact-match on absolute PCs. This is O(N) over all
-        // safepoints in the program — Phase 1's cross-check fires at
-        // sample points, not on hot paths, so the simplicity is worth
-        // the cycles. Phase 2's precise marker will need a faster
-        // structure (e.g., interval map keyed on fn_base + fn_size).
-        for entries in self.by_base.values() {
-            for &(abs_pc, fn_idx, rec_idx) in entries {
-                if abs_pc == pc {
-                    return Some(&self.parsed.functions[fn_idx].records[rec_idx]);
-                }
+        // M2 fast path: O(log N) function lookup via binary search by
+        // base, then O(log K) per-fn safepoint lookup. Plus a ±range
+        // fallback for the call-size convention. Phase 1's cost on
+        // stress tests was the motivator (10k allocs × tens of
+        // records × chain depth M).
+        for try_pc in [pc, pc.wrapping_sub(4), pc.wrapping_sub(5)] {
+            if let Some(record) = self.lookup_exact(try_pc) {
+                return Some(record);
             }
         }
         None
+    }
+
+    fn lookup_exact(&self, pc: usize) -> Option<&ParsedRecord> {
+        // Binary-search by base for the function containing `pc`.
+        // The functions array is sorted ascending by base; we want
+        // the last fn whose base <= pc AND whose range_end >= pc.
+        let idx_by_base = match self.functions.binary_search_by(|f| {
+            if f.base > pc {
+                std::cmp::Ordering::Greater
+            } else if f.range_end < pc {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        }) {
+            Ok(i) => i,
+            Err(_) => return None,
+        };
+        let f = &self.functions[idx_by_base];
+        let rec_idx = match f.abs_pcs.binary_search_by_key(&pc, |e| e.0) {
+            Ok(i) => f.abs_pcs[i].1,
+            Err(_) => return None,
+        };
+        Some(&self.parsed.functions[f.fn_idx].records[rec_idx])
     }
 
     pub fn parsed(&self) -> &ParsedSection {
@@ -230,11 +275,13 @@ impl StackmapIndex {
 
     /// Number of (function-name, record) pairs the index resolved a
     /// non-zero base address for. Functions whose symbol failed to
-    /// resolve via `dlsym` are silently skipped (the symbol may have
-    /// been stripped or renamed); cross-check assertions rely on
-    /// `lookup(pc)` returning `None` rather than panicking.
+    /// resolve via `dlsym` are silently skipped.
     pub fn resolved_record_count(&self) -> usize {
-        self.by_base.values().map(|v| v.len()).sum()
+        self.functions.iter().map(|f| f.abs_pcs.len()).sum()
+    }
+
+    pub fn resolved_function_count(&self) -> usize {
+        self.functions.len()
     }
 }
 
@@ -246,15 +293,84 @@ static INDEX: OnceLock<Option<StackmapIndex>> = OnceLock::new();
 /// section is missing (e.g., the binary was linked without the
 /// stackmap section, or the runtime is being exercised via a unit test
 /// that doesn't link a real binary).
+///
+/// When `SIGIL_GC_XCHECK_TRACE` is set in the environment, init writes
+/// a one-line diagnostic to stderr summarising
+/// `(section_present, parsed_fn_count, parsed_record_count,
+/// resolved_record_count)` — makes M1-class lookup regressions
+/// diagnosable in seconds. See PR #163 review M1 / N5.
 pub fn init_index() -> Option<&'static StackmapIndex> {
     INDEX
         .get_or_init(|| {
-            let bytes = locate_section_bytes()?;
-            let parsed = parse_section(bytes).ok()?;
-            let by_base = resolve_function_bases(&parsed);
-            Some(StackmapIndex { parsed, by_base })
+            let trace = std::env::var_os("SIGIL_GC_XCHECK_TRACE").is_some();
+            let bytes = match locate_section_bytes() {
+                Some(b) => b,
+                None => {
+                    if trace {
+                        eprintln!(
+                            "[stackmap] init: section_present=false (unit-test \
+                             binary or missing __start_sigil_stackmaps/getsectiondata)"
+                        );
+                    }
+                    return None;
+                }
+            };
+            let parsed = match parse_section(bytes) {
+                Ok(p) => p,
+                Err(e) => {
+                    if trace {
+                        eprintln!("[stackmap] init: parse_section error {e:?}");
+                    }
+                    return None;
+                }
+            };
+            let parsed_records: usize = parsed.functions.iter().map(|f| f.records.len()).sum();
+            let functions = build_indexed_functions(&parsed);
+            let resolved_records: usize = functions.iter().map(|f| f.abs_pcs.len()).sum();
+            if trace {
+                eprintln!(
+                    "[stackmap] init: section_present=true \
+                     parsed_fns={} parsed_records={} resolved_fns={} \
+                     resolved_records={}",
+                    parsed.functions.len(),
+                    parsed_records,
+                    functions.len(),
+                    resolved_records,
+                );
+            }
+            // N1 sanity: if the section was present but zero fns
+            // resolved, dlsym is failing — likely a missing
+            // `--export-dynamic` or stripped symbols. Surface
+            // immediately rather than silently produce a vacuous
+            // cross-check.
+            debug_assert!(
+                resolved_records > 0,
+                "stackmap section present ({parsed_records} parsed records) \
+                 but zero resolved — dlsym failed for every function. Likely \
+                 cause: --export-dynamic missing or symbols stripped.",
+            );
+            Some(StackmapIndex { parsed, functions })
         })
         .as_ref()
+}
+
+/// Strip pointer-authentication code (PAC) bits from a return-PC.
+///
+/// On aarch64 macOS (Apple Silicon), Cranelift's prologue may sign the
+/// return address via `paci` (per `aarch64/abi.rs:578`); the saved-LR
+/// at `*(fp+8)` carries PAC bits in the upper part of the 64-bit slot.
+/// Comparing the signed PC against an unsigned `function_base +
+/// pc_offset` would fail. Stripping the top 17 bits (canonical user
+/// address space is 47-bit on Apple Silicon) reduces the PC to the
+/// same bit pattern the index stored.
+///
+/// On x86_64 / aarch64-linux there's no PAC by default; the top bits
+/// are zero for valid user addresses; this strip is a no-op. Always
+/// applying it is cheaper than gating on cfg + matches the lookup
+/// caller's needs.
+#[inline]
+fn pac_strip(pc: usize) -> usize {
+    pc & 0x0000_7fff_ffff_ffff
 }
 
 /// Locate the stackmap section bytes via platform-specific linker
@@ -330,24 +446,38 @@ extern "C" {
     ) -> *const u8;
 }
 
-/// Resolve each function-block's `symbol_name` to a runtime address
-/// via `dlsym(RTLD_DEFAULT, ...)`. Returns a per-base-address map of
-/// absolute safepoint PCs. Unresolved symbols are skipped silently
+/// Build the sorted IndexedFunction list used by `StackmapIndex::lookup`.
+/// Each function block's `symbol_name` resolves to a runtime address via
+/// `dlsym(RTLD_DEFAULT, ...)`. Unresolved symbols are skipped silently
 /// (see `StackmapIndex::resolved_record_count`).
-fn resolve_function_bases(parsed: &ParsedSection) -> BTreeMap<usize, Vec<(usize, usize, usize)>> {
-    let mut by_base: BTreeMap<usize, Vec<(usize, usize, usize)>> = BTreeMap::new();
+///
+/// The returned Vec is sorted ascending by `base`, and each entry's
+/// `abs_pcs` is sorted ascending by absolute PC — so `lookup` can do
+/// two binary searches (O(log F + log K)) instead of O(F·K).
+fn build_indexed_functions(parsed: &ParsedSection) -> Vec<IndexedFunction> {
+    let mut out: Vec<IndexedFunction> = Vec::new();
     for (fn_idx, f) in parsed.functions.iter().enumerate() {
         let base = match dlsym_resolve(&f.symbol_name) {
             Some(b) => b,
             None => continue,
         };
-        let entries = by_base.entry(base).or_default();
-        for (rec_idx, r) in f.records.iter().enumerate() {
-            let abs_pc = base.wrapping_add(r.pc_offset as usize);
-            entries.push((abs_pc, fn_idx, rec_idx));
-        }
+        let mut abs_pcs: Vec<(usize, usize)> = f
+            .records
+            .iter()
+            .enumerate()
+            .map(|(rec_idx, r)| (base.wrapping_add(r.pc_offset as usize), rec_idx))
+            .collect();
+        abs_pcs.sort_by_key(|e| e.0);
+        let max_abs_pc = abs_pcs.last().map(|e| e.0).unwrap_or(base);
+        out.push(IndexedFunction {
+            base,
+            range_end: max_abs_pc.wrapping_add(FN_RANGE_PAD),
+            abs_pcs,
+            fn_idx,
+        });
     }
-    by_base
+    out.sort_by_key(|fi| fi.base);
+    out
 }
 
 fn dlsym_resolve(symbol: &str) -> Option<usize> {
@@ -446,12 +576,20 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
         Some(i) => i,
         None => return Vec::new(),
     };
+    let trace = xcheck_trace_enabled();
     let mut roots = Vec::new();
     let mut fp = current_caller_fp();
+    let mut frame_idx = 0usize;
     while !fp.is_null() {
         let frame = unsafe { walk_frame(fp) };
+        // Strip pointer-authentication code (PAC) bits from the
+        // saved return-PC. On Apple Silicon Cranelift's prologue may
+        // sign LR via `paci`; the raw saved bits include the PAC tag
+        // in the upper part of the address, which would never match
+        // the unsigned (function_base + pc_offset) the index stored.
+        let stripped_pc = pac_strip(frame.return_pc);
         if !frame.saved_fp.is_null() {
-            if let Some(record) = index.lookup(frame.return_pc) {
+            if let Some(record) = index.lookup(stripped_pc) {
                 // The safepoint at `frame.return_pc` lives in the
                 // function that **called** the frame at `fp` (the
                 // OUTER frame). The outer frame's FP is
@@ -463,9 +601,21 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
                 // mis-address by the inner-vs-outer FP delta and
                 // surface as "non-heap-pointer-shaped" values at
                 // supposed GC slots — which is what PR #163 CI on
-                // macos-14 surfaced before this fix.
+                // macos-14 surfaced before the dc37279 fix.
                 let outer_fp = frame.saved_fp as usize;
                 let frame_sp = outer_fp.wrapping_sub(record.frame_size as usize);
+                if trace {
+                    eprintln!(
+                        "[stackmap] walk frame={} fp=0x{:x} return_pc=0x{:x} \
+                         stripped=0x{:x} matched frame_size={} entries={}",
+                        frame_idx,
+                        fp as usize,
+                        frame.return_pc,
+                        stripped_pc,
+                        record.frame_size,
+                        record.entries.len(),
+                    );
+                }
                 for entry in &record.entries {
                     roots.push(RootLocation {
                         addr: frame_sp.wrapping_add(entry.sp_offset as usize),
@@ -473,6 +623,12 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
                         return_pc: frame.return_pc,
                     });
                 }
+            } else if trace {
+                eprintln!(
+                    "[stackmap] walk frame={} fp=0x{:x} return_pc=0x{:x} \
+                     stripped=0x{:x} no_match",
+                    frame_idx, fp as usize, frame.return_pc, stripped_pc,
+                );
             }
         }
         if frame.saved_fp.is_null() || frame.saved_fp as usize <= fp as usize {
@@ -480,8 +636,19 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
             break;
         }
         fp = frame.saved_fp;
+        frame_idx += 1;
+    }
+    if trace && !roots.is_empty() {
+        eprintln!("[stackmap] walk returning {} roots", roots.len());
     }
     roots
+}
+
+/// Cached env-var lookup for SIGIL_GC_XCHECK_TRACE. Reads once and
+/// caches via OnceLock; steady-state cost is one relaxed load.
+fn xcheck_trace_enabled() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("SIGIL_GC_XCHECK_TRACE").is_some())
 }
 
 struct Frame {

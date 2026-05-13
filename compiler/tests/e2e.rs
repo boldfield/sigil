@@ -18401,6 +18401,46 @@ fn assert_no_cross_check_abort(test_name: &str, stderr: &str, code: i32) {
          stderr={stderr:?}",
     );
 }
+
+/// Parse the atexit summary line emitted by `runtime::stackmap_xcheck`
+/// when `SIGIL_GC_CROSS_CHECK=1` is set. The line shape is:
+///
+/// ```text
+/// [SIGIL_GC_CROSS_CHECK] allocs_checked=N roots_total=M \
+///   fns_resolved=K records_resolved=L
+/// ```
+///
+/// Returns `(allocs_checked, roots_total, fns_resolved, records_resolved)`.
+/// Panics with the full stderr if the line isn't present — that
+/// indicates the cross-check didn't run or the runtime crashed
+/// before atexit fired.
+fn parse_cross_check_summary(stderr: &str) -> (u64, u64, u64, u64) {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[SIGIL_GC_CROSS_CHECK] allocs_checked="))
+        .unwrap_or_else(|| {
+            panic!(
+                "cross-check atexit summary line not found in stderr; \
+                 stderr=\n{stderr}"
+            )
+        });
+    let mut allocs: u64 = 0;
+    let mut roots: u64 = 0;
+    let mut fns: u64 = 0;
+    let mut records: u64 = 0;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("allocs_checked=") {
+            allocs = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("roots_total=") {
+            roots = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("fns_resolved=") {
+            fns = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("records_resolved=") {
+            records = v.parse().unwrap_or(0);
+        }
+    }
+    (allocs, roots, fns, records)
+}
 //
 // Coverage rationale:
 //   - `hello.sigil` — minimal alloc surface (only the string-literal
@@ -18450,6 +18490,14 @@ fn cross_check_option_demo_runs_cleanly() {
 
 #[test]
 fn cross_check_choose_demo_runs_cleanly() {
+    // PR #163 review M1 — coverage assertion. choose_demo.sigil is
+    // PR #162's G1 example with 7 fn blocks / 8 stack-map records;
+    // it's the example known to have non-zero records under v1
+    // codegen. We assert `roots_total > 0` over the program's
+    // lifetime — without that, a future regression that makes the
+    // walker / lookup vacuous would silently pass every other
+    // cross-check test (they assert "no abort", which is trivially
+    // true when the harness never finds anything to validate).
     let root = workspace_root();
     let source = root.join("examples/choose_demo.sigil");
     let (_stdout, stderr, code) = compile_file_and_run_with_env(
@@ -18458,6 +18506,24 @@ fn cross_check_choose_demo_runs_cleanly() {
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
     assert_no_cross_check_abort("choose_demo.sigil", &stderr, code);
+    let (allocs, roots, fns, records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs > 0,
+        "expected ≥1 alloc to fire the cross-check on choose_demo.sigil; \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+    );
+    assert!(
+        records > 0,
+        "expected ≥1 resolved stackmap record (G1's measurement: 8); \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+    );
+    assert!(
+        roots > 0,
+        "Phase 1 ship gate: walker must find ≥1 precise root over \
+         choose_demo.sigil's lifetime. roots_total=0 means the cross-check \
+         harness is silently vacuous (PR #163 review M1). \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+    );
 }
 
 #[test]
@@ -18496,6 +18562,19 @@ fn cross_check_tree_stress_drop_repeat_runs_cleanly() {
     // Sum-per-round = 2^12 - 1 = 4,095; ×10 rounds = 40,950.
     assert_eq!(stdout.trim_end(), "40950");
     assert_eq!(code, 0);
+    // PR #163 review M3 — substantiate the "10k cons cells, drop,
+    // repeat" stress claim. tree_stress_repeat.sigil allocates a
+    // depth-12 binary tree (2^13 - 1 = 8,191 nodes) ×10 rounds =
+    // 81,910 node allocations. The cross-check fires on every
+    // `sigil_alloc`, so allocs_checked should comfortably exceed
+    // 10,000.
+    let (allocs, _roots, _fns, _records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs >= 10_000,
+        "tree_stress_repeat.sigil must fire >=10k cross-checks to \
+         substantiate the plan body's stress requirement; \
+         allocs_checked={allocs}",
+    );
 }
 
 // ===== Broader cross-check coverage =======================================
