@@ -450,17 +450,29 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
     let mut fp = current_caller_fp();
     while !fp.is_null() {
         let frame = unsafe { walk_frame(fp) };
-        if let Some(record) = index
-            .lookup(frame.return_pc)
-            .or_else(|| index.lookup(frame.return_pc.wrapping_sub(SAFE_CALL_PC_BACKOFF)))
-        {
-            let frame_sp = (fp as usize).wrapping_sub(record.frame_size as usize);
-            for entry in &record.entries {
-                roots.push(RootLocation {
-                    addr: frame_sp.wrapping_add(entry.sp_offset as usize),
-                    kind: entry.kind,
-                    return_pc: frame.return_pc,
-                });
+        if !frame.saved_fp.is_null() {
+            if let Some(record) = index.lookup(frame.return_pc) {
+                // The safepoint at `frame.return_pc` lives in the
+                // function that **called** the frame at `fp` (the
+                // OUTER frame). The outer frame's FP is
+                // `frame.saved_fp` (the value the inner prologue
+                // saved); its SP at the safepoint is
+                // `outer_FP - active_size`, where `active_size` is
+                // what Cranelift records as the stackmap record's
+                // `frame_size`. Using the inner FP here would
+                // mis-address by the inner-vs-outer FP delta and
+                // surface as "non-heap-pointer-shaped" values at
+                // supposed GC slots — which is what PR #163 CI on
+                // macos-14 surfaced before this fix.
+                let outer_fp = frame.saved_fp as usize;
+                let frame_sp = outer_fp.wrapping_sub(record.frame_size as usize);
+                for entry in &record.entries {
+                    roots.push(RootLocation {
+                        addr: frame_sp.wrapping_add(entry.sp_offset as usize),
+                        kind: entry.kind,
+                        return_pc: frame.return_pc,
+                    });
+                }
             }
         }
         if frame.saved_fp.is_null() || frame.saved_fp as usize <= fp as usize {
@@ -471,15 +483,6 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
     }
     roots
 }
-
-#[cfg(target_arch = "x86_64")]
-const SAFE_CALL_PC_BACKOFF: usize = 5; // typical x86_64 call insn is 5 bytes (call rel32)
-
-#[cfg(target_arch = "aarch64")]
-const SAFE_CALL_PC_BACKOFF: usize = 4; // aarch64 BL is 4 bytes
-
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const SAFE_CALL_PC_BACKOFF: usize = 0;
 
 struct Frame {
     saved_fp: *const usize,
