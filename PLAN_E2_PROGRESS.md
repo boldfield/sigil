@@ -172,7 +172,33 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 6 — Boehm precise-mode API spike
 
-- status: pending
+- status: **in PR (Task 6 branch)**
+- API surface pinned: `GC_make_descriptor(bitmap, len_bits) -> GC_descr` +
+  `GC_malloc_explicitly_typed(size_in_bytes, descr) -> *mut c_void`
+  (from `gc/gc_typed.h`, libgc 8.x). Heavier alternatives
+  (`GC_REGISTER_MARK_PROC`, raw `GC_DESCR_KIND`, `GC_malloc_kind`)
+  considered and rejected — `GC_malloc_explicitly_typed` wraps
+  kind selection internally and is the right shape for v1's
+  bitmap-driven precise marking.
+- Repro: `runtime/tests/boehm_precise_spike.rs` (2 integration
+  tests). `make_descriptor_returns_nonzero_handle` confirms the
+  descriptor constructor returns a non-trivial handle.
+  `malloc_explicitly_typed_round_trip` allocates a 2-word object
+  via the typed allocator, stores a pointer into its precise
+  slot, forces a full `GC_gcollect`, and asserts the slot
+  survives unchanged. Both pass on pod's Debian 12 / libgc 8.x.
+- Doc: `runtime/docs/boehm-precise-spike.md` documents the chosen
+  API, the constraints on `size_in_bytes` (>=
+  `len_bits * sizeof(GC_word)`), and the Sigil-pointer-bitmap →
+  Boehm-descriptor-bitmap mapping (Sigil's bit-`k` is per-payload-
+  word; Boehm's bit-0 is the header word → shift by 1).
+- Per-test infra note: cargo-test spawns a fresh OS thread per
+  `#[test]`; each must `GC_register_my_thread(NULL)` before
+  `GC_gcollect` or Boehm aborts. The spike's `enrol_gc()` helper
+  is the matching production-grade pattern from
+  `runtime/src/test_support.rs::GcThreadEnrolment` minus the
+  HANDLER_STACK/ARENA registrations (the spike doesn't allocate
+  through those).
 
 ### Task 7 — Descriptor cache
 
