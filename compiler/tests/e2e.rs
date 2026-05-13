@@ -18498,12 +18498,21 @@ fn cross_check_choose_demo_runs_cleanly() {
     // walker / lookup vacuous would silently pass every other
     // cross-check test (they assert "no abort", which is trivially
     // true when the harness never finds anything to validate).
+    //
+    // `SIGIL_GC_XCHECK_TRACE=1` enables the init diagnostic line +
+    // per-walk trace — when this test fails, the trace + summary
+    // are in stderr (visible in CI failure output) so M1-class
+    // regressions diagnose in seconds rather than another review
+    // round.
     let root = workspace_root();
     let source = root.join("examples/choose_demo.sigil");
     let (_stdout, stderr, code) = compile_file_and_run_with_env(
         &source,
         "cross_check_choose_demo",
-        &[("SIGIL_GC_CROSS_CHECK", "1")],
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_GC_XCHECK_TRACE", "1"),
+        ],
     );
     assert_no_cross_check_abort("choose_demo.sigil", &stderr, code);
     let (allocs, roots, fns, records) = parse_cross_check_summary(&stderr);
