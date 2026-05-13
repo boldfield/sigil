@@ -18519,19 +18519,22 @@ fn cross_check_choose_demo_runs_cleanly() {
     assert!(
         allocs > 0,
         "expected ≥1 alloc to fire the cross-check on choose_demo.sigil; \
-         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
     );
     assert!(
         records > 0,
         "expected ≥1 resolved stackmap record (G1's measurement: 8); \
-         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
     );
     assert!(
         roots > 0,
         "Phase 1 ship gate: walker must find ≥1 precise root over \
          choose_demo.sigil's lifetime. roots_total=0 means the cross-check \
          harness is silently vacuous (PR #163 review M1). \
-         summary: allocs={allocs} roots={roots} fns={fns} records={records}",
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
     );
 }
 
