@@ -79,14 +79,13 @@
 //! triggered from `sigil_gc_init`.
 //!
 //! Each subsequent `prev` pointer in the chain is reachable through
-//! the previous frame's payload; Boehm scans those conservatively
-//! because `sigil_alloc` allocates HandlerFrames via `GC_malloc` (the
-//! per-bit precision of the pointer bitmap is v2-forward-compat
-//! metadata; v1 Boehm consumes it as a binary signal selecting between
-//! `GC_malloc` and `GC_malloc_atomic`). The `arms[i].closure_ptr`
-//! slots and `return_closure` slot become reachable through the
-//! HandlerFrame allocation and are scanned conservatively along with
-//! the rest of the block.
+//! the previous frame's payload. Plan E2 Task 8 switched `sigil_alloc`
+//! to allocate HandlerFrames via `GC_malloc_explicitly_typed` with a
+//! descriptor built from the Header's pointer bitmap, so Boehm's mark
+//! phase scans only the payload words the bitmap names as GC pointers
+//! (`prev`, `return_closure`, every `arms[i].closure_ptr`). Atomic
+//! payloads — no GC pointers in any payload word — continue to use
+//! `GC_malloc_atomic` (Boehm skips scanning entirely).
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
@@ -946,11 +945,12 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
 
     // Explicitly zero-init the variable-length arms region rather than
     // depending on the Boehm allocator-zeroing contract. `GC_malloc` /
-    // `GC_malloc_atomic` zero today, but that's a libgc-version
-    // contract, not a Rust contract. Future Boehm flag flips (e.g. a
-    // switch to `GC_malloc_atomic_uncollectable`) would silently flip
-    // arm-slot reads from null to garbage. The cost is one
-    // `write_bytes` over ≤ 224 bytes (`16 * 14` for the arms region).
+    // `GC_malloc_atomic` / `GC_malloc_explicitly_typed` all zero
+    // today, but that's a libgc-version contract, not a Rust contract.
+    // Future Boehm flag flips (e.g. a switch to
+    // `GC_malloc_atomic_uncollectable`) would silently flip arm-slot
+    // reads from null to garbage. The cost is one `write_bytes` over
+    // ≤ 224 bytes (`16 * 14` for the arms region).
     let arms_region_start = (frame_ptr as *mut u8).add(core::mem::size_of::<HandlerFrame>());
     let arms_region_bytes = (arm_count as usize) * 16;
     // SAFETY: gc-heap-ptr arithmetic (the destination pointer addresses

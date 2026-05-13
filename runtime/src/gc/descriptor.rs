@@ -158,6 +158,21 @@ fn build_descriptor(sigil_bitmap: u32, payload_word_count: u8) -> usize {
     // `payload_word_count ≤ COUNT_MASK = 63` (Header's 6-bit
     // representable max), so `len_bits = 1 + payload_word_count
     // ≤ 64` — exactly within the single-word backing buffer.
+    //
+    // Bitmap-coverage argument when `payload_word_count > 31`:
+    // Sigil's `pointer_bitmap` is `u32` and covers payload words
+    // 0..31. The `u32 → usize` cast zero-extends, so
+    // `boehm_bitmap = (sigil_bitmap as usize) << 1` has bits
+    // 33..63 set to 0. Boehm reads those as "payload words 32..62
+    // are NOT pointers." This is correct by construction: Sigil's
+    // bitmap encoding has no representation for pointers in those
+    // words, so they cannot hold GC refs. Handler frames at
+    // `MAX_HANDLER_ARMS = 14` are the only currently-emitted case
+    // that even reaches `count = 32` — every "implicit non-pointer"
+    // bit in that descriptor is a non-pointer field by codegen
+    // contract (handler frame's `prev` / `return_closure` /
+    // `arm[i].closure_ptr` slots all live at indices ≤ 31).
+    //
     // `&boehm_bitmap` is valid for the call's duration; Boehm
     // doesn't retain the pointer.
     unsafe { GC_make_descriptor(&boehm_bitmap, len_bits) }

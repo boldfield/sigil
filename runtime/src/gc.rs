@@ -1,9 +1,13 @@
-//! Boehm GC integration — plan A1 Stage 1 task 2.
+//! Boehm GC integration — plan A1 Stage 1 task 2; Plan E2 Task 8
+//! switched the per-object allocator to Boehm's typed-malloc path.
 //!
-//! The runtime wraps Boehm's `GC_init` + `GC_malloc` in the FFI surface
-//! the compiler emits calls to. Header construction happens on the caller
-//! side (through `header::Header::new`); `sigil_alloc` writes the header
-//! to the first 8 bytes of the Boehm block and returns a pointer to that
+//! The runtime wraps Boehm's `GC_init` + the typed/atomic allocator
+//! pair (`GC_malloc_atomic` for non-pointer payloads,
+//! `GC_malloc_explicitly_typed` for pointer-bearing payloads via
+//! Task 7's descriptor cache) in the FFI surface the compiler emits
+//! calls to. Header construction happens on the caller side (through
+//! `header::Header::new`); `sigil_alloc` writes the header to the
+//! first 8 bytes of the Boehm block and returns a pointer to that
 //! header.
 //!
 //! **Allocations always return a pointer to the header**, never to the
@@ -174,6 +178,37 @@ pub extern "C" fn sigil_gc_init() {
     crate::profile::maybe_init();
 }
 
+/// Debug-only precondition check for the precise-marking path in
+/// `sigil_alloc`: the requested allocation size must be large enough
+/// that `GC_malloc_explicitly_typed`'s descriptor bitmap covers the
+/// full block. `GC_malloc_explicitly_typed` requires
+/// `size_in_bytes >= (1 + payload_count) * 8` — one word for the
+/// Sigil header plus `payload_count` payload words.
+///
+/// Extracted from `sigil_alloc` as a regular Rust fn (not `extern "C"`)
+/// so the `debug_assert!` panics unwind cleanly under `#[should_panic]`
+/// tests. Through the C ABI the panic would convert to an abort and
+/// `cargo test` would treat it as a process crash, not a passing
+/// `#[should_panic]`.
+///
+/// For bitmap-bearing objects, codegen emits `payload_bytes =
+/// payload_count * 8` (word-aligned payload), so `total = 8 +
+/// payload_count * 8 = (1 + count) * 8` exactly meets the floor.
+/// A drift between codegen's `payload_bytes` and the Header's `count`
+/// would surface as a Boehm scan beyond the allocation — this check
+/// pins the discipline at the boundary.
+#[inline]
+fn assert_precise_alloc_size(total: usize, count: u8, bitmap: u32) {
+    debug_assert!(
+        total >= (1 + count as usize).saturating_mul(8),
+        "sigil_alloc: total bytes {} < precise-descriptor minimum {} (count={}, bitmap=0b{:b})",
+        total,
+        (1 + count as usize) * 8,
+        count,
+        bitmap,
+    );
+}
+
 /// Allocate `8 + payload_bytes` from Boehm, write the 8-byte header, and
 /// return a pointer to the header (never to the payload). Callers hold a
 /// header pointer as their canonical reference to the object.
@@ -230,27 +265,11 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
         // cache (Task 7) hands out one `GC_descr` per shape; first
         // observation of a `(bitmap, count)` shape builds the
         // descriptor via `GC_make_descriptor`, subsequent calls reuse
-        // the cached handle.
-        //
-        // Constraint check (debug only): `GC_malloc_explicitly_typed`
-        // requires `size_in_bytes >= (1 + payload_count) * 8` so the
-        // descriptor's bitmap covers the full allocation. For
-        // bitmap-bearing objects, codegen always emits
-        // `payload_bytes = payload_count * 8` (word-aligned payload),
-        // so `total = 8 + payload_count * 8 = (1 + count) * 8`
-        // exactly meets the floor. A drift between codegen's
-        // `payload_bytes` and the Header's `count` would surface as a
-        // Boehm scan beyond the allocation — the debug_assert pins
-        // the discipline at the boundary.
+        // the cached handle. The precondition check lives in
+        // `assert_precise_alloc_size` — see its doc-comment for the
+        // rationale.
         let count = h.payload_count();
-        debug_assert!(
-            total >= (1 + count as usize).saturating_mul(8),
-            "sigil_alloc: total bytes {} < precise-descriptor minimum {} (count={}, bitmap=0b{:b})",
-            total,
-            (1 + count as usize) * 8,
-            count,
-            h.pointer_bitmap(),
-        );
+        assert_precise_alloc_size(total, count, h.pointer_bitmap());
         let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
         // SAFETY: `descr` was built by `GC_make_descriptor` and is
         // alive for the process lifetime (the cache never evicts).
@@ -482,6 +501,22 @@ mod tests {
             2,
             "distinct-shape alloc must add a fresh cache entry"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "precise-descriptor minimum")]
+    fn assert_precise_alloc_size_panics_when_total_underflows_count() {
+        // Structural defense for the precise-marking path: a drift
+        // between codegen's `payload_bytes` and the Header's `count`
+        // would let `GC_malloc_explicitly_typed`'s mark phase walk
+        // beyond the allocation. The `assert_precise_alloc_size`
+        // helper catches the drift; this test pins that the helper
+        // actually trips.
+        //
+        // count=2, total=8 → minimum required is (1+2)*8 = 24,
+        // total of 8 is well below the floor.
+        assert_precise_alloc_size(8, 2, 0b1);
     }
 
     #[test]
