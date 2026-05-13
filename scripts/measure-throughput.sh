@@ -18,8 +18,8 @@
 #     runtime/src/counters.rs::sigil_counter_print_all).
 #
 # Per-host:
-#   - Linux uses GNU /usr/bin/time -v.
-#   - macOS uses BSD /usr/bin/time -l.
+#   - Linux uses GNU /usr/bin/time -v (apt: `time` package).
+#   - macOS uses BSD /usr/bin/time -l (base system).
 # Both surface "maximum resident set size" which we normalise to kB.
 #
 # Emitted JSON shape:
@@ -30,15 +30,12 @@
 #     "peak_rss_kb":   {"median": <kb>, "iqr": <kb>, "min": <kb>, "max": <kb>},
 #     "alloc_count":   <int, from SIGIL_COUNTER_BOEHM_ALLOC_COUNT>,
 #     "alloc_bytes":   <int, from SIGIL_COUNTER_BOEHM_ALLOC_BYTES>,
-#     "boehm_gc_time_ms": <int, from boehm_gc_time_ms>
+#     "boehm_gc_time_ms": <int or null, from boehm_gc_time_ms>
 #   }
 #
 # Wall-clock / RSS are aggregated across runs; alloc counters are
 # read from the last run only (they're deterministic — a workload
 # allocates the same number of objects every run).
-#
-# Exits non-zero if any run exits non-zero, if the binary doesn't
-# exist, or if a counter line is missing from a run's stderr.
 
 set -euo pipefail
 
@@ -60,48 +57,78 @@ if ! [[ "$RUNS" =~ ^[1-9][0-9]*$ ]]; then
     exit 1
 fi
 
-case "$(uname -s)" in
-    Linux)
-        TIME_BIN="/usr/bin/time"
-        TIME_ARGS=(-v)
-        TIME_WALL_PATTERN='Elapsed (wall clock) time'
-        TIME_RSS_PATTERN='Maximum resident set size'
-        RSS_UNIT_KB=1
-        ;;
-    Darwin)
-        TIME_BIN="/usr/bin/time"
-        TIME_ARGS=(-l)
-        TIME_WALL_PATTERN='real'
-        TIME_RSS_PATTERN='maximum resident set size'
-        # macOS time -l reports RSS in bytes; normalise to kB.
-        RSS_UNIT_KB=0
-        ;;
+OS_KIND="$(uname -s)"
+case "$OS_KIND" in
+    Linux|Darwin) ;;
     *)
-        echo "measure-throughput: unsupported OS $(uname -s)" >&2
+        echo "measure-throughput: unsupported OS $OS_KIND" >&2
         exit 1
         ;;
 esac
 
-# Parse Linux's "h:mm:ss" or "mm:ss.ss" wall-clock format → ms.
-linux_wall_to_ms() {
-    local raw="$1"
-    awk -v t="$raw" 'BEGIN {
-        n = split(t, parts, ":");
-        ms = 0;
-        if (n == 3) {
-            ms = (parts[1] * 3600 + parts[2] * 60 + parts[3]) * 1000;
-        } else if (n == 2) {
-            ms = (parts[1] * 60 + parts[2]) * 1000;
-        } else {
-            ms = parts[1] * 1000;
-        }
-        printf "%d\n", ms + 0.5;
-    }'
-}
-
-# Parse Darwin's "N.NNN real" format → ms.
-darwin_wall_to_ms() {
-    awk -v t="$1" 'BEGIN { printf "%d\n", (t * 1000) + 0.5 }'
+# Parse the time-output file into shell-eval friendly key=value lines.
+# Centralised here so both extraction and conversion live in one awk
+# pass per OS — avoids regex / pipefail traps that were eating
+# wall-clock values when the previous grep+sed implementation matched
+# unexpected line shapes.
+#
+# Emits to stdout:
+#   wall_ms=<int>
+#   rss_kb=<int>
+parse_time_log() {
+    local file="$1"
+    local kind="$2"
+    if [[ "$kind" == "Linux" ]]; then
+        awk '
+            # GNU time -v: leading TAB, then label, then ": value".
+            # Wall-clock line: "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.42"
+            # We only care about the last whitespace-separated field of
+            # the matching line (the time itself), so use $NF.
+            /Elapsed \(wall clock\) time/ {
+                v = $NF;
+                ms = 0;
+                n = split(v, parts, ":");
+                if (n == 3) {
+                    ms = (parts[1] * 3600 + parts[2] * 60 + parts[3]) * 1000;
+                } else if (n == 2) {
+                    ms = (parts[1] * 60 + parts[2]) * 1000;
+                } else {
+                    ms = parts[1] * 1000;
+                }
+                printf "wall_ms=%d\n", ms + 0.5;
+                wall_seen = 1;
+            }
+            /Maximum resident set size/ {
+                # Last field is kB on GNU time.
+                printf "rss_kb=%d\n", $NF;
+                rss_seen = 1;
+            }
+            END {
+                if (!wall_seen) printf "wall_ms=0\n";
+                if (!rss_seen)  printf "rss_kb=0\n";
+            }
+        ' "$file"
+    else
+        awk '
+            # macOS BSD time -l: "        0.42 real         0.00 user ..."
+            # Wall-clock is the first field of the "real" line.
+            $2 == "real" {
+                ms = ($1 * 1000) + 0.5;
+                printf "wall_ms=%d\n", ms;
+                wall_seen = 1;
+            }
+            /maximum resident set size/ {
+                # First field is bytes on macOS BSD time; normalise to kB.
+                kb = ($1 / 1024) + 0.5;
+                printf "rss_kb=%d\n", kb;
+                rss_seen = 1;
+            }
+            END {
+                if (!wall_seen) printf "wall_ms=0\n";
+                if (!rss_seen)  printf "rss_kb=0\n";
+            }
+        ' "$file"
+    fi
 }
 
 wall_ms_values=()
@@ -113,43 +140,40 @@ last_gc_time_ms=""
 for ((i = 1; i <= RUNS; i++)); do
     time_log="$(mktemp)"
     stderr_log="$(mktemp)"
-    # Run under `time`, redirect time's own stderr to time_log and
-    # the child's stderr to stderr_log via a separate FD shuffle.
-    if ! "$TIME_BIN" "${TIME_ARGS[@]}" -o "$time_log" \
+    if ! /usr/bin/time \
+            $([[ "$OS_KIND" == "Linux" ]] && echo "-v" || echo "-l") \
+            -o "$time_log" \
             env SIGIL_PRINT_STATS=1 "$BINARY" \
             > /dev/null 2> "$stderr_log"; then
         echo "measure-throughput: run $i failed" >&2
+        echo "--- time log ---" >&2
+        cat "$time_log" >&2
+        echo "--- stderr log ---" >&2
         cat "$stderr_log" >&2
         rm -f "$time_log" "$stderr_log"
         exit 1
     fi
 
-    # Extract wall-clock + RSS from the time-output file.
-    case "$(uname -s)" in
-        Linux)
-            wall_raw=$(grep "$TIME_WALL_PATTERN" "$time_log" \
-                | sed 's/.*time (h:mm:ss or m:ss): //')
-            wall_ms=$(linux_wall_to_ms "$wall_raw")
-            rss_raw=$(grep "$TIME_RSS_PATTERN" "$time_log" | awk '{print $NF}')
-            rss_kb="$rss_raw"
-            ;;
-        Darwin)
-            wall_raw=$(grep "real" "$time_log" | awk '{print $1}')
-            wall_ms=$(darwin_wall_to_ms "$wall_raw")
-            rss_raw=$(grep "$TIME_RSS_PATTERN" "$time_log" | awk '{print $1}')
-            if [[ "$RSS_UNIT_KB" -eq 0 ]]; then
-                rss_kb=$(awk -v b="$rss_raw" 'BEGIN { printf "%d\n", (b / 1024) + 0.5 }')
-            else
-                rss_kb="$rss_raw"
-            fi
-            ;;
-    esac
+    # eval the awk-emitted key=value pairs into wall_ms + rss_kb.
+    wall_ms=""
+    rss_kb=""
+    while IFS= read -r kv; do
+        eval "$kv"
+    done < <(parse_time_log "$time_log" "$OS_KIND")
 
     if [[ -z "$wall_ms" || -z "$rss_kb" ]]; then
-        echo "measure-throughput: run $i — failed to parse time output:" >&2
+        echo "measure-throughput: run $i — parser returned empty values:" >&2
         cat "$time_log" >&2
         rm -f "$time_log" "$stderr_log"
         exit 1
+    fi
+
+    # If the parser said wall_ms=0, dump the time log on the first
+    # run so failures are diagnosable in CI output. (Subsequent runs
+    # likely repeat the same failure mode; one dump is enough.)
+    if [[ "$wall_ms" == "0" && "$i" -eq 1 ]]; then
+        echo "measure-throughput: warning — wall_ms=0 on first run. time log content:" >&2
+        cat "$time_log" >&2
     fi
 
     wall_ms_values+=("$wall_ms")

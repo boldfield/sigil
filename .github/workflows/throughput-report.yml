@@ -59,12 +59,15 @@ jobs:
           # pre-Phase-2 SHA without re-fetching mid-job.
           fetch-depth: 0
 
-      - name: install Boehm GC + lld (Linux)
+      - name: install Boehm GC + lld + GNU time (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgc-dev pkg-config lld clang
-          # GNU coreutils on Linux ships /usr/bin/time -v already.
+          sudo apt-get install -y libgc-dev pkg-config lld clang time
+          # The `time` package installs /usr/bin/time (GNU time, supports
+          # -v). bash's builtin `time` doesn't support -v / -o and is
+          # not what we want; ensure /usr/bin/time is present.
+          /usr/bin/time --version
 
       - name: install Boehm GC (macOS)
         if: runner.os == 'macOS'
