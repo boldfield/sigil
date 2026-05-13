@@ -451,15 +451,31 @@ extern "C" {
 /// `dlsym(RTLD_DEFAULT, ...)`. Unresolved symbols are skipped silently
 /// (see `StackmapIndex::resolved_record_count`).
 ///
+/// When `SIGIL_GC_XCHECK_TRACE=1`, every symbol-resolution attempt
+/// logs to stderr — useful for diagnosing M1-class regressions where
+/// the symbols ARE in the binary but dlsym can't find them (e.g.,
+/// missing `--export-dynamic`).
+///
 /// The returned Vec is sorted ascending by `base`, and each entry's
 /// `abs_pcs` is sorted ascending by absolute PC — so `lookup` can do
 /// two binary searches (O(log F + log K)) instead of O(F·K).
 fn build_indexed_functions(parsed: &ParsedSection) -> Vec<IndexedFunction> {
+    let trace = std::env::var_os("SIGIL_GC_XCHECK_TRACE").is_some();
     let mut out: Vec<IndexedFunction> = Vec::new();
     for (fn_idx, f) in parsed.functions.iter().enumerate() {
         let base = match dlsym_resolve(&f.symbol_name) {
-            Some(b) => b,
-            None => continue,
+            Some(b) => {
+                if trace {
+                    eprintln!("[stackmap] dlsym(\"{}\") = 0x{:x}", f.symbol_name, b);
+                }
+                b
+            }
+            None => {
+                if trace {
+                    eprintln!("[stackmap] dlsym(\"{}\") = NULL", f.symbol_name);
+                }
+                continue;
+            }
         };
         let mut abs_pcs: Vec<(usize, usize)> = f
             .records
