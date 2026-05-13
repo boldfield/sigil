@@ -80,6 +80,7 @@ jobs:
       - name: workload + script SHAs sanity check
         run: |
           test -f examples/descriptor_cache_stress.sigil
+          test -f examples/tree_stress_repeat_large.sigil
           test -x scripts/measure-throughput.sh
           test -x scripts/diff-throughput.py
 
@@ -93,14 +94,14 @@ jobs:
       - name: post — compile workloads
         run: |
           mkdir -p post-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
             ./target/release/sigil "examples/${w}.sigil" -o "post-bins/${w}"
           done
 
       - name: post — measure workloads
         run: |
           mkdir -p throughput-data/post
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
             scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs || '5' }}" \
               > "throughput-data/post/${w}.json"
             echo "--- post/${w} ---"
@@ -122,6 +123,7 @@ jobs:
           # These don't exist at the PRE SHA, so cp (not git apply) is
           # the cleaner mechanism.
           cp ${{ github.workspace }}/examples/descriptor_cache_stress.sigil examples/
+          cp ${{ github.workspace }}/examples/tree_stress_repeat_large.sigil examples/
           mkdir -p scripts
           cp ${{ github.workspace }}/scripts/measure-throughput.sh scripts/
           cp ${{ github.workspace }}/scripts/diff-throughput.py scripts/
@@ -136,7 +138,7 @@ jobs:
         run: |
           cd /tmp/pre-phase-2
           mkdir -p ${{ github.workspace }}/pre-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
             ./target/release/sigil "examples/${w}.sigil" \
               -o "${{ github.workspace }}/pre-bins/${w}"
           done
@@ -144,7 +146,7 @@ jobs:
       - name: pre — measure workloads
         run: |
           mkdir -p throughput-data/pre
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
             scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs || '5' }}" \
               > "throughput-data/pre/${w}.json"
             echo "--- pre/${w} ---"
@@ -165,7 +167,7 @@ jobs:
             echo "Post SHA: \`${{ github.sha }}\`"
             echo "Runs per workload: ${{ inputs.runs || '5' }}"
             echo ""
-            for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+            for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
               scripts/diff-throughput.py "${w}" \
                 "throughput-data/pre/${w}.json" \
                 "throughput-data/post/${w}.json"

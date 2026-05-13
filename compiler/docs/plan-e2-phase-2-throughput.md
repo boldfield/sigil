@@ -22,32 +22,44 @@ the rendered `deltas-<os>.md` summary the workflow produces.
 
 ### Workloads
 
-Five workloads, all in `examples/`:
+Six workloads, all in `examples/`:
 
-1. **`fib_perf.sigil`** — naïve recursive `fib(20)`. No heap allocations
-   for the recursion itself; the only alloc is the `int_to_string` result
-   that `IO.println` consumes. Pins the alloc-free perf floor —
-   any regression on the precise-marking work would mean the descriptor
-   cache lookup costs something even on near-zero-alloc workloads.
+1. **`fib_perf.sigil`** — naïve recursive `fib(20)`. ~6 heap allocations
+   total. Pins the alloc-free perf floor. Reads at the
+   `/usr/bin/time` ~10ms precision floor on both CI hosts (≈ 0 ± 0 ms);
+   the report relies on RSS + alloc_count for cross-checking rather
+   than wall-clock for this workload.
 
 2. **`fib_cps_perf.sigil`** — CPS-color `fib(20)` via effect handlers.
-   Per-call CPS allocates closure records → ~2³⁰ allocations across the
-   recursion. Pins the closure-shape (TAG_CLOSURE, count=2, bitmap=0b10)
-   alloc-path cost.
+   ~22k allocations of TAG_CLOSURE / TAG_CONTINUATION shapes. Subject
+   to the Plan B Task 60 perf gate (50ms x86 / 500ms aarch64). Below
+   the precision floor on both hosts.
 
 3. **`tree.sigil`** — depth-15 binary tree (65,535 nodes). Each node is
-   `Node(Int, Tree, Tree)` → count=3, bitmap≈0b110 (two pointers, one int).
-   Pins the multi-pointer shape descriptor-cache cost.
+   `Node(Int, Tree, Tree)` → count=3, bitmap=0b110 (two pointers, one int).
+   Pins the multi-pointer shape descriptor-cache cost. Subject to the
+   Plan A3 Task 44 perf gate (500ms aarch64 CI). Below the precision floor.
 
 4. **`tree_stress_repeat.sigil`** — 10 rounds of depth-12 tree build +
-   fold + drop, ~81,910 allocations across sustained alloc pressure. Pins
-   the alloc-path cost under retention churn (Boehm's heap-growth
-   threshold may trigger more collections than the single-tree workload).
+   fold + drop, ~81,910 allocations. Subject to its own perf gate. Below
+   the precision floor.
 
-5. **`descriptor_cache_stress.sigil`** — new workload for this report.
-   10 distinct sum-type shapes × 10,000 allocations each = 100,000
+5. **`tree_stress_repeat_large.sigil`** — **new for this report.** 30
+   rounds of depth-14 build + fold + drop, ~983,010 allocations.
+   A sibling of `tree_stress_repeat.sigil` scaled up for measurable
+   wall-clock signal — keeps the existing workload's perf gate
+   untouched. Expected wall-clock: 100–200ms per checkpoint.
+
+6. **`descriptor_cache_stress.sigil`** — **new for this report.** 10
+   distinct sum-type shapes × 500,000 allocations each = 5,000,000
    total. Exercises the descriptor cache at its widest shape diversity
-   (10 entries; one cache miss per shape, ~99.99% hit rate steady-state).
+   (10 entries; one cache miss per shape, ~99.999% hit rate
+   steady-state). Expected wall-clock: 150–300ms per checkpoint.
+
+The wall-clock precision floor for the first four workloads is a known
+limitation; their measurement value lies in RSS + alloc_count + GC
+time deltas, where any change is signal regardless of wall-clock
+resolution.
 
 ### Metrics
 
@@ -108,12 +120,19 @@ Builds a depth-15 binary tree (65,535 allocations), folds, prints sum.
 
 10 rounds of depth-12 build-fold-drop = 81,910 allocations.
 
+### `tree_stress_repeat_large.sigil`
+
+New. 30 rounds of depth-14 build + fold + drop. ~983,010 allocations.
+Sibling of `tree_stress_repeat.sigil` scaled up so wall-clock signal
+clears the `/usr/bin/time` precision floor without touching the
+existing workload's Plan B Task 60 perf gate.
+
 ### `descriptor_cache_stress.sigil`
 
-New. 10 distinct sum-type shapes × 10,000 allocations each. Each
-shape has a unique `(payload_count, pointer_bitmap)` pair, so the
-descriptor cache builds 10 entries (one cache miss per shape) and
-serves 99,990 hits.
+New. 10 distinct sum-type shapes × 500,000 allocations each =
+5,000,000 total. Each shape has a unique `(payload_count,
+pointer_bitmap)` pair, so the descriptor cache builds 10 entries
+(one cache miss per shape) and serves 4,999,990 hits.
 
 ## Pre-Phase-2 measurements
 

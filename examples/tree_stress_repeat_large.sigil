@@ -1,0 +1,56 @@
+// examples/tree_stress_repeat_large.sigil
+//
+// Plan E2 Phase 2 throughput-report workload — sibling to
+// `tree_stress_repeat.sigil` scaled up for measurable wall-clock
+// signal. 30 rounds of depth-14 binary tree build + fold + drop.
+//
+// Why a sibling, not a modification of `tree_stress_repeat.sigil`:
+// The original `tree_stress_repeat.sigil` is wired into the
+// Plan B Task 60 perf-floor CI gate (50ms x86 / 500ms aarch64
+// at 81,910 allocations / 10 rounds of depth-12). Scaling the
+// alloc count would either inflate the gate's wall-clock past the
+// 500ms aarch64 bound (causing CI failure) or require widening
+// the gate as part of this PR — out of scope. A sibling at a
+// larger workload size sidesteps both.
+//
+// This workload allocates 30 × (2^15 - 1) = 30 × 32,767 =
+// 983,010 nodes. At ~100ns/alloc on modern hardware, the run
+// should land in the 100-200ms range — comfortably above
+// /usr/bin/time's ~10ms precision floor, so wall-clock deltas
+// between pre and post-Phase-2 are measurable.
+//
+// Per-round sum: 2^14 - 1 = 16,383. Total: 30 × 16,383 = 491,490.
+
+import std.io
+
+type Tree = | Leaf | Node(Int, Tree, Tree)
+
+fn sum_tree(t: Tree) -> Int ![] {
+  match t {
+    Leaf => 0,
+    Node(v, l, r) => v + sum_tree(l) + sum_tree(r),
+  }
+}
+
+fn build(depth: Int) -> Tree ![] {
+  match depth {
+    0 => Leaf,
+    _ => Node(1, build(depth - 1), build(depth - 1)),
+  }
+}
+
+fn iter(rounds: Int, depth: Int, total: Int) -> Int ![] {
+  match rounds {
+    0 => total,
+    _ => {
+      let s: Int = sum_tree(build(depth));
+      iter(rounds - 1, depth, total + s)
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = iter(30, 14, 0);
+  perform IO.println(int_to_string(total));
+  0
+}

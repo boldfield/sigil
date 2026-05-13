@@ -3,20 +3,20 @@
 // Plan E2 Phase 2 throughput-report workload (plan
 // `2026-05-13-sigil-plan-e2-phase-2-throughput-report.md`, Task 2).
 //
-// Allocates N = 1,000,000 objects across K = 10 distinct sum-type
-// shapes, 100,000 per shape. Each shape's pointer-bitmap × payload-
+// Allocates N = 5,000,000 objects across K = 10 distinct sum-type
+// shapes, 500,000 per shape. Each shape's pointer-bitmap × payload-
 // count pair is unique, so the runtime's descriptor cache
 // (`runtime/src/gc/descriptor.rs`) holds exactly 10 entries by
 // the end of the run. The first allocation of each shape is a
-// cache miss (`GC_make_descriptor` called); the remaining 99,999
+// cache miss (`GC_make_descriptor` called); the remaining 499,999
 // are cache hits.
 //
-// N was bumped from the plan body's 100k to 1M after the first
-// CI measurement run showed wall_clock_ms at the edge of /usr/bin/time
-// precision (~10ms) — the report needs > 100ms signal to distinguish
-// a real delta from runner noise (per the design doc's 1.5× IQR
-// rejection threshold). 1M allocs runs in ~50-200ms depending on
-// the checkpoint.
+// N has been bumped progressively from the plan body's initial
+// 100k → 1M → 5M after successive CI runs showed wall_clock_ms
+// at the edge of /usr/bin/time precision (~10ms floor). The
+// report needs > 100ms signal to distinguish a real delta from
+// runner noise (per the design doc's 1.5× IQR rejection
+// threshold). 5M allocs runs in ~150-300ms per checkpoint.
 //
 // Workload shape:
 //   - `Tree`: a shared heap-typed scratch value the 10 stress
@@ -166,7 +166,7 @@ fn alloc_t10(n: Int, leaf: Tree, total: Int) -> Int ![] {
 
 fn main() -> Int ![IO] {
   let leaf: Tree = Leaf;
-  let n: Int = 100000;
+  let n: Int = 500000;
   let s1: Int  = alloc_t1(n, leaf, 0);
   let s2: Int  = alloc_t2(n, leaf, 0);
   let s3: Int  = alloc_t3(n, leaf, 0);
