@@ -12554,11 +12554,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let arith_effect_id_v = builder.ins().iconst(types::I32, 0);
         let arith_arm_count_v = builder.ins().iconst(types::I32, 2);
         let arith_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let arith_frame_new_call = builder.ins().call(
+        let arith_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[arith_effect_id_v, arith_arm_count_v, arith_resumes_many_v],
         );
-        let arith_frame_ptr = builder.inst_results(arith_frame_new_call)[0];
 
         let arith_null_closure = builder.ins().iconst(pointer_ty, 0);
 
@@ -12603,11 +12603,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
         let io_arm_count_v = builder.ins().iconst(types::I32, 3);
         let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let io_frame_new_call = builder.ins().call(
+        let io_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[io_effect_id_v, io_arm_count_v, io_resumes_many_v],
         );
-        let io_frame_ptr = builder.inst_results(io_frame_new_call)[0];
 
         let io_null_closure = builder.ins().iconst(pointer_ty, 0);
         // Helper for installing each IO arm at its op_id.
@@ -12633,11 +12633,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let env_effect_id_v = builder.ins().iconst(types::I32, 3);
         let env_arm_count_v = builder.ins().iconst(types::I32, 3);
         let env_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let env_frame_new_call = builder.ins().call(
+        let env_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[env_effect_id_v, env_arm_count_v, env_resumes_many_v],
         );
-        let env_frame_ptr = builder.inst_results(env_frame_new_call)[0];
         let env_null_closure = builder.ins().iconst(pointer_ty, 0);
         let install_env_arm =
             |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
@@ -12660,11 +12660,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let fs_effect_id_v = builder.ins().iconst(types::I32, 4);
         let fs_arm_count_v = builder.ins().iconst(types::I32, 10);
         let fs_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let fs_frame_new_call = builder.ins().call(
+        let fs_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[fs_effect_id_v, fs_arm_count_v, fs_resumes_many_v],
         );
-        let fs_frame_ptr = builder.inst_results(fs_frame_new_call)[0];
         let fs_null_closure = builder.ins().iconst(pointer_ty, 0);
         let install_fs_arm =
             |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
@@ -12692,7 +12692,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let process_effect_id_v = builder.ins().iconst(types::I32, 5);
         let process_arm_count_v = builder.ins().iconst(types::I32, 1);
         let process_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let process_frame_new_call = builder.ins().call(
+        let process_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[
                 process_effect_id_v,
@@ -12700,7 +12701,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 process_resumes_many_v,
             ],
         );
-        let process_frame_ptr = builder.inst_results(process_frame_new_call)[0];
         let process_null_closure = builder.ins().iconst(pointer_ty, 0);
         let process_run_op_id_v = builder.ins().iconst(types::I32, 0);
         let process_run_fn_ptr = builder.ins().func_addr(pointer_ty, process_run_arm_ref);
@@ -21968,11 +21968,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .builder
                         .ins()
                         .iconst(types::I32, if resumes_many { 1 } else { 0 });
-                    let frame_call = self.builder.ins().call(
+                    let frame_ptr = lower_alloc_call(
+                        &mut self.builder,
                         self.handler_frame_new_ref,
                         &[effect_id_v, arm_count_v, resumes_many_v],
                     );
-                    let frame_ptr = self.builder.inst_results(frame_call)[0];
                     if frame_1_ptr_snapshot.is_none() {
                         frame_1_ptr_snapshot = Some(frame_ptr);
                     }
