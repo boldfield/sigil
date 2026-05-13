@@ -81,13 +81,45 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 4 — Stackmap section v1 writer
 
-- status: pending
-- bumps `STACKMAP_VERSION_V1` to authoritative; section carries real
-  PC-keyed entries from `code.buffer.user_stack_maps()`.
-- recommendation from PR #151's spike doc: extend the v1 record with
-  a per-entry type byte (free from Cranelift; useful for Phase 2's
-  bitmap-vs-typecheck cross-check).
-- **G1 verification test lands here** per PR #156's deferral.
+- status: **in PR (Task 4 branch)**
+- v1 wire format: per-function blocks. Section header (12B) + per-fn
+  header (12B: name_len, record_count, text_offset) + name + per-record
+  header (12B: pc_offset, frame_size, entry_count, flags) + 5B entries
+  (kind:1 + sp_offset:4). Constants in `sigil-abi::stackmap`.
+- v0 writer + `push_placeholder` + `function_code_offset` retired
+  entirely (120 dead call sites + `Lowerer.stackmap` field removed).
+- Writer integration: post-`define_function` reads
+  `ctx.compiled_code().unwrap().buffer.user_stack_maps()` via a single
+  helper `define_fn_and_capture_stackmap` used at all 10 codegen sites.
+- Per-entry type byte: `STACKMAP_ENTRY_KIND_HEAP_POINTER = 0x01`
+  (the only kind v1 emits — Phase 2 may add scalar kinds for the
+  cross-check). Cranelift's `(ir::Type, sp_offset)` discarded in favour
+  of the heap-pointer-only contract (all Sigil-side flags are heap
+  pointers via `lower_alloc_call` / `lower_heap_pointer_load`).
+- Runtime parser `runtime/src/stackmap.rs` updated to v1; v0 sections
+  rejected as stale build artifacts (`UnknownVersion(0)`).
+- **G1 verification test lands**: `compiler/tests/e2e.rs` →
+  `stackmap_section_parses_v1_with_real_safepoints` compiles
+  `examples/choose_demo.sigil`, parses the `__SIGIL,__stackmaps`
+  section, asserts ≥1 fn block + ≥1 safepoint record + every entry
+  kind is `STACKMAP_ENTRY_KIND_HEAP_POINTER`. Bring-up measurement:
+  7 fn blocks, 8 records, 9 total entries.
+- **IR-level unit test lands** (per plan-body's "hand-build a known
+  IR" spec): `compiler/tests/stackmap_v1_round_trip.rs` →
+  `hand_built_alloc_and_call_round_trips_through_v1_section` builds
+  a one-fn IR (alloc → flag → consume call → return live ptr) via
+  `FunctionBuilder` + `ObjectModule::define_function`, captures
+  `user_stack_maps` into `StackMapV1Builder`, serializes, parses
+  back via `sigil_runtime::stackmap::parse_section`, and asserts
+  exactly one fn block / ≥1 record / ≥1 heap-pointer entry.
+- **C-shim handler-frame allocs flagged**: 5 raw
+  `builder.ins().call(frame_new_ref, ...)` sites in `emit_main_shim`
+  (ArithError / IO / Env / Fs / Process handler frames) +
+  `Expr::Handle` lowering's `self.handler_frame_new_ref` call site
+  refactored to use `lower_alloc_call` so their results are
+  `declare_value_needs_stack_map`'d (PR #156 / #159 missed these
+  because they're not at user-code alloc sites). Closes a Task 2c
+  residual surfaced by the G1 bring-up.
 
 ### Task 5 — Runtime stackmap reader + cross-check
 
@@ -129,9 +161,36 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ## Deviations
 
-None recorded yet. Plan-body Task 3's "stackmap section non-empty"
-test was covered transitively rather than via a fresh test — see
-the Task 3 entry above.
+- **Task 3** — plan-body's "stackmap section non-empty" test was
+  covered transitively rather than via a fresh test (see the Task 3
+  entry above).
+
+- **Task 4 wire format** — diverges from plan-body's literal spec.
+  Plan body says: `record = (PC offset, frame size, live-value
+  bitmap, register set)`. Shipped: per-record header
+  (`pc_offset:4 | frame_size:4 | entry_count:2 | flags:2`) + variable
+  per-entry list (`kind:1 | sp_offset:4`). Rationale: PR #151's
+  Cranelift 0.131 spike doc found Cranelift exposes
+  `(ir::Type, sp_offset)` per entry and recommended carrying the
+  per-entry kind byte instead of a packed bitmap (free from
+  Cranelift, useful for Phase 2's bitmap-vs-typecheck cross-check).
+  No "register set" field — Cranelift's `UserStackMap` does not
+  expose register-resident GC refs; all entries are spilled to the
+  frame and addressed via `sp_offset`. Per-function blocks (not in
+  plan body) added because the runtime needs to map PC ranges to
+  the symbol owning them; without grouping the flat record stream
+  cannot be resolved against `dlsym`-style base lookups (Task 5).
+
+- **Task 4 unit-test interpretation** — plan body's "hand-build a
+  known IR with one alloc + one fn call; emit; parse the section
+  back" lands as an integration test
+  (`compiler/tests/stackmap_v1_round_trip.rs`) that exercises the
+  ObjectModule → user_stack_maps → StackMapV1Builder → serialize →
+  parse_section path. The G1 e2e test
+  (`compiler/tests/e2e.rs::stackmap_section_parses_v1_with_real_safepoints`)
+  covers the same wire-format contract through the full
+  `emit_object` + object-file path on a real Sigil program
+  (`choose_demo.sigil`). Two layers of coverage on the same shape.
 
 ## Open follow-ups
 

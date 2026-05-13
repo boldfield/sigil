@@ -26,15 +26,16 @@
 //!   calls `sigil_panic_arith_error("division by zero")` /
 //!   `("remainder by zero")`, whose C-string payloads live in
 //!   `.rodata` / `__TEXT,__cstring`.
-//! - Safepoint metadata at every call site is accumulated through
-//!   `StackMapBuilder` and written to `.sigil_stackmaps` (ELF) /
-//!   `__SIGIL,__stackmaps` (Mach-O). The section carries a versioned
-//!   header so a v2 precise-GC reader can recognise Stage 1's
-//!   placeholder entries and bail / resynthesise from relocations rather
-//!   than consuming them as real safepoint data. See PLAN_A1_DEVIATIONS
-//!   (`[DEVIATION Task 0.11]`) for the rationale and the v0 → v1
-//!   migration plan. Plan A2's new call sites (`sigil_panic_arith_error`
-//!   per div/mod site) are added to the same placeholder stream.
+//! - Safepoint metadata is captured per-function through
+//!   `StackMapV1Builder` and written to `.sigil_stackmaps` (ELF) /
+//!   `__SIGIL,__stackmaps` (Mach-O) as v1 records. Each
+//!   `module.define_function(...)` site funnels through
+//!   `define_fn_and_capture_stackmap`, which reads
+//!   `ctx.compiled_code().buffer.user_stack_maps()` after the function
+//!   is defined and pushes a per-function block (symbol name +
+//!   per-record `(pc_offset, frame_size, entries)`) into the builder.
+//!   Plan E2 Phase 1 Task 4 retired Plan A1's v0 placeholder format;
+//!   the v1 wire format is documented at `sigil-abi::stackmap`.
 //! - No interior pointers. Generated code never computes a pointer into
 //!   the middle of a heap object; it calls runtime helpers that work with
 //!   header pointers and extract transient payload views internally.
@@ -46,7 +47,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use cranelift::codegen::ir::{
-    condcodes::IntCC, AbiParam, BlockArg, FuncRef, GlobalValue, Inst, Signature, UserFuncName,
+    condcodes::IntCC, AbiParam, BlockArg, FuncRef, GlobalValue, Signature, UserFuncName,
 };
 use cranelift::codegen::isa;
 use cranelift::codegen::settings;
@@ -58,8 +59,7 @@ use cranelift_object::{ObjectBuilder, ObjectModule};
 use target_lexicon::Triple;
 
 use sigil_abi::stackmap::{
-    STACKMAP_FLAG_PLACEHOLDER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_RECORD_SIZE,
-    STACKMAP_VERSION_PLACEHOLDER,
+    STACKMAP_ENTRY_KIND_HEAP_POINTER, STACKMAP_HEADER_SIZE, STACKMAP_MAGIC, STACKMAP_VERSION_V1,
 };
 use sigil_abi::tag::TAG_INT_SHIFT;
 use sigil_header_constants::{header_word, MAX_CLOSURE_ENV_SLOTS, TAG_CLOSURE};
@@ -7316,90 +7316,181 @@ fn mangle_user_fn(name: &str) -> String {
     format!("sigil_user_{sanitized}")
 }
 
-/// Accumulator for safepoint records emitted during function lowering.
+/// Accumulator for v1 stackmap records, populated post-`define_function`
+/// from each compiled function's `code.buffer.user_stack_maps()` and
+/// serialised into the object-file section after every function is
+/// defined.
 ///
-/// Wire-format constants (`STACKMAP_MAGIC`, `STACKMAP_VERSION_PLACEHOLDER`,
-/// `STACKMAP_HEADER_SIZE`, `STACKMAP_RECORD_SIZE`, `STACKMAP_FLAG_PLACEHOLDER`)
-/// live in `sigil-abi::stackmap` (Plan B Stage 4.5.5). The runtime's
-/// section parser (`sigil_runtime::stackmap::parse_section`) reads
-/// against the same constants.
+/// Wire-format constants (`STACKMAP_MAGIC`, `STACKMAP_VERSION_V1`,
+/// `STACKMAP_HEADER_SIZE`, `STACKMAP_FN_HEADER_SIZE`,
+/// `STACKMAP_RECORD_HEADER_SIZE_V1`, `STACKMAP_ENTRY_SIZE_V1`,
+/// `STACKMAP_ENTRY_KIND_HEAP_POINTER`) live in `sigil-abi::stackmap`.
+/// The runtime's section parser (`sigil_runtime::stackmap::parse_section`)
+/// reads against the same constants.
 ///
-/// Plan A1 emits **version 0 (placeholder)** records:
+/// v1 binary layout (per `sigil-abi::stackmap` doc-comment):
 ///
 /// ```text
-/// header  = magic:4 "SGST" | version:4 | record_count:4              // 12 bytes
-/// record  = pc_offset:4    | live_count:2 (always 0 in v0) | flags:2 //  8 bytes
+/// section header (12 bytes):
+///   magic:4 "SGST" | version:4 (=1) | fn_count:4
+///
+/// per-function block (variable):
+///   fn_header:12 = name_len:4 | record_count:4 | text_offset:4 (=0 in v1)
+///   name: name_len bytes (UTF-8 linker symbol)
+///   records[record_count]:
+///     record_header:12 = pc_offset:4 | frame_size:4 | entry_count:2 | flags:2
+///     entries[entry_count]:
+///       entry:5 = kind:1 | sp_offset:4
 /// ```
 ///
-/// `flags` has bit 0 (`STACKMAP_FLAG_PLACEHOLDER`) set in v0 so a v2
-/// reader that only understands version 1 can detect stale placeholder
-/// records on a per-record basis as well as via the version field.
-///
-/// Version 1 (Plan B) will reuse the same header; the record format
-/// gains a live-value list per record and `pc_offset` becomes a real
-/// post-regalloc code offset via Cranelift's safepoint API.
-///
-/// Stage 1 populates each record with an opaque placeholder (the
-/// Cranelift `Inst` handle of the call site, not a real post-regalloc
-/// code offset) and `live_count = 0`. Plan B replaces `push_placeholder`
-/// with a real `push(pc_offset, live_values)` API backed by Cranelift's
-/// safepoint metadata. The section header's version field is bumped at
-/// the same time so existing consumers can distinguish the formats.
-pub struct StackMapBuilder {
-    records: Vec<StackMapRecord>,
+/// Plan A1's v0 placeholder format is retired by this builder; the
+/// `push_placeholder` API and the `function_code_offset` IR-handle
+/// approximation are gone, replaced by Cranelift's automatic safepoint
+/// pass + `code.buffer.user_stack_maps()` post-compile read.
+pub struct StackMapV1Builder {
+    functions: Vec<StackMapV1Function>,
 }
 
-struct StackMapRecord {
-    pc_offset_placeholder: u32,
+struct StackMapV1Function {
+    symbol_name: String,
+    records: Vec<StackMapV1Record>,
 }
 
-impl StackMapBuilder {
+struct StackMapV1Record {
+    pc_offset: u32,
+    frame_size: u32,
+    flags: u16,
+    entries: Vec<StackMapV1Entry>,
+}
+
+struct StackMapV1Entry {
+    kind: u8,
+    sp_offset: u32,
+}
+
+impl StackMapV1Builder {
     pub fn new() -> Self {
         Self {
-            records: Vec::new(),
+            functions: Vec::new(),
         }
     }
 
-    /// Record a safepoint call site. Stage 1 stores the Cranelift `Inst`
-    /// handle as the `pc_offset` field — this is a placeholder; the
-    /// `STACKMAP_FLAG_PLACEHOLDER` bit in the record's flags makes that
-    /// status visible to downstream readers.
-    pub fn push_placeholder(&mut self, pc_offset_placeholder: u32) {
-        self.records.push(StackMapRecord {
-            pc_offset_placeholder,
+    /// Record a compiled function's stack maps as a v1 function block.
+    /// Called once per successful `module.define_function(...)`, before
+    /// the next `module.clear_context(...)`. Functions with no
+    /// safepoints (zero stack-map entries from Cranelift) emit an empty
+    /// function block — readers tolerate `record_count == 0`.
+    pub fn push_function(
+        &mut self,
+        symbol_name: String,
+        maps: &[(u32, u32, cranelift::codegen::ir::UserStackMap)],
+    ) {
+        let mut records = Vec::with_capacity(maps.len());
+        for (pc_offset, frame_size, sm) in maps {
+            let entries: Vec<StackMapV1Entry> = sm
+                .entries()
+                .map(|(_ty, sp_offset)| StackMapV1Entry {
+                    kind: STACKMAP_ENTRY_KIND_HEAP_POINTER,
+                    sp_offset,
+                })
+                .collect();
+            records.push(StackMapV1Record {
+                pc_offset: *pc_offset,
+                frame_size: *frame_size,
+                flags: 0,
+                entries,
+            });
+        }
+        self.functions.push(StackMapV1Function {
+            symbol_name,
+            records,
         });
     }
 
-    pub fn len(&self) -> usize {
-        self.records.len()
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+    /// Total record count across all function blocks. Diagnostic only;
+    /// the v1 reader walks per-function blocks rather than a flat count.
+    pub fn total_records(&self) -> usize {
+        self.functions.iter().map(|f| f.records.len()).sum()
     }
 
-    /// Serialise the section body (header + all records). Little-endian
-    /// on the host; the section is not relocated, so endianness of the
-    /// emitter matches endianness of the consumer.
+    /// Serialise the section body (section header + per-function blocks).
+    /// Little-endian on the host; the section is not relocated, so
+    /// endianness of the emitter matches endianness of the consumer.
     pub fn serialize(&self) -> Vec<u8> {
-        let mut out =
-            Vec::with_capacity(STACKMAP_HEADER_SIZE + self.records.len() * STACKMAP_RECORD_SIZE);
+        // Conservative capacity: section header + per-fn (header + name +
+        // per-record (header + entries)). Actual size is computed exactly
+        // in the loop below.
+        let mut out = Vec::with_capacity(STACKMAP_HEADER_SIZE);
         out.extend_from_slice(STACKMAP_MAGIC);
-        out.extend_from_slice(&STACKMAP_VERSION_PLACEHOLDER.to_le_bytes());
-        out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
-        for r in &self.records {
-            out.extend_from_slice(&r.pc_offset_placeholder.to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes()); // live_count = 0 in v0
-            out.extend_from_slice(&STACKMAP_FLAG_PLACEHOLDER.to_le_bytes());
+        out.extend_from_slice(&STACKMAP_VERSION_V1.to_le_bytes());
+        out.extend_from_slice(&(self.functions.len() as u32).to_le_bytes());
+
+        for f in &self.functions {
+            let name_bytes = f.symbol_name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(f.records.len() as u32).to_le_bytes());
+            out.extend_from_slice(&0u32.to_le_bytes()); // text_offset reserved
+            out.extend_from_slice(name_bytes);
+
+            for r in &f.records {
+                out.extend_from_slice(&r.pc_offset.to_le_bytes());
+                out.extend_from_slice(&r.frame_size.to_le_bytes());
+                out.extend_from_slice(&(r.entries.len() as u16).to_le_bytes());
+                out.extend_from_slice(&r.flags.to_le_bytes());
+                for e in &r.entries {
+                    out.push(e.kind);
+                    out.extend_from_slice(&e.sp_offset.to_le_bytes());
+                }
+            }
         }
         out
     }
 }
 
-impl Default for StackMapBuilder {
+impl Default for StackMapV1Builder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Capture v1 stack maps from a just-defined function and clear the
+/// context for the next function. Replaces the
+/// `module.define_function(...)? + module.clear_context(...)` pair at
+/// every codegen site that defines a function — the helper guarantees
+/// the `user_stack_maps()` read happens between the two (`clear_context`
+/// drops the compiled-code data Cranelift exposes).
+///
+/// The function's linker symbol name is looked up via
+/// `module.declarations().get_function_decl(func_id).name`. Falls back
+/// to `fn_label` if Cranelift returns an anonymous decl — this only
+/// happens for entirely-internal helpers, which Plan E2's codegen does
+/// not create (every fn we define is name-declared first).
+fn define_fn_and_capture_stackmap(
+    module: &mut ObjectModule,
+    ctx: &mut cranelift::codegen::Context,
+    func_id: cranelift_module::FuncId,
+    fn_label: &str,
+    stackmap: &mut StackMapV1Builder,
+) -> Result<(), String> {
+    let symbol_name = module
+        .declarations()
+        .get_function_decl(func_id)
+        .name
+        .clone()
+        .unwrap_or_else(|| fn_label.to_string());
+    module
+        .define_function(func_id, ctx)
+        .map_err(|e| format_define_failure(fn_label, &e, ctx))?;
+    if let Some(compiled) = ctx.compiled_code() {
+        let maps = compiled.buffer.user_stack_maps();
+        stackmap.push_function(symbol_name, maps);
+    }
+    module.clear_context(ctx);
+    Ok(())
 }
 
 /// Compile `cc` to an object file at `out_path`. Returns `Ok(())` on
@@ -9885,9 +9976,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         }
     }
 
-    // Accumulate safepoint records. Stage 1 writes placeholder records
-    // (see StackMapBuilder's doc comment).
-    let mut stackmap = StackMapBuilder::new();
+    // Accumulate v1 safepoint records, one per-function block per
+    // `module.define_function(...)` (via `define_fn_and_capture_stackmap`).
+    // See `StackMapV1Builder`'s doc comment for the wire format.
+    let mut stackmap = StackMapV1Builder::new();
 
     // Define string-literal data objects: one DataId per literal, payload
     // is the raw UTF-8 bytes with no header.
@@ -10429,7 +10521,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // captured + bound in the synth-cont env.
                     let mut lowerer = Lowerer {
                         builder,
-                        stackmap: &mut stackmap,
                         env,
                         pointer_ty,
                         chain_outer_post_arm_k_pushes: 0,
@@ -10798,7 +10889,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                             let closure_record = lower_alloc_call(
                                 &mut lowerer.builder,
-                                lowerer.stackmap,
                                 lowerer.builtins.alloc_ref,
                                 &[header_v, payload_v],
                             );
@@ -11020,10 +11110,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     ra_fired_perform,
                                 ],
                             );
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                perform_call,
-                            ));
                             lowerer.builder.inst_results(perform_call)[0]
                         } else {
                             // ConstantDone arm. Classifier guarantees
@@ -11076,10 +11162,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 done_or_dispatch_return_arm_via_args_ref,
                                 &[const_v, ra_closure, ra_fn, ra_fired_ptr],
                             );
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                done_call,
-                            ));
                             lowerer.builder.inst_results(done_call)[0]
                         };
 
@@ -11133,10 +11215,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     lowerer.builder.ins().return_(&[next_step]);
                     lowerer.builder.finalize();
 
-                    module
-                        .define_function(entry.func_id, &mut ctx)
-                        .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
-                    module.clear_context(&mut ctx);
+                    define_fn_and_capture_stackmap(
+                        &mut module,
+                        &mut ctx,
+                        entry.func_id,
+                        &f.name,
+                        &mut stackmap,
+                    )?;
                     continue;
                 }
 
@@ -11483,12 +11568,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let cp = lower_alloc_call(
-                            &mut builder,
-                            &mut stackmap,
-                            alloc_ref,
-                            &[header_v, payload_v],
-                        );
+                        let cp = lower_alloc_call(&mut builder, alloc_ref, &[header_v, payload_v]);
 
                         // Null code_ptr at offset 8.
                         let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -11648,12 +11728,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let cp = lower_alloc_call(
-                            &mut builder,
-                            &mut stackmap,
-                            alloc_ref,
-                            &[header_v, payload_v],
-                        );
+                        let cp = lower_alloc_call(&mut builder, alloc_ref, &[header_v, payload_v]);
 
                         let null_v = builder.ins().iconst(pointer_ty, 0);
                         builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
@@ -11762,7 +11837,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // the trampoline directly.
                 let mut lowerer = Lowerer {
                     builder,
-                    stackmap: &mut stackmap,
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
@@ -11845,17 +11919,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         lowerer.next_step_call_ref,
                         &[k_closure_loaded, synth_cont_addr_v, three_v],
                     );
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                     let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                     let argp_call = lowerer
                         .builder
                         .ins()
                         .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
                     let argp_v = lowerer.builder.inst_results(argp_call)[0];
 
                     let zero = lowerer.builder.ins().iconst(types::I64, 0);
@@ -12004,10 +12072,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     ra_fired_perform,
                                 ],
                             );
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                perform_call,
-                            ));
                             lowerer.builder.inst_results(perform_call)[0]
                         }
                         // Plan D Task 112 — body's first step is a
@@ -12132,18 +12196,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 lowerer.next_step_call_ref,
                                 &[null_closure, callee_fn_addr, arg_count_v],
                             );
-                            lowerer
-                                .stackmap
-                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                             let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                             let argp_call = lowerer
                                 .builder
                                 .ins()
                                 .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                argp_call,
-                            ));
                             let argp_v = lowerer.builder.inst_results(argp_call)[0];
                             for (i, w) in widened_args.iter().enumerate() {
                                 lowerer.builder.ins().store(
@@ -12201,10 +12258,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // ending the `&mut ctx.func` borrow. The module ops
                 // below safely get `&mut ctx`.
 
-                module
-                    .define_function(entry.func_id, &mut ctx)
-                    .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
-                module.clear_context(&mut ctx);
+                define_fn_and_capture_stackmap(
+                    &mut module,
+                    &mut ctx,
+                    entry.func_id,
+                    &f.name,
+                    &mut stackmap,
+                )?;
                 continue;
             }
 
@@ -12236,7 +12296,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let is_main = f.name == "main";
             let mut lowerer = Lowerer {
                 builder,
-                stackmap: &mut stackmap,
                 env,
                 pointer_ty,
                 chain_outer_post_arm_k_pushes: 0,
@@ -12406,10 +12465,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             }
             lowerer.builder.finalize();
         }
-        module
-            .define_function(entry.func_id, &mut ctx)
-            .map_err(|e| format_define_failure(&f.name, &e, &ctx))?;
-        module.clear_context(&mut ctx);
+        define_fn_and_capture_stackmap(
+            &mut module,
+            &mut ctx,
+            entry.func_id,
+            &f.name,
+            &mut stackmap,
+        )?;
     }
 
     // --- main shim -------------------------------------------------------
@@ -12486,8 +12548,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let arith_div_arm_ref = module.declare_func_in_func(arith_error_div_arm, builder.func);
         let arith_mod_arm_ref = module.declare_func_in_func(arith_error_mod_arm, builder.func);
 
-        let init_call = builder.ins().call(gc_init_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, init_call));
+        builder.ins().call(gc_init_ref, &[]);
 
         // ────── ArithError handler frame (first-pushed, last-popped) ──────
         // effect_id=0 (reserved low id), arm_count=2 (div_by_zero,
@@ -12495,19 +12556,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let arith_effect_id_v = builder.ins().iconst(types::I32, 0);
         let arith_arm_count_v = builder.ins().iconst(types::I32, 2);
         let arith_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let arith_frame_new_call = builder.ins().call(
+        let arith_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[arith_effect_id_v, arith_arm_count_v, arith_resumes_many_v],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, arith_frame_new_call));
-        let arith_frame_ptr = builder.inst_results(arith_frame_new_call)[0];
 
         let arith_null_closure = builder.ins().iconst(pointer_ty, 0);
 
         // op_id 0 = `div_by_zero` (alphabetically first).
         let arith_div_op_id_v = builder.ins().iconst(types::I32, 0);
         let arith_div_fn_ptr = builder.ins().func_addr(pointer_ty, arith_div_arm_ref);
-        let arith_set_div_call = builder.ins().call(
+        builder.ins().call(
             frame_set_arm_ref,
             &[
                 arith_frame_ptr,
@@ -12516,12 +12576,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arith_null_closure,
             ],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, arith_set_div_call));
 
         // op_id 1 = `mod_by_zero`.
         let arith_mod_op_id_v = builder.ins().iconst(types::I32, 1);
         let arith_mod_fn_ptr = builder.ins().func_addr(pointer_ty, arith_mod_arm_ref);
-        let arith_set_mod_call = builder.ins().call(
+        builder.ins().call(
             frame_set_arm_ref,
             &[
                 arith_frame_ptr,
@@ -12530,13 +12589,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 arith_null_closure,
             ],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, arith_set_mod_call));
 
         // Push ArithError first (becomes last-popped = bottom-of-stack
         // for this shim's bracket); save its pointer for the
         // discipline-check comparison at the second pop.
-        let arith_push_call = builder.ins().call(handle_push_ref, &[arith_frame_ptr]);
-        stackmap.push_placeholder(function_code_offset(&builder, arith_push_call));
+        builder.ins().call(handle_push_ref, &[arith_frame_ptr]);
 
         // ────── IO handler frame (last-pushed, first-popped) ──────
         // effect_id=1, arm_count=3. Op IDs (alphabetical, post-Plan-C-
@@ -12548,34 +12605,29 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
         let io_arm_count_v = builder.ins().iconst(types::I32, 3);
         let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let io_frame_new_call = builder.ins().call(
+        let io_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[io_effect_id_v, io_arm_count_v, io_resumes_many_v],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, io_frame_new_call));
-        let io_frame_ptr = builder.inst_results(io_frame_new_call)[0];
 
         let io_null_closure = builder.ins().iconst(pointer_ty, 0);
         // Helper for installing each IO arm at its op_id.
-        let install_io_arm = |builder: &mut FunctionBuilder<'_>,
-                              stackmap: &mut StackMapBuilder,
-                              op_id: i64,
-                              arm_fn_ref: FuncRef| {
-            let op_id_v = builder.ins().iconst(types::I32, op_id);
-            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
-            let set_arm_call = builder.ins().call(
-                frame_set_arm_ref,
-                &[io_frame_ptr, op_id_v, arm_fn_ptr, io_null_closure],
-            );
-            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
-        };
-        install_io_arm(&mut builder, &mut stackmap, 0, io_print_arm_ref); // print
-        install_io_arm(&mut builder, &mut stackmap, 1, io_println_arm_ref); // println
-        install_io_arm(&mut builder, &mut stackmap, 2, io_read_line_arm_ref); // read_line
+        let install_io_arm =
+            |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
+                let op_id_v = builder.ins().iconst(types::I32, op_id);
+                let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+                builder.ins().call(
+                    frame_set_arm_ref,
+                    &[io_frame_ptr, op_id_v, arm_fn_ptr, io_null_closure],
+                );
+            };
+        install_io_arm(&mut builder, 0, io_print_arm_ref); // print
+        install_io_arm(&mut builder, 1, io_println_arm_ref); // println
+        install_io_arm(&mut builder, 2, io_read_line_arm_ref); // read_line
 
         // Push the IO frame.
-        let push_call = builder.ins().call(handle_push_ref, &[io_frame_ptr]);
-        stackmap.push_placeholder(function_code_offset(&builder, push_call));
+        builder.ins().call(handle_push_ref, &[io_frame_ptr]);
 
         // ────── Env handler frame (effect_id=3, arm_count=3) ──────
         // Plan C addendum (CLI external-system effects, EE3). Op IDs
@@ -12583,30 +12635,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let env_effect_id_v = builder.ins().iconst(types::I32, 3);
         let env_arm_count_v = builder.ins().iconst(types::I32, 3);
         let env_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let env_frame_new_call = builder.ins().call(
+        let env_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[env_effect_id_v, env_arm_count_v, env_resumes_many_v],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, env_frame_new_call));
-        let env_frame_ptr = builder.inst_results(env_frame_new_call)[0];
         let env_null_closure = builder.ins().iconst(pointer_ty, 0);
-        let install_env_arm = |builder: &mut FunctionBuilder<'_>,
-                               stackmap: &mut StackMapBuilder,
-                               op_id: i64,
-                               arm_fn_ref: FuncRef| {
-            let op_id_v = builder.ins().iconst(types::I32, op_id);
-            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
-            let set_arm_call = builder.ins().call(
-                frame_set_arm_ref,
-                &[env_frame_ptr, op_id_v, arm_fn_ptr, env_null_closure],
-            );
-            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
-        };
-        install_env_arm(&mut builder, &mut stackmap, 0, env_args_arm_ref);
-        install_env_arm(&mut builder, &mut stackmap, 1, env_var_arm_ref);
-        install_env_arm(&mut builder, &mut stackmap, 2, env_vars_arm_ref);
-        let env_push_call = builder.ins().call(handle_push_ref, &[env_frame_ptr]);
-        stackmap.push_placeholder(function_code_offset(&builder, env_push_call));
+        let install_env_arm =
+            |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
+                let op_id_v = builder.ins().iconst(types::I32, op_id);
+                let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+                builder.ins().call(
+                    frame_set_arm_ref,
+                    &[env_frame_ptr, op_id_v, arm_fn_ptr, env_null_closure],
+                );
+            };
+        install_env_arm(&mut builder, 0, env_args_arm_ref);
+        install_env_arm(&mut builder, 1, env_var_arm_ref);
+        install_env_arm(&mut builder, 2, env_vars_arm_ref);
+        builder.ins().call(handle_push_ref, &[env_frame_ptr]);
 
         // ────── Fs handler frame (effect_id=4, arm_count=10) ──────
         // Op IDs (alphabetical): exists=0, file_size=1, is_dir=2,
@@ -12615,44 +12662,40 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let fs_effect_id_v = builder.ins().iconst(types::I32, 4);
         let fs_arm_count_v = builder.ins().iconst(types::I32, 10);
         let fs_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let fs_frame_new_call = builder.ins().call(
+        let fs_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[fs_effect_id_v, fs_arm_count_v, fs_resumes_many_v],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, fs_frame_new_call));
-        let fs_frame_ptr = builder.inst_results(fs_frame_new_call)[0];
         let fs_null_closure = builder.ins().iconst(pointer_ty, 0);
-        let install_fs_arm = |builder: &mut FunctionBuilder<'_>,
-                              stackmap: &mut StackMapBuilder,
-                              op_id: i64,
-                              arm_fn_ref: FuncRef| {
-            let op_id_v = builder.ins().iconst(types::I32, op_id);
-            let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
-            let set_arm_call = builder.ins().call(
-                frame_set_arm_ref,
-                &[fs_frame_ptr, op_id_v, arm_fn_ptr, fs_null_closure],
-            );
-            stackmap.push_placeholder(function_code_offset(builder, set_arm_call));
-        };
-        install_fs_arm(&mut builder, &mut stackmap, 0, fs_exists_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 1, fs_file_size_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 2, fs_is_dir_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 3, fs_is_file_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 4, fs_mkdir_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 5, fs_read_dir_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 6, fs_read_file_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 7, fs_remove_dir_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 8, fs_remove_file_arm_ref);
-        install_fs_arm(&mut builder, &mut stackmap, 9, fs_write_file_arm_ref);
-        let fs_push_call = builder.ins().call(handle_push_ref, &[fs_frame_ptr]);
-        stackmap.push_placeholder(function_code_offset(&builder, fs_push_call));
+        let install_fs_arm =
+            |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
+                let op_id_v = builder.ins().iconst(types::I32, op_id);
+                let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+                builder.ins().call(
+                    frame_set_arm_ref,
+                    &[fs_frame_ptr, op_id_v, arm_fn_ptr, fs_null_closure],
+                );
+            };
+        install_fs_arm(&mut builder, 0, fs_exists_arm_ref);
+        install_fs_arm(&mut builder, 1, fs_file_size_arm_ref);
+        install_fs_arm(&mut builder, 2, fs_is_dir_arm_ref);
+        install_fs_arm(&mut builder, 3, fs_is_file_arm_ref);
+        install_fs_arm(&mut builder, 4, fs_mkdir_arm_ref);
+        install_fs_arm(&mut builder, 5, fs_read_dir_arm_ref);
+        install_fs_arm(&mut builder, 6, fs_read_file_arm_ref);
+        install_fs_arm(&mut builder, 7, fs_remove_dir_arm_ref);
+        install_fs_arm(&mut builder, 8, fs_remove_file_arm_ref);
+        install_fs_arm(&mut builder, 9, fs_write_file_arm_ref);
+        builder.ins().call(handle_push_ref, &[fs_frame_ptr]);
 
         // ────── Process handler frame (effect_id=5, arm_count=1) ──────
         // Op IDs: run=0.
         let process_effect_id_v = builder.ins().iconst(types::I32, 5);
         let process_arm_count_v = builder.ins().iconst(types::I32, 1);
         let process_resumes_many_v = builder.ins().iconst(types::I32, 0);
-        let process_frame_new_call = builder.ins().call(
+        let process_frame_ptr = lower_alloc_call(
+            &mut builder,
             frame_new_ref,
             &[
                 process_effect_id_v,
@@ -12660,12 +12703,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 process_resumes_many_v,
             ],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, process_frame_new_call));
-        let process_frame_ptr = builder.inst_results(process_frame_new_call)[0];
         let process_null_closure = builder.ins().iconst(pointer_ty, 0);
         let process_run_op_id_v = builder.ins().iconst(types::I32, 0);
         let process_run_fn_ptr = builder.ins().func_addr(pointer_ty, process_run_arm_ref);
-        let process_set_run_call = builder.ins().call(
+        builder.ins().call(
             frame_set_arm_ref,
             &[
                 process_frame_ptr,
@@ -12674,9 +12715,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 process_null_closure,
             ],
         );
-        stackmap.push_placeholder(function_code_offset(&builder, process_set_run_call));
-        let process_push_call = builder.ins().call(handle_push_ref, &[process_frame_ptr]);
-        stackmap.push_placeholder(function_code_offset(&builder, process_push_call));
+        builder.ins().call(handle_push_ref, &[process_frame_ptr]);
 
         // user-main takes the closure-calling-convention closure_ptr as
         // arg 0. The shim is not a closure entry point, so it passes a
@@ -12710,7 +12749,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let um_call = builder
             .ins()
             .call(user_main_ref, &[null_closure, terminal_out_v]);
-        stackmap.push_placeholder(function_code_offset(&builder, um_call));
 
         // Pop in reverse order of push: Process, Fs, Env, IO,
         // ArithError. In debug builds verify each pop matches the
@@ -12718,7 +12756,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // ArithError gets the discipline trap at the bottom — mirrors
         // Phase 4f's `Expr::Handle`-exit discipline).
         let process_pop_call = builder.ins().call(handle_pop_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, process_pop_call));
         if cfg!(debug_assertions) {
             let popped_process = builder.inst_results(process_pop_call)[0];
             let process_mismatch =
@@ -12737,7 +12774,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.seal_block(ok);
         }
         let fs_pop_call = builder.ins().call(handle_pop_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, fs_pop_call));
         if cfg!(debug_assertions) {
             let popped_fs = builder.inst_results(fs_pop_call)[0];
             let fs_mismatch = builder.ins().icmp(IntCC::NotEqual, popped_fs, fs_frame_ptr);
@@ -12753,7 +12789,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.seal_block(ok);
         }
         let env_pop_call = builder.ins().call(handle_pop_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, env_pop_call));
         if cfg!(debug_assertions) {
             let popped_env = builder.inst_results(env_pop_call)[0];
             let env_mismatch = builder
@@ -12771,7 +12806,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.seal_block(ok);
         }
         let io_pop_call = builder.ins().call(handle_pop_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, io_pop_call));
         if cfg!(debug_assertions) {
             let popped_io = builder.inst_results(io_pop_call)[0];
             let io_mismatch = builder.ins().icmp(IntCC::NotEqual, popped_io, io_frame_ptr);
@@ -12787,7 +12821,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.seal_block(ok);
         }
         let arith_pop_call = builder.ins().call(handle_pop_ref, &[]);
-        stackmap.push_placeholder(function_code_offset(&builder, arith_pop_call));
         if cfg!(debug_assertions) {
             let popped_arith = builder.inst_results(arith_pop_call)[0];
             let arith_mismatch = builder
@@ -12817,10 +12850,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.ins().return_(&[narrowed]);
         builder.finalize();
     }
-    module
-        .define_function(main, &mut ctx)
-        .map_err(|e| format_define_failure("main", &e, &ctx))?;
-    module.clear_context(&mut ctx);
+    define_fn_and_capture_stackmap(&mut module, &mut ctx, main, "main", &mut stackmap)?;
 
     // --- Plan B Task 55 (Phase 4c): synthetic handler-arm CPS fns ------
     //
@@ -12999,7 +13029,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let mut lowerer = Lowerer {
                     builder,
-                    stackmap: &mut stackmap,
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
@@ -13183,7 +13212,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                     let step_0_closure_ptr = lower_alloc_call(
                         &mut lowerer.builder,
-                        lowerer.stackmap,
                         builtins.alloc_ref,
                         &[header_v, payload_v],
                     );
@@ -13309,17 +13337,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                     let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                     let argp_call = lowerer
                         .builder
                         .ins()
                         .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
                     let argp_v = lowerer.builder.inst_results(argp_call)[0];
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
@@ -13462,7 +13484,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                         let cp = lower_alloc_call(
                             &mut lowerer.builder,
-                            lowerer.stackmap,
                             lowerer.builtins.alloc_ref,
                             &[header_v, payload_v],
                         );
@@ -13666,17 +13687,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         next_step_call_ref,
                         &[post_arm_k_closure_v, post_arm_k_fn_addr, one_v],
                     );
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns_id));
                     let ns_ptr_id = lowerer.builder.inst_results(call_ns_id)[0];
                     let argp_call_id = lowerer
                         .builder
                         .ins()
                         .call(next_step_args_ptr_ref, &[ns_ptr_id]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call_id));
                     let argp_v_id = lowerer.builder.inst_results(argp_call_id)[0];
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
@@ -13695,17 +13710,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                     let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                     let argp_call = lowerer
                         .builder
                         .ins()
                         .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
                     let argp_v = lowerer.builder.inst_results(argp_call)[0];
                     lowerer.builder.ins().store(
                         MemFlags::trusted(),
@@ -13786,17 +13795,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                     let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                     let argp_call = lowerer
                         .builder
                         .ins()
                         .call(next_step_args_ptr_ref, &[ns_ptr]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
                     let argp_v = lowerer.builder.inst_results(argp_call)[0];
                     // Trailing-pair convention: [arg,
                     // post_arm_k_closure, post_arm_k_fn] at offsets
@@ -13872,18 +13875,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .builder
                         .ins()
                         .call(next_step_discharged_ref, &[widened_body]);
-                    lowerer
-                        .stackmap
-                        .push_placeholder(function_code_offset(&lowerer.builder, done_call));
                     lowerer.builder.inst_results(done_call)[0]
                 };
                 lowerer.builder.ins().return_(&[next_step_ptr]);
                 lowerer.builder.finalize();
             }
-            module
-                .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format_define_failure("handler arm fn", &e, &ctx))?;
-            module.clear_context(&mut ctx);
+            define_fn_and_capture_stackmap(
+                &mut module,
+                &mut ctx,
+                synth.func_id,
+                "handler arm fn",
+                &mut stackmap,
+            )?;
         }
     }
 
@@ -14056,7 +14059,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let mut lowerer = Lowerer {
                     builder,
-                    stackmap: &mut stackmap,
                     env,
                     pointer_ty,
                     chain_outer_post_arm_k_pushes: 0,
@@ -14152,18 +14154,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     next_step_call_ref,
                     &[post_handle_k_closure_v, post_handle_k_fn_v, three_v],
                 );
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                 let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
 
                 let argp_call = lowerer
                     .builder
                     .ins()
                     .call(next_step_args_ptr_ref, &[ns_ptr]);
-                lowerer
-                    .stackmap
-                    .push_placeholder(function_code_offset(&lowerer.builder, argp_call));
                 let argp_v = lowerer.builder.inst_results(argp_call)[0];
 
                 lowerer.builder.ins().store(
@@ -14193,10 +14189,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 lowerer.builder.ins().return_(&[ns_ptr]);
                 lowerer.builder.finalize();
             }
-            module
-                .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| format_define_failure("handler return-arm fn", &e, &ctx))?;
-            module.clear_context(&mut ctx);
+            define_fn_and_capture_stackmap(
+                &mut module,
+                &mut ctx,
+                synth.func_id,
+                "handler return-arm fn",
+                &mut stackmap,
+            )?;
         }
     }
 
@@ -14243,7 +14242,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             ctx.func.name = UserFuncName::user(0, post_arm_k.func_id.as_u32());
 
             let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-            let mut stackmap = StackMapBuilder::new();
+            let mut stackmap = StackMapV1Builder::new();
             let block = builder.create_block();
             builder.append_block_params_for_function_params(block);
             builder.switch_to_block(block);
@@ -14351,7 +14350,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             builder.declare_value_needs_stack_map(closure_ptr);
             let mut lowerer = Lowerer {
                 builder,
-                stackmap: &mut stackmap,
                 env,
                 pointer_ty,
                 chain_outer_post_arm_k_pushes: 0,
@@ -14475,17 +14473,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 done_or_dispatch_return_arm_via_args_ref,
                 &[widened_tail, ra_closure_pak, ra_fn_pak, ra_fired_ptr_pak],
             );
-            lowerer
-                .stackmap
-                .push_placeholder(function_code_offset(&lowerer.builder, done_call));
             let next_step = lowerer.builder.inst_results(done_call)[0];
             lowerer.builder.ins().return_(&[next_step]);
             lowerer.builder.finalize();
 
-            module
-                .define_function(post_arm_k.func_id, &mut ctx)
-                .map_err(|e| format_define_failure("post-arm-k synth fn", &e, &ctx))?;
-            module.clear_context(&mut ctx);
+            define_fn_and_capture_stackmap(
+                &mut module,
+                &mut ctx,
+                post_arm_k.func_id,
+                "post-arm-k synth fn",
+                &mut stackmap,
+            )?;
         }
     }
 
@@ -14529,7 +14527,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 ctx.func.name = UserFuncName::user(0, step.func_id.as_u32());
                 {
                     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                    let mut stackmap = StackMapBuilder::new();
+                    let _stackmap = StackMapV1Builder::new();
                     let block = builder.create_block();
                     builder.append_block_params_for_function_params(block);
                     builder.switch_to_block(block);
@@ -14618,10 +14616,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             next_step_call_local,
                             &[return_closure_v, return_fn_v, three_v],
                         );
-                        stackmap.push_placeholder(function_code_offset(&builder, ns_call));
                         let ns_v = builder.inst_results(ns_call)[0];
                         let argp_call = builder.ins().call(next_step_args_ptr_local, &[ns_v]);
-                        stackmap.push_placeholder(function_code_offset(&builder, argp_call));
                         let argp_v = builder.inst_results(argp_call)[0];
                         builder.ins().store(
                             MemFlags::trusted(),
@@ -14645,8 +14641,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             argp_v,
                             POST_ARM_K_FN_OFF,
                         );
-                        let rl_call = builder.ins().call(run_loop_local, &[ns_v, terminal_out]);
-                        stackmap.push_placeholder(function_code_offset(&builder, rl_call));
+                        builder.ins().call(run_loop_local, &[ns_v, terminal_out]);
                         builder.ins().load(
                             types::I64,
                             MemFlags::trusted(),
@@ -14774,7 +14769,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                     let mut lowerer = Lowerer {
                         builder,
-                        stackmap: &mut stackmap,
                         env,
                         pointer_ty,
                         chain_outer_post_arm_k_pushes: 0,
@@ -14902,10 +14896,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     .builder
                                     .ins()
                                     .call(next_step_discharged_ref, &[widened_tail]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    disch_call,
-                                ));
                                 let next_step = lowerer.builder.inst_results(disch_call)[0];
                                 lowerer.builder.ins().return_(&[next_step]);
                             } else {
@@ -14946,10 +14936,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     done_or_dispatch_return_arm_via_args_ref,
                                     &[widened_tail, ra_closure_slc, ra_fn_slc, ra_fired_ptr_slc],
                                 );
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    done_call,
-                                ));
                                 let next_step = lowerer.builder.inst_results(done_call)[0];
                                 lowerer.builder.ins().return_(&[next_step]);
                             }
@@ -15117,7 +15103,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                             let next_closure_ptr = lower_alloc_call(
                                 &mut lowerer.builder,
-                                lowerer.stackmap,
                                 lowerer.builtins.alloc_ref,
                                 &[header_v, payload_v],
                             );
@@ -15297,18 +15282,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 .builder
                                 .ins()
                                 .call(next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-                            lowerer
-                                .stackmap
-                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                             let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                             let argp_call = lowerer
                                 .builder
                                 .ins()
                                 .call(next_step_args_ptr_ref, &[ns_ptr]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                argp_call,
-                            ));
                             let argp_v = lowerer.builder.inst_results(argp_call)[0];
                             lowerer.builder.ins().store(
                                 MemFlags::trusted(),
@@ -15333,16 +15311,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         }
                     }
                 }
-                module
-                    .define_function(step.func_id, &mut ctx)
-                    .map_err(|e| {
-                        format!(
-                            "define post_arm_k_{} synth fn for `{}`'s chain: {e}",
-                            step_idx + 1,
-                            synth.k_name
-                        )
-                    })?;
-                module.clear_context(&mut ctx);
+                let step_label = format!(
+                    "post_arm_k_{} synth fn for `{}`'s chain",
+                    step_idx + 1,
+                    synth.k_name,
+                );
+                define_fn_and_capture_stackmap(
+                    &mut module,
+                    &mut ctx,
+                    step.func_id,
+                    &step_label,
+                    &mut stackmap,
+                )?;
             }
         }
     }
@@ -15412,45 +15392,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // dispatch their result through the post-arm-k
                 // continuation.
                 //
-                // TODO(plan-b-task-55-phase-4e-captures/stackmap-root-audit):
-                // This marker covers FOUR sites where heap pointers
-                // live across arena allocations:
-                //   1. THIS site (Slice A's helper synth-cont load
-                //      of `post_arm_k_closure` — null for tail-`k`
-                //      arms, but a real heap-allocated TAG_CLOSURE
-                //      record under Slice B / C non-tail-`k` paths).
-                //   2. Slice C arm-fn body emit: `widened_arg1` +
-                //      `post_arm_k_1_closure_ptr` live across
-                //      `next_step_call` after the closure-record alloc.
-                //   3. Slice C `post_arm_k_1` body: `widened_arg2`
-                //      lives across `post_arm_k_2`'s closure-record
-                //      alloc.
-                //   4. (Slice D, future): surrounding-lambda capture
-                //      pointers live across arm-closure-record alloc.
-                //
-                // Today the closure_ptr-load path here is the only
-                // one with a load that an explicit stackmap-root
-                // annotation could attach to. The other three sites
-                // construct heap pointers via `sigil_alloc` calls
-                // and the resulting SSA values are live across
-                // subsequent allocations — relying on Cranelift /
-                // StackMapBuilder auto-tracking to root them.
-                //
-                // Closeout commit: either document the auto-tracking
-                // guarantee end-to-end (StackMapBuilder/Lowerer
-                // contract: "any SSA value of pointer type live
-                // across an instruction marked via push_placeholder
-                // is recorded as a root") OR add explicit root
-                // annotations at the four sites and remove this TODO.
-                // End-to-end verification with fresh-heap-String
-                // allocations is gated on Stage 6 stdlib growth
-                // (when `String.concat` / `String.from_int` etc.
-                // expose runtime string allocation that would force
-                // GC pressure through these sites).
-                //
-                // Failure mode if missed: heap pointer dangles after
-                // a GC sweep, trampoline dispatches into freed
-                // memory.
+                // Heap-pointer rooting at these sites is handled by
+                // Plan E2 Phase 1: the post-arm-k closure load funnels
+                // through `lower_heap_pointer_load` (Task 2b), and
+                // alloc-then-call patterns funnel through
+                // `lower_alloc_call` (Task 2a) — both flag the SSA
+                // value via `declare_value_needs_stack_map`. Cranelift's
+                // safepoint pass then propagates the flag and
+                // `define_fn_and_capture_stackmap` (Task 4) records the
+                // resulting v1 stack-map entries at every safepoint
+                // call inside this synth-cont.
                 let synth_cont_args_ptr = block_params[1];
                 let post_arm_k_closure = lower_heap_pointer_load(
                     &mut builder,
@@ -15469,25 +15420,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // [result])` dispatch. Used by both branches of the
                 // match below. Returns the NextStep pointer to be
                 // returned by the synth-cont fn.
-                let emit_dispatch_to_post_arm_k = |builder: &mut FunctionBuilder<'_>,
-                                                   stackmap: &mut StackMapBuilder,
-                                                   result_value: Value|
-                 -> Value {
-                    let one_v = builder.ins().iconst(types::I32, 1);
-                    let call_ns = builder.ins().call(
-                        next_step_call_ref,
-                        &[post_arm_k_closure, post_arm_k_fn, one_v],
-                    );
-                    stackmap.push_placeholder(function_code_offset(builder, call_ns));
-                    let ns_ptr = builder.inst_results(call_ns)[0];
-                    let argp_call = builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
-                    stackmap.push_placeholder(function_code_offset(builder, argp_call));
-                    let argp_v = builder.inst_results(argp_call)[0];
-                    builder
-                        .ins()
-                        .store(MemFlags::trusted(), result_value, argp_v, 0);
-                    ns_ptr
-                };
+                let emit_dispatch_to_post_arm_k =
+                    |builder: &mut FunctionBuilder<'_>, result_value: Value| -> Value {
+                        let one_v = builder.ins().iconst(types::I32, 1);
+                        let call_ns = builder.ins().call(
+                            next_step_call_ref,
+                            &[post_arm_k_closure, post_arm_k_fn, one_v],
+                        );
+                        let ns_ptr = builder.inst_results(call_ns)[0];
+                        let argp_call = builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
+                        let argp_v = builder.inst_results(argp_call)[0];
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), result_value, argp_v, 0);
+                        ns_ptr
+                    };
 
                 match &synth.kind {
                     CpsContinuationKind::ConstantDone { constant_value } => {
@@ -15531,7 +15478,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             done_or_dispatch_return_arm_via_args_ref,
                             &[constant_v, ra_closure, ra_fn, ra_fired_ptr],
                         );
-                        stackmap.push_placeholder(function_code_offset(&builder, done_call));
                         let next_step = builder.inst_results(done_call)[0];
                         builder.ins().return_(&[next_step]);
                         builder.finalize();
@@ -15726,7 +15672,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         builder.declare_value_needs_stack_map(closure_ptr);
                         let mut lowerer = Lowerer {
                             builder,
-                            stackmap: &mut stackmap,
                             env,
                             pointer_ty,
                             // PR #108 review follow-up — this Lowerer
@@ -16433,20 +16378,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     lowerer.next_step_call_ref,
                                                     &[null_closure, callee_addr, arg_count_v],
                                                 );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(&lowerer.builder, call_ns),
-                                                );
                                                 let ns_ptr =
                                                     lowerer.builder.inst_results(call_ns)[0];
                                                 let argp_call = lowerer.builder.ins().call(
                                                     lowerer.next_step_args_ptr_ref,
                                                     &[ns_ptr],
-                                                );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(
-                                                        &lowerer.builder,
-                                                        argp_call,
-                                                    ),
                                                 );
                                                 let argp_v =
                                                     lowerer.builder.inst_results(argp_call)[0];
@@ -16659,12 +16595,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         ra_fired_perform,
                                                     ],
                                                 );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(
-                                                        &lowerer.builder,
-                                                        perform_call,
-                                                    ),
-                                                );
                                                 let ns_ptr =
                                                     lowerer.builder.inst_results(perform_call)[0];
                                                 lowerer.builder.ins().return_(&[ns_ptr]);
@@ -16745,7 +16675,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .iconst(pointer_ty, branch_payload);
                                                 let branch_closure = lower_alloc_call(
                                                     &mut lowerer.builder,
-                                                    lowerer.stackmap,
                                                     lowerer.builtins.alloc_ref,
                                                     &[bh_v, bp_v],
                                                 );
@@ -16962,12 +16891,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         ra_fn_pc,
                                                         ra_fired_pc,
                                                     ],
-                                                );
-                                                lowerer.stackmap.push_placeholder(
-                                                    function_code_offset(
-                                                        &lowerer.builder,
-                                                        perf_call,
-                                                    ),
                                                 );
                                                 let ns_ptr =
                                                     lowerer.builder.inst_results(perf_call)[0];
@@ -17465,20 +17388,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         three_v_top_caller,
                                     ],
                                 );
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    call_ns_top_caller,
-                                ));
                                 let ns_ptr_top_caller =
                                     lowerer.builder.inst_results(call_ns_top_caller)[0];
                                 let argp_call_top_caller = lowerer
                                     .builder
                                     .ins()
                                     .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_top_caller]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    argp_call_top_caller,
-                                ));
                                 let argp_v_top_caller =
                                     lowerer.builder.inst_results(argp_call_top_caller)[0];
                                 lowerer.builder.ins().store(
@@ -17520,20 +17435,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.next_step_call_ref,
                                     &[post_arm_k_closure, post_arm_k_fn, one_v_top_post],
                                 );
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    call_ns_top_post,
-                                ));
                                 let ns_ptr_top_post =
                                     lowerer.builder.inst_results(call_ns_top_post)[0];
                                 let argp_call_top_post = lowerer
                                     .builder
                                     .ins()
                                     .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_top_post]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    argp_call_top_post,
-                                ));
                                 let argp_v_top_post =
                                     lowerer.builder.inst_results(argp_call_top_post)[0];
                                 lowerer.builder.ins().store(
@@ -17576,19 +17483,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.next_step_call_ref,
                                     &[caller_k_closure_loaded, caller_k_fn_loaded, three_v_wrap],
                                 );
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    call_ns_wrap,
-                                ));
                                 let ns_ptr_wrap = lowerer.builder.inst_results(call_ns_wrap)[0];
                                 let argp_call_wrap = lowerer
                                     .builder
                                     .ins()
                                     .call(lowerer.next_step_args_ptr_ref, &[ns_ptr_wrap]);
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    argp_call_wrap,
-                                ));
                                 let argp_v_wrap = lowerer.builder.inst_results(argp_call_wrap)[0];
                                 lowerer.builder.ins().store(
                                     MemFlags::trusted(),
@@ -17682,7 +17581,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
                                 let next_closure_ptr = lower_alloc_call(
                                     &mut lowerer.builder,
-                                    lowerer.stackmap,
                                     lowerer.builtins.alloc_ref,
                                     &[header_v, payload_v],
                                 );
@@ -17833,14 +17731,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     args_ptr,
                                     POST_ARM_K_FN_OFF,
                                 );
-                                let push_call = lowerer.builder.ins().call(
+                                lowerer.builder.ins().call(
                                     outer_post_arm_k_push_ref,
                                     &[outer_post_arm_k_closure, outer_post_arm_k_fn],
                                 );
-                                lowerer.stackmap.push_placeholder(function_code_offset(
-                                    &lowerer.builder,
-                                    push_call,
-                                ));
 
                                 let next_step_ns = match next_step {
                                     ChainedNextStep::Perform(next_perform) => {
@@ -17963,10 +17857,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 ra_fired_mid,
                                             ],
                                         );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            perform_call,
-                                        ));
                                         lowerer.builder.inst_results(perform_call)[0]
                                     }
                                     // Plan D Task 112 — wrapper-Call
@@ -18088,19 +17978,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             lowerer.next_step_call_ref,
                                             &[null_closure, callee_fn_addr, arg_count_v],
                                         );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            call_ns,
-                                        ));
                                         let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                                         let argp_call = lowerer
                                             .builder
                                             .ins()
                                             .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            argp_call,
-                                        ));
                                         let argp_v = lowerer.builder.inst_results(argp_call)[0];
                                         for (i, w) in widened_args.iter().enumerate() {
                                             lowerer.builder.ins().store(
@@ -18235,10 +18117,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             .builder
                                             .ins()
                                             .call(lowerer.next_step_discharged_ref, &[widened]);
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            done_call,
-                                        ));
                                         let done_ns = lowerer.builder.inst_results(done_call)[0];
                                         lowerer.builder.ins().return_(&[done_ns]);
 
@@ -18252,19 +18130,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             lowerer.next_step_call_ref,
                                             &[caller_k_closure, caller_k_fn, arg_count_v],
                                         );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            call_ns,
-                                        ));
                                         let call_ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                                         let argp_call = lowerer
                                             .builder
                                             .ins()
                                             .call(lowerer.next_step_args_ptr_ref, &[call_ns_ptr]);
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            argp_call,
-                                        ));
                                         let argp = lowerer.builder.inst_results(argp_call)[0];
                                         lowerer.builder.ins().store(
                                             MemFlags::trusted(),
@@ -18347,19 +18217,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             lowerer.next_step_call_ref,
                                             &[null_closure, callee_addr, arg_count_v],
                                         );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            call_ns,
-                                        ));
                                         let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                                         let argp_call = lowerer
                                             .builder
                                             .ins()
                                             .call(lowerer.next_step_args_ptr_ref, &[ns_ptr]);
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            argp_call,
-                                        ));
                                         let argp = lowerer.builder.inst_results(argp_call)[0];
                                         for (i, arg_v) in lowered_args.iter().enumerate() {
                                             let at = lowerer.builder.func.dfg.value_type(*arg_v);
@@ -18485,10 +18347,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 ra_fired_branch,
                                             ],
                                         );
-                                        lowerer.stackmap.push_placeholder(function_code_offset(
-                                            &lowerer.builder,
-                                            perf_call,
-                                        ));
                                         let ns_ptr = lowerer.builder.inst_results(perf_call)[0];
                                         lowerer.builder.ins().return_(&[ns_ptr]);
                                     }
@@ -18679,7 +18537,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             arm_pattern_captures.len() + helper_param_captures.len();
                         let mut lowerer = Lowerer {
                             builder,
-                            stackmap: &mut stackmap,
                             env,
                             pointer_ty,
                             chain_outer_post_arm_k_pushes: 0,
@@ -18904,14 +18761,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // gets pushed (a no-op pop later) and
                             // overwritten with the callee's own
                             // trailing pair from its k(arg) slots.
-                            let push_call = lowerer.builder.ins().call(
+                            lowerer.builder.ins().call(
                                 outer_post_arm_k_push_ref,
                                 &[post_arm_k_closure, post_arm_k_fn],
                             );
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                push_call,
-                            ));
 
                             // arg_count = N + 5 so the trampoline
                             // allocates an arena args buffer with room
@@ -18929,18 +18782,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 next_step_call_ref,
                                 &[null_closure_v, target_fn_addr, total_arg_count_v],
                             );
-                            lowerer
-                                .stackmap
-                                .push_placeholder(function_code_offset(&lowerer.builder, call_ns));
                             let ns_ptr = lowerer.builder.inst_results(call_ns)[0];
                             let argp_call = lowerer
                                 .builder
                                 .ins()
                                 .call(next_step_args_ptr_ref, &[ns_ptr]);
-                            lowerer.stackmap.push_placeholder(function_code_offset(
-                                &lowerer.builder,
-                                argp_call,
-                            ));
                             let argp_v = lowerer.builder.inst_results(argp_call)[0];
 
                             // Write user args at offsets 0..N*8.
@@ -19033,27 +18879,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 pointer_ty,
                                 "Phase B.2 CompoundMatchArmPostPerform fallback tail widen",
                             );
-                            let next_step = emit_dispatch_to_post_arm_k(
-                                &mut lowerer.builder,
-                                lowerer.stackmap,
-                                widened_tail,
-                            );
+                            let next_step =
+                                emit_dispatch_to_post_arm_k(&mut lowerer.builder, widened_tail);
                             lowerer.builder.ins().return_(&[next_step]);
                             lowerer.builder.finalize();
                         }
                     }
                 }
             }
-            module
-                .define_function(synth.func_id, &mut ctx)
-                .map_err(|e| {
-                    format_define_failure(
-                        &format!("synth-cont for `{}`", synth.parent_fn_name),
-                        &e,
-                        &ctx,
-                    )
-                })?;
-            module.clear_context(&mut ctx);
+            let synth_label = format!("synth-cont for `{}`", synth.parent_fn_name);
+            define_fn_and_capture_stackmap(
+                &mut module,
+                &mut ctx,
+                synth.func_id,
+                &synth_label,
+                &mut stackmap,
+            )?;
         }
     }
 
@@ -19284,10 +19125,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         builder.ins().return_(&[ret_v]);
         builder.finalize();
-        module
-            .define_function(shim_id, &mut ctx)
-            .map_err(|e| format_define_failure(&format!("sync_shim for `{fn_name}`"), &e, &ctx))?;
-        module.clear_context(&mut ctx);
+        let shim_label = format!("sync_shim for `{fn_name}`");
+        define_fn_and_capture_stackmap(&mut module, &mut ctx, shim_id, &shim_label, &mut stackmap)?;
     }
 
     // --- finish and add the stackmap section ----------------------------
@@ -19353,7 +19192,6 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 /// arithmetic as plain 64-bit integer math.
 struct Lowerer<'a, 'b> {
     builder: FunctionBuilder<'a>,
-    stackmap: &'a mut StackMapBuilder,
     env: BTreeMap<String, Value>,
     pointer_ty: Type,
 
@@ -19830,10 +19668,9 @@ enum TailResult {
 impl<'a, 'b> Lowerer<'a, 'b> {
     /// Thin wrapper over the module-level `lower_alloc_call` so Lowerer call
     /// sites can use the funneled helper without threading `&mut self.builder`
-    /// and `&mut self.stackmap` explicitly. See the free `lower_alloc_call`
-    /// for the allocator contract.
+    /// explicitly. See the free `lower_alloc_call` for the allocator contract.
     fn lower_alloc_call(&mut self, callee: FuncRef, args: &[Value]) -> Value {
-        lower_alloc_call(&mut self.builder, self.stackmap, callee, args)
+        lower_alloc_call(&mut self.builder, callee, args)
     }
 
     /// 2026-05-04 return-arm-via-args lift Stage 3b/5 — load the active
@@ -20371,8 +20208,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                     self.next_step_call_ref,
                                     &[null_call_closure, callee_addr, arg_count_v],
                                 );
-                                self.stackmap
-                                    .push_placeholder(function_code_offset(&self.builder, ns_call));
                                 let ns_ptr = self.builder.inst_results(ns_call)[0];
 
                                 // Copy our local args buffer into the
@@ -20431,14 +20266,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                                         types::I32,
                                         self.chain_outer_post_arm_k_pushes as i64,
                                     );
-                                    let drop_call = self
-                                        .builder
+                                    self.builder
                                         .ins()
                                         .call(self.outer_post_arm_k_drop_ref, &[drop_n]);
-                                    self.stackmap.push_placeholder(function_code_offset(
-                                        &self.builder,
-                                        drop_call,
-                                    ));
                                 }
 
                                 // Return the NextStep — the surrounding
@@ -20906,8 +20736,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             func_ref,
             &[null_closure_ptr, args_ptr, args_len, terminal_out],
         );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, cps_call));
         let next_step = self.builder.inst_results(cps_call)[0];
 
         // 2026-05-04 return-arm-via-args lift Stage 5 — TLS push/pop
@@ -20922,8 +20750,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.run_loop_ref, &[next_step, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
 
         // 2026-05-04 return-arm-via-args lift Stage 5 — read the
@@ -21169,15 +20995,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call_ns));
         let ns_ptr = self.builder.inst_results(call_ns)[0];
         let argp_call = self
             .builder
             .ins()
             .call(self.next_step_args_ptr_ref, &[ns_ptr]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, argp_call));
         let argp_v = self.builder.inst_results(argp_call)[0];
         self.builder
             .ins()
@@ -21235,8 +21057,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.next_step_discharged_ref, &[widened_body]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, done_call));
         self.builder.inst_results(done_call)[0]
     }
 
@@ -21288,12 +21108,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.next_step_call_ref, &[k_closure_v, k_fn_v, three_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, call_ns));
         let ns = self.builder.inst_results(call_ns)[0];
         let argp_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, argp_call));
         let argp = self.builder.inst_results(argp_call)[0];
         self.builder
             .ins()
@@ -21316,8 +21132,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.run_loop_ref, &[ns, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
 
         // Narrow to the match scrutinee's Cranelift type. Look up via
@@ -21701,8 +21515,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 ra_fired_lpv,
             ],
         );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, perform_call));
         let call_next_step = self.builder.inst_results(perform_call)[0];
         // `sigil_perform` returns a `NextStep::Call` (it builds the
         // Call to the arm + (k_closure, k_fn); it does not invoke
@@ -21715,8 +21527,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.run_loop_ref, &[call_next_step, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let widened = self.builder.inst_results(run_loop_call)[0];
 
         // Phase 4c: narrow the run_loop result back to the op's
@@ -21863,8 +21673,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.next_step_discharged_ref, &[v_disch]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, disch_call));
         let ns_disch = self.builder.inst_results(disch_call)[0];
         self.builder.ins().return_(&[ns_disch]);
 
@@ -22133,13 +21941,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .builder
                         .ins()
                         .iconst(types::I32, if resumes_many { 1 } else { 0 });
-                    let frame_call = self.builder.ins().call(
+                    let frame_ptr = lower_alloc_call(
+                        &mut self.builder,
                         self.handler_frame_new_ref,
                         &[effect_id_v, arm_count_v, resumes_many_v],
                     );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, frame_call));
-                    let frame_ptr = self.builder.inst_results(frame_call)[0];
                     if frame_1_ptr_snapshot.is_none() {
                         frame_1_ptr_snapshot = Some(frame_ptr);
                     }
@@ -22218,12 +22024,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             self.alloc_arm_closure_record(&captures, frame_ptr_for_arm)
                         };
 
-                        let set_call = self.builder.ins().call(
+                        self.builder.ins().call(
                             self.handler_frame_set_arm_ref,
                             &[frame_ptr, op_id_v, fn_ptr_v, arm_closure_ptr],
                         );
-                        self.stackmap
-                            .push_placeholder(function_code_offset(&self.builder, set_call));
                     }
 
                     // Plan B Task 55 (Phase 4g): register the synth
@@ -22272,14 +22076,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             } else {
                                 self.alloc_arm_closure_record(&ret_captures, None)
                             };
-                            let set_return_call = self.builder.ins().call(
+                            self.builder.ins().call(
                                 self.handler_frame_set_return_ref,
                                 &[frame_ptr, ret_fn_ptr_v, ret_closure_ptr],
                             );
-                            self.stackmap.push_placeholder(function_code_offset(
-                                &self.builder,
-                                set_return_call,
-                            ));
                             // Task 78.5 G4 Approach 6 deep-redo —
                             // stash for the custom direct-Cps-call body
                             // wrapper below.
@@ -22287,9 +22087,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         }
                     }
 
-                    let push_call = self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, push_call));
+                    self.builder.ins().call(self.handle_push_ref, &[frame_ptr]);
                 }
 
                 // Step 2: lower the body. May contain `sigil_perform`
@@ -22441,8 +22239,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let mut last_popped: Option<Value> = None;
                 for _ in 0..n_frames {
                     let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, pop_call));
                     last_popped = Some(self.builder.inst_results(pop_call)[0]);
                 }
 
@@ -22904,12 +22700,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     // frame allocation persists until no live
                     // reference remains (codegen's `snap` hold
                     // continues that liveness through this dispatch
-                    // path). No `stackmap.push_placeholder` is
-                    // required here because (a) `load.i64` is not
-                    // a safepoint under Boehm and (b) a future
-                    // precise-GC pass would need to add stackmap
-                    // entries at every call site live across this
-                    // load anyway, not at the load itself.
+                    // path). No explicit safepoint is required at
+                    // this load — Cranelift's safepoint pass attaches
+                    // v1 stackmap entries at every non-tail `call`
+                    // live across the SSA value the load produces,
+                    // not at the load itself. The `lower_heap_pointer_load`
+                    // helper (Plan E2 Phase 1 Task 2b) flags the
+                    // resulting value via `declare_value_needs_stack_map`.
                     let return_fn_v = self.builder.ins().load(
                         self.pointer_ty,
                         MemFlags::trusted(),
@@ -22932,16 +22729,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         self.next_step_call_ref,
                         &[return_closure_v, return_fn_v, three_v],
                     );
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, call_ns));
                     let ns_ptr = self.builder.inst_results(call_ns)[0];
 
                     let argp_call = self
                         .builder
                         .ins()
                         .call(self.next_step_args_ptr_ref, &[ns_ptr]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, argp_call));
                     let argp_v = self.builder.inst_results(argp_call)[0];
 
                     // Trailing-pair slot writes: [body_val, null, identity].
@@ -22983,8 +22776,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .builder
                         .ins()
                         .call(self.run_loop_ref, &[ns_ptr, terminal_out]);
-                    self.stackmap
-                        .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                     let widened_handle_val = self.builder.inst_results(run_loop_call)[0];
 
                     // Narrow back to the return arm body's Cranelift
@@ -23392,12 +23183,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // closure record's frame_ptr slot kept it GC-rooted. Re-pushing
         // overwrites frame.prev with the current head, threading it
         // back into the live stack.
-        let push_call = self
-            .builder
+        self.builder
             .ins()
             .call(self.handle_push_ref, &[frame_ptr_loaded]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, push_call));
 
         // Re-push any handler frames that were crossed by the originating
         // sigil_perform. These are recorded in a TLS stack by sigil_perform
@@ -23407,8 +23195,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.repush_crossed_frames_ref, &[frame_ptr_loaded]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, repush_call));
         let crossed_count = self.builder.inst_results(repush_call)[0];
 
         // Lower the arg, widen to I64 for the args buffer.
@@ -23448,16 +23234,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.next_step_call_ref, &[k_closure, k_fn, arg_count_v]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, next_step_call));
         let ns = self.builder.inst_results(next_step_call)[0];
 
         // sigil_next_step_args_ptr(ns) → *mut u64; write trailing-
         // pair convention `[widened_arg, null_post_arm_k_closure,
         // identity_fn_addr]` at offsets 0 / 8 / 16.
         let args_ptr_call = self.builder.ins().call(self.next_step_args_ptr_ref, &[ns]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, args_ptr_call));
         let args_buf = self.builder.inst_results(args_ptr_call)[0];
         self.builder
             .ins()
@@ -23483,19 +23265,14 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             .builder
             .ins()
             .call(self.run_loop_ref, &[ns, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
         let _initial_result = self.builder.inst_results(run_loop_call)[0];
 
         // Pop crossed handler frames and apply their return arms to the
         // terminal value (innermost first). The return arms fire via
         // run_loop inside sigil_pop_crossed_frames, updating terminal_out.
-        let pop_crossed_call = self
-            .builder
+        self.builder
             .ins()
             .call(self.pop_crossed_frames_ref, &[crossed_count, terminal_out]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, pop_crossed_call));
 
         // Reload the result value from terminal_out — crossed return arms
         // may have transformed it (e.g., catch's return(v) => Ok(v)).
@@ -23509,8 +23286,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Stage-6.8-followup Layer 3c — pop the originating handler
         // frame we re-pushed before run_loop.
         let pop_call = self.builder.ins().call(self.handle_pop_ref, &[]);
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, pop_call));
         let _popped = self.builder.inst_results(pop_call)[0];
 
         // Stage-6.8-followup Layer 2 fix: apply the originating handle's
@@ -23644,16 +23419,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     self.next_step_call_ref,
                     &[ret_closure, ret_fn_addr, three_v],
                 );
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call_ns));
                 let ns_ptr = self.builder.inst_results(call_ns)[0];
 
                 let argp_call = self
                     .builder
                     .ins()
                     .call(self.next_step_args_ptr_ref, &[ns_ptr]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, argp_call));
                 let argp_v = self.builder.inst_results(argp_call)[0];
 
                 self.builder.ins().store(
@@ -23685,8 +23456,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .builder
                     .ins()
                     .call(self.run_loop_ref, &[ns_ptr, terminal_out_2]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, run_loop_call_2));
                 let wrapped = self.builder.inst_results(run_loop_call_2)[0];
                 self.builder.ins().jump(merge_block, &[wrapped.into()]);
 
@@ -23806,8 +23575,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .builder
                     .ins()
                     .call(self.next_step_discharged_ref, &[v_propagate]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, disch_call));
                 let disch_ns = self.builder.inst_results(disch_call)[0];
                 self.builder.ins().return_(&[disch_ns]);
             } else {
@@ -24049,8 +23816,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             self.builtins.cont_invoke_ref,
             &[cont_ptr, widened_arg, terminal_out],
         );
-        self.stackmap
-            .push_placeholder(function_code_offset(&self.builder, invoke_call));
         self.builder.inst_results(invoke_call)[0]
     }
 
@@ -24210,8 +23975,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         all_args.extend(arg_vals);
                         all_args.push(terminal_out);
                         let call = self.builder.ins().call(func_ref, &all_args);
-                        self.stackmap
-                            .push_placeholder(function_code_offset(&self.builder, call));
                         self.builder.inst_results(call)[0]
                     }
                     UserFnAbi::Cps => {
@@ -24330,8 +24093,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             func_ref,
                             &[null_closure_ptr, args_ptr, args_len, terminal_out],
                         );
-                        self.stackmap
-                            .push_placeholder(function_code_offset(&self.builder, cps_call));
                         let next_step = self.builder.inst_results(cps_call)[0];
 
                         // Task 78.5 G4 Approach 6 deep-redo (PR #80
@@ -24374,8 +24135,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                             .builder
                             .ins()
                             .call(self.run_loop_ref, &[next_step, terminal_out]);
-                        self.stackmap
-                            .push_placeholder(function_code_offset(&self.builder, run_loop_call));
                         let raw_u64 = self.builder.inst_results(run_loop_call)[0];
 
                         // Narrow `raw_u64` back to the callee's
@@ -24514,12 +24273,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let arr = self.lower_expr(&args[0]);
                 let idx = self.lower_expr(&args[1]);
                 let val = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
+                self.builder
                     .ins()
                     .call(self.builtins.mut_array_set_ref, &[arr, idx, val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 // sigil_mut_array_set returns nothing; produce the
                 // Sigil-level Unit value (I8 zero) for the caller.
                 self.builder.ins().iconst(types::I8, 0)
@@ -24688,12 +24444,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let arr = self.lower_expr(&args[0]);
                 let idx = self.lower_expr(&args[1]);
                 let val = self.lower_expr(&args[2]);
-                let call = self
-                    .builder
+                self.builder
                     .ins()
                     .call(self.builtins.mut_byte_array_set_ref, &[arr, idx, val]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 // sigil_mut_byte_array_set returns nothing; produce
                 // the Sigil-level Unit value (I8 zero).
                 self.builder.ins().iconst(types::I8, 0)
@@ -25101,12 +24854,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 assert_eq!(args.len(), 2, "sb_append builtin arg count is not 2");
                 let sb = self.lower_expr(&args[0]);
                 let s = self.lower_expr(&args[1]);
-                let call = self
-                    .builder
+                self.builder
                     .ins()
                     .call(self.builtins.sb_append_ref, &[sb, s]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 // sigil_string_builder_append returns nothing;
                 // produce Sigil-level Unit (I8 zero).
                 self.builder.ins().iconst(types::I8, 0)
@@ -25430,8 +25180,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .builder
                     .ins()
                     .call(self.builtins.sigil_ref_set_ref, &[cell, widened]);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 // Result is Unit. Runtime returns I64 0; codegen
                 // produces an I8 0 sentinel for the surrounding
                 // expression value flow.
@@ -25507,8 +25255,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 all_args.extend(arg_vals);
                 all_args.push(terminal_out);
                 let call = self.builder.ins().call(func_ref, &all_args);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
             }
             _ => {
@@ -25638,8 +25384,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                     .builder
                     .ins()
                     .call_indirect(sig_ref, code_ptr, &all_args);
-                self.stackmap
-                    .push_placeholder(function_code_offset(&self.builder, call));
                 self.builder.inst_results(call)[0]
             }
         }
@@ -27473,24 +27217,13 @@ fn widen_to_i64(
     }
 }
 
-/// Best-effort PC-offset approximation for Stage 1's placeholder stackmap.
-/// Cranelift's real stack-map API ships in Plan B; the number here is a
-/// deterministic-enough integer that keeps the record format parseable.
-fn function_code_offset(_b: &FunctionBuilder<'_>, call_inst: Inst) -> u32 {
-    // Inst indices are stable within a function. Plan B will replace this
-    // with the real post-regalloc code-offset Cranelift exposes via
-    // CallSiteRelocInfo; for Stage 1 we keep it deterministic by using the
-    // inst index.
-    call_inst.as_u32()
-}
-
 /// Emit a call to a runtime allocator and return the resulting heap pointer,
-/// flagged for Cranelift's stack-map machinery. Funneling every allocator call
-/// site through this helper guarantees the
-/// `declare_value_needs_stack_map` flag and the stackmap placeholder entry —
-/// without it, "mark by convention at each site" has a demonstrable miss
-/// class (see PR #156 review-cycle history: three rounds of sweeping by
-/// hand kept missing more sites). Plan E2 Phase 1 Task 2.
+/// flagged for Cranelift's stack-map machinery. Funneling every allocator
+/// call site through this helper guarantees the
+/// `declare_value_needs_stack_map` flag — without it, "mark by convention
+/// at each site" has a demonstrable miss class (see PR #156 review-cycle
+/// history: three rounds of sweeping by hand kept missing more sites).
+/// Plan E2 Phase 1 Task 2.
 ///
 /// **Allocator contract.** The callee MUST return a single value of pointer
 /// type that names a freshly-allocated GC-managed heap object (the result
@@ -27499,14 +27232,8 @@ fn function_code_offset(_b: &FunctionBuilder<'_>, call_inst: Inst) -> u32 {
 /// or `Unit` (e.g. `sigil_mut_array_set`) must NOT be routed through this
 /// helper — over-marking a non-pointer value would trip the Cranelift
 /// safepoint pass's size-and-power-of-two assertion.
-fn lower_alloc_call(
-    builder: &mut FunctionBuilder<'_>,
-    stackmap: &mut StackMapBuilder,
-    callee: FuncRef,
-    args: &[Value],
-) -> Value {
+fn lower_alloc_call(builder: &mut FunctionBuilder<'_>, callee: FuncRef, args: &[Value]) -> Value {
     let call = builder.ins().call(callee, args);
-    stackmap.push_placeholder(function_code_offset(builder, call));
     let ptr = builder.inst_results(call)[0];
     builder.declare_value_needs_stack_map(ptr);
     ptr
@@ -31349,32 +31076,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stackmap_record_size_is_eight() {
-        assert_eq!(STACKMAP_RECORD_SIZE, 8);
-    }
-
-    #[test]
-    fn stackmap_header_layout() {
+    fn stackmap_v1_header_layout() {
         // Constants pin the shipped format. The single source is
-        // `sigil_abi::stackmap`; any future v1 bump (Plan B Task 55+)
-        // lands there, and both this builder and the runtime parser
-        // pick it up automatically.
+        // `sigil_abi::stackmap`; cross-checked here against the
+        // compiler-side serializer.
         assert_eq!(STACKMAP_MAGIC, b"SGST");
-        assert_eq!(STACKMAP_VERSION_PLACEHOLDER, 0);
+        assert_eq!(STACKMAP_VERSION_V1, 1);
         assert_eq!(STACKMAP_HEADER_SIZE, 12);
-        assert_eq!(STACKMAP_FLAG_PLACEHOLDER, 0x0001);
+        assert_eq!(STACKMAP_ENTRY_KIND_HEAP_POINTER, 0x01);
     }
 
     #[test]
-    fn stackmap_builder_empty_serializes_to_header_only() {
-        let b = StackMapBuilder::new();
+    fn stackmap_v1_empty_serializes_to_header_only() {
+        let b = StackMapV1Builder::new();
         let bytes = b.serialize();
         assert_eq!(bytes.len(), STACKMAP_HEADER_SIZE);
         assert_eq!(&bytes[0..4], STACKMAP_MAGIC);
         assert_eq!(
             u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
-            STACKMAP_VERSION_PLACEHOLDER,
+            STACKMAP_VERSION_V1,
         );
+        // fn_count == 0
         assert_eq!(
             u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
             0,
@@ -31382,26 +31104,78 @@ mod tests {
     }
 
     #[test]
-    fn stackmap_builder_round_trips_placeholder_records() {
-        let mut b = StackMapBuilder::new();
-        b.push_placeholder(0x1111_2222);
-        b.push_placeholder(0x3333_4444);
+    fn stackmap_v1_single_function_with_two_zero_entry_records() {
+        // Synthesise a fn block with two records, each with zero entries
+        // (since constructing a `UserStackMap` outside Cranelift's
+        // private constructor is not feasible). Exercises the layout
+        // serializer's per-fn-header + per-record-header writers
+        // independently of Cranelift integration.
+        let mut b = StackMapV1Builder::new();
+        b.functions.push(StackMapV1Function {
+            symbol_name: "sigil_user_test".to_string(),
+            records: vec![
+                StackMapV1Record {
+                    pc_offset: 0x1111_2222,
+                    frame_size: 32,
+                    flags: 0,
+                    entries: Vec::new(),
+                },
+                StackMapV1Record {
+                    pc_offset: 0x3333_4444,
+                    frame_size: 32,
+                    flags: 0,
+                    entries: Vec::new(),
+                },
+            ],
+        });
         let bytes = b.serialize();
-        assert_eq!(b.len(), 2);
-        assert_eq!(bytes.len(), STACKMAP_HEADER_SIZE + 2 * STACKMAP_RECORD_SIZE,);
-        // Record 0.
-        let r0 = STACKMAP_HEADER_SIZE;
+        assert_eq!(b.function_count(), 1);
+        assert_eq!(b.total_records(), 2);
+
+        // Section header: magic | version | fn_count(=1)
+        assert_eq!(&bytes[0..4], STACKMAP_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            STACKMAP_VERSION_V1,
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            1,
+        );
+
+        // Fn header at offset 12: name_len(=15), record_count(=2), text_offset(=0)
+        let name = b"sigil_user_test";
+        assert_eq!(
+            u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+            name.len() as u32,
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]),
+            2,
+        );
+        assert_eq!(
+            u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            0,
+        );
+        // Name bytes.
+        assert_eq!(&bytes[24..24 + name.len()], &name[..]);
+
+        // Record 0 at offset 24 + name.len().
+        let r0 = 24 + name.len();
         assert_eq!(
             u32::from_le_bytes([bytes[r0], bytes[r0 + 1], bytes[r0 + 2], bytes[r0 + 3]]),
             0x1111_2222,
         );
-        assert_eq!(u16::from_le_bytes([bytes[r0 + 4], bytes[r0 + 5]]), 0);
         assert_eq!(
-            u16::from_le_bytes([bytes[r0 + 6], bytes[r0 + 7]]),
-            STACKMAP_FLAG_PLACEHOLDER,
+            u32::from_le_bytes([bytes[r0 + 4], bytes[r0 + 5], bytes[r0 + 6], bytes[r0 + 7]]),
+            32,
         );
-        // Record 1.
-        let r1 = STACKMAP_HEADER_SIZE + STACKMAP_RECORD_SIZE;
+        assert_eq!(u16::from_le_bytes([bytes[r0 + 8], bytes[r0 + 9]]), 0);
+        assert_eq!(u16::from_le_bytes([bytes[r0 + 10], bytes[r0 + 11]]), 0);
+
+        // Record 1 immediately follows the 12-byte record-0 header
+        // (zero entries = no entry bytes appended).
+        let r1 = r0 + 12;
         assert_eq!(
             u32::from_le_bytes([bytes[r1], bytes[r1 + 1], bytes[r1 + 2], bytes[r1 + 3]]),
             0x3333_4444,

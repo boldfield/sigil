@@ -304,18 +304,26 @@ fn hello() {
     assert_eq!(stdout, "hello, world\n", "hello-world stdout mismatch");
 }
 
-/// Compile `examples/hello.sigil` (compile-only, no link), then
-/// inspect the `.o` file's stackmap section bytes and parse them via
-/// the runtime's parser. Asserts the v0 placeholder invariants:
-/// magic, version = 0, every record flagged placeholder,
-/// `live_count = 0`.
+/// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
+/// (compile-only, no link), inspect the `.o` file's stackmap section
+/// bytes, and parse them via the runtime's v1 parser. Asserts the v1
+/// invariants: magic, version = 1, ≥1 function block, ≥1 safepoint
+/// record (the `Some(42)` ctor alloc result lives across the
+/// subsequent `int_to_string` / `IO.println` call), every entry kind
+/// is `STACKMAP_ENTRY_KIND_HEAP_POINTER`.
+///
+/// `hello.sigil` would be a more obvious choice but its only "alloc"
+/// is a static string-literal GV addr — Cranelift's safepoint pass
+/// produces zero entries because no `declare_value_needs_stack_map`
+/// value is live across a non-tail call. `option_demo.sigil` exercises
+/// the alloc-then-call path the task body cares about.
 #[test]
-fn stackmap_section_parses_v0_placeholder() {
+fn stackmap_section_parses_v1_with_real_safepoints() {
     use sigil_compiler::{
         closure_convert, codegen, color, elaborate, lexer, monomorphize, parser, resolve, typecheck,
     };
     use sigil_runtime::stackmap::{
-        parse_section, ParseError, STACKMAP_FLAG_PLACEHOLDER, STACKMAP_VERSION_PLACEHOLDER,
+        parse_section, ParseError, STACKMAP_ENTRY_KIND_HEAP_POINTER, STACKMAP_VERSION_V1,
     };
 
     // The helper does not invoke the compiler binary, but it does read
@@ -325,11 +333,12 @@ fn stackmap_section_parses_v0_placeholder() {
     let _ = sigil_binary();
 
     let root = workspace_root();
-    let src = std::fs::read_to_string(root.join("examples/hello.sigil")).expect("read hello.sigil");
+    let src = std::fs::read_to_string(root.join("examples/choose_demo.sigil"))
+        .expect("read choose_demo.sigil");
 
-    let (toks, lex_errs) = lexer::lex("hello.sigil", &src);
+    let (toks, lex_errs) = lexer::lex("choose_demo.sigil", &src);
     assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
-    let (prog, parse_errs) = parser::parse("hello.sigil", &toks);
+    let (prog, parse_errs) = parser::parse("choose_demo.sigil", &toks);
     assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
     let (rp, resolve_errs) = resolve::resolve(prog);
     assert!(resolve_errs.is_empty(), "resolve errors: {resolve_errs:?}");
@@ -346,48 +355,66 @@ fn stackmap_section_parses_v0_placeholder() {
 
     let bytes = std::fs::read(&obj_path).expect("read object file");
 
-    // The object-file section we wrote is tagged `__SIGIL,__stackmaps`
-    // (Mach-O) or `.sigil_stackmaps` (ELF). Rather than re-parse the
-    // enclosing object format here, locate the section by searching for
-    // the magic bytes — which are anchored inside the section we wrote,
-    // and collision with generated code is vanishingly unlikely for a
-    // 4-byte ASCII pattern ("SGST") followed by a zero version word.
-    let needle: &[u8] = &[b'S', b'G', b'S', b'T', 0, 0, 0, 0];
-    let pos = bytes
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .expect("stackmap magic+version not found in object file");
-    let section = &bytes[pos..];
-    let parsed = parse_section(section).unwrap_or_else(|e: ParseError| {
+    // Walk the object file via the `object` crate (re-exported by
+    // cranelift-object) and locate the stackmap section by name —
+    // `.sigil_stackmaps` (ELF) or `__stackmaps` (Mach-O). The earlier
+    // bring-up of this test used a byte-pattern locator
+    // (`bytes.windows(8).position(|w| w == b"SGST\x01\x00\x00\x00")`),
+    // which has a structural false-positive risk: a string literal,
+    // static-data integer, or coincidental code byte sequence could
+    // match the 8-byte pattern earlier in the file and the test would
+    // parse garbage. The proper section walk is robust against that.
+    use cranelift_object::object::{Object, ObjectSection};
+    let obj = cranelift_object::object::File::parse(&bytes[..]).expect("parse object file");
+    let section = obj
+        .section_by_name(".sigil_stackmaps")
+        .or_else(|| obj.section_by_name("__stackmaps"))
+        .expect("stackmap section not found in object file");
+    let section_data = section.data().expect("read section data");
+    let parsed = parse_section(section_data).unwrap_or_else(|e: ParseError| {
         panic!("stackmap parse failed: {e:?}");
     });
-    assert_eq!(parsed.version, STACKMAP_VERSION_PLACEHOLDER);
-    // Plan B Task 57 closeout-review observation — assert "≥1
-    // record" rather than an exact count. The exact count is
-    // mechanically derivable but brittle: every shim-touching
-    // change (Phase A2 → Slice 1 → Slice 2 was 4 → 9 → 14) requires
-    // updating it. The load-bearing invariant this test pins is
-    // **(a) the magic + version parse correctly, (b) every record
-    // is a v0 placeholder (live_count = 0, flag set)** — those are
-    // the per-record invariants the loop below verifies. The
-    // record count is currently a "non-zero records exist" sanity
-    // check; lifting it to `≥ 1` decouples this test from shim
-    // call-site drift. A future task that introduces a
-    // counter-aware test (e.g., asserting `HandlerWalkCount`
-    // increments per println) is the right home for cardinality
-    // assertions.
+    assert_eq!(parsed.version, STACKMAP_VERSION_V1);
+    // G1 acceptance:
+    //   - ≥1 function block in the section.
+    //   - ≥1 safepoint record across all blocks (choose_demo's
+    //     multi-shot handler arms have flagged values live across
+    //     synth-cont / post-arm-k calls — confirmed by the 2026-05-13
+    //     bring-up of this test: 7 fn blocks, 8 records, 9 entries).
+    //   - every entry kind is `STACKMAP_ENTRY_KIND_HEAP_POINTER`
+    //     (v1 emits no other kind from codegen).
+    let total_records: usize = parsed.functions.iter().map(|f| f.records.len()).sum();
+    let total_entries: usize = parsed
+        .functions
+        .iter()
+        .flat_map(|f| f.records.iter())
+        .map(|r| r.entries.len())
+        .sum();
     assert!(
-        !parsed.records.is_empty(),
-        "expected at least one placeholder record (got 0); shim must emit \
-         stackmap records for its FFI calls"
+        !parsed.functions.is_empty(),
+        "expected at least one function block in v1 stackmap section"
     );
-    for r in &parsed.records {
-        assert_eq!(r.live_count, 0, "v0 invariant: live_count always 0");
-        assert_eq!(
-            r.flags & STACKMAP_FLAG_PLACEHOLDER,
-            STACKMAP_FLAG_PLACEHOLDER,
-            "v0 invariant: placeholder flag set on every record",
-        );
+    assert!(
+        total_records >= 1,
+        "expected at least one safepoint record across {} function blocks; \
+         got {} records / {} entries — choose_demo's multi-shot continuation \
+         path normally produces real entries, so 0 suggests a regression in \
+         declare_value_needs_stack_map coverage at one of the Cps callee sites",
+        parsed.functions.len(),
+        total_records,
+        total_entries,
+    );
+    for f in &parsed.functions {
+        for r in &f.records {
+            for e in &r.entries {
+                assert_eq!(
+                    e.kind, STACKMAP_ENTRY_KIND_HEAP_POINTER,
+                    "v1 invariant: every entry must be heap-pointer kind \
+                     (got {:#x} in fn `{}` at pc_offset {:#x})",
+                    e.kind, f.symbol_name, r.pc_offset,
+                );
+            }
+        }
     }
 
     let _ = std::fs::remove_file(&obj_path);
