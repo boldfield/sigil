@@ -78,6 +78,7 @@ pub mod profile;
 pub mod random;
 pub mod refs;
 pub mod stackmap;
+pub mod stackmap_xcheck;
 pub mod string;
 pub mod string_builder;
 pub mod value;

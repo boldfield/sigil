@@ -20,3 +20,4 @@ sigil-header-constants = { path = "../header-constants" }
 # crate so the public surface (`sigil_runtime::stackmap::STACKMAP_*`,
 # `sigil_runtime::value::TAG_*`) stays backward-compatible.
 sigil-abi = { path = "../abi" }
+libc = { workspace = true }

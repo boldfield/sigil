@@ -169,6 +169,16 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     counters::incr(CounterId::BoehmAllocCount);
     counters::add(CounterId::BoehmAllocBytes, total as u64);
 
+    // Plan E2 Phase 1 Task 5 — opt-in stackmap cross-check hook.
+    // Gated by `SIGIL_GC_CROSS_CHECK=1` at runtime; production paths
+    // skip this entirely (the env var is read once at startup and
+    // cached). On each sampled alloc, the precise root walker is
+    // invoked and asserts (a) every precise root address lies inside
+    // the calling thread's stack range, and (b) the value at each
+    // address is heap-pointer-shaped per Boehm's view. Diverges abort
+    // the process with a diagnostic.
+    crate::stackmap_xcheck::maybe_cross_check();
+
     // v2 profile-data surface — sampled allocation profile hook.
     // Inlined; the fast path is a single relaxed atomic load + branch
     // when SIGIL_ALLOC_PROFILE is unset.

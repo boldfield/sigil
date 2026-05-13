@@ -3,7 +3,7 @@
 //! The compiler emits one safepoint record per Cranelift `call` /
 //! `call_indirect` into an object-file section:
 //!
-//! - ELF (Linux):   `.sigil_stackmaps`
+//! - ELF (Linux):   `sigil_stackmaps`  (no leading `.` — see below)
 //! - Mach-O:        `__SIGIL,__stackmaps`
 //!
 //! Plan A1 shipped **version 0 (placeholder)** records: `live_count = 0`,
@@ -49,9 +49,21 @@
 //! `text_offset` is reserved as zero in v1. A future version may use
 //! it to record the function's `.text`-relative offset so the runtime
 //! does not need `dlsym` at lookup time.
+//!
+//! ## ELF section name discipline
+//!
+//! The ELF section name is `sigil_stackmaps` (NOT `.sigil_stackmaps`).
+//! The leading dot was dropped in Plan E2 Phase 1 Task 5 so that the
+//! GNU linker auto-generates `__start_sigil_stackmaps` /
+//! `__stop_sigil_stackmaps` symbols pointing at the section bounds —
+//! the runtime reader uses those directly to locate the section bytes
+//! without parsing `/proc/self/exe`. The Mach-O `__SIGIL,__stackmaps`
+//! pair is unchanged; its runtime API is `getsectiondata`.
 
-/// ELF section name used on `x86_64-unknown-linux-gnu`.
-pub const ELF_SECTION_NAME: &str = ".sigil_stackmaps";
+/// ELF section name used on `x86_64-unknown-linux-gnu`. No leading
+/// dot — see crate-level doc-comment for the rationale (auto-generated
+/// `__start_*` / `__stop_*` linker symbols).
+pub const ELF_SECTION_NAME: &str = "sigil_stackmaps";
 
 /// Mach-O segment + section pair used on `aarch64-apple-darwin`.
 pub const MACHO_SEGMENT_NAME: &str = "__SIGIL";
@@ -96,7 +108,7 @@ mod tests {
 
     #[test]
     fn section_names_are_fixed() {
-        assert_eq!(ELF_SECTION_NAME, ".sigil_stackmaps");
+        assert_eq!(ELF_SECTION_NAME, "sigil_stackmaps");
         assert_eq!(MACHO_SEGMENT_NAME, "__SIGIL");
         assert_eq!(MACHO_SECTION_NAME, "__stackmaps");
     }

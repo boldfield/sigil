@@ -140,6 +140,18 @@ fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
 /// Panics on compile failure; callers that expect compilation to fail
 /// should instead drive the compiler by hand.
 fn compile_file_and_run(source_path: &Path, test_name: &str) -> (String, String, i32) {
+    compile_file_and_run_with_env(source_path, test_name, &[])
+}
+
+/// Like `compile_file_and_run` but sets `env_vars` on the child process
+/// invocation only (compilation itself runs in the parent's
+/// environment). Used by Plan E2 Phase 1 Task 5's cross-check tests
+/// which run `SIGIL_GC_CROSS_CHECK=1` against the compiled binary.
+fn compile_file_and_run_with_env(
+    source_path: &Path,
+    test_name: &str,
+    env_vars: &[(&str, &str)],
+) -> (String, String, i32) {
     let root = workspace_root();
     let sigil_bin = sigil_binary();
 
@@ -160,9 +172,11 @@ fn compile_file_and_run(source_path: &Path, test_name: &str) -> (String, String,
         String::from_utf8_lossy(&compile.stderr),
     );
 
-    let run = Command::new(&bin_path)
-        .output()
-        .expect("failed to execute compiled binary");
+    let mut run_cmd = Command::new(&bin_path);
+    for (k, v) in env_vars {
+        run_cmd.env(k, v);
+    }
+    let run = run_cmd.output().expect("failed to execute compiled binary");
 
     let code = run.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
@@ -357,8 +371,10 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
 
     // Walk the object file via the `object` crate (re-exported by
     // cranelift-object) and locate the stackmap section by name —
-    // `.sigil_stackmaps` (ELF) or `__stackmaps` (Mach-O). The earlier
-    // bring-up of this test used a byte-pattern locator
+    // `sigil_stackmaps` (ELF; no leading dot, so the GNU linker
+    // auto-generates `__start_*` / `__stop_*` symbols for the runtime)
+    // or `__stackmaps` (Mach-O). The earlier bring-up of this test
+    // used a byte-pattern locator
     // (`bytes.windows(8).position(|w| w == b"SGST\x01\x00\x00\x00")`),
     // which has a structural false-positive risk: a string literal,
     // static-data integer, or coincidental code byte sequence could
@@ -367,7 +383,7 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
     use cranelift_object::object::{Object, ObjectSection};
     let obj = cranelift_object::object::File::parse(&bytes[..]).expect("parse object file");
     let section = obj
-        .section_by_name(".sigil_stackmaps")
+        .section_by_name("sigil_stackmaps")
         .or_else(|| obj.section_by_name("__stackmaps"))
         .expect("stackmap section not found in object file");
     let section_data = section.data().expect("read section data");
@@ -18350,4 +18366,363 @@ fn many_string_literals_compile_and_run() {
         "stdout must end with the final literal; got last 20 bytes: {:?}",
         &stdout[stdout.len().saturating_sub(20)..]
     );
+}
+
+// ===== Plan E2 Phase 1 Task 5 — cross-check exit-clean tests ==============
+//
+// Each test compiles an example with the default codegen path (Boehm
+// conservative GC) and runs it once with `SIGIL_GC_CROSS_CHECK=1`
+// set on the child process. The cross-check harness aborts on the
+// first divergence between the precise stackmap walker and the
+// conservative-shape view of the calling thread's stack.
+//
+// "Zero divergence" is asserted via:
+//   1. stderr does NOT contain `SIGIL_GC_CROSS_CHECK:` (the diagnostic
+//      prefix the harness writes before `std::process::abort`).
+//   2. exit code is NOT 134 (Unix SIGABRT — `process::abort` raises
+//      SIGABRT, which the shell surfaces as 128+6=134).
+//
+// The example's "normal" exit code is NOT asserted as 0 — some
+// examples (arith) intentionally exit non-zero with a computed value.
+// Per-example output assertions stay in the dedicated "is this
+// program correct" tests; the cross-check tests assert only "the
+// harness didn't fire."
+
+fn assert_no_cross_check_abort(test_name: &str, stderr: &str, code: i32) {
+    assert!(
+        !stderr.contains("SIGIL_GC_CROSS_CHECK:"),
+        "{test_name}: SIGIL_GC_CROSS_CHECK harness aborted; \
+         stderr=\n{stderr}",
+    );
+    assert_ne!(
+        code, 134,
+        "{test_name}: child exited with SIGABRT (cross-check abort \
+         is the most likely cause even if stderr was truncated); \
+         stderr={stderr:?}",
+    );
+}
+
+/// Parse the atexit summary line emitted by `runtime::stackmap_xcheck`
+/// when `SIGIL_GC_CROSS_CHECK=1` is set. The line shape is:
+///
+/// ```text
+/// [SIGIL_GC_CROSS_CHECK] allocs_checked=N roots_total=M \
+///   fns_resolved=K records_resolved=L
+/// ```
+///
+/// Returns `(allocs_checked, roots_total, fns_resolved, records_resolved)`.
+/// Panics with the full stderr if the line isn't present — that
+/// indicates the cross-check didn't run or the runtime crashed
+/// before atexit fired.
+fn parse_cross_check_summary(stderr: &str) -> (u64, u64, u64, u64) {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("[SIGIL_GC_CROSS_CHECK] allocs_checked="))
+        .unwrap_or_else(|| {
+            panic!(
+                "cross-check atexit summary line not found in stderr; \
+                 stderr=\n{stderr}"
+            )
+        });
+    let mut allocs: u64 = 0;
+    let mut roots: u64 = 0;
+    let mut fns: u64 = 0;
+    let mut records: u64 = 0;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("allocs_checked=") {
+            allocs = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("roots_total=") {
+            roots = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("fns_resolved=") {
+            fns = v.parse().unwrap_or(0);
+        } else if let Some(v) = tok.strip_prefix("records_resolved=") {
+            records = v.parse().unwrap_or(0);
+        }
+    }
+    (allocs, roots, fns, records)
+}
+//
+// Coverage rationale:
+//   - `hello.sigil` — minimal alloc surface (only the string-literal
+//     load path goes through `sigil_alloc`-flagged sites via the
+//     ctor / chain alloc paths). Sanity baseline.
+//   - `option_demo.sigil` — sum-type allocation (Some(42), None).
+//   - `tree.sigil` — alloc-heavy (65,535 cons-equivalent allocs); the
+//     plan-body stress test ("10k cons cells, drop, repeat") is
+//     satisfied by this depth-15 binary tree.
+//   - `choose_demo.sigil` — multi-shot continuation; exercises the
+//     synth-cont closure-record alloc + post-arm-k chain that
+//     PR #162's G1 test surfaced as the only example with non-zero
+//     stack-map records under choose_demo today.
+//
+// A SIGIL_GC_CROSS_CHECK abort writes a diagnostic to stderr and
+// exits with code 134 (SIGABRT). Exit 0 is the "zero divergence"
+// assertion.
+
+#[test]
+fn cross_check_hello_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/hello.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_hello",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("hello.sigil", &stderr, code);
+    // Output should be the same as the un-cross-checked run.
+    assert_eq!(stdout, "hello, world\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn cross_check_option_demo_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/option_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_option_demo",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("option_demo.sigil", &stderr, code);
+    assert_eq!(stdout, "42\n-1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn cross_check_choose_demo_runs_cleanly() {
+    // PR #163 review M1 — coverage assertion. choose_demo.sigil is
+    // PR #162's G1 example with 7 fn blocks / 8 stack-map records;
+    // it's the example known to have non-zero records under v1
+    // codegen. We assert `roots_total > 0` over the program's
+    // lifetime — without that, a future regression that makes the
+    // walker / lookup vacuous would silently pass every other
+    // cross-check test (they assert "no abort", which is trivially
+    // true when the harness never finds anything to validate).
+    //
+    // `SIGIL_GC_XCHECK_TRACE=1` enables the init diagnostic line +
+    // per-walk trace — when this test fails, the trace + summary
+    // are in stderr (visible in CI failure output) so M1-class
+    // regressions diagnose in seconds rather than another review
+    // round.
+    let root = workspace_root();
+    let source = root.join("examples/choose_demo.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_choose_demo",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_GC_XCHECK_TRACE", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("choose_demo.sigil", &stderr, code);
+    let (allocs, roots, fns, records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs > 0,
+        "expected ≥1 alloc to fire the cross-check on choose_demo.sigil; \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
+    assert!(
+        records > 0,
+        "expected ≥1 resolved stackmap record (G1's measurement: 8); \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
+    assert!(
+        roots > 0,
+        "Phase 1 ship gate: walker must find ≥1 precise root over \
+         choose_demo.sigil's lifetime. roots_total=0 means the cross-check \
+         harness is silently vacuous (PR #163 review M1). \
+         summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
+    // PR #163 review M1 third-pass requirement: `fns_resolved` must
+    // be close to `parsed_fns` (the reviewer required ≥6 of 7 for
+    // choose_demo). A symbol-resolution regression that only finds
+    // the C-shim "main" (the original sole `Linkage::Export` site)
+    // produces fns_resolved=1; the Linkage::Local→Export sweep at
+    // codegen.rs's 10 declare_function sites makes the user / synth /
+    // handler fns all dlsym-resolvable too. choose_demo has 7
+    // parsed fns; assert ≥6 resolve so the walker covers all the
+    // safepoint records, not just the trivial fraction.
+    assert!(
+        fns >= 6,
+        "expected ≥6 of choose_demo.sigil's 7 fn blocks to resolve via \
+         dlsym; got fns_resolved={fns}. Likely cause: not all user/synth \
+         function emit sites use Linkage::Export. summary: allocs={allocs} \
+         roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
+}
+
+#[test]
+fn cross_check_tree_stress_runs_cleanly() {
+    // tree.sigil's depth-15 binary tree allocates 65,535 nodes —
+    // alloc-heavy single-build coverage. Every alloc fires the
+    // cross-check; exit 0 = zero divergence across all 65,535
+    // safepoints.
+    let root = workspace_root();
+    let source = root.join("examples/tree.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("tree.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_tree_stress_drop_repeat_runs_cleanly() {
+    // Plan body's literal "10k cons cells, drop, repeat" — the
+    // drop-repeat axis. examples/tree_stress_repeat.sigil builds +
+    // folds + drops a depth-12 binary tree 10 times (81,910 total
+    // allocations across 10 build-fold-drop cycles). Exercises the
+    // cross-check across GC pressure between rounds (Boehm's
+    // collector decides when to mark; the cross-check runs at every
+    // alloc regardless). Exit 0 = zero divergence.
+    let root = workspace_root();
+    let source = root.join("examples/tree_stress_repeat.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress_drop_repeat",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("tree_stress_repeat.sigil", &stderr, code);
+    // Sum-per-round = 2^12 - 1 = 4,095; ×10 rounds = 40,950.
+    assert_eq!(stdout.trim_end(), "40950");
+    assert_eq!(code, 0);
+    // PR #163 review M3 — substantiate the "10k cons cells, drop,
+    // repeat" stress claim. tree_stress_repeat.sigil allocates a
+    // depth-12 binary tree (2^13 - 1 = 8,191 nodes) ×10 rounds =
+    // 81,910 node allocations. The cross-check fires on every
+    // `sigil_alloc`, so allocs_checked should comfortably exceed
+    // 10,000.
+    let (allocs, _roots, _fns, _records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs >= 10_000,
+        "tree_stress_repeat.sigil must fire >=10k cross-checks to \
+         substantiate the plan body's stress requirement; \
+         allocs_checked={allocs}",
+    );
+}
+
+// ===== Broader cross-check coverage =======================================
+//
+// Plan body says: "E2E: run existing tests with `SIGIL_GC_CROSS_CHECK=1`;
+// assert zero divergence." The 4 tests above cover hand-picked
+// shapes (hello / sum-type / multi-shot / alloc-heavy). The block
+// below extends coverage to a representative subset of the broader
+// example suite — handler frames (arith), raise+catch (catch),
+// error-recovery (div_recover), CPS-heavy fns (fib_cps_perf),
+// generics (generic_map), higher-order fns (higher_order), handler
+// nesting (nested_effects), state effects (state). Each runs under
+// `SIGIL_GC_CROSS_CHECK=1`; exit 0 = zero divergence on that
+// example's safepoint set.
+//
+// Examples deliberately not covered here (CI cost-vs-coverage):
+//   - sudoku.sigil, multishot_stress.sigil: long-running.
+//   - interpreter.sigil, json.sigil: large surface, covered by
+//     existing dedicated e2e tests.
+//   - fib_perf / fibonacci / choose: structurally similar to ones
+//     above.
+// These are not gaps in cross-check correctness — every alloc on
+// every example fires the same cross-check path. The subset bounds
+// CI wall time without losing coverage class.
+
+#[test]
+fn cross_check_arith_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/arith.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_arith",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    // arith.sigil exits with a computed code (26 today); we assert
+    // only that the cross-check didn't abort.
+    assert_no_cross_check_abort("arith.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_catch_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_catch",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("catch.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_div_recover_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/div_recover.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_div_recover",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("div_recover.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_fib_cps_perf_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_fib_cps_perf",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("fib_cps_perf.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_generic_map_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/generic_map.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_generic_map",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("generic_map.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_higher_order_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/higher_order.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_higher_order",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("higher_order.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_nested_effects_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/nested_effects.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_nested_effects",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("nested_effects.sigil", &stderr, code);
+}
+
+#[test]
+fn cross_check_state_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/state.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_state",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_no_cross_check_abort("state.sigil", &stderr, code);
 }
