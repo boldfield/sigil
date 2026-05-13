@@ -1,0 +1,176 @@
+// examples/descriptor_cache_stress.sigil
+//
+// Plan E2 Phase 2 throughput-report workload (plan
+// `2026-05-13-sigil-plan-e2-phase-2-throughput-report.md`, Task 2).
+//
+// Allocates N = 100,000 objects across K = 10 distinct sum-type
+// shapes, 10,000 per shape. Each shape's pointer-bitmap × payload-
+// count pair is unique, so the runtime's descriptor cache
+// (`runtime/src/gc/descriptor.rs`) holds exactly 10 entries by
+// the end of the run. The first allocation of each shape is a
+// cache miss (`GC_make_descriptor` called); the remaining 9,999
+// are cache hits.
+//
+// Workload shape:
+//   - `Tree`: a shared heap-typed scratch value the 10 stress
+//     shapes embed in their payload slots. Allocated once at
+//     program start as `Leaf`; reused across every alloc so the
+//     descriptor-cache cost dominates the measurement (rather
+//     than per-shape constructor work).
+//   - `T1`..`T10`: 10 single-variant sum types varying the
+//     `(count, bitmap)` pair the codegen emits in the header:
+//     T1   = 1 ptr             — count=1, bitmap=0b1
+//     T2   = 2 ptrs            — count=2, bitmap=0b11
+//     T3   = (Int, Tree)       — count=2, bitmap=0b10
+//     T4   = (Tree, Int)       — count=2, bitmap=0b01
+//     T5   = 3 ptrs            — count=3, bitmap=0b111
+//     T6   = (Int, 2 ptrs)     — count=3, bitmap=0b110
+//     T7   = (Tree, Int, Tree) — count=3, bitmap=0b101
+//     T8   = 4 ptrs            — count=4, bitmap=0b1111
+//     T9   = (Int, Tree, Int, Tree)   — count=4, bitmap=0b1010
+//     T10  = (Tree, Int, Tree, Int)   — count=4, bitmap=0b0101
+//   - The `alloc_t<n>` workers each tail-recurse 10,000 times,
+//     allocating one fresh `C<n>(...)` per iteration and adding
+//     1 to an accumulator so the allocations are not dead-code-
+//     eliminated. After all 10 workers run, `main` prints the
+//     total (always `100000`) and exits.
+//
+// The workload intentionally does NOT retain the allocated
+// objects — each goes out of scope at the end of its recursive
+// step. This isolates the descriptor-cache + typed-malloc
+// alloc-path cost from mark-phase cost. (A retention-heavy
+// workload like `tree_stress_repeat.sigil` already covers
+// mark-phase cost via the existing perf suite.)
+
+import std.io
+
+type Tree = | Leaf | Node(Int, Tree, Tree)
+
+type T1  = | C1(Tree)
+type T2  = | C2(Tree, Tree)
+type T3  = | C3(Int, Tree)
+type T4  = | C4(Tree, Int)
+type T5  = | C5(Tree, Tree, Tree)
+type T6  = | C6(Int, Tree, Tree)
+type T7  = | C7(Tree, Int, Tree)
+type T8  = | C8(Tree, Tree, Tree, Tree)
+type T9  = | C9(Int, Tree, Int, Tree)
+type T10 = | C10(Tree, Int, Tree, Int)
+
+fn alloc_t1(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T1 = C1(leaf);
+      alloc_t1(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t2(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T2 = C2(leaf, leaf);
+      alloc_t2(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t3(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T3 = C3(0, leaf);
+      alloc_t3(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t4(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T4 = C4(leaf, 0);
+      alloc_t4(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t5(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T5 = C5(leaf, leaf, leaf);
+      alloc_t5(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t6(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T6 = C6(0, leaf, leaf);
+      alloc_t6(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t7(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T7 = C7(leaf, 0, leaf);
+      alloc_t7(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t8(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T8 = C8(leaf, leaf, leaf, leaf);
+      alloc_t8(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t9(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T9 = C9(0, leaf, 0, leaf);
+      alloc_t9(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn alloc_t10(n: Int, leaf: Tree, total: Int) -> Int ![] {
+  match n {
+    0 => total,
+    _ => {
+      let v: T10 = C10(leaf, 0, leaf, 0);
+      alloc_t10(n - 1, leaf, total + 1)
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let leaf: Tree = Leaf;
+  let n: Int = 10000;
+  let s1: Int  = alloc_t1(n, leaf, 0);
+  let s2: Int  = alloc_t2(n, leaf, 0);
+  let s3: Int  = alloc_t3(n, leaf, 0);
+  let s4: Int  = alloc_t4(n, leaf, 0);
+  let s5: Int  = alloc_t5(n, leaf, 0);
+  let s6: Int  = alloc_t6(n, leaf, 0);
+  let s7: Int  = alloc_t7(n, leaf, 0);
+  let s8: Int  = alloc_t8(n, leaf, 0);
+  let s9: Int  = alloc_t9(n, leaf, 0);
+  let s10: Int = alloc_t10(n, leaf, 0);
+  let total: Int = s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8 + s9 + s10;
+  perform IO.println(int_to_string(total));
+  0
+}

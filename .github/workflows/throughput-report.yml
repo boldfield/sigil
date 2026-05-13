@@ -1,0 +1,173 @@
+name: throughput-report
+
+# Plan E2 throughput-report measurement workflow. Triggered manually
+# via the Actions UI ("Run workflow") on the branch holding the
+# throughput-report PR. Builds + measures the Sigil compiler at two
+# checkpoints — the pre-Phase-2 SHA and the branch's current HEAD —
+# across a workload suite, then uploads the per-workload JSON files
+# + a generated markdown summary as artifacts. The PR author then
+# pastes the artifact contents into the throughput report doc.
+#
+# Why workflow_dispatch only (no push/pull_request trigger):
+# - Each run builds the compiler twice (~10 min/OS × 2 OS = ~20 min).
+#   Auto-triggering on every push would saturate the actions queue
+#   for what is effectively a one-shot measurement per PR.
+# - Wall-clock measurements need a quiet runner; we don't want
+#   competing CI lanes for the same commit muddying the data.
+#
+# The workflow is checkpointed in measurement.yml on both lanes
+# (ubuntu-24.04 + macos-14) so the report can attribute deltas to
+# the same platform on each side.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pre_sha:
+        description: "Pre-Phase-2 commit SHA"
+        required: true
+        default: "4f7ec86c52c4aa7335571c0be5e7e771e766c0ad"
+      runs:
+        description: "Measurement runs per workload"
+        required: true
+        default: "5"
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: 1
+  SOURCE_DATE_EPOCH: "0"
+  TZ: UTC
+
+jobs:
+  measure:
+    name: measure (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can `git worktree add` at the
+          # pre-Phase-2 SHA without re-fetching mid-job.
+          fetch-depth: 0
+
+      - name: install Boehm GC + lld (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgc-dev pkg-config lld clang
+          # GNU coreutils on Linux ships /usr/bin/time -v already.
+
+      - name: install Boehm GC (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install bdw-gc pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          # macOS's /usr/bin/time -l ships with the base system.
+
+      - name: workload + script SHAs sanity check
+        run: |
+          test -f examples/descriptor_cache_stress.sigil
+          test -x scripts/measure-throughput.sh
+          test -x scripts/diff-throughput.py
+
+      # ----------------------------------------------------------------
+      # POST-Phase-2 build + measure (current branch HEAD).
+      # ----------------------------------------------------------------
+      - name: post — cargo build --release
+        run: |
+          cargo build --release -p sigil-compiler -p sigil-runtime
+
+      - name: post — compile workloads
+        run: |
+          mkdir -p post-bins
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+            ./target/release/sigil "examples/${w}.sigil" -o "post-bins/${w}"
+          done
+
+      - name: post — measure workloads
+        run: |
+          mkdir -p throughput-data/post
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+            scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs }}" \
+              > "throughput-data/post/${w}.json"
+            echo "--- post/${w} ---"
+            cat "throughput-data/post/${w}.json"
+          done
+
+      # ----------------------------------------------------------------
+      # PRE-Phase-2 worktree at the input SHA. The new workload +
+      # scripts + the gc-time probe live on this branch and don't
+      # exist at the PRE SHA; cherry-pick them onto the worktree per
+      # the plan body's documented methodology.
+      # ----------------------------------------------------------------
+      - name: pre — worktree at ${{ inputs.pre_sha }}
+        run: |
+          git worktree add /tmp/pre-phase-2 ${{ inputs.pre_sha }}
+          cd /tmp/pre-phase-2
+          git log --oneline -1
+          # Copy the throughput-report-only files onto the worktree.
+          # These don't exist at the PRE SHA, so cp (not git apply) is
+          # the cleaner mechanism.
+          cp ${{ github.workspace }}/examples/descriptor_cache_stress.sigil examples/
+          mkdir -p scripts
+          cp ${{ github.workspace }}/scripts/measure-throughput.sh scripts/
+          cp ${{ github.workspace }}/scripts/diff-throughput.py scripts/
+          chmod +x scripts/measure-throughput.sh scripts/diff-throughput.py
+
+      - name: pre — cargo build --release
+        run: |
+          cd /tmp/pre-phase-2
+          cargo build --release -p sigil-compiler -p sigil-runtime
+
+      - name: pre — compile workloads
+        run: |
+          cd /tmp/pre-phase-2
+          mkdir -p ${{ github.workspace }}/pre-bins
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+            ./target/release/sigil "examples/${w}.sigil" \
+              -o "${{ github.workspace }}/pre-bins/${w}"
+          done
+
+      - name: pre — measure workloads
+        run: |
+          mkdir -p throughput-data/pre
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+            scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs }}" \
+              > "throughput-data/pre/${w}.json"
+            echo "--- pre/${w} ---"
+            cat "throughput-data/pre/${w}.json"
+          done
+
+      # ----------------------------------------------------------------
+      # Produce a markdown summary the PR author can paste into the
+      # throughput report's "Deltas" section.
+      # ----------------------------------------------------------------
+      - name: render deltas summary
+        run: |
+          mkdir -p throughput-data
+          {
+            echo "## Deltas — ${{ matrix.os }}"
+            echo ""
+            echo "Pre SHA: \`${{ inputs.pre_sha }}\`"
+            echo "Post SHA: \`${{ github.sha }}\`"
+            echo "Runs per workload: ${{ inputs.runs }}"
+            echo ""
+            for w in fib_perf fib_cps_perf tree tree_stress_repeat descriptor_cache_stress; do
+              scripts/diff-throughput.py "${w}" \
+                "throughput-data/pre/${w}.json" \
+                "throughput-data/post/${w}.json"
+              echo ""
+            done
+          } > "throughput-data/deltas-${{ matrix.os }}.md"
+          cat "throughput-data/deltas-${{ matrix.os }}.md"
+
+      - name: upload throughput JSON + deltas
+        uses: actions/upload-artifact@v4
+        with:
+          name: throughput-data-${{ matrix.os }}
+          path: throughput-data/
+          retention-days: 30

@@ -309,9 +309,15 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   GC stress tests' `SIGIL_GC_STRESS_INNER` discipline).
 - 309 runtime lib tests pass (was 307 + new differential test +
   atomic sanity test).
-- Throughput delta deferred to the Phase 2 closeout PR (separate
-  measurement workload; this PR's deliverable is the precision
-  proof itself).
+- Throughput delta — ⏳ scaffolding shipped, measurement data
+  pending. See
+  [`compiler/docs/plan-e2-phase-2-throughput.md`](compiler/docs/plan-e2-phase-2-throughput.md)
+  for the methodology, workload definitions, and the report
+  shell. Trigger
+  [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml)
+  manually to populate the "Pre-Phase-2 measurements",
+  "Post-Phase-2 measurements", and "Deltas" sections; flip this
+  bullet to ✅ once the data + Discussion are filled in.
 
 ## Phase 3 — Precise stack roots
 
