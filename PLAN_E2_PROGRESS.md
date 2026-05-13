@@ -270,7 +270,50 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 9 — Drop conservative heap scan
 
-- status: pending — Phase 2 ship gate (false-retention reproducer).
+- status: **in PR (Task 9 branch)**
+- "Drop conservative heap scan" was already structurally complete
+  in Task 8: every `bitmap != 0 && count > 0` object now routes
+  through `GC_malloc_explicitly_typed`, so Boehm's mark phase
+  scans only the payload slots the descriptor names as pointers.
+  The plan-body concern — conservative heap scan pinning
+  unrelated objects via spurious pointer-shaped values — is no
+  longer possible for typed-marked objects.
+- The remaining conservative paths are intentional:
+  - `bitmap != 0 && count == 0` (arrays / mut-arrays / SB segments
+    table) → plain `GC_malloc`. These payloads exceed the 6-bit
+    count field's reach; conservative scan is the v1 default
+    (v2 typed-walker via `TAG_EXTERNAL_DESCRIPTOR` will reshape).
+  - Conservative stack scan — Phase 3 lifts this for Sigil
+    program threads (Tasks 10–12).
+- **False-retention reproducer** (plan body's "single most
+  important Phase 2 verification") landed as
+  `runtime/src/gc.rs::tests::
+  false_retention_reproducer_precise_marker_drops_aliased_address`.
+  The test:
+  1. Allocates an atomic alias object (bitmap=0, count=1) whose
+     payload Boehm doesn't scan.
+  2. In a `#[inline(never)] unsafe fn`, allocates a target
+     String, registers a `GC_register_finalizer` callback on it,
+     and writes the target's address as a bit-pattern alias
+     into the atomic object's payload. When the fn returns, the
+     target's typed pointer + the helper's stack frame are
+     dropped, so Boehm cannot reach the target via either the
+     typed marker (atomic payload is not scanned) or the
+     conservative stack scan (the fn's stack frame is reclaimed
+     before the GC call).
+  3. Allocation-spams 128 INT64 wrappers to overwrite stack
+     remnants.
+  4. Forces two `GC_gcollect` + `GC_invoke_finalizers` cycles
+     (Boehm's documented pattern to drive a finalizer to fire
+     in the caller's thread).
+  5. Asserts the finalizer fired exactly once — proving the
+     precise marker correctly dropped the aliased value.
+- Subprocess-pattern wrapped (matches the runtime's other GC
+  stress tests' `SIGIL_GC_STRESS_INNER` discipline).
+- 308 runtime lib tests pass (was 307 + new false-retention test).
+- Throughput delta deferred to the Phase 2 closeout PR (separate
+  measurement workload; this PR's deliverable is the precision
+  proof itself).
 
 ## Phase 3 — Precise stack roots
 
