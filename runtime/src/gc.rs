@@ -83,6 +83,27 @@ extern "C" {
     #[cfg(test)]
     pub(crate) fn GC_unregister_my_thread() -> i32;
 
+    // Boehm finalizer surface — Plan E2 Phase 2 Task 9. Used by the
+    // false-retention reproducer to assert an unreachable object is
+    // actually collected (rather than indirectly inferring liveness
+    // from heap statistics). `GC_register_finalizer(obj, fn, cd,
+    // ofn, ocd)` schedules `fn(obj, cd)` to run when `obj` becomes
+    // unreachable; `GC_invoke_finalizers()` synchronously runs any
+    // pending finalizers (we call it after `GC_gcollect` to force
+    // the assertion to happen in the test's thread instead of an
+    // arbitrary deferred moment). Gated to test builds so the
+    // production staticlib stays free of test-only Boehm symbols.
+    #[cfg(test)]
+    pub(crate) fn GC_register_finalizer(
+        obj: *mut c_void,
+        fn_: extern "C" fn(*mut c_void, *mut c_void),
+        cd: *mut c_void,
+        ofn: *mut extern "C" fn(*mut c_void, *mut c_void),
+        ocd: *mut *mut c_void,
+    );
+    #[cfg(test)]
+    pub(crate) fn GC_invoke_finalizers() -> i32;
+
     // Boehm typed-malloc descriptor constructor — Plan E2 Phase 2.
     // `bitmap` is a slice of `GC_word` (== usize on 64-bit targets);
     // bit `i` (LSB-first within each word) is `1` iff word `i` of
@@ -653,6 +674,263 @@ mod tests {
                     "string {i} payload corrupted after GC"
                 );
             }
+        }
+    }
+
+    /// Track finalizer firings across the false-retention test's
+    /// lifetime. Only one test in this module registers finalizers,
+    /// so a single static counter is sufficient.
+    static FINALIZER_FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn target_finalizer_cb(_obj: *mut std::ffi::c_void, _cd: *mut std::ffi::c_void) {
+        FINALIZER_FIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn false_retention_reproducer_precise_marker_drops_aliased_address() {
+        // **Phase 2 ship-gate test** (plan body: "the single most
+        // important Phase 2 verification — it's the bug class we
+        // set out to close").
+        //
+        // The differential property Task 8 added:
+        //
+        //   Pre-Task 8:  every `bitmap != 0` object went through plain
+        //                `GC_malloc`. Boehm scanned its FULL payload
+        //                conservatively — every word treated as a
+        //                potential pointer, including words the
+        //                Header's bitmap explicitly named as
+        //                non-pointers. A bit pattern in a "supposedly
+        //                non-pointer" slot would falsely retain its
+        //                target.
+        //
+        //   Post-Task 8: `bitmap != 0 && count > 0` routes through
+        //                `GC_malloc_explicitly_typed` with a
+        //                descriptor that names each slot's pointer-
+        //                ness precisely. Boehm's mark phase reads
+        //                only the slots whose bitmap bit is SET.
+        //                A bit pattern in a slot whose bit is CLEAR
+        //                is not followed.
+        //
+        // The discriminator is the typed-malloc precision behaviour.
+        // To test it, we pick a closure-shape header (`count = 2`,
+        // `bitmap = 0b10`):
+        //
+        //   payload word 0:  code_ptr slot — bitmap bit 0 = 0 (non-ptr)
+        //   payload word 1:  env slot 0   — bitmap bit 1 = 1 (ptr)
+        //
+        // We write the target's address into payload word 0 (the
+        // bitmap-bit-CLEAR slot) and 0 into payload word 1. With
+        // the precise marker, Boehm sees alias_obj as reachable,
+        // reads its descriptor, follows slot 1 (null), skips slot 0
+        // (bit cleared). Target is unreachable.
+        //
+        // If a future regression reroutes typed-malloc allocations
+        // back through plain `GC_malloc` or builds a misshapen
+        // descriptor, the conservative full-payload scan would
+        // follow the bit pattern in slot 0 and retain target —
+        // the finalizer would not fire and this test would FAIL.
+        // That's the regression boundary the test pins.
+        //
+        // Runs in a subprocess (matches the Task 6 / handlers GC
+        // stress pattern) so Boehm's per-thread state doesn't
+        // bleed across parallel cargo workers.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess(
+                "false_retention_reproducer_precise_marker_drops_aliased_address",
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        FINALIZER_FIRED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // Allocate the typed-malloc alias object: TAG_CLOSURE, count=2,
+        // bitmap=0b10. Word 0 (code_ptr slot) is bitmap-bit-CLEAR;
+        // word 1 (env slot 0) is bitmap-bit-SET. Routes through
+        // `GC_malloc_explicitly_typed` per Task 8's dispatch.
+        let typed_header = Header::new(header::TAG_CLOSURE, 2, 0b10).raw();
+        let alias_obj = sigil_alloc(typed_header, 16);
+        assert!(!alias_obj.is_null());
+        // Initialise both payload slots to zero so we don't smuggle
+        // any stale pointer-shaped values in (Boehm zeroes by
+        // contract but the codebase doesn't rely on it elsewhere —
+        // see handlers::sigil_handler_frame_new's explicit zeroing).
+        // SAFETY: gc-heap-ptr arithmetic (alias_obj freshly allocated, we own both payload slots).
+        unsafe {
+            let payload: *mut u64 = alias_obj.add(8).cast();
+            payload.add(0).write(0);
+            payload.add(1).write(0);
+        }
+
+        // Allocate the target + register its finalizer + write the
+        // target's address into payload word 0 (the bitmap-bit-CLEAR
+        // slot) — ALL inside a nested helper fn whose stack frame is
+        // popped before we return. When this returns:
+        //   - target's typed pointer is gone (helper's stack frame
+        //     reclaimed).
+        //   - target_addr local is gone (same).
+        //   - The only remaining reference to target is the
+        //     bit-pattern alias in alias_obj's word 0. With precise
+        //     marking, Boehm reads the bitmap and DOES NOT follow
+        //     this slot. Target is unreachable.
+        #[inline(never)]
+        unsafe fn alloc_target_and_alias_into_typed(alias_obj: *mut u8) {
+            let s_bytes = b"FALSE-RETENTION-TYPED";
+            // SAFETY: gc-heap-ptr arithmetic (s_bytes is a stack-local byte literal; sigil_string_new copies).
+            let target = sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
+            assert!(!target.is_null());
+            GC_register_finalizer(
+                target as *mut std::ffi::c_void,
+                target_finalizer_cb,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            // SAFETY: gc-heap-ptr arithmetic (alias_obj freshly allocated, we own payload word 0).
+            let payload: *mut u64 = alias_obj.add(8).cast();
+            payload.add(0).write(target as u64);
+            // Leave word 1 (the actual pointer slot) null — Boehm's
+            // precise marker WILL follow this slot per the descriptor.
+            // A null value is the safe choice; any non-null would
+            // also retain whatever it points to.
+        }
+        unsafe { alloc_target_and_alias_into_typed(alias_obj) };
+
+        // Allocation-spam to overwrite any stack slots that may
+        // still hold target's typed pointer. Matches the discipline
+        // in the handler GC stress tests.
+        for _ in 0..128 {
+            let h = Header::new(header::TAG_INT64, 1, 0).raw();
+            let _ = sigil_alloc(h, 8);
+        }
+
+        // Force a full collection. Two GC cycles + invoke_finalizers
+        // is Boehm's documented pattern for surfacing a finalizer in
+        // the caller's thread: the first collection marks target
+        // unreachable and queues the finalizer; the second runs it.
+        unsafe {
+            GC_gcollect();
+            GC_invoke_finalizers();
+            GC_gcollect();
+            GC_invoke_finalizers();
+        }
+
+        // Assert: target's finalizer fired. If it didn't, the
+        // precise marker is leaking — Boehm is following the
+        // bitmap-bit-CLEAR slot when it shouldn't.
+        let fired = FINALIZER_FIRED.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            fired, 1,
+            "false-retention reproducer: target's finalizer did NOT fire after \
+             two GC cycles. Either the precise marker is falsely retaining the \
+             target via the aliased bit pattern in payload word 0 (bitmap bit \
+             clear; the slot SHOULD be skipped), or stack-side pointer-shaped \
+             values from the conservative stack scan are still holding a \
+             reference. (FINALIZER_FIRED = {fired})"
+        );
+
+        // Pin alias_obj across the GC cycles so the optimiser can't
+        // dead-code-eliminate the test setup. Word 0 still holds the
+        // bit-pattern alias (Boehm didn't disturb the slot — it just
+        // didn't follow the value).
+        // SAFETY: gc-heap-ptr arithmetic (re-reads alias_obj's payload after the assertion).
+        unsafe {
+            let payload: *const u64 = alias_obj.add(8).cast();
+            let read = payload.read();
+            assert_ne!(
+                read, 0,
+                "alias_obj payload word 0 was cleared during the test (alias_obj itself was lost)"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_payload_not_scanned_by_conservative_marker() {
+        // Sanity check (NOT the Phase 2 ship-gate property).
+        //
+        // `GC_malloc_atomic` has skipped payload scanning since libgc
+        // 1.0 — this property predates Sigil entirely and is
+        // independent of Task 8's typed-malloc work. The test pins
+        // it anyway because:
+        //
+        //   1. It exercises the `#[inline(never)] unsafe fn` stack-
+        //      frame-pop discipline that the false-retention test
+        //      depends on (so a Rust-side regression that breaks
+        //      frame reclamation would surface here too).
+        //   2. It exercises the two-GC-cycle + invoke_finalizers
+        //      pattern that the false-retention test relies on.
+        //   3. It pins `GC_malloc_atomic` as continuing to behave
+        //      atomically post-Task 8 (we didn't accidentally route
+        //      bitmap=0 through a non-atomic path).
+        //
+        // The reviewer of PR #167 (commit ad451e1) correctly flagged
+        // that the originally-named "false-retention reproducer"
+        // test was actually this property in disguise. Splitting
+        // the test let both purposes be expressed cleanly.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess("atomic_payload_not_scanned_by_conservative_marker");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        FINALIZER_FIRED.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        // Atomic alias object (bitmap=0 → GC_malloc_atomic).
+        let atomic_header = Header::new(header::TAG_INT64, 1, 0).raw();
+        let alias_obj = sigil_alloc(atomic_header, 8);
+        assert!(!alias_obj.is_null());
+
+        #[inline(never)]
+        unsafe fn alloc_target_and_alias_into_atomic(alias_obj: *mut u8) {
+            let s_bytes = b"ATOMIC-PAYLOAD-TARGET";
+            // SAFETY: gc-heap-ptr arithmetic (s_bytes is a stack-local byte literal; sigil_string_new copies).
+            let target = sigil_string_new(s_bytes.as_ptr(), s_bytes.len());
+            assert!(!target.is_null());
+            GC_register_finalizer(
+                target as *mut std::ffi::c_void,
+                target_finalizer_cb,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            // SAFETY: gc-heap-ptr arithmetic (alias_obj freshly allocated, we own its payload).
+            let payload: *mut u64 = alias_obj.add(8).cast();
+            payload.write(target as u64);
+        }
+        unsafe { alloc_target_and_alias_into_atomic(alias_obj) };
+
+        for _ in 0..128 {
+            let h = Header::new(header::TAG_INT64, 1, 0).raw();
+            let _ = sigil_alloc(h, 8);
+        }
+
+        unsafe {
+            GC_gcollect();
+            GC_invoke_finalizers();
+            GC_gcollect();
+            GC_invoke_finalizers();
+        }
+
+        let fired = FINALIZER_FIRED.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            fired, 1,
+            "atomic-payload test: target's finalizer did NOT fire after \
+             two GC cycles. Either GC_malloc_atomic is unexpectedly \
+             scanning its payload (regression), or stack-side pointer- \
+             shaped values are still holding a reference. \
+             (FINALIZER_FIRED = {fired})"
+        );
+
+        // SAFETY: gc-heap-ptr arithmetic (re-reads alias_obj's payload after the assertion).
+        unsafe {
+            let payload: *const u64 = alias_obj.add(8).cast();
+            let read = payload.read();
+            assert_ne!(
+                read, 0,
+                "alias_obj payload was cleared during the test (alias_obj itself was lost)"
+            );
         }
     }
 
