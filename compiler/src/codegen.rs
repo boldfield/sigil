@@ -3674,7 +3674,7 @@ fn collect_branch_chain_allocs(
                     let global_idx = base_idx + i;
                     let name = format!("sigil_post_yield_cont_{global_idx}");
                     let func_id = module
-                        .declare_function(&name, Linkage::Local, synth_cont_sig)
+                        .declare_function(&name, Linkage::Export, synth_cont_sig)
                         .map_err(|e| format!("declare {name}: {e}"))?;
                     branch_func_ids.push(func_id);
                 }
@@ -5547,7 +5547,7 @@ fn collect_handle_arms_in_expr(
                 let global_idx = out.synth.len();
                 let mangled = format!("sigil_handler_arm_{global_idx}");
                 let func_id = module
-                    .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                    .declare_function(&mangled, Linkage::Export, ctx.cps_arm_sig)
                     .map_err(|e| format!("declare {mangled}: {e}"))?;
                 // Validate that the op_id is registered (op_ids
                 // populated at end of typecheck for every effect's
@@ -5679,7 +5679,7 @@ fn collect_handle_arms_in_expr(
                     let post_arm_k_mangled =
                         format!("sigil_handler_post_arm_k_{post_arm_k_arm_fn_idx}");
                     let post_arm_k_func_id = module
-                        .declare_function(&post_arm_k_mangled, Linkage::Local, ctx.cps_arm_sig)
+                        .declare_function(&post_arm_k_mangled, Linkage::Export, ctx.cps_arm_sig)
                         .map_err(|e| format!("declare {post_arm_k_mangled}: {e}"))?;
                     let binding_ty = cranelift_ty_for_type_expr(shape.binding_te, ctx.pointer_ty);
                     // Plan B Task 78.5 G1 — captures-bearing slice of
@@ -5768,7 +5768,7 @@ fn collect_handle_arms_in_expr(
                             let mangled =
                                 format!("sigil_handler_post_arm_k_{step_idx_1based}_{arm_fn_idx}");
                             let func_id = module
-                                .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                                .declare_function(&mangled, Linkage::Export, ctx.cps_arm_sig)
                                 .map_err(|e| format!("declare {mangled}: {e}"))?;
                             step_func_ids.push(func_id);
                         }
@@ -5948,7 +5948,7 @@ fn collect_handle_arms_in_expr(
                 let global_idx = out.return_synth.len();
                 let mangled = format!("sigil_handler_return_arm_{global_idx}");
                 let func_id = module
-                    .declare_function(&mangled, Linkage::Local, ctx.cps_arm_sig)
+                    .declare_function(&mangled, Linkage::Export, ctx.cps_arm_sig)
                     .map_err(|e| format!("declare {mangled}: {e}"))?;
 
                 // Captures: typecheck-side `handle_return_arm_captures`
@@ -9482,7 +9482,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
             let mangled = mangle_user_fn(&f.name);
             let func_id = module
-                .declare_function(&mangled, Linkage::Local, &sig)
+                .declare_function(&mangled, Linkage::Export, &sig)
                 .map_err(|e| format!("declare {mangled}: {e}"))?;
             user_fns.insert(
                 f.name.clone(),
@@ -9559,7 +9559,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 shim_sig.returns.push(AbiParam::new(ret_ty));
                 let shim_name = format!("{mangled}__sync_shim");
                 let shim_id = module
-                    .declare_function(&shim_name, Linkage::Local, &shim_sig)
+                    .declare_function(&shim_name, Linkage::Export, &shim_sig)
                     .map_err(|e| format!("declare {shim_name}: {e}"))?;
                 sync_shim_fn_ids.insert(f.name.clone(), shim_id);
             }
@@ -9600,7 +9600,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let synth_cont_idx = cps_continuation_synth.len();
                     let synth_cont_name = format!("sigil_post_yield_cont_{synth_cont_idx}");
                     let synth_cont_func_id = module
-                        .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                        .declare_function(&synth_cont_name, Linkage::Export, &synth_cont_sig)
                         .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
                     cps_continuation_synth.push(CpsContinuationSynth {
                         func_id: synth_cont_func_id,
@@ -9812,7 +9812,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let global_idx = starting_idx + step;
                             let synth_cont_name = format!("sigil_post_yield_cont_{global_idx}");
                             let synth_cont_func_id = module
-                                .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                                .declare_function(
+                                    &synth_cont_name,
+                                    Linkage::Export,
+                                    &synth_cont_sig,
+                                )
                                 .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
                             step_func_ids.push(synth_cont_func_id);
                         }
@@ -10812,7 +10816,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let synth_cont_name =
                                 format!("sigil_post_yield_cont_{synth_cont_global_idx}");
                             let synth_cont_func_id = module
-                                .declare_function(&synth_cont_name, Linkage::Local, &synth_cont_sig)
+                                .declare_function(
+                                    &synth_cont_name,
+                                    Linkage::Export,
+                                    &synth_cont_sig,
+                                )
                                 .map_err(|e| format!("declare {synth_cont_name}: {e}"))?;
                             cps_continuation_synth.push(CpsContinuationSynth {
                                 func_id: synth_cont_func_id,

@@ -18536,6 +18536,23 @@ fn cross_check_choose_demo_runs_cleanly() {
          summary: allocs={allocs} roots={roots} fns={fns} records={records}\n\
          --- stderr ---\n{stderr}",
     );
+    // PR #163 review M1 third-pass requirement: `fns_resolved` must
+    // be close to `parsed_fns` (the reviewer required ≥6 of 7 for
+    // choose_demo). A symbol-resolution regression that only finds
+    // the C-shim "main" (the original sole `Linkage::Export` site)
+    // produces fns_resolved=1; the Linkage::Local→Export sweep at
+    // codegen.rs's 10 declare_function sites makes the user / synth /
+    // handler fns all dlsym-resolvable too. choose_demo has 7
+    // parsed fns; assert ≥6 resolve so the walker covers all the
+    // safepoint records, not just the trivial fraction.
+    assert!(
+        fns >= 6,
+        "expected ≥6 of choose_demo.sigil's 7 fn blocks to resolve via \
+         dlsym; got fns_resolved={fns}. Likely cause: not all user/synth \
+         function emit sites use Linkage::Export. summary: allocs={allocs} \
+         roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
 }
 
 #[test]
