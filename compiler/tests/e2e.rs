@@ -18374,9 +18374,33 @@ fn many_string_literals_compile_and_run() {
 // conservative GC) and runs it once with `SIGIL_GC_CROSS_CHECK=1`
 // set on the child process. The cross-check harness aborts on the
 // first divergence between the precise stackmap walker and the
-// conservative-shape view of the calling thread's stack — so a
-// successful exit (code 0) is equivalent to "zero divergence" for
-// every alloc on every safepoint in the example's execution.
+// conservative-shape view of the calling thread's stack.
+//
+// "Zero divergence" is asserted via:
+//   1. stderr does NOT contain `SIGIL_GC_CROSS_CHECK:` (the diagnostic
+//      prefix the harness writes before `std::process::abort`).
+//   2. exit code is NOT 134 (Unix SIGABRT — `process::abort` raises
+//      SIGABRT, which the shell surfaces as 128+6=134).
+//
+// The example's "normal" exit code is NOT asserted as 0 — some
+// examples (arith) intentionally exit non-zero with a computed value.
+// Per-example output assertions stay in the dedicated "is this
+// program correct" tests; the cross-check tests assert only "the
+// harness didn't fire."
+
+fn assert_no_cross_check_abort(test_name: &str, stderr: &str, code: i32) {
+    assert!(
+        !stderr.contains("SIGIL_GC_CROSS_CHECK:"),
+        "{test_name}: SIGIL_GC_CROSS_CHECK harness aborted; \
+         stderr=\n{stderr}",
+    );
+    assert_ne!(
+        code, 134,
+        "{test_name}: child exited with SIGABRT (cross-check abort \
+         is the most likely cause even if stderr was truncated); \
+         stderr={stderr:?}",
+    );
+}
 //
 // Coverage rationale:
 //   - `hello.sigil` — minimal alloc surface (only the string-literal
@@ -18404,13 +18428,10 @@ fn cross_check_hello_runs_cleanly() {
         "cross_check_hello",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "SIGIL_GC_CROSS_CHECK=1 must not abort hello.sigil; \
-         stdout={stdout:?} stderr={stderr:?}",
-    );
+    assert_no_cross_check_abort("hello.sigil", &stderr, code);
     // Output should be the same as the un-cross-checked run.
     assert_eq!(stdout, "hello, world\n");
+    assert_eq!(code, 0);
 }
 
 #[test]
@@ -18422,35 +18443,27 @@ fn cross_check_option_demo_runs_cleanly() {
         "cross_check_option_demo",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "SIGIL_GC_CROSS_CHECK=1 must not abort option_demo.sigil; \
-         stdout={stdout:?} stderr={stderr:?}",
-    );
+    assert_no_cross_check_abort("option_demo.sigil", &stderr, code);
     assert_eq!(stdout, "42\n-1\n");
+    assert_eq!(code, 0);
 }
 
 #[test]
 fn cross_check_choose_demo_runs_cleanly() {
     let root = workspace_root();
     let source = root.join("examples/choose_demo.sigil");
-    let (stdout, stderr, code) = compile_file_and_run_with_env(
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
         &source,
         "cross_check_choose_demo",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "SIGIL_GC_CROSS_CHECK=1 must not abort choose_demo.sigil; \
-         stdout={stdout:?} stderr={stderr:?}",
-    );
+    assert_no_cross_check_abort("choose_demo.sigil", &stderr, code);
 }
 
 #[test]
 fn cross_check_tree_stress_runs_cleanly() {
     // tree.sigil's depth-15 binary tree allocates 65,535 nodes —
-    // satisfies the plan body's "10k cons cells, drop, repeat"
-    // stress-test requirement (and more). Every alloc fires the
+    // alloc-heavy single-build coverage. Every alloc fires the
     // cross-check; exit 0 = zero divergence across all 65,535
     // safepoints.
     let root = workspace_root();
@@ -18460,11 +18473,7 @@ fn cross_check_tree_stress_runs_cleanly() {
         "cross_check_tree_stress",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "SIGIL_GC_CROSS_CHECK=1 must not abort tree.sigil stress run; \
-         stderr={stderr:?}",
-    );
+    assert_no_cross_check_abort("tree.sigil", &stderr, code);
 }
 
 #[test]
@@ -18483,13 +18492,10 @@ fn cross_check_tree_stress_drop_repeat_runs_cleanly() {
         "cross_check_tree_stress_drop_repeat",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "SIGIL_GC_CROSS_CHECK=1 must not abort tree_stress_repeat.sigil; \
-         stderr={stderr:?}",
-    );
+    assert_no_cross_check_abort("tree_stress_repeat.sigil", &stderr, code);
     // Sum-per-round = 2^12 - 1 = 4,095; ×10 rounds = 40,950.
     assert_eq!(stdout.trim_end(), "40950");
+    assert_eq!(code, 0);
 }
 
 // ===== Broader cross-check coverage =======================================
@@ -18524,7 +18530,9 @@ fn cross_check_arith_runs_cleanly() {
         "cross_check_arith",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(code, 0, "arith.sigil cross-check abort; stderr={stderr:?}");
+    // arith.sigil exits with a computed code (26 today); we assert
+    // only that the cross-check didn't abort.
+    assert_no_cross_check_abort("arith.sigil", &stderr, code);
 }
 
 #[test]
@@ -18536,7 +18544,7 @@ fn cross_check_catch_runs_cleanly() {
         "cross_check_catch",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(code, 0, "catch.sigil cross-check abort; stderr={stderr:?}");
+    assert_no_cross_check_abort("catch.sigil", &stderr, code);
 }
 
 #[test]
@@ -18548,10 +18556,7 @@ fn cross_check_div_recover_runs_cleanly() {
         "cross_check_div_recover",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "div_recover.sigil cross-check abort; stderr={stderr:?}"
-    );
+    assert_no_cross_check_abort("div_recover.sigil", &stderr, code);
 }
 
 #[test]
@@ -18563,10 +18568,7 @@ fn cross_check_fib_cps_perf_runs_cleanly() {
         "cross_check_fib_cps_perf",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "fib_cps_perf.sigil cross-check abort; stderr={stderr:?}"
-    );
+    assert_no_cross_check_abort("fib_cps_perf.sigil", &stderr, code);
 }
 
 #[test]
@@ -18578,10 +18580,7 @@ fn cross_check_generic_map_runs_cleanly() {
         "cross_check_generic_map",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "generic_map.sigil cross-check abort; stderr={stderr:?}"
-    );
+    assert_no_cross_check_abort("generic_map.sigil", &stderr, code);
 }
 
 #[test]
@@ -18593,10 +18592,7 @@ fn cross_check_higher_order_runs_cleanly() {
         "cross_check_higher_order",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "higher_order.sigil cross-check abort; stderr={stderr:?}"
-    );
+    assert_no_cross_check_abort("higher_order.sigil", &stderr, code);
 }
 
 #[test]
@@ -18608,10 +18604,7 @@ fn cross_check_nested_effects_runs_cleanly() {
         "cross_check_nested_effects",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(
-        code, 0,
-        "nested_effects.sigil cross-check abort; stderr={stderr:?}"
-    );
+    assert_no_cross_check_abort("nested_effects.sigil", &stderr, code);
 }
 
 #[test]
@@ -18623,5 +18616,5 @@ fn cross_check_state_runs_cleanly() {
         "cross_check_state",
         &[("SIGIL_GC_CROSS_CHECK", "1")],
     );
-    assert_eq!(code, 0, "state.sigil cross-check abort; stderr={stderr:?}");
+    assert_no_cross_check_abort("state.sigil", &stderr, code);
 }
