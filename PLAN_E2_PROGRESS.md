@@ -172,7 +172,35 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 6 — Boehm precise-mode API spike
 
-- status: pending
+- status: **in PR (Task 6 branch)**
+- API surface pinned: `GC_make_descriptor(bitmap, len_bits) -> GC_descr` +
+  `GC_malloc_explicitly_typed(size_in_bytes, descr) -> *mut c_void`
+  (from `gc/gc_typed.h`, libgc 8.x). Heavier alternatives
+  (`GC_REGISTER_MARK_PROC`, raw `GC_DESCR_KIND`, `GC_malloc_kind`)
+  considered and rejected — `GC_malloc_explicitly_typed` wraps
+  kind selection internally and is the right shape for v1's
+  bitmap-driven precise marking.
+- Repro: `runtime/tests/boehm_precise_spike.rs` (2 integration
+  tests). `make_descriptor_returns_nonzero_handle` confirms the
+  descriptor constructor returns a non-trivial handle.
+  `malloc_explicitly_typed_round_trip` allocates a 2-word object
+  via the typed allocator, stores a pointer into its precise
+  slot, forces a full `GC_gcollect`, and asserts the slot
+  survives unchanged. CI matrix (ubuntu-24.04 + macos-14) is the
+  authoritative verification environment.
+- Doc: `runtime/docs/boehm-precise-spike.md` documents the chosen
+  API, the constraints on `size_in_bytes` (>=
+  `len_bits * sizeof(GC_word)`), and the Sigil-pointer-bitmap →
+  Boehm-descriptor-bitmap mapping (Sigil's bit-`k` is per-payload-
+  word; Boehm's bit-0 is the header word → shift by 1).
+- Per-test infra: each spike test runs in its own subprocess via
+  the same pattern the runtime's GC stress tests use
+  (`SIGIL_BOEHM_SPIKE_INNER` env var, mirrors
+  `SIGIL_GC_STRESS_INNER` in `runtime/src/handlers.rs`). This is
+  required because libgc 8.x retains stale per-thread mark state
+  across cargo-test thread tear-downs — both with and without
+  symmetric `GC_unregister_my_thread`, both on the pod and on
+  the CI matrix.
 
 ### Task 7 — Descriptor cache
 
