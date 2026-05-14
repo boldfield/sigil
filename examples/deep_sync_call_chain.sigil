@@ -1,0 +1,65 @@
+// examples/deep_sync_call_chain.sigil
+//
+// Plan E2 Phase 3 throughput-report workload. Designed to
+// exercise the boundary Task 12 introduced: dropping Boehm's
+// conservative stack scan on Sigil program threads via
+// `GC_do_blocking` around `sigil_run_loop`, substituting the
+// stackmap-driven precise walker invoked from
+// `GC_set_push_other_roots`.
+//
+// Shape: a non-tail-recursive `build_nontco(n)` that allocates
+// a `C(n, build_nontco(n - 1))` cell at every frame. Wrapping
+// the recursive call in the constructor defeats TCO so all 2000
+// frames remain live on the C stack while the chain is built —
+// pre-Phase-3, Boehm's conservative scan walks every word of
+// every frame at every mark; post-Phase-3, only the stackmap-
+// emitted precise roots get pushed (one heap-pointer slot per
+// frame). The companion `sum_list` recursion is also non-tail
+// by construction (`v + sum_list(rest)` combines after the
+// call returns), so the fold leg matches the unfold leg.
+//
+// Sizing: 200 rounds × 2000-deep = 400,000 allocations across
+// ~6.4 MB of payload. Each round leaves its prior list
+// unreachable, sustaining heap pressure across many full-GC
+// cycles. Per-round sum = 2000 * 2001 / 2 = 2_001_000. Total
+// expected output = 200 * 2_001_000 = 400_200_000.
+//
+// On a quiet CI runner, wall-clock should land in the
+// 100-400 ms range — comfortably above `/usr/bin/time`'s
+// ~10 ms precision floor so the pre/post delta is measurable
+// even when the per-alloc and per-frame-walk costs are
+// individually below that floor.
+
+import std.io
+
+type Cons = | Nil | C(Int, Cons)
+
+fn build_nontco(n: Int) -> Cons ![] {
+  match n {
+    0 => Nil,
+    _ => C(n, build_nontco(n - 1)),
+  }
+}
+
+fn sum_list(c: Cons) -> Int ![] {
+  match c {
+    Nil => 0,
+    C(v, rest) => v + sum_list(rest),
+  }
+}
+
+fn iter(rounds: Int, depth: Int, total: Int) -> Int ![] {
+  match rounds {
+    0 => total,
+    _ => {
+      let xs: Cons = build_nontco(depth);
+      iter(rounds - 1, depth, total + sum_list(xs))
+    },
+  }
+}
+
+fn main() -> Int ![IO] {
+  let total: Int = iter(200, 2000, 0);
+  perform IO.println(int_to_string(total));
+  0
+}

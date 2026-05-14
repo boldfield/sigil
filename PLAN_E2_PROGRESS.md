@@ -530,6 +530,30 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 - Spike doc (`runtime/docs/boehm-per-thread-roots-spike.md`)
   updated with "Task 12 implementation notes" section
   documenting the four-piece composition.
+- Throughput delta — ✅ documented in
+  [`compiler/docs/plan-e2-phase-3-throughput.md`](compiler/docs/plan-e2-phase-3-throughput.md).
+  TL;DR: descriptor_cache_stress (5M allocs) +23.5% wall-clock
+  on ubuntu (170→210 ms) / +25.0% on macos (120→150 ms) =
+  ~6–8 ns/alloc from Phase 3's FP-capture + GC_call_with_gc_active
+  wrap. Combined with Phase 2's +21%/+86% (descriptor cache
+  + typed-malloc), Plan E2's full per-alloc cost is ~14 ns
+  ubuntu / ~18 ns macos. **Mark-phase delta unmeasured —
+  `boehm_gc_time_ms = 0` on every workload × every checkpoint,
+  INCLUDING the workload (`deep_sync_call_chain`,
+  200×2000-deep) designed to trigger many GCs.** This is a
+  stronger statement than Phase 2's "unmeasured at this
+  scale" — Phase 3's hypothesis (dropping conservative stack
+  scan reduces mark time) is unfalsifiable at any practical
+  Sigil workload size today, pending a follow-up plan that
+  forces frequent collections via `GC_set_max_heap_size` or
+  exposing `GC_gcollect()` to Sigil. Existing perf-floor
+  workloads (`fib_perf`, `fib_cps_perf`, `tree`,
+  `tree_stress_repeat`) stay below `/usr/bin/time`'s ~10ms
+  precision floor and pass their CI gates with the same
+  headroom as pre-Phase-3. Workflow run:
+  [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
+  Re-run via
+  [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
 
 ## Deviations
 

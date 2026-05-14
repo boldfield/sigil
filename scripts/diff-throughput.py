@@ -31,9 +31,11 @@ from pathlib import Path
 
 def pct_delta(pre, post) -> str:
     # Either side may be `None` (the JSON `null` for
-    # `boehm_gc_time_ms` on a pre-Phase-2 checkpoint that didn't
-    # have the runtime probe). Render those as "n/a" so the report
-    # surfaces the gap honestly rather than implying a 100% delta.
+    # `boehm_gc_time_ms` on a checkpoint that doesn't have the
+    # runtime probe — Phase 2 pre was such a checkpoint;
+    # post-Phase-2 checkpoints all carry the probe). Render those
+    # as "n/a" so the report surfaces the gap honestly rather than
+    # implying a 100% delta.
     if pre is None or post is None:
         return "n/a"
     if pre == 0:
@@ -61,7 +63,14 @@ def render(workload: str, pre: dict, post: dict) -> str:
     rows = []
     rows.append(f"### `{workload}`")
     rows.append("")
-    rows.append("| Metric | Pre-Phase-2 | Post-Phase-2 | Δ abs | Δ % |")
+    # Generic "Pre" / "Post" headers — the phase label is in the
+    # report doc's surrounding prose (and the SHAs are emitted at
+    # the top of the deltas summary the workflow renders). Earlier
+    # versions of this script hardcoded "Pre-Phase-2" / "Post-Phase-2";
+    # that ages badly once a Phase 3 (or Phase 4) report runs through
+    # the same script. Phase 2 / Phase 3 / future reports all use
+    # generic headers.
+    rows.append("| Metric | Pre | Post | Δ abs | Δ % |")
     rows.append("|---|---|---|---|---|")
 
     # Wall-clock + RSS use median ± IQR.
