@@ -6039,10 +6039,10 @@ impl Tc {
                                 span.clone(),
                                 format!(
                                     "ambiguous bare name `{name}` — defined in {}. \
-                                     Multiple imported modules export `{name}`; \
-                                     remove all but one of these imports, or rename \
-                                     the user fn to avoid the collision (qualified-call \
-                                     syntax `module.fn(...)` is a future v2 surface).{stdlib_hint}",
+                                     Multiple imported modules export `{name}`. \
+                                     Add a `use mod.{{ {name} }};` line to pin the \
+                                     intended module, or write the call qualified: \
+                                     `mod.{name}(...)`.{stdlib_hint}",
                                     modules.join(", ")
                                 ),
                             );
@@ -17434,64 +17434,60 @@ mod tests {
         );
     }
 
-    /// E0147 stdlib-shadow extension (2026-05-10 harness-data fix):
-    /// when a user fn collides with a stdlib export, the diagnostic
-    /// appends a hint pointing at the stdlib version. Without this,
-    /// the LLM's natural retry path ("rename my fn") is harder to
-    /// arrive at — the cross-language harness showed sonnet
-    /// repeatedly defining `fn int_compare` because std.ordering
-    /// already exports one and the original E0147 message didn't
-    /// surface that.
+    /// Plan F1 — repurposed E0147 fires at `use`-line collisions, not
+    /// call-site ambiguity. The original test asserted the pre-Plan-F1
+    /// behavior: a user `fn int_compare` colliding with std.ordering's
+    /// export tripped E0147 at the call site. Under qualified-default
+    /// imports the call-site collision is impossible by construction —
+    /// user code references the user fn (file-qualified), stdlib code
+    /// references the stdlib fn (via its file's `use` binding), and
+    /// no overlap reaches a single resolution point.
+    ///
+    /// The new analogous failure shape is two `use` lines competing
+    /// for the same local name, which we exercise in the test below.
     #[test]
-    fn bare_name_user_vs_stdlib_collision_includes_stdlib_hint() {
-        // User redeclares `int_compare` (already exported by
-        // std.ordering). Trips E0147 with the new stdlib-side hint.
+    fn use_line_collision_fires_e0147() {
         let src = "import std.list\n\
-                   import std.ordering\n\
-                   fn int_compare(a: Int, b: Int) -> Ordering ![] {\n  \
-                     if a < b { Less } else { if a > b { Greater } else { Equal } }\n\
-                   }\n\n\
+                   import std.option\n\
+                   use std.list.{map}\n\
+                   use std.option.{map}\n\
                    fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(2, Cons(1, Nil));\n  \
-                     let _ys: List[Int] = list_sort(xs, int_compare);\n  \
                      0\n\
                    }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
             .find(|e| e.code.as_str() == "E0147")
-            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
+            .unwrap_or_else(|| panic!("expected E0147 on duplicate `use`; got {errs:?}"));
         assert!(
-            e.message.contains("std.ordering"),
-            "stdlib origin should appear in message: {e:?}"
+            e.message.contains("duplicate `use` of name `map`"),
+            "new E0147 should name the colliding local name: {e:?}"
         );
         assert!(
-            e.message.contains("call the stdlib version directly"),
-            "stdlib-shadow hint missing: {e:?}"
+            e.message.contains("std.list"),
+            "first contributor (std.list) should appear in message: {e:?}"
+        );
+        assert!(
+            e.message.contains("std.option"),
+            "second contributor (std.option) should appear in message: {e:?}"
         );
     }
 
-    /// Cross-stdlib collision (no user fn) does NOT get the
-    /// stdlib-shadow hint. The hint is specifically for user-fn-vs-
-    /// stdlib-fn collisions; cross-stdlib (`std.list::map` vs
-    /// `std.option::map`) needs a different fix (drop one import).
+    /// Aliasing one of the colliding `use` bindings sidesteps E0147 —
+    /// both names are now distinct in the file's bare namespace.
     #[test]
-    fn bare_name_cross_stdlib_collision_no_stdlib_hint() {
+    fn use_line_collision_resolved_by_alias_no_e0147() {
         let src = "import std.list\n\
                    import std.option\n\
+                   use std.list.{map}\n\
+                   use std.option.{map as option_map}\n\
                    fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
-                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
                      0\n\
                    }\n";
         let errs = pipeline(src);
-        let e = errs
-            .iter()
-            .find(|e| e.code.as_str() == "E0147")
-            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
         assert!(
-            !e.message.contains("call the stdlib version directly"),
-            "stdlib-shadow hint should NOT fire on cross-stdlib collision: {e:?}"
+            !has_code(&errs, "E0147"),
+            "alias should suppress duplicate-use E0147; got {errs:?}"
         );
     }
 
