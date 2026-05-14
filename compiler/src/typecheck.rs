@@ -1712,7 +1712,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for item in &program.items {
         match item {
             Item::Fn(f) => tc.check_fn(f),
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan A3 task 38 / Plan B task 48: validate variant
             // field types under the type's own generic-parameter
             // substitution so `Cons(A, List[A])` resolves cleanly.
@@ -1843,7 +1843,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     td.generic_params.iter().map(|gp| gp.name.clone()).collect(),
                 );
             }
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan B task 53 — effect declarations carry their own
             // generic params for op signatures, but they don't
             // participate in the call-site / ctor-site instantiation
@@ -8362,7 +8362,7 @@ fn desugar_let_bound_continuations(program: &mut Program) {
             // a computed handle expression) is added, this match
             // needs to extend. Other current Items (Type, Effect,
             // Import) carry no Expr at all.
-            Item::Type(_) | Item::Effect(_) | Item::Import(_) => {}
+            Item::Type(_) | Item::Effect(_) | Item::Import(_) | Item::Use(_) => {}
         }
     }
 }

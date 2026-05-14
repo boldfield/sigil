@@ -207,6 +207,10 @@ impl<'a> Parser<'a> {
                     Some(i) => items.push(Item::Import(i)),
                     None => self.synchronise_to_semi_or_brace(),
                 },
+                TokenKind::Use => match self.parse_use_decl() {
+                    Some(u) => items.push(Item::Use(Box::new(u))),
+                    None => self.synchronise_to_semi_or_brace(),
+                },
                 TokenKind::Fn => match self.parse_fn_decl() {
                     Some(f) => items.push(Item::Fn(Box::new(f))),
                     None => self.synchronise_to_semi_or_brace(),
@@ -223,7 +227,7 @@ impl<'a> Parser<'a> {
                     let span = self.peek().span.clone();
                     self.err(
                         span,
-                        "expected `import`, `fn`, `type`, or `effect` at top level",
+                        "expected `import`, `use`, `fn`, `type`, or `effect` at top level",
                     );
                     self.synchronise_to_semi_or_brace();
                 }
@@ -250,6 +254,17 @@ impl<'a> Parser<'a> {
             self.advance();
             path.push(self.parse_ident("module component")?);
         }
+        // Plan F1 — optional `as <alias>` clause. Aliases the module
+        // (not individual symbols): `import std.option as O;` makes
+        // `O.x` a synonym for `std.option.x` at qualified call sites.
+        // The alias must be a single identifier — `as foo.bar` is
+        // rejected.
+        let mut alias = None;
+        if matches!(self.peek().kind, TokenKind::As) {
+            self.advance();
+            let alias_name = self.parse_ident("module alias after `as`")?;
+            alias = Some(alias_name);
+        }
         if matches!(self.peek().kind, TokenKind::Semi) {
             self.advance();
         }
@@ -265,7 +280,136 @@ impl<'a> Parser<'a> {
                 ),
             ));
         }
-        Some(ImportDecl { path, span: start })
+        Some(ImportDecl {
+            path,
+            alias,
+            span: start,
+        })
+    }
+
+    /// Plan F1 — selective bare-name opt-in for an imported module.
+    ///
+    /// Grammar:
+    /// ```text
+    /// use_decl    := 'use' qualified_path '.' '{' use_binding (',' use_binding)* '}' ';'
+    /// use_binding := IDENT ('as' IDENT)?
+    /// qualified_path := IDENT ('.' IDENT)*
+    /// ```
+    ///
+    /// Wildcard `use mod.path.*;` is rejected with a dedicated error
+    /// (we'd otherwise re-introduce the cross-module bare-name
+    /// ambiguity class). Empty binding lists `use mod.path.{};` are
+    /// also rejected — a `use` with zero symbols is dead code.
+    fn parse_use_decl(&mut self) -> Option<UseDecl> {
+        let start = self.peek().span.clone();
+        self.expect(&TokenKind::Use, "`use`")?;
+        // Parse the qualified module path: at least two segments
+        // separated by `.`. The trailing `.` before `{...}` is part
+        // of the path lexically, but the LAST segment is the module's
+        // tail name, not a symbol. We accumulate dotted idents until
+        // we see `{` (the binding-list opener).
+        let mut module_path = Vec::new();
+        let head = self.parse_ident("module name in `use` path")?;
+        module_path.push(head);
+        loop {
+            if !matches!(self.peek().kind, TokenKind::Dot) {
+                let span = self.peek().span.clone();
+                self.err(
+                    span,
+                    "expected `.` between module-path segments in `use`",
+                );
+                return None;
+            }
+            self.advance(); // consume `.`
+            // Wildcard form: `use mod.*;`. Reject with a clear message.
+            if matches!(self.peek().kind, TokenKind::Star) {
+                let span = self.peek().span.clone();
+                self.advance(); // consume the `*` for parity
+                if matches!(self.peek().kind, TokenKind::Semi) {
+                    self.advance();
+                }
+                self.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0034"),
+                    span,
+                    "wildcard `use` is not supported; list names explicitly: \
+                     `use mod.path.{name1, name2}`."
+                        .to_string(),
+                ));
+                return None;
+            }
+            // Brace-enclosed binding list ends the path.
+            if matches!(self.peek().kind, TokenKind::LBrace) {
+                break;
+            }
+            module_path.push(self.parse_ident("module-path segment in `use`")?);
+        }
+        self.expect(&TokenKind::LBrace, "`{` opening `use` binding list")?;
+        let mut bindings: Vec<UseBinding> = Vec::new();
+        while !matches!(self.peek().kind, TokenKind::RBrace | TokenKind::Eof) {
+            let bind_start = self.peek().span.clone();
+            let source_name = self.parse_ident("imported symbol name")?;
+            // Reject nested-path bindings: `use mod.{a.b}` is a structural
+            // mistake (callers usually meant `use mod.a.{b}`).
+            if matches!(self.peek().kind, TokenKind::Dot) {
+                let span = self.peek().span.clone();
+                self.err(
+                    span,
+                    "expected `,`, `}`, or `as` after symbol name (nested \
+                     paths like `{a.b}` are not allowed — write \
+                     `use mod.a.{b}` instead)",
+                );
+                return None;
+            }
+            let local_name = if matches!(self.peek().kind, TokenKind::As) {
+                self.advance();
+                self.parse_ident("local alias after `as`")?
+            } else {
+                source_name.clone()
+            };
+            bindings.push(UseBinding {
+                source_name,
+                local_name,
+                span: bind_start,
+            });
+            if matches!(self.peek().kind, TokenKind::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        let close = self.peek().span.clone();
+        self.expect(&TokenKind::RBrace, "`}` closing `use` binding list")?;
+        if matches!(self.peek().kind, TokenKind::Semi) {
+            self.advance();
+        }
+        if bindings.is_empty() {
+            self.errors.push(CompilerError::new(
+                Severity::Error,
+                errors::code("E0035"),
+                close,
+                "`use` declaration must name at least one symbol".to_string(),
+            ));
+            return None;
+        }
+        // v1 imports gate (E0031 mirror): the `use` source must be a
+        // stdlib path. User-code modules are not addressable in v1.
+        if module_path.first().map(String::as_str) != Some("std") {
+            self.errors.push(CompilerError::new(
+                Severity::Error,
+                errors::code("E0031"),
+                start.clone(),
+                format!(
+                    "user-code modules are not addressable in v1 (saw `use {} ...`)",
+                    module_path.join(".")
+                ),
+            ));
+        }
+        Some(UseDecl {
+            module_path,
+            bindings,
+            span: start,
+        })
     }
 
     fn parse_ident(&mut self, what: &str) -> Option<String> {
@@ -1606,7 +1750,7 @@ impl<'a> Parser<'a> {
                     }
                     continue;
                 }
-                TokenKind::Ident(ref n) if n == "as" => {
+                TokenKind::As => {
                     let span = self.peek().span.clone();
                     self.errors.push(CompilerError::new(
                         Severity::Error,
@@ -1685,12 +1829,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 return None;
             }
-            // `as` is a contextual keyword — currently always parses as
-            // an `Ident("as")` token since it is not in the keyword
-            // table. We catch it specifically before falling through
-            // to the Ident arm so the diagnostic is E0110, not a
-            // generic "expected pattern".
-            TokenKind::Ident(ref n) if n == "as" => {
+            // `as` is a reserved keyword (Plan F1 — import / use
+            // aliasing). At a pattern entry point an `as` token is
+            // ill-formed regardless of what precedes it; we reject
+            // with E0110 here so the diagnostic is "as-bindings are
+            // not supported," not the generic "expected pattern"
+            // that an unmatched keyword would otherwise produce.
+            TokenKind::As => {
                 self.errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0110"),
@@ -1927,6 +2072,119 @@ mod tests {
         let (toks, _) = lex("x.sigil", src);
         let (_prog, errs) = parse("x.sigil", &toks);
         assert!(errs.iter().any(|e| e.code.as_str() == "E0031"));
+    }
+
+    // --- Plan F1 — qualified imports + use declarations -------------------
+
+    fn parse_only(src: &str) -> (Program, Vec<CompilerError>) {
+        let (toks, lex_errs) = lex("x.sigil", src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        parse("x.sigil", &toks)
+    }
+
+    #[test]
+    fn parses_use_single_binding() {
+        let (prog, errs) = parse_only("use std.list.{map};\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Use(u) = &prog.items[0] else {
+            panic!("expected Item::Use first, got {:?}", prog.items[0]);
+        };
+        assert_eq!(u.module_path, vec!["std".to_string(), "list".to_string()]);
+        assert_eq!(u.bindings.len(), 1);
+        assert_eq!(u.bindings[0].source_name, "map");
+        assert_eq!(u.bindings[0].local_name, "map");
+    }
+
+    #[test]
+    fn parses_use_with_alias() {
+        let (prog, errs) =
+            parse_only("use std.list.{map as list_map};\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Use(u) = &prog.items[0] else {
+            panic!();
+        };
+        assert_eq!(u.bindings.len(), 1);
+        assert_eq!(u.bindings[0].source_name, "map");
+        assert_eq!(u.bindings[0].local_name, "list_map");
+    }
+
+    #[test]
+    fn parses_use_multiple_bindings_with_mixed_aliases() {
+        let src = "use std.list.{map, fold as list_fold, filter};\n\
+                   fn main() -> Int ![] { 0 }\n";
+        let (prog, errs) = parse_only(src);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Use(u) = &prog.items[0] else {
+            panic!();
+        };
+        let pairs: Vec<(&str, &str)> = u
+            .bindings
+            .iter()
+            .map(|b| (b.source_name.as_str(), b.local_name.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("map", "map"), ("fold", "list_fold"), ("filter", "filter")]
+        );
+    }
+
+    #[test]
+    fn use_wildcard_is_e0034() {
+        let (_prog, errs) = parse_only("use std.list.*;\nfn main() -> Int ![] { 0 }\n");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0034"),
+            "expected E0034 for wildcard `use`, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn use_empty_binding_list_is_e0035() {
+        let (_prog, errs) = parse_only("use std.list.{};\nfn main() -> Int ![] { 0 }\n");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0035"),
+            "expected E0035 for empty `use` list, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn use_nested_binding_path_is_rejected() {
+        let (_prog, errs) = parse_only("use std.list.{map.fold};\nfn main() -> Int ![] { 0 }\n");
+        // Doesn't pin a specific code — recovery may surface E0010 or
+        // similar. The point is that the binding-list parser refuses
+        // dotted names; assert at least one error fires.
+        assert!(!errs.is_empty(), "expected at least one parse error");
+    }
+
+    #[test]
+    fn user_use_is_e0031() {
+        let (_prog, errs) =
+            parse_only("use mylib.foo.{x};\nfn main() -> Int ![] { 0 }\n");
+        assert!(
+            errs.iter().any(|e| e.code.as_str() == "E0031"),
+            "expected E0031 for non-std `use`, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn parses_import_with_alias() {
+        let (prog, errs) =
+            parse_only("import std.option as O;\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Import(imp) = &prog.items[0] else {
+            panic!("expected Item::Import first");
+        };
+        assert_eq!(imp.path, vec!["std".to_string(), "option".to_string()]);
+        assert_eq!(imp.alias.as_deref(), Some("O"));
+    }
+
+    #[test]
+    fn parses_import_without_alias_still_works() {
+        let (prog, errs) = parse_only("import std.list\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Import(imp) = &prog.items[0] else {
+            panic!();
+        };
+        assert!(imp.alias.is_none());
     }
 
     #[test]

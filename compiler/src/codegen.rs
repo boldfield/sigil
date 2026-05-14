@@ -718,7 +718,7 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                     }
                 }
             }
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan B Task 55 — `effect Name { op: ... }` declarations
             // emit no codegen output (they only populate the
             // typecheck-time effect registry consulted by `perform`
@@ -1104,7 +1104,7 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
             crate::ast::Item::Effect(e) => {
                 effects_resumes_many.insert(e.name.clone(), e.resumes_many);
             }
-            crate::ast::Item::Import(_) => {}
+            crate::ast::Item::Import(_) | crate::ast::Item::Use(_) => {}
         }
     }
     globals.insert("int_to_string".to_string());

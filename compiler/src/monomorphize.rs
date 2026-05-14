@@ -291,7 +291,7 @@ pub(crate) fn program_has_generics(program: &Program) -> bool {
                     return true;
                 }
             }
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             Item::Effect(_) => {}
         }
     }
@@ -609,7 +609,7 @@ impl<'a> Monomorphizer<'a> {
                         ctor_to_type.insert(v.name.clone(), td.name.clone());
                     }
                 }
-                Item::Import(_) => {}
+                Item::Import(_) | Item::Use(_) => {}
                 // Plan B task 53 — effect decls do not yet have an
                 // entry in the registry; Task 54 adds it. Skipping
                 // here keeps Task 53's parser-only commit compile-

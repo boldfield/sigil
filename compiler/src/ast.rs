@@ -56,11 +56,61 @@ pub enum Item {
     /// downstream passes until Task 54 lands the row-polymorphic
     /// effect-checker and effect registry.
     Effect(Box<EffectDecl>),
+    /// Plan F1 — selective `use` declaration: `use std.list.{map, fold};`
+    /// brings exactly the named symbols into the file's bare namespace.
+    /// See [`UseDecl`].
+    Use(Box<UseDecl>),
 }
 
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
     pub path: Vec<String>,
+    /// Plan F1 — optional module alias from `import std.option as O;`.
+    /// `Some("O")` makes `O.x` an alias for `std.option.x` at qualified
+    /// reference sites. `None` is the bare `import std.option;` form.
+    pub alias: Option<String>,
+    pub span: Span,
+}
+
+/// Plan F1 — selective bare-name opt-in for an imported module's
+/// symbols. Syntax: `use mod.path.{name1, name2 as renamed, name3};`.
+///
+/// Wildcard `use mod.*` is intentionally NOT supported: it would
+/// re-introduce the cross-module bare-name ambiguity class (E0147)
+/// that the qualified-imports rewrite is designed to close. The
+/// parser rejects `use mod.*` with a fixed error message.
+///
+/// Empty binding lists (`use mod.{};`) are rejected at parse time —
+/// a `use` with no symbols has no effect and is almost certainly a
+/// typo.
+#[derive(Clone, Debug)]
+pub struct UseDecl {
+    /// The module path being `use`d, with `std` head and submodule
+    /// segments (e.g. `["std", "list"]`). The dot-prefixed leading
+    /// `std.` is required by the same E0031 rule that gates imports.
+    pub module_path: Vec<String>,
+    /// Symbols to bring bare. Order is source order; duplicates within
+    /// a single `use` line are rejected by the resolver.
+    pub bindings: Vec<UseBinding>,
+    pub span: Span,
+}
+
+/// Plan F1 — one symbol selected by a [`UseDecl`].
+///
+/// `use std.list.{map};` produces `UseBinding { source_name: "map",
+/// local_name: "map" }`.
+///
+/// `use std.list.{map as list_map};` produces `UseBinding { source_name:
+/// "map", local_name: "list_map" }`.
+#[derive(Clone, Debug)]
+pub struct UseBinding {
+    /// The name exported by the source module — what the symbol is
+    /// called inside the imported module.
+    pub source_name: String,
+    /// The name this `use` introduces into the current file's bare
+    /// namespace. Equals `source_name` unless the binding had an
+    /// `as <ident>` clause.
+    pub local_name: String,
     pub span: Span,
 }
 

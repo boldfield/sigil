@@ -125,6 +125,31 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "// Stdlib bug. No user-side fix. Report with the cycle named in the diagnostic.",
     },
     ErrorEntry {
+        code: "E0034",
+        short: "wildcard `use` is not supported",
+        long: "Sigil's `use` declaration is intentionally selective: each `use` line \
+               names every symbol it brings into the file's bare namespace. Wildcards \
+               (`use std.list.*;`) would re-introduce the cross-module bare-name \
+               ambiguity class (E0147) that qualified-only imports were designed to \
+               close: as the stdlib grows, names like `map`, `fold`, `filter`, and \
+               `length` collide across `std.list`, `std.option`, `std.result`, and \
+               others. Listing names explicitly keeps each file self-describing — a \
+               reader (human or LLM) sees in one place which symbols are in scope.",
+        fix_example: "// Wrong:\n// use std.list.*;\n\n\
+                      // Right (list every name you want bare):\nuse std.list.{map, fold, filter};",
+    },
+    ErrorEntry {
+        code: "E0035",
+        short: "empty `use` binding list",
+        long: "A `use` declaration must name at least one symbol. `use mod.{};` is \
+               always dead code — it imports nothing, parses with no effect, and is \
+               almost certainly a typo for the intended binding list. Either delete \
+               the `use` line entirely, or fill in the symbols it should bring \
+               bare.",
+        fix_example: "// Wrong:\n// use std.list.{};\n\n\
+                      // Right:\nuse std.list.{map, fold};",
+    },
+    ErrorEntry {
         code: "E0040",
         short: "program has no `fn main`",
         long: "Every Sigil program is a standalone executable and must declare a \

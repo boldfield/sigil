@@ -86,10 +86,11 @@ fn build() -> BTreeMap<String, BTreeSet<String>> {
                         insert_if_public(&mut out, &v.name, &module);
                     }
                 }
-                Item::Import(_) | Item::Effect(_) => {
-                    // Imports don't declare names; effect names live in
-                    // their own diagnostic surface (E0138) which doesn't
-                    // route through this index.
+                Item::Import(_) | Item::Use(_) | Item::Effect(_) => {
+                    // Imports and `use` lines don't declare names (they
+                    // bind from other modules' declarations); effect
+                    // names live in their own diagnostic surface (E0138)
+                    // which doesn't route through this index.
                 }
             }
         }
