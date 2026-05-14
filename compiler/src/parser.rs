@@ -314,14 +314,11 @@ impl<'a> Parser<'a> {
         loop {
             if !matches!(self.peek().kind, TokenKind::Dot) {
                 let span = self.peek().span.clone();
-                self.err(
-                    span,
-                    "expected `.` between module-path segments in `use`",
-                );
+                self.err(span, "expected `.` between module-path segments in `use`");
                 return None;
             }
             self.advance(); // consume `.`
-            // Wildcard form: `use mod.*;`. Reject with a clear message.
+                            // Wildcard form: `use mod.*;`. Reject with a clear message.
             if matches!(self.peek().kind, TokenKind::Star) {
                 let span = self.peek().span.clone();
                 self.advance(); // consume the `*` for parity
@@ -1251,7 +1248,7 @@ impl<'a> Parser<'a> {
                 Some(Expr::BoolLit(false, tok.span))
             }
             TokenKind::Ident(ref n) => {
-                let name = n.clone();
+                let head = n.clone();
                 let name_span = tok.span.clone();
                 self.advance();
                 // Plan A3 task 37: record literal `Ctor { f: v, ... }`.
@@ -1263,42 +1260,42 @@ impl<'a> Parser<'a> {
                 // `=>` token is already consumed, so the lambda arm
                 // does not enter this path under the wrong flag state.
                 if !self.no_record_lits && matches!(self.peek().kind, TokenKind::LBrace) {
-                    return self.parse_record_lit(name, name_span);
+                    return self.parse_record_lit(head, name_span);
                 }
-                // E0151 — `IDENT.IDENT` in expression position. Sigil
-                // v1 has no field-access operator by design (per the
-                // 2026-05-10 cross-language harness data: LLMs trained
-                // on Rust/Go/Python reflexively write `e.field`, hit
-                // generic E0010 "expected `)`", and don't recover on
-                // retry). Records are read by pattern-match destructure
-                // only. Catch the natural-but-wrong shape here and
-                // surface a teaching diagnostic instead of letting the
-                // parser-error recovery emit the misleading "expected
-                // `)`" one stack frame up.
+                // Plan F1 — accumulate dotted-identifier chains as a
+                // single dotted Ident name. Used for qualified-name
+                // references (`std.list.map`, `Option.Some`, etc.).
+                // The typechecker's `Expr::Ident` resolver splits on
+                // `.` to classify the form (bare name vs qualified-
+                // path).
                 //
-                // This branch deliberately does not consume the `Dot`
-                // — the parser stays at a known-bad token so the outer
-                // recovery can resume from the caller's expected
-                // boundary (most commonly a `,` or `)` in a call's arg
-                // list). Returning the parsed `Ident` keeps the
-                // partial-AST shape for downstream diagnostics; the
-                // caller may emit additional errors (which is fine —
-                // E0151 lands first and points at the actual mistake).
-                if matches!(self.peek().kind, TokenKind::Dot) {
-                    let dot_span = self.peek().span.clone();
-                    self.errors.push(CompilerError::new(
-                        Severity::Error,
-                        errors::code("E0151"),
-                        dot_span,
-                        format!(
-                            "Sigil v1 has no field-access operator (`.field`); records \
-                             are read by pattern-match destructure. Replace `{name}.field` \
-                             with `match {name} {{ TypeName {{ field, .. }} => field }}`, \
-                             or define a small accessor fn over the same destructure"
-                        ),
-                    ));
+                // We only walk the chain while the lookahead is `Dot`
+                // FOLLOWED BY an `Ident` token. A trailing `.` with
+                // no ident (e.g. `e.`) leaves the bare ident in place
+                // so downstream parser-recovery sees the same token
+                // stream it did pre-Plan-F1.
+                //
+                // E0151 (field-access) used to fire here at parse
+                // time. Under qualified imports, `a.b` is potentially
+                // a valid qualified-name reference — we can't tell
+                // syntactically. The check moves to resolve-time,
+                // which has the import context to decide.
+                let mut full = head;
+                while matches!(self.peek().kind, TokenKind::Dot) {
+                    let after_dot = self.peek_at(1).cloned();
+                    let is_ident_next = matches!(
+                        after_dot.as_ref().map(|t| &t.kind),
+                        Some(TokenKind::Ident(_))
+                    );
+                    if !is_ident_next {
+                        break;
+                    }
+                    self.advance(); // consume `.`
+                    let seg = self.parse_ident("path segment after `.`")?;
+                    full.push('.');
+                    full.push_str(&seg);
                 }
-                Some(Expr::Ident(name, name_span))
+                Some(Expr::Ident(full, name_span))
             }
             TokenKind::Perform => self.parse_perform_expr().map(Expr::Perform),
             TokenKind::LParen => {
@@ -2157,8 +2154,7 @@ mod tests {
 
     #[test]
     fn user_use_is_e0031() {
-        let (_prog, errs) =
-            parse_only("use mylib.foo.{x};\nfn main() -> Int ![] { 0 }\n");
+        let (_prog, errs) = parse_only("use mylib.foo.{x};\nfn main() -> Int ![] { 0 }\n");
         assert!(
             errs.iter().any(|e| e.code.as_str() == "E0031"),
             "expected E0031 for non-std `use`, got {errs:?}"
@@ -2167,8 +2163,7 @@ mod tests {
 
     #[test]
     fn parses_import_with_alias() {
-        let (prog, errs) =
-            parse_only("import std.option as O;\nfn main() -> Int ![] { 0 }\n");
+        let (prog, errs) = parse_only("import std.option as O;\nfn main() -> Int ![] { 0 }\n");
         assert!(errs.is_empty(), "errs: {errs:?}");
         let Item::Import(imp) = &prog.items[0] else {
             panic!("expected Item::Import first");
@@ -2677,14 +2672,14 @@ mod tests {
         assert!(!errs.is_empty(), "missing lambda body should parse-error");
     }
 
-    /// E0151 — `.field` access in expression position. Sigil v1 has
-    /// no field-access operator; the natural-but-wrong shape that
-    /// LLMs trained on Rust/Go/Python reach for (`e.score`) hits
-    /// this. The diagnostic teaches the destructure pattern; without
-    /// it, the user sees a misleading generic E0010 ("expected `)`")
-    /// from the parser-recovery one stack frame up.
+    /// Plan F1 — `IDENT.IDENT` in expression position now parses as
+    /// a qualified-path reference (`Expr::Ident("e.score", _)`) and
+    /// no longer fires E0151 at parse time. The diagnostic for an
+    /// unresolved qualified path moves to typecheck (E0046 / unknown
+    /// identifier with the dotted name), where the import context is
+    /// known.
     #[test]
-    fn ident_dot_ident_fires_e0151() {
+    fn ident_dot_ident_parses_as_dotted_ident() {
         let errs = parse_errs(
             "fn main() -> Int ![IO] {\n  \
                  let x: Int = e.score;\n  \
@@ -2692,13 +2687,9 @@ mod tests {
                }\n",
         );
         assert!(
-            errs.iter().any(|e| e.code.as_str() == "E0151"),
-            "expected E0151 for `e.score`, got: {errs:?}"
-        );
-        let e = errs.iter().find(|e| e.code.as_str() == "E0151").unwrap();
-        assert!(
-            e.message.contains("pattern-match destructure"),
-            "diagnostic should teach the destructure pattern: {e:?}"
+            !errs.iter().any(|e| e.code.as_str() == "E0151"),
+            "Plan F1: parser should accept `e.score` as a qualified-path \
+             ident — typecheck emits the unresolved diagnostic. got: {errs:?}"
         );
     }
 

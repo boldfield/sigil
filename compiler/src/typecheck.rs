@@ -850,6 +850,24 @@ pub struct CtorInfo {
     pub variant_index: usize,
 }
 
+/// Plan F1 — a single resolved `use` binding: the file-qualified
+/// scheme key and the source name in that module. Maps a per-file
+/// `local_name` to "look up `<module_file>::<source_name>` in
+/// `fn_schemes` / `types` / `ctors` / `effects`."
+#[derive(Clone, Debug)]
+pub struct FileQualifiedSym {
+    /// The module's file path as used in `fn_schemes`' dual-key form
+    /// (e.g. `"list.sigil"`, matching `f.span.file` for items loaded
+    /// from `std/list.sigil`). For the user's own program the file
+    /// is `program.file` (typically `"<user-supplied>.sigil"`).
+    pub module_file: String,
+    /// The original name in the source module (e.g. `"map"`). Equal
+    /// to the binding's `local_name` unless the binding was aliased
+    /// (`use std.list.{map as list_map}` → source_name = "map",
+    /// local_name = "list_map").
+    pub source_name: String,
+}
+
 /// Plan B Task 57 — names of effects synthesized into `tc.effects`
 /// at typecheck pre-pass start. Order is load-bearing: `effect_id`
 /// assignment phase 1 walks this slice in order, giving `ArithError
@@ -1466,6 +1484,9 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         call_callee_tys: BTreeMap::new(),
         fn_schemes: BTreeMap::new(),
         bare_name_origins: BTreeMap::new(),
+        resolved_idents: BTreeMap::new(),
+        file_use_bindings: BTreeMap::new(),
+        file_module_paths: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
         next_scope_id: 0,
@@ -1526,6 +1547,14 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // to `std/state.sigil` only at call-site resolution. See
     // `register_builtin_ref_schemes` for the surface.
     register_builtin_ref_schemes(&mut tc);
+    // Plan F1 — qualified imports pre-pass. Build per-file `use`
+    // binding maps and per-file import / alias module maps from the
+    // program's `Item::Use` and `Item::Import` declarations BEFORE
+    // any fn body is checked, so `Expr::Ident` resolution inside any
+    // fn (including stdlib fns appended by `imports::resolve`) can
+    // consult the right file's bindings as soon as it enters body
+    // walk. Emits the new use-line-collision E0147 here too.
+    build_use_bindings_prepass(&mut tc, &program);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -2078,6 +2107,20 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         .any(|e| matches!(e.severity, Severity::Error));
     if !has_errors {
         desugar_let_bound_continuations(&mut program);
+        // Plan F1 — qualified-imports AST rewrite. Mangles colliding
+        // top-level fn names (`fn map` in `std.list` AND `std.option`
+        // both become `<file>::map`) and rewrites Expr::Ident
+        // references to match, so monomorphize's flat `fn_decls`
+        // registry dispatches to the right entry. The post-pass
+        // visits the same AST the desugar pass just stabilised; we
+        // gate on `!has_errors` for the same reason — partial-error
+        // ASTs shouldn't carry the rewrite.
+        rewrite_resolved_idents(
+            &mut program,
+            &tc.resolved_idents,
+            &tc.bare_name_origins,
+            &mut tc.fn_schemes,
+        );
     }
 
     (
@@ -2100,6 +2143,386 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         },
         tc.errors,
     )
+}
+
+/// Plan F1 — qualified imports / `use` pre-pass.
+///
+/// Walks the program's `Item::Import` and `Item::Use` items, grouped
+/// by the file each declaration came from, and populates `tc.file_use_-
+/// bindings` + `tc.file_module_paths` so `Expr::Ident` resolution can
+/// translate bare names and qualified paths to `fn_schemes`' file-
+/// qualified keys.
+///
+/// Why this matters: a bare `map(xs, f)` in `std/list.sigil`'s `for_each`
+/// helper resolves to `list.sigil::map` (this module's own `map`); a
+/// bare `map(xs, f)` in a user file with `use std.list.{map}` resolves
+/// to the same `list.sigil::map` via the binding map; a qualified
+/// `std.option.map(opt, f)` in any file resolves via the import path
+/// (`std.option` -> `option.sigil`) regardless of `use` bindings. A
+/// single resolution rule, three entry points.
+///
+/// Emits the new use-line-collision E0147 when a single file's `use`
+/// lines bring two different source modules' names into the same
+/// bare slot.
+fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
+    // Each file gets its own (initially empty) binding + module maps.
+    // We seed empty entries for files that have an `Item::Use` OR
+    // `Item::Import` so the per-file resolver helpers can distinguish
+    // "file has declarations, none brought name X" from "file has no
+    // import structure at all."
+    let mut by_file_uses: BTreeMap<String, Vec<&UseDecl>> = BTreeMap::new();
+    let mut by_file_imports: BTreeMap<String, Vec<&ImportDecl>> = BTreeMap::new();
+    for item in &program.items {
+        match item {
+            Item::Use(u) => {
+                by_file_uses
+                    .entry(u.span.file.clone())
+                    .or_default()
+                    .push(u.as_ref());
+            }
+            Item::Import(i) => {
+                by_file_imports
+                    .entry(i.span.file.clone())
+                    .or_default()
+                    .push(i);
+            }
+            _ => {}
+        }
+    }
+    // Build the import / alias module-path table per file. For each
+    // `import std.list` we record both `"std.list"` -> `"list.sigil"`
+    // (the long-form qualified-path callee key) and any alias
+    // `import std.option as O` -> `"O"` -> `"option.sigil"`.
+    for (file, imports) in &by_file_imports {
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        for imp in imports {
+            let module_file = match module_file_for_path(&imp.path) {
+                Some(f) => f,
+                None => continue,
+            };
+            let dotted = imp.path.join(".");
+            map.insert(dotted, module_file.clone());
+            if let Some(alias) = &imp.alias {
+                map.insert(alias.clone(), module_file);
+            }
+        }
+        if !map.is_empty() {
+            tc.file_module_paths.insert(file.clone(), map);
+        }
+    }
+    // Build the `use`-binding table. Collision detection fires here:
+    // two `use` lines that bring the same local_name from two
+    // different sources is a structural file-level error (the new-
+    // meaning E0147 — see compiler/src/errors/catalog.rs for the
+    // long-form rationale). Aliasing one of the colliding lines
+    // (`use std.list.{map as list_map}`) sidesteps it.
+    for (file, uses) in &by_file_uses {
+        let mut map: BTreeMap<String, FileQualifiedSym> = BTreeMap::new();
+        for u in uses {
+            // Resolve this use's module path to a file key. Failure
+            // here means the module path isn't a `std.*` form (E0031
+            // already fired at parse), or the module isn't loaded
+            // (E0032). Either way, skip this `use` line silently —
+            // the upstream error is the user-actionable one.
+            let module_file = match module_file_for_path(&u.module_path) {
+                Some(f) => f,
+                None => continue,
+            };
+            for binding in &u.bindings {
+                if let Some(prev) = map.get(&binding.local_name).cloned() {
+                    // Two `use` lines bring the same local name. Name
+                    // both contributors so the user can decide which
+                    // to alias / remove. The diagnostic anchors at the
+                    // colliding binding's span (the SECOND occurrence)
+                    // — the first occurrence is described in prose.
+                    let new_module_label = module_label_from_stdlib_file(&module_file);
+                    let old_module_label = module_label_from_stdlib_file(&prev.module_file);
+                    if prev.module_file == module_file && prev.source_name == binding.source_name {
+                        // Duplicate `use` of the same `(module, name)`
+                        // from the same source — likely a copy-paste
+                        // typo. Still surface the diagnostic but the
+                        // message can suggest "remove one of these"
+                        // since aliasing doesn't help. (The plan's
+                        // E0147 long-form covers this — both contributors
+                        // named, fix is removal.)
+                    }
+                    tc.errors.push(CompilerError::new(
+                        Severity::Error,
+                        crate::errors::code("E0147"),
+                        binding.span.clone(),
+                        format!(
+                            "duplicate `use` of name `{}` — already brought in from \
+                             `{}` earlier in this file; this `use` from `{}` conflicts. \
+                             Alias one (`use {}.{} as <other_name>`) or remove one.",
+                            binding.local_name,
+                            old_module_label,
+                            new_module_label,
+                            new_module_label,
+                            binding.source_name,
+                        ),
+                    ));
+                    // Keep the FIRST binding in the map so downstream
+                    // lookups still resolve to something deterministic.
+                    continue;
+                }
+                map.insert(
+                    binding.local_name.clone(),
+                    FileQualifiedSym {
+                        module_file: module_file.clone(),
+                        source_name: binding.source_name.clone(),
+                    },
+                );
+            }
+        }
+        if !map.is_empty() {
+            tc.file_use_bindings.insert(file.clone(), map);
+        }
+    }
+}
+
+/// Plan F1 — post-typecheck AST rewrite. Mangles colliding top-level
+/// `Item::Fn` names and rewrites `Expr::Ident` references to match,
+/// so monomorphize / codegen's flat-namespace lookups dispatch to the
+/// right entry when multiple files contribute the same bare fn name.
+///
+/// Strategy:
+///   - Build a `collisions` set: fn names appearing in `bare_name_-
+///     origins` with two or more producing files. Exclude `"main"`
+///     (the entry-point shim assumes the bare name).
+///   - Walk every `Item::Fn`. If its bare name is in `collisions`,
+///     rename to `"<file>::<name>"` and mirror the rename onto
+///     `fn_schemes` so downstream lookups keyed by the mangled name
+///     find the typecheck-built scheme.
+///   - Walk every fn body's `Expr::Ident`:
+///     1. If the span has a `resolved_idents` entry (recorded by
+///        the qualified-imports lookup path), replace the name with
+///        the canonical key.
+///     2. Otherwise, if the name matches a same-file (intra-module)
+///        renamed fn, rewrite to the mangled form so intra-file
+///        recursive / sibling calls keep resolving to their own
+///        module's fn.
+///
+/// Non-colliding fns and references stay bare-named — the rewrite
+/// only ever fires on names that would otherwise dispatch wrong, so
+/// the AST diff is small and downstream tooling that inspects fn /
+/// callee names sees mangling only for the rare collision case.
+fn rewrite_resolved_idents(
+    program: &mut Program,
+    resolved_idents: &BTreeMap<Span, String>,
+    bare_name_origins: &BTreeMap<String, Vec<String>>,
+    fn_schemes: &mut BTreeMap<String, Scheme>,
+) {
+    let mut collisions: BTreeSet<String> = BTreeSet::new();
+    for (name, origins) in bare_name_origins {
+        if origins.len() >= 2 && name != "main" {
+            collisions.insert(name.clone());
+        }
+    }
+    if collisions.is_empty() && resolved_idents.is_empty() {
+        // Fast path: nothing to rewrite. Pre-migration programs with
+        // no `use` lines and no colliding fn names take this path —
+        // no AST diff, no fn_schemes mutation.
+        return;
+    }
+    // First pass: collect each colliding fn's per-file mangled key,
+    // mirror the scheme onto the mangled key. We need the mapping
+    // before walking bodies so intra-file Expr::Ident rewrites can
+    // determine the right target.
+    //
+    // `same_file_rename` maps (file, bare_name) -> mangled_name. The
+    // body walker consults it to translate intra-file recursive /
+    // sibling references that didn't go through the use-binding path.
+    let mut same_file_rename: BTreeMap<(String, String), String> = BTreeMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            if collisions.contains(&f.name) {
+                let mangled = format!("{}::{}", f.span.file, f.name);
+                if let Some(scheme) = fn_schemes.get(&f.name).cloned() {
+                    fn_schemes.insert(mangled.clone(), scheme);
+                }
+                if let Some(scheme) = fn_schemes
+                    .get(&format!("{}::{}", f.span.file, f.name))
+                    .cloned()
+                {
+                    fn_schemes.insert(mangled.clone(), scheme);
+                }
+                same_file_rename.insert((f.span.file.clone(), f.name.clone()), mangled);
+            }
+        }
+    }
+    // Second pass: actually mutate Item::Fn names and walk bodies.
+    for item in &mut program.items {
+        if let Item::Fn(f) = item {
+            let file = f.span.file.clone();
+            if let Some(new_name) = same_file_rename.get(&(file.clone(), f.name.clone())) {
+                f.name = new_name.clone();
+            }
+            rewrite_block(&mut f.body, &file, resolved_idents, &same_file_rename);
+        }
+    }
+}
+
+fn rewrite_block(
+    b: &mut Block,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    for stmt in &mut b.stmts {
+        rewrite_stmt(stmt, fn_file, resolved_idents, same_file_rename);
+    }
+    if let Some(tail) = b.tail.as_mut() {
+        rewrite_expr(tail, fn_file, resolved_idents, same_file_rename);
+    }
+}
+
+fn rewrite_stmt(
+    s: &mut Stmt,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    match s {
+        Stmt::Let(l) => rewrite_expr(&mut l.value, fn_file, resolved_idents, same_file_rename),
+        Stmt::Expr(e) => rewrite_expr(e, fn_file, resolved_idents, same_file_rename),
+        Stmt::Perform(p) => {
+            for a in &mut p.args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+    }
+}
+
+fn rewrite_expr(
+    e: &mut Expr,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    match e {
+        Expr::Ident(name, span) => {
+            if let Some(canonical) = resolved_idents.get(span) {
+                *name = canonical.clone();
+                return;
+            }
+            // Intra-file recursive / sibling call: a bare reference
+            // to a same-file fn that the legacy path's file-qualified-
+            // hit resolved. If that fn was renamed for collision, the
+            // reference must be rewritten too.
+            if let Some(new_name) = same_file_rename.get(&(fn_file.to_string(), name.clone())) {
+                *name = new_name.clone();
+            }
+        }
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::UnitLit(_) => {}
+        Expr::Unary { operand, .. } => {
+            rewrite_expr(operand, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_expr(lhs, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(rhs, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Call { callee, args, .. } => {
+            rewrite_expr(callee, fn_file, resolved_idents, same_file_rename);
+            for a in args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            rewrite_expr(cond, fn_file, resolved_idents, same_file_rename);
+            rewrite_block(then_block, fn_file, resolved_idents, same_file_rename);
+            rewrite_block(else_block, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            rewrite_expr(scrutinee, fn_file, resolved_idents, same_file_rename);
+            for arm in arms {
+                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Block(b) => {
+            rewrite_block(b, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Lambda { body, .. } => {
+            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Perform(p) => {
+            for a in &mut p.args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Handle {
+            body,
+            op_arms,
+            return_arm,
+            ..
+        } => {
+            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+            for arm in op_arms {
+                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+            }
+            if let Some(ra) = return_arm.as_mut() {
+                rewrite_expr(&mut ra.body, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                rewrite_expr(&mut f.value, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                rewrite_expr(el, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            // Post-closure-conversion variant; pre-CC the rewrite
+            // pass shouldn't see it, but the recursive walker is
+            // total in shape so we cover it for robustness.
+            for e in env_exprs {
+                rewrite_expr(e, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::ClosureEnvLoad { .. } => {
+            // Synthesized leaf; nothing to rewrite (the `name` field
+            // is a captured-variable label, not a fn reference).
+        }
+    }
+}
+
+/// Plan F1 — `["std", "list"]` -> `"list.sigil"`, mirroring
+/// [`crate::imports::path_to_module`]'s shape so the resolver and the
+/// import loader agree on what file string an import / use line
+/// targets. `path[0]` must be `"std"` (the v1 import gate) and there
+/// must be at least one component after it; other shapes return
+/// `None` (the user's E0031 / E0032 diagnostics handle the error).
+fn module_file_for_path(path: &[String]) -> Option<String> {
+    if path.first().map(String::as_str) != Some("std") || path.len() < 2 {
+        return None;
+    }
+    Some(format!("{}.sigil", path[1..].join("/")))
+}
+
+/// Render a stdlib module file path like `"list.sigil"` or
+/// `"iter/fold.sigil"` back to the dotted `std.list` / `std.iter.fold`
+/// form for diagnostics. Inverse of [`module_file_for_path`].
+///
+/// Distinct from [`__module_label_from_file`] which preserves the
+/// basename-only convention used by E0147's pre-Plan-F1 emit (and so
+/// doesn't propagate nested-path components into the label).
+fn module_label_from_stdlib_file(file: &str) -> String {
+    let stem = file.trim_end_matches(".sigil");
+    format!("std.{}", stem.replace('/', "."))
 }
 
 /// Language builtins — functions that appear to user code as ordinary
@@ -3142,6 +3565,43 @@ struct Tc {
     /// participate — they're always in scope without imports and
     /// never conflict with each other.
     bare_name_origins: BTreeMap<String, Vec<String>>,
+    /// Plan F1 — Expr::Ident span → canonical fn key used by
+    /// downstream passes (monomorphize / codegen). Populated whenever
+    /// the qualified-imports resolution path picks a fn whose bare
+    /// name collides with another module's. The post-typecheck AST
+    /// rewrite pass consults this map and replaces colliding bare
+    /// references with their file-mangled form (`"<file>::<name>"`)
+    /// so monomorphize's `fn_decls` lookup hits the right entry.
+    /// Non-colliding refs are absent from this map and stay
+    /// bare-named — minimising the AST surface change.
+    resolved_idents: BTreeMap<Span, String>,
+    /// Plan F1 — per-file selective bare-name bindings introduced by
+    /// `use` declarations. Outer key is the file path that owns the
+    /// `use` line (matches `span.file`); inner map is `local_name`
+    /// → file-qualified target key (`"<module_file>::<source_name>"`),
+    /// which mirrors `fn_schemes`' existing dual-key shape. Built by
+    /// `build_use_bindings_prepass` from every `Item::Use` in the
+    /// program before any `check_fn` walks. Consulted by `Expr::Ident`
+    /// resolution after the local-env check: a bare name in the
+    /// current fn's file's binding map resolves to the file-qualified
+    /// scheme key directly, sidestepping the (now-legacy) bare-name
+    /// `fn_schemes` fallback.
+    ///
+    /// Builtin schemes (e.g., `int_to_string` from `register_builtin_*`)
+    /// are registered with bare-name keys only, not file-qualified.
+    /// The lookup falls back to the bare `source_name` from the binding
+    /// when the file-qualified key misses; builtin names are globally
+    /// unique so this fallback never picks the wrong scheme.
+    file_use_bindings: BTreeMap<String, BTreeMap<String, FileQualifiedSym>>,
+    /// Plan F1 — per-file import resolution table. Outer key is the
+    /// file path that owns the `import` line; inner map is the
+    /// reference-form module label (either the full dotted path
+    /// `"std.list"` or an `import std.option as O` alias `"O"`) →
+    /// the module file used as the prefix in `fn_schemes`' file-
+    /// qualified keys (e.g. `"list.sigil"`). Read by qualified-path
+    /// `Expr::Ident` resolution to translate `std.list.map` or
+    /// `O.map` into the `fn_schemes` lookup key `"list.sigil::map"`.
+    file_module_paths: BTreeMap<String, BTreeMap<String, String>>,
     /// Type-variable id supply — one counter per `Tc` lifetime.
     /// Allocated via `fresh_ty_var`; freed when the substitution
     /// resolves them. Codegen-entry walker in task 48 asserts no
@@ -3330,6 +3790,64 @@ struct HandlerScope {
 }
 
 impl Tc {
+    /// Plan F1 — resolve `name` (possibly dotted) against the current
+    /// fn's file-scope `use` bindings + import / alias table, and look
+    /// up the resulting file-qualified scheme key in `fn_schemes`.
+    ///
+    /// Returns `Some((scheme, canonical_key))` on a definite hit where
+    /// `canonical_key` is the form (file-qualified or bare) under which
+    /// the scheme is registered — used by the AST rewrite pass to make
+    /// monomorphize's `fn_decls` lookup consistent. Returns `None` if
+    /// no qualified-imports path covers this name (the caller should
+    /// try the legacy bare-name path). Distinguishing "no Plan-F1 hit"
+    /// from "Plan-F1 hit but no fn_schemes entry" intentionally
+    /// favours fall-through during migration: a bare name that has no
+    /// `use` line in the current file is treated as "needs the
+    /// legacy lookup", not as "unresolved".
+    fn resolve_qualified_or_use_scheme(&self, name: &str) -> Option<(Scheme, String)> {
+        let file = self.current_fn_file.as_ref()?;
+        if name.contains('.') {
+            // Qualified-path reference. Walk segments against the
+            // current file's import / alias table.
+            let modules = self.file_module_paths.get(file)?;
+            let segments: Vec<&str> = name.split('.').collect();
+            // Try the longest module label first so single-alias
+            // `O.map` doesn't mismatch a multi-segment import.
+            for split in (1..segments.len()).rev() {
+                let module_label = segments[..split].join(".");
+                let sym = segments[split..].join(".");
+                if let Some(module_file) = modules.get(&module_label) {
+                    let file_key = format!("{module_file}::{sym}");
+                    if let Some(scheme) = self.fn_schemes.get(&file_key).cloned() {
+                        return Some((scheme, file_key));
+                    }
+                    // Builtins fall back to the bare source-name key.
+                    if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
+                        return Some((scheme, sym));
+                    }
+                    return None;
+                }
+            }
+            None
+        } else {
+            // Bare name. Consult the current file's `use` bindings.
+            let bindings = self.file_use_bindings.get(file)?;
+            let resolved = bindings.get(name)?;
+            let file_key = format!("{}::{}", resolved.module_file, resolved.source_name);
+            if let Some(scheme) = self.fn_schemes.get(&file_key).cloned() {
+                return Some((scheme, file_key));
+            }
+            // Builtin schemes use bare-name keys only — fall back so
+            // a `use std.int.{int_to_string}` line resolves correctly.
+            // Builtin names are globally unique so this never
+            // dispatches to the wrong target.
+            if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
+                return Some((scheme, resolved.source_name.clone()));
+            }
+            None
+        }
+    }
+
     fn push_error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
         self.errors.push(CompilerError::new(
             Severity::Error,
@@ -5438,16 +5956,44 @@ impl Tc {
                 if let Some(ty) = self.env.get(name).cloned() {
                     return Some(ty);
                 }
-                // Plan D Task 117 (b) Phase 4 — try the file-qualified
-                // key first so a fn body's recursive call to a same-
-                // named sibling-module fn resolves to its own module's
-                // scheme. Falls back to the bare name (Plan C Tier 1
-                // addendum: ambiguous bare-name lookups now emit E0147
-                // instead of silently picking last-registered).
-                let file_qualified_hit = self
-                    .current_fn_file
-                    .as_ref()
-                    .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned());
+                // Plan F1 — qualified-name + use-binding-driven scheme
+                // lookup. Three resolution paths, in order of priority:
+                //
+                //   1. Dotted name (`std.list.map`, `O.fold`, ...) —
+                //      resolved through the current file's import /
+                //      alias table.
+                //   2. Bare name with a `use` binding in the current
+                //      file — resolved through that binding's
+                //      `(module_file, source_name)` pair.
+                //   3. Bare name with no `use` binding — falls through
+                //      to the pre-Plan-F1 last-wins lookup below. The
+                //      bare-name origin map's E0147 emit is the
+                //      legacy ambiguity surface; after the qualified-
+                //      imports migration adds `use` lines to every
+                //      file, the fall-through path is unreachable in
+                //      practice.
+                let plan_f1_resolved = self.resolve_qualified_or_use_scheme(name);
+                let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
+                if let Some((_, ref canonical)) = plan_f1_resolved {
+                    // Record the canonical key for the AST rewrite
+                    // pass — only when it differs from the surface
+                    // name (qualified path or aliased bare-name). The
+                    // post-typecheck rewrite consults this map and
+                    // updates Expr::Ident names so monomorphize's
+                    // fn_decls / codegen's user_fn_refs lookups hit
+                    // the right entry. Same-key resolutions (the
+                    // common case where the source_name in a
+                    // non-collision `use` matches the bare lookup
+                    // key) leave the AST unchanged.
+                    if canonical != name {
+                        self.resolved_idents.insert(span.clone(), canonical.clone());
+                    }
+                }
+                let file_qualified_hit = plan_f1_scheme.or_else(|| {
+                    self.current_fn_file
+                        .as_ref()
+                        .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned())
+                });
                 let scheme_opt = file_qualified_hit.or_else(|| {
                     // Bare-name fallback path. Check ambiguity BEFORE
                     // returning the last-wins entry: if 2+ source
@@ -12017,6 +12563,9 @@ mod tests {
             call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
             bare_name_origins: BTreeMap::new(),
+            resolved_idents: BTreeMap::new(),
+            file_use_bindings: BTreeMap::new(),
+            file_module_paths: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
             next_scope_id: 0,
