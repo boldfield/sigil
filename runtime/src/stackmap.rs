@@ -1176,4 +1176,169 @@ mod tests {
             Err(ParseError::UnknownEntryKind(0xAB))
         );
     }
+
+    // ===== Plan E2 Phase 3 Task 12 — walker safety-check tests =====
+    //
+    // The hardening added to `walk_for_gc_with_callback_from` (safe
+    // stack-range check + 4 MB stack-hop bound) guards against
+    // libgc's `-fomit-frame-pointer` internals leaking wild FPs
+    // onto the walker's chain post-Task 12. The positive path is
+    // covered end-to-end by the `precise_walker_deep_*` e2e tests
+    // (compiler/tests/e2e.rs); these tests pin the negative path:
+    // when the safety checks DO trigger, the walker bails cleanly
+    // instead of dereferencing into unmapped or arbitrary memory.
+
+    /// RAII guard that swaps `profile::unwind::SAFE_STACK_{LO,HI}`
+    /// to caller-supplied bounds, restoring the previous values on
+    /// Drop (including panic-via-abort). Tests that install custom
+    /// stack bounds use this so a panic mid-test doesn't leave the
+    /// globals corrupted for sibling parallel tests.
+    ///
+    /// **Serial discipline.** Cargo runs `#[test]` items in
+    /// parallel by default. The unwinder atomics are
+    /// process-global, so two tests both swapping them race. Tests
+    /// using this guard MUST hold `SAFE_STACK_RANGE_TEST_LOCK` for
+    /// the duration of the swap so sibling tests observe the
+    /// installed bounds without contention.
+    struct SafeStackRangeGuard {
+        prev_lo: usize,
+        prev_hi: usize,
+        _lock_guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    static SAFE_STACK_RANGE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    impl SafeStackRangeGuard {
+        fn install(lo: usize, hi: usize) -> Self {
+            let lock = SAFE_STACK_RANGE_TEST_LOCK.get_or_init(|| std::sync::Mutex::new(()));
+            let _lock_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_lo = crate::profile::unwind::SAFE_STACK_LO
+                .swap(lo, std::sync::atomic::Ordering::Relaxed);
+            let prev_hi = crate::profile::unwind::SAFE_STACK_HI
+                .swap(hi, std::sync::atomic::Ordering::Relaxed);
+            SafeStackRangeGuard {
+                prev_lo,
+                prev_hi,
+                _lock_guard,
+            }
+        }
+    }
+
+    impl Drop for SafeStackRangeGuard {
+        fn drop(&mut self) {
+            crate::profile::unwind::SAFE_STACK_LO
+                .store(self.prev_lo, std::sync::atomic::Ordering::Relaxed);
+            crate::profile::unwind::SAFE_STACK_HI
+                .store(self.prev_hi, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn walker_safe_range_rejects_wild_starting_fp() {
+        // Install a tight safe range that does NOT cover the
+        // wild FP we're about to pass. Without the range gate,
+        // the walker's first `walk_frame` call would dereference
+        // 0x4000_0000 (a non-stack, possibly unmapped address)
+        // and either SEGV or read arbitrary process memory. The
+        // gate must bail BEFORE the deref.
+        let _guard = SafeStackRangeGuard::install(0x1000, 0x2000);
+
+        let mut yielded = 0usize;
+        walk_for_gc_with_callback_from(0x4000usize as *const usize, |_r| {
+            yielded += 1;
+        });
+
+        // The walker doesn't crash, doesn't yield any root.
+        // (Even without the gate, init_index() returns None in
+        // tests so no root would be yielded; the LOAD-BEARING
+        // assertion is "test completed without SEGV".)
+        assert_eq!(yielded, 0);
+    }
+
+    #[test]
+    fn walker_hop_bound_bails_on_large_jump() {
+        // Construct a 2-slot synthetic frame whose `prev_fp`
+        // points 5 MB above the base — beyond the walker's
+        // 4 MB stack-hop ceiling. Without the hop bound, the
+        // walker would try `walk_frame(base + 5 MB)` after the
+        // first iteration; that address is arbitrary process
+        // memory and the deref would either SEGV or read
+        // garbage. The hop bound must bail BEFORE the next
+        // iteration.
+        //
+        // We install a safe stack range that DOES cover both
+        // `base` and `base + 5 MB` so the range gate alone
+        // wouldn't catch this — the hop bound is the
+        // load-bearing check.
+        let mut frames: Vec<usize> = vec![0; 2];
+        // SAFETY: gc-heap-ptr arithmetic (test-only synthetic frame record on the system heap, not Boehm-managed).
+        let base = frames.as_mut_ptr() as usize;
+        // prev_fp = base + 5 MB; return_pc = 0xDEAD sentinel.
+        frames[0] = base + 5 * 1024 * 1024;
+        frames[1] = 0xDEAD;
+
+        let _guard = SafeStackRangeGuard::install(base, base + 10 * 1024 * 1024);
+
+        let mut yielded = 0usize;
+        // `base` points at a live Vec, so the first
+        // `walk_frame(base)` is in-bounds. The walker reads
+        // `frames[0] = base + 5 MB` as `saved_fp`, sees the
+        // hop > 4 MB, and bails. No subsequent deref occurs.
+        walk_for_gc_with_callback_from(base as *const usize, |_r| {
+            yielded += 1;
+        });
+
+        // No SEGV, no yielded roots.
+        let _ = frames; // keep `frames` alive across the walk.
+        assert_eq!(yielded, 0);
+    }
+
+    #[test]
+    fn walker_with_no_safe_range_installed_still_walks_well_formed_chain() {
+        // Confirm the safety gates degrade gracefully when no
+        // safe range has been installed (the cache is zero/zero,
+        // which represents "no sigil_gc_init has run yet" — e.g.,
+        // a test that calls the walker directly without going
+        // through the runtime's normal startup path). The walker
+        // must still walk a well-formed chain, just without the
+        // range gate to back the alignment + inversion checks.
+        //
+        // Use the same synthetic-chain shape as
+        // `walks_synthetic_well_formed_chain` (3 frames, then
+        // `prev_fp = 0` terminates). The chain is short and
+        // tight; no hop exceeds the bound.
+        let mut frames: Vec<usize> = vec![0; 6];
+        // SAFETY: gc-heap-ptr arithmetic (test-only synthetic frame record on the system heap, not Boehm-managed).
+        let base = frames.as_mut_ptr() as usize;
+        frames[0] = base + 2 * core::mem::size_of::<usize>();
+        frames[1] = 0x1000;
+        frames[2] = base + 4 * core::mem::size_of::<usize>();
+        frames[3] = 0x1100;
+        frames[4] = 0;
+        frames[5] = 0x1200;
+
+        // Force the range to zero/zero (uninstalled state) for
+        // the duration of this test, even if a sibling test
+        // happens to have populated it. `SafeStackRangeGuard`'s
+        // direct `swap` stores the supplied bounds verbatim
+        // (unlike `profile::unwind::install_safe_stack_range`,
+        // which rejects `hi <= lo`).
+        let _guard = SafeStackRangeGuard::install(0, 0);
+
+        let mut yielded = 0usize;
+        // Synthetic well-formed chain on the heap; reads stay
+        // inside the Vec.
+        walk_for_gc_with_callback_from(base as *const usize, |_r| {
+            yielded += 1;
+        });
+
+        // The walker traverses the chain without any safety-gate
+        // bail (well-formed chain + no installed range), but
+        // yields no roots because init_index() returns None in
+        // test context. The point is that the walker completed
+        // the traversal without crashing.
+        let _ = frames;
+        assert_eq!(yielded, 0);
+    }
 }

@@ -124,7 +124,7 @@
 
 use std::cell::Cell;
 use std::ffi::c_void;
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 // `GC_set_push_other_roots` is Phase 3-specific; declared here.
 // `GC_get_push_other_roots` is paired: per `gc_mark.h`'s
@@ -211,36 +211,47 @@ static PRECISE_WALKER_INSTALLED: Once = Once::new();
 /// live-object collection. PR #170 CI surfaced this as exit -1
 /// SIGSEGVs on alloc-heavy workloads.
 ///
-/// Captured at install time + invoked from our wrapper. Stored
-/// in a static so the wrapper can find it without any extra
-/// state plumbing; the value is set exactly once (by the
-/// `Once`-gated install) and read by every callback invocation
-/// thereafter — no synchronisation needed beyond the Once's
-/// happens-before edge.
+/// Captured at install time + invoked from our wrapper. Storing
+/// in a `OnceLock` provides the same set-once happens-before
+/// edge as the `static mut` it replaced (PR #171 re-review N1
+/// follow-up) without the unsafe-read at every callback
+/// invocation, AND is forward-compatible if a future plan
+/// enables parallel markers — `OnceLock::get` is safe to call
+/// concurrently from multiple marker threads. Today only the
+/// single marker thread reads it (Task 12 keeps Boehm
+/// single-marker via `GC_set_markers_count(1)`), so either
+/// shape works correctness-wise; `OnceLock` is the modern
+/// Rust shape and removes the only `unsafe` read in this
+/// module that wasn't FFI.
 ///
-/// **Single-marker safety.** Task 12 pins Boehm to single-marker
-/// mode via `GC_set_markers_count(1)` BEFORE `GC_init`, so the
-/// callback always fires on the install thread and the
-/// `static mut` read is data-race-free. *[Forward-looking — not
-/// Task 12's territory]:* if a FUTURE plan enables parallel
-/// markers (workload threshold, multi-Sigil-thread support, etc.),
-/// migrate this slot to an `AtomicUsize` carrying the transmuted
-/// proc pointer (or a `OnceLock<GcPushOtherRootsProc>`) so
-/// concurrent marker threads can read it safely.
-static mut PRIOR_PUSH_OTHER_ROOTS: Option<GcPushOtherRootsProc> = None;
+/// **Empty `OnceLock` semantics.** If Boehm has no prior proc
+/// installed at the time we capture (the common case when our
+/// `GC_set_push_other_roots` is the first call), `GC_get_push_other_roots`
+/// returns `None` and we LEAVE the OnceLock empty rather than
+/// setting it. The callback then sees `PRIOR_PUSH_OTHER_ROOTS.get() == None`
+/// and skips the chain call — same behaviour as the prior
+/// `Option<GcPushOtherRootsProc>` shape.
+static PRIOR_PUSH_OTHER_ROOTS: OnceLock<GcPushOtherRootsProc> = OnceLock::new();
 
 fn install_push_other_roots_once() {
     PRECISE_WALKER_INSTALLED.call_once(|| {
-        // SAFETY: `Once::call_once` guarantees exactly one
-        // installation per process, satisfying `gc_mark.h:309`'s
-        // external-sync requirement. The proc has `'static`
-        // lifetime; Boehm holds it for the process's life. We
-        // capture the prior proc BEFORE the setter so our
-        // wrapper can chain to it (see `push_sigil_thread_precise_roots`
-        // doc + `PRIOR_PUSH_OTHER_ROOTS` doc).
+        // SAFETY (FFI boundaries only): `Once::call_once`
+        // guarantees exactly one installation per process,
+        // satisfying `gc_mark.h:309`'s external-sync requirement.
+        // The proc has `'static` lifetime; Boehm holds it for
+        // the process's life. We capture the prior proc BEFORE
+        // the setter so our wrapper can chain to it (see
+        // `push_sigil_thread_precise_roots` doc +
+        // `PRIOR_PUSH_OTHER_ROOTS` doc).
+        let prior = unsafe { GC_get_push_other_roots() };
+        if let Some(prior) = prior {
+            // Best-effort set; under the Once guard a previous
+            // set is impossible, so this won't return Err in
+            // production. `let _ = ...` swallows the Result for
+            // defensiveness against future refactors.
+            let _ = PRIOR_PUSH_OTHER_ROOTS.set(prior);
+        }
         unsafe {
-            let prior = GC_get_push_other_roots();
-            PRIOR_PUSH_OTHER_ROOTS = prior;
             GC_set_push_other_roots(push_sigil_thread_precise_roots);
         }
     });
@@ -409,15 +420,12 @@ extern "C" fn push_sigil_thread_precise_roots() {
     // captured at install time (see `install_push_other_roots_once`).
     //
     // SAFETY: the prior proc is an `extern "C" fn()` Boehm
-    // installed; calling it is the documented contract. The
-    // `static mut` read is safe because the value is written
-    // exactly once (inside `Once::call_once`) and is read only
-    // after that write has completed (the `Once` provides the
-    // happens-before edge: the callback can only fire after
-    // `GC_set_push_other_roots` returns, which happens after
-    // the write).
-    let prior = unsafe { PRIOR_PUSH_OTHER_ROOTS };
-    if let Some(prior) = prior {
+    // installed; calling it is the documented contract.
+    // `OnceLock::get` is safe; it returns `Some(&proc)` after
+    // the install completed (happens-before via `Once::call_once`
+    // → `GC_set_push_other_roots` → callback can fire) or
+    // `None` if Boehm had no prior proc to chain to.
+    if let Some(prior) = PRIOR_PUSH_OTHER_ROOTS.get() {
         prior();
     }
 
