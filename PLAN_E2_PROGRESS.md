@@ -325,7 +325,34 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 10 — Per-thread root config spike
 
-- status: pending
+- status: **in PR (Task 10 branch)**
+- API question answered: `GC_register_my_thread` takes a
+  `const struct GC_stack_base *` and nothing else; the
+  precise / conservative distinction is **global** in libgc 8.x,
+  not per-thread.
+- Workaround the plan body anticipated is what Boehm itself
+  documents (`gc.h` line 1620):
+  `GC_do_blocking` + `GC_call_with_gc_active` + `GC_set_push_other_roots`.
+  Sigil program threads will be wrapped in `GC_do_blocking`
+  (excludes their frames from conservative scan); runtime-
+  internal threads stay un-wrapped (Boehm's default scan).
+  The stackmap-driven precise walker hooks
+  `GC_set_push_other_roots` to supply roots to the marker.
+- macOS aarch64: no new quirks — `GC_DARWIN_THREADS` uses
+  Mach `task_threads` for suspension, `pthread_get_stackaddr_np`
+  for stack-bottom detection; both already validated by Plan B
+  Task 56 + Plan E2 Phase 1 on the macos-14 CI lane.
+- Spike doc: `runtime/docs/boehm-per-thread-roots-spike.md`.
+- Spike test: `runtime/tests/boehm_per_thread_roots_spike.rs` —
+  two integration tests (subprocess-wrapped, matching the Phase
+  2 Task 6 discipline):
+  - `push_other_roots_callback_is_invoked_during_mark` — asserts
+    the registered callback fires from inside `GC_gcollect`.
+  - `push_other_roots_getter_round_trips_setter` — asserts the
+    getter returns the proc the setter installed (needed by
+    Task 11 for chaining into a prior callback).
+- No 8.x escalation; every API Phase 3 needs is present and
+  exposed on both target hosts.
 
 ### Task 11 — Thread registration discriminator
 
