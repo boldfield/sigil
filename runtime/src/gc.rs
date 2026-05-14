@@ -93,8 +93,10 @@ extern "C" {
     // Plan E2 Phase 3 Task 12: production runtime threads (CPU /
     // alloc profile drainers) do NOT need to enrol — they neither
     // allocate from Boehm nor hold Boehm pointers on their stack.
-    // See `gc::threads::register_runtime_thread_for_conservative_roots`'s
-    // doc for the rationale. So these symbols stay test-only.
+    // See `gc::threads::ensure_gc_process_state_initialised`'s
+    // doc + the `gc::threads` module doc's "Runtime threads
+    // don't enrol with Boehm" section for the rationale. So
+    // these symbols stay test-only.
     #[cfg(test)]
     pub(crate) fn GC_allow_register_threads();
     #[cfg(test)]
@@ -273,6 +275,26 @@ pub extern "C" fn sigil_gc_init() {
         // push_other_roots callback (Once-gated); pre-warms the
         // stackmap module's lazy initialisers.
         crate::gc::threads::register_sigil_thread_for_precise_roots();
+
+        // Plan E2 Phase 3 Task 12 — prime the safe-stack-range
+        // cache for BOTH FP-chain walkers (the SIGPROF unwinder
+        // and the GC mark-phase precise walker) BEFORE either
+        // can fire. `pthread_attr_getstack` /
+        // `pthread_get_stackaddr_np` are not async-signal-safe
+        // for the SIGPROF case AND not STW-safe for the GC mark
+        // phase (the mark phase suspends other threads, and any
+        // libc malloc/lock the pthread queries might take could
+        // deadlock against a suspended thread holding malloc's
+        // internal lock). The cache MUST be populated off both
+        // paths. Doing it here (`sigil_gc_init`, on the main
+        // thread, before any worker spawns) is the canonical
+        // safe point. Both walkers validate FPs against the
+        // cached range to harden against
+        // `-fomit-frame-pointer`-compiled libgc internals
+        // leaking wild rbp values onto the unwind path.
+        if let Some((lo, hi)) = crate::stackmap_xcheck::thread_stack_bounds() {
+            crate::profile::unwind::install_safe_stack_range(lo, hi);
+        }
     }
 
     // v2 profile-data surface — gated by env vars. When neither
@@ -519,17 +541,64 @@ struct SigilCallerFpGuard;
 
 #[cfg(not(test))]
 impl SigilCallerFpGuard {
-    /// `#[inline(always)]` is load-bearing: the FP must be captured
-    /// from *sigil_alloc's* frame, not from this helper's frame. With
-    /// inlining, the call to `capture_caller_fp_for_walk` (itself
-    /// `#[inline(never)]`) takes place in sigil_alloc's frame, so
-    /// the helper's `*rbp` deref yields sigil_alloc's FP.
+    /// `#[inline(always)]` is load-bearing in production code: the
+    /// FP must be captured from *sigil_alloc's* frame, not from
+    /// this helper's frame. With inlining, the call to
+    /// `capture_caller_fp_for_walk` (itself `#[inline(never)]`)
+    /// takes place in sigil_alloc's frame, so the helper's `*rbp`
+    /// deref yields sigil_alloc's FP.
+    ///
+    /// Sigil's build config pins this: `.cargo/config.toml` sets
+    /// `-C force-frame-pointers=yes` for both Linux and macOS
+    /// rustflags, and the workspace release profile inherits the
+    /// `opt-level = 3` that makes `#[inline(always)]` a strong
+    /// hint. A `debug_assert!` in `capture()` provides a
+    /// belt-and-suspenders runtime sanity check: the captured FP
+    /// must lie inside the calling thread's pthread-known stack
+    /// range when the cache is populated (post-`sigil_gc_init`).
+    /// If a future codegen change ever caused the inline to be
+    /// declined, an off-by-one frame would either crash the
+    /// walker (caught by the same stack-range gate added to
+    /// `walk_for_gc_with_callback_from`) or trip this assertion
+    /// in debug builds.
     #[inline(always)]
     fn capture() -> Self {
         let fp = crate::stackmap::capture_caller_fp_for_walk();
+        debug_assert!(
+            captured_fp_looks_plausible(fp),
+            "sigil_alloc FP capture out of stack range: fp=0x{:x} \
+             (likely #[inline(always)] inlining declined; \
+             investigate runtime build flags)",
+            fp as usize,
+        );
         crate::gc::threads::capture_sigil_caller_fp(fp);
         SigilCallerFpGuard
     }
+}
+
+/// Debug-only sanity check for the captured FP. Returns true when:
+/// (a) the safe-stack-range cache hasn't been populated yet
+///     (`sigil_gc_init` hasn't run, or pthread bounds weren't
+///     available — in both cases we have nothing to validate
+///     against and must accept whatever FP we got), OR
+/// (b) the FP is non-null AND falls inside the cached
+///     `[stack_lo, stack_hi)` range.
+///
+/// A `false` reading in production-mode debug builds indicates
+/// either an `#[inline(always)]` failure on
+/// `SigilCallerFpGuard::capture` (the helper produced its own
+/// frame's FP instead of sigil_alloc's) or a wild rbp value from
+/// a Rust codegen surprise. Either is a bug worth surfacing
+/// during development.
+#[cfg(not(test))]
+fn captured_fp_looks_plausible(fp: *const usize) -> bool {
+    let lo = crate::profile::unwind::SAFE_STACK_LO.load(std::sync::atomic::Ordering::Relaxed);
+    let hi = crate::profile::unwind::SAFE_STACK_HI.load(std::sync::atomic::Ordering::Relaxed);
+    if lo == 0 || hi <= lo {
+        return true;
+    }
+    let fp_addr = fp as usize;
+    fp_addr != 0 && fp_addr >= lo && fp_addr < hi
 }
 
 #[cfg(not(test))]

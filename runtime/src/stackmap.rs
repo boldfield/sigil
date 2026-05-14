@@ -682,10 +682,40 @@ pub fn walk_for_gc_with_callback_from<F: FnMut(RootLocation)>(starting_fp: *cons
         None => return,
     };
     let trace = xcheck_trace_enabled();
+    // Plan E2 Phase 3 Task 12 — read the cached safe-stack range
+    // once. `profile::unwind`'s atomics are populated by
+    // `sigil_gc_init` (off the STW path) before any GC fires. If
+    // either bound is zero, no range was installed (e.g., this
+    // walker is being invoked from a cargo-test context that
+    // bypasses sigil_gc_init); the FP validation degrades to
+    // alignment + inversion + hop-bound only. The SIGPROF
+    // unwinder (`profile::unwind::capture_stack_from`) applies
+    // the same defensive pattern — see its doc for the failure
+    // mode this guards against (`-fomit-frame-pointer`-compiled
+    // libgc internals leaking wild rbp values into the unwind
+    // chain).
+    let safe_lo = crate::profile::unwind::SAFE_STACK_LO.load(std::sync::atomic::Ordering::Relaxed);
+    let safe_hi = crate::profile::unwind::SAFE_STACK_HI.load(std::sync::atomic::Ordering::Relaxed);
+    let safe_range_installed = safe_lo != 0 && safe_hi > safe_lo;
     let mut fp = starting_fp;
     let mut frame_idx = 0usize;
     let mut yielded: usize = 0;
     while !fp.is_null() {
+        // Reject FPs outside the calling thread's known stack
+        // range BEFORE dereferencing. This catches the failure
+        // mode where libgc internals leak a wild rbp onto the
+        // walker's chain — same shape as the SIGPROF unwinder
+        // hardening. Same caveat as well: if no range is
+        // installed (test context), the check is bypassed.
+        if safe_range_installed && ((fp as usize) < safe_lo || (fp as usize) >= safe_hi) {
+            if trace {
+                eprintln!(
+                    "[stackmap] walk frame={} fp=0x{:x} outside safe stack range [0x{:x}, 0x{:x}) — bailing",
+                    frame_idx, fp as usize, safe_lo, safe_hi,
+                );
+            }
+            break;
+        }
         let frame = unsafe { walk_frame(fp) };
         // Strip pointer-authentication code (PAC) bits from the
         // saved return-PC. On Apple Silicon Cranelift's prologue may
@@ -739,6 +769,23 @@ pub fn walk_for_gc_with_callback_from<F: FnMut(RootLocation)>(starting_fp: *cons
         }
         if frame.saved_fp.is_null() || frame.saved_fp as usize <= fp as usize {
             // Bottom of chain (or corruption); stop walking.
+            break;
+        }
+        // Stack-hop bound: a legitimate saved_fp is at most a few
+        // MB higher than fp — function frames are typically <1 KB
+        // and rarely exceed ~1 MB even for stack-heavy code. A
+        // larger hop is a strong signal we're reading FP-omitted
+        // intermediate frames (libgc internals on the post-Task 12
+        // walk path, where the chain crosses GC_do_blocking's
+        // library frames). Same threshold as the SIGPROF unwinder.
+        const STACK_HOP_MAX: usize = 4 * 1024 * 1024;
+        if (frame.saved_fp as usize).wrapping_sub(fp as usize) > STACK_HOP_MAX {
+            if trace {
+                eprintln!(
+                    "[stackmap] walk frame={} fp=0x{:x} saved_fp=0x{:x} hop > {} bytes — bailing",
+                    frame_idx, fp as usize, frame.saved_fp as usize, STACK_HOP_MAX,
+                );
+            }
             break;
         }
         fp = frame.saved_fp;

@@ -261,14 +261,13 @@ extern "C" fn sigprof_handler(
 /// samples into the global `SAMPLES` vec. Exits cleanly when
 /// [`DRAINER_STOP`] is set.
 fn drainer_loop() {
-    // Plan E2 Phase 3 Task 11: register as "runtime-internal,
-    // conservative roots" via the `gc::threads` discriminator.
-    // The call is a no-op on Boehm state today (the drainer
-    // doesn't allocate from Boehm; the API doesn't enroll the
-    // thread until Task 12 chooses to) but pre-warms the
-    // process-wide push_other_roots install + stackmap
-    // initialisers exactly once per process regardless of
-    // which thread (Sigil or runtime) registers first.
+    // Plan E2 Phase 3 — ensure the process-wide `push_other_roots`
+    // install + stackmap initialisers have fired regardless of
+    // which thread (Sigil or runtime) hits the path first. The
+    // call is a no-op on per-thread Boehm state by design — see
+    // `gc::threads::ensure_gc_process_state_initialised`'s doc
+    // and the module doc's "Runtime threads don't enrol with
+    // Boehm" section.
     //
     // **Constraint** (see `runtime/src/gc/threads.rs` module
     // doc → "Runtime invariant"): runtime-internal threads
@@ -279,7 +278,7 @@ fn drainer_loop() {
     // needs heap allocation, the `gc::threads` design needs a
     // multi-Sigil-thread registry walk before that worker
     // lands.
-    crate::gc::threads::register_runtime_thread_for_conservative_roots();
+    crate::gc::threads::ensure_gc_process_state_initialised();
 
     let ring_ptr = CPU_RING_PTR.load(Ordering::Acquire);
     if ring_ptr.is_null() {

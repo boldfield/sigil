@@ -475,8 +475,10 @@ doesn't route through `GC_pthread_create`'s auto-
 cleanup hook so an enrolled drainer would leak its
 registration on exit — which CI surfaced as a CPU-
 profile e2e crash before any Sigil output appeared.
-`register_runtime_thread_for_conservative_roots` stays
-a no-op on Boehm state.
+The function was also renamed from
+`register_runtime_thread_for_conservative_roots` (PR #170)
+to `ensure_gc_process_state_initialised` so the name matches
+the actual no-op-on-Boehm-state behaviour.
 
 The four pieces compose to a thread model where:
 - Boehm's STW conservatively scans ABOVE the
