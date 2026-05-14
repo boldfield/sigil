@@ -147,16 +147,20 @@ use std::sync::Once;
 // dependency. Keep the `use` removed until Task 12 reinstates it.
 
 // `GC_set_push_other_roots` is Phase 3-specific; declared here.
-// Task 12 may fold it into the parent extern block once
-// production callers exist outside this module.
+// `GC_get_push_other_roots` is paired: per `gc_mark.h`'s
+// comment "A client supplied procedure should also call the
+// original procedure." We capture the prior procedure at
+// install time and invoke it from our wrapper so Boehm's
+// internal push_other_roots usage (TLS roots, dynamic-library
+// roots) keeps working. PR #170 CI surfaced that NOT chaining
+// to the prior procedure causes live-object collection on
+// alloc-heavy workloads (tree.sigil exit -1, sudoku exit -1,
+// etc.) — Boehm's internal roots get dropped on every mark.
 //
 // `GC_allow_register_threads` + `GC_register_my_thread` are
 // intentionally NOT used by this module today — see the doc
 // comment on `register_runtime_thread_for_conservative_roots`
-// for the parallel-marker rationale. Task 12 reintroduces them
-// when the empirical interaction with the marker is
-// characterised + sigil_alloc gains the `GC_do_blocking`
-// wrapping that makes the precise walker load-bearing.
+// for the parallel-marker rationale.
 //
 // `GC_push_all_eager` is the call the precise walker WILL make
 // once Task 12 re-enables the walker body. Task 11's callback
@@ -167,6 +171,7 @@ use std::sync::Once;
 #[link(name = "gc")]
 extern "C" {
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
+    fn GC_get_push_other_roots() -> Option<GcPushOtherRootsProc>;
     fn GC_push_all_eager(bottom: *mut c_void, top: *mut c_void);
 }
 
@@ -189,13 +194,38 @@ thread_local! {
 /// on the main thread before the profile drainer ever spawns).
 static PRECISE_WALKER_INSTALLED: Once = Once::new();
 
+/// The push_other_roots procedure Boehm had registered BEFORE
+/// our install. Per `gc_mark.h`, "A client supplied procedure
+/// should also call the original procedure" — Boehm uses
+/// `GC_set_push_other_roots` for its own internal root-supply
+/// hooks (TLS roots; dynamic-library roots on platforms where
+/// `dl_iterate_phdr` isn't sufficient). Without chaining, those
+/// roots are silently dropped on every mark phase, leading to
+/// live-object collection. PR #170 CI surfaced this as exit -1
+/// SIGSEGVs on alloc-heavy workloads.
+///
+/// Captured at install time + invoked from our wrapper. Stored
+/// in a static so the wrapper can find it without any extra
+/// state plumbing; the value is set exactly once (by the
+/// `Once`-gated install) and read by every callback invocation
+/// thereafter — no synchronisation needed beyond the Once's
+/// happens-before edge.
+static mut PRIOR_PUSH_OTHER_ROOTS: Option<GcPushOtherRootsProc> = None;
+
 fn install_push_other_roots_once() {
     PRECISE_WALKER_INSTALLED.call_once(|| {
         // SAFETY: `Once::call_once` guarantees exactly one
         // installation per process, satisfying `gc_mark.h:309`'s
         // external-sync requirement. The proc has `'static`
-        // lifetime; Boehm holds it for the process's life.
-        unsafe { GC_set_push_other_roots(push_sigil_thread_precise_roots) };
+        // lifetime; Boehm holds it for the process's life. We
+        // capture the prior proc BEFORE the setter so our
+        // wrapper can chain to it (see `push_sigil_thread_precise_roots`
+        // doc + `PRIOR_PUSH_OTHER_ROOTS` doc).
+        unsafe {
+            let prior = GC_get_push_other_roots();
+            PRIOR_PUSH_OTHER_ROOTS = prior;
+            GC_set_push_other_roots(push_sigil_thread_precise_roots);
+        }
     });
 }
 
@@ -330,11 +360,37 @@ pub fn register_runtime_thread_for_conservative_roots() {
 /// boundary outside libgc → libgc internal frames don't get
 /// walked.
 extern "C" fn push_sigil_thread_precise_roots() {
+    // Chain to Boehm's prior push_other_roots first. Per
+    // `gc_mark.h`, "A client supplied procedure should also
+    // call the original procedure" — Boehm's internal proc
+    // pushes TLS roots + dynamic-library roots that our
+    // wrapper would otherwise drop. The prior proc is
+    // captured at install time (see `install_push_other_roots_once`).
+    //
+    // SAFETY: the prior proc is an `extern "C" fn()` Boehm
+    // installed; calling it is the documented contract. The
+    // `static mut` read is safe because the value is written
+    // exactly once (inside `Once::call_once`) and is read only
+    // after that write has completed (the `Once` provides the
+    // happens-before edge: the callback can only fire after
+    // `GC_set_push_other_roots` returns, which happens after
+    // the write).
+    let prior = unsafe { PRIOR_PUSH_OTHER_ROOTS };
+    if let Some(prior) = prior {
+        prior();
+    }
+
+    // The precise-root walking body is intentionally a no-op
+    // for Task 11 — the walker SIGSEGVs when invoked from
+    // inside libgc's mark phase (libgc may compile without
+    // frame pointers; walking the FP chain through libgc
+    // frames yields garbage). Task 12 replaces this with
+    // `walk_for_gc_with_callback_from(captured_fp, …)` once
+    // `sigil_alloc`'s `GC_do_blocking` boundary captures the
+    // user-level FP outside libgc's call chain. Until then,
+    // chaining to the prior proc is the load-bearing work
+    // here.
     let _is_sigil = IS_SIGIL_THREAD.with(Cell::get);
-    // No-op — see fn doc-comment. Task 12 replaces the body
-    // with `walk_for_gc_with_callback_from(captured_fp, …)`
-    // once `sigil_alloc`'s `GC_do_blocking` boundary captures
-    // the user-level FP.
 }
 
 #[cfg(test)]
