@@ -50,6 +50,7 @@
 // savings — that's a Plan E2 follow-up, not this report.
 
 import std.io
+use std.io.{IO};
 
 type Tree = | Leaf | Node(Int, Tree, Tree)
 

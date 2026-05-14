@@ -1,0 +1,232 @@
+{
+  "std.array": [
+    "array_get_opt",
+    "array_set_opt"
+  ],
+  "std.byte_array": [
+    "byte_array_get_opt",
+    "byte_array_slice_opt",
+    "byte_from_int",
+    "string_from_bytes"
+  ],
+  "std.choose": [
+    "Choose",
+    "all_choices",
+    "all_choices_helper",
+    "first_choice",
+    "first_choice_helper"
+  ],
+  "std.clock": [
+    "Clock",
+    "now",
+    "run_frozen_clock",
+    "run_os_clock"
+  ],
+  "std.env": [
+    "env_args",
+    "env_var",
+    "env_vars"
+  ],
+  "std.float": [
+    "string_to_float"
+  ],
+  "std.format": [
+    "ABool",
+    "AChar",
+    "AFloat",
+    "AInt",
+    "AInt64",
+    "AString",
+    "FormatArg",
+    "format",
+    "format1",
+    "format2",
+    "format3",
+    "format4",
+    "format5",
+    "format6",
+    "format7",
+    "format8",
+    "format_bool",
+    "format_char",
+    "format_float",
+    "format_int",
+    "format_int64",
+    "format_string"
+  ],
+  "std.fs": [
+    "AlreadyExists",
+    "FsError",
+    "InvalidUtf8",
+    "IsADirectory",
+    "NotADirectory",
+    "NotFound",
+    "Other",
+    "PermissionDenied",
+    "exists",
+    "file_size",
+    "is_dir",
+    "is_file",
+    "mkdir",
+    "read_dir",
+    "read_file",
+    "remove_dir",
+    "remove_file",
+    "write_file"
+  ],
+  "std.int": [
+    "int_add_safe",
+    "int_max",
+    "int_min",
+    "int_sub_safe"
+  ],
+  "std.io": [
+    "IO"
+  ],
+  "std.json": [
+    "JArray",
+    "JBool",
+    "JInt",
+    "JLCons",
+    "JLNil",
+    "JList",
+    "JNull",
+    "JOCons",
+    "JONil",
+    "JObject",
+    "JString",
+    "JValue",
+    "json_parse",
+    "json_render"
+  ],
+  "std.list": [
+    "Cons",
+    "List",
+    "Nil",
+    "append",
+    "filter",
+    "fold",
+    "length",
+    "list_sort",
+    "list_sort_char",
+    "list_sort_float",
+    "list_sort_int",
+    "list_sort_string",
+    "map",
+    "range",
+    "reverse"
+  ],
+  "std.map": [
+    "Map",
+    "MapBranch",
+    "MapLeaf",
+    "MapNode",
+    "map_char_keys",
+    "map_contains",
+    "map_empty",
+    "map_filter",
+    "map_fold",
+    "map_from_list",
+    "map_get",
+    "map_insert",
+    "map_int_keys",
+    "map_is_empty",
+    "map_keys",
+    "map_map",
+    "map_remove",
+    "map_size",
+    "map_string_keys",
+    "map_to_list",
+    "map_values"
+  ],
+  "std.mut_array": [
+    "mut_array_get_opt",
+    "mut_array_set_opt"
+  ],
+  "std.mut_byte_array": [
+    "mut_byte_array_get_opt",
+    "mut_byte_array_set_opt"
+  ],
+  "std.option": [
+    "and_then",
+    "map",
+    "unwrap_or"
+  ],
+  "std.ordering": [
+    "Equal",
+    "Greater",
+    "Less",
+    "Ordering",
+    "bool_compare",
+    "char_compare",
+    "float_compare",
+    "int64_compare",
+    "int_compare",
+    "string_compare"
+  ],
+  "std.pair": [
+    "fst",
+    "snd"
+  ],
+  "std.process": [
+    "NotFound",
+    "Other",
+    "PermissionDenied",
+    "ProcessError",
+    "run",
+    "run_list"
+  ],
+  "std.raise": [
+    "Raise",
+    "catch",
+    "raise"
+  ],
+  "std.random": [
+    "Random",
+    "random_int",
+    "run_pseudo_random",
+    "run_seeded_random",
+    "xorshift_step"
+  ],
+  "std.result": [
+    "and_then",
+    "map",
+    "map_err"
+  ],
+  "std.set": [
+    "Set",
+    "set_char",
+    "set_contains",
+    "set_difference",
+    "set_empty",
+    "set_eq",
+    "set_filter",
+    "set_fold",
+    "set_from_list",
+    "set_insert",
+    "set_int",
+    "set_intersect",
+    "set_is_empty",
+    "set_remove",
+    "set_size",
+    "set_string",
+    "set_subset",
+    "set_to_list",
+    "set_union"
+  ],
+  "std.state": [
+    "State",
+    "run_state"
+  ],
+  "std.string": [
+    "Empty",
+    "NonDecimal",
+    "Overflow",
+    "ParseError",
+    "string_byte_at_opt",
+    "string_replace",
+    "string_split",
+    "string_substring_opt",
+    "string_to_int"
+  ]
+}

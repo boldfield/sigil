@@ -23,6 +23,8 @@
 import std.raise
 import std.result
 import std.ordering
+use std.ordering.{Equal, string_compare};
+use std.raise.{Raise, catch, raise};
 
 type Expr =
   | EVar(String)

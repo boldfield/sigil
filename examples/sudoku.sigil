@@ -63,6 +63,7 @@
 
 import std.choose
 import std.option
+use std.choose.{Choose, first_choice, first_choice_helper};
 
 fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
   match i {

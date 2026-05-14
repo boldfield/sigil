@@ -16,6 +16,7 @@
 // Per-round sum: 2^12 - 1 = 4,095. Total across 10 rounds: 40,950.
 
 import std.io
+use std.io.{IO};
 
 type Tree = | Leaf | Node(Int, Tree, Tree)
 

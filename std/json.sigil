@@ -69,6 +69,8 @@ import std.string_builder
 import std.raise
 import std.result
 import std.state
+use std.raise.{Raise, catch, raise};
+use std.state.{State, run_state};
 
 type JValue =
   | JNull

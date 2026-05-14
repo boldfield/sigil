@@ -84,6 +84,7 @@
 import std.list
 import std.option
 import std.string
+use std.list.{Cons, List, Nil};
 
 // `FormatArg` is the sum of every primitive type the formatter
 // can stringify. Constructors mirror the Sigil v1 primitive set:

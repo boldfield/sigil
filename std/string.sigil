@@ -124,6 +124,7 @@
 import std.list
 import std.option
 import std.result
+use std.list.{Cons, List, Nil, reverse};
 
 // `ParseError` variants mirror the integer codes returned by
 // `string_to_int_validate` (1=Empty, 2=NonDecimal, 3=Overflow).

@@ -27,6 +27,7 @@
 // patterns the Plan A2 language can't express).
 
 import std.io
+use std.io.{IO};
 
 fn fib(n: Int) -> Int ![] {
   match n {

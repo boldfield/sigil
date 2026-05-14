@@ -45,6 +45,7 @@
 // `list_sort_*` get the convenience wrappers without writing a
 // second `import` line.
 import std.ordering
+use std.ordering.{Greater, Ordering, char_compare, float_compare, int_compare, string_compare};
 
 type List[A] = | Nil | Cons(A, List[A])
 

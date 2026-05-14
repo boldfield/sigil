@@ -1,6 +1,8 @@
 import std.state
 import std.raise
 import std.result
+use std.raise.{Raise, catch};
+use std.state.{State, run_state};
 
 fn inner_body() -> Int ![State[Int], Raise[String]] {
   let pos: Int = perform State.get();

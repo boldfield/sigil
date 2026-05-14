@@ -51,6 +51,7 @@
 import std.array
 import std.list
 import std.result
+use std.list.{List};
 
 // `FsError` variants — keep ordered so variant index N corresponds
 // to runtime tag N (NotFound = variant 0 = tag 1, etc.). Note: the

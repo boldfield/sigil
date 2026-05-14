@@ -31,6 +31,7 @@
 // individually below that floor.
 
 import std.io
+use std.io.{IO};
 
 type Cons = | Nil | C(Int, Cons)
 
