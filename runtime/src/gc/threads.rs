@@ -181,25 +181,45 @@ use std::sync::Once;
 // etc.) — Boehm's internal roots get dropped on every mark.
 //
 // `GC_allow_register_threads` + `GC_register_my_thread` are
-// intentionally NOT used by this module today — see the doc
-// comment on `register_runtime_thread_for_conservative_roots`
-// for the parallel-marker rationale.
+// used by `register_runtime_thread_for_conservative_roots`
+// post-Task-12. Safe to call now because Task 12's
+// `GC_set_markers_count(1)` in `sigil_gc_init` pins Boehm to
+// single-marker mode before `GC_allow_register_threads`'s
+// implicit `GC_start_mark_threads()` can spawn parallel
+// markers.
 //
-// `GC_push_all_eager` is the call the precise walker WILL make
-// once Task 12 re-enables the walker body. Task 11's callback
-// is a no-op (see `push_sigil_thread_precise_roots` doc),
-// so the symbol isn't used yet — but the declaration stays
-// here so Task 12's diff is the callback body change only.
+// `GC_push_all_eager` pushes a root range from inside the
+// `GC_set_push_other_roots` callback. Task 12 callback uses
+// it per precise root the walker yields.
+//
+// `GC_allow_register_threads` + `GC_register_my_thread` live
+// in `crate::gc`'s extern block (shared with `test_support`'s
+// per-test enrolment). The Task 12 production enrolment path
+// reaches them through that module via the `cfg(not(test))`
+// block in `register_runtime_thread_for_conservative_roots`.
 #[link(name = "gc")]
 extern "C" {
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
     fn GC_get_push_other_roots() -> Option<GcPushOtherRootsProc>;
-    // Task 12 reinstates the walker body that calls
-    // `GC_push_all_eager` for each precise root the walker
-    // yields. Kept declared so the diff to enable the walker
-    // is body-only.
-    #[allow(dead_code)]
     fn GC_push_all_eager(bottom: *mut c_void, top: *mut c_void);
+}
+
+#[cfg(not(test))]
+const GC_SUCCESS: i32 = 0;
+#[cfg(not(test))]
+const GC_DUPLICATE: i32 = 1;
+
+#[cfg(not(test))]
+static ALLOW_REGISTER_THREADS: Once = Once::new();
+
+#[cfg(not(test))]
+fn allow_register_threads_once() {
+    ALLOW_REGISTER_THREADS.call_once(|| {
+        // SAFETY: Once::call_once + GC_set_markers_count(1) at
+        // sigil_gc_init time keeps Boehm in single-marker mode
+        // so this call doesn't spawn parallel markers.
+        unsafe { crate::gc::GC_allow_register_threads() };
+    });
 }
 
 type GcPushOtherRootsProc = extern "C" fn();
@@ -211,6 +231,23 @@ thread_local! {
     /// threads). Set to `true` by
     /// `register_sigil_thread_for_precise_roots`.
     static IS_SIGIL_THREAD: Cell<bool> = const { Cell::new(false) };
+
+    /// Plan E2 Phase 3 Task 12 — captured user-level FP for the
+    /// precise walker. `sigil_alloc` writes this on entry (before
+    /// calling into libgc) so the `push_other_roots` callback —
+    /// which runs from inside libgc's mark phase, where the
+    /// current FP is somewhere inside libgc's internal frames
+    /// (possibly compiled with `-fomit-frame-pointer`) — can walk
+    /// from the LAST KNOWN Sigil-emitted frame instead of from
+    /// libgc's internal call chain.
+    ///
+    /// `null` when no Sigil alloc is in progress on this thread.
+    /// The callback short-circuits to "no precise roots from this
+    /// thread" in that case. Today this matters in two cases:
+    /// (a) a non-Sigil thread triggered GC (drainer-spawned
+    /// allocation, future); (b) main thread's startup phase
+    /// before the first sigil_alloc fires.
+    static CAPTURED_SIGIL_CALLER_FP: Cell<*const usize> = const { Cell::new(std::ptr::null()) };
 }
 
 /// Install `GC_set_push_other_roots(push_sigil_thread_precise_roots)`
@@ -362,6 +399,34 @@ pub fn register_sigil_thread_for_precise_roots() {
 pub fn register_runtime_thread_for_conservative_roots() {
     install_push_other_roots_once();
     crate::stackmap::prewarm_for_stw();
+    // Plan E2 Phase 3 Task 12 — enroll the calling thread with
+    // Boehm so STW suspends it and its stack is conservatively
+    // scanned. Safe to enable now because `sigil_gc_init` pinned
+    // marker count to 1 BEFORE `GC_init`, so
+    // `GC_allow_register_threads`'s implicit
+    // `GC_start_mark_threads()` call doesn't spawn parallel
+    // markers (the count-1 pin makes "additional" markers zero).
+    //
+    // Production-only: cargo's per-test worker threads call this
+    // through `register_runtime_thread_does_not_set_sigil_flag`,
+    // but cargo's workers exit without `GC_unregister_my_thread`,
+    // leaking stale TLS ranges as Boehm roots and segfaulting
+    // process teardown on the next mark. Production runtime
+    // threads (CPU-profile drainer) are long-lived and process-
+    // scoped, so the leak doesn't apply there. Tests cover the
+    // discriminator surface (`IS_SIGIL_THREAD` stays false)
+    // independently of the Boehm enrolment.
+    #[cfg(not(test))]
+    {
+        allow_register_threads_once();
+        // SAFETY: NULL stack base = Boehm auto-detects; standard
+        // for threads not created via GC_pthread_create.
+        let rc = unsafe { crate::gc::GC_register_my_thread(std::ptr::null()) };
+        debug_assert!(
+            rc == GC_SUCCESS || rc == GC_DUPLICATE,
+            "GC_register_my_thread(NULL) returned rc={rc}"
+        );
+    }
     // IS_SIGIL_THREAD stays at its default `false`.
 }
 
@@ -413,6 +478,31 @@ pub fn register_runtime_thread_for_conservative_roots() {
 /// parameter instead of reading the current one). The
 /// boundary outside libgc → libgc internal frames don't get
 /// walked.
+/// Plan E2 Phase 3 Task 12 — Sigil-side FP-capture hook. Called
+/// from `sigil_alloc` (only when the calling thread is a Sigil
+/// thread) BEFORE the call into libgc, so the captured FP is
+/// outside any libgc internal frames.
+///
+/// The captured FP is the FP of `sigil_alloc`'s caller — i.e.,
+/// the Sigil-emitted function that allocated. The mark-phase
+/// callback walks UP from there through the Sigil call chain.
+///
+/// Cheap: one TLS write per alloc. Sigil alloc-heavy workloads
+/// pay ~ns/alloc for this.
+#[inline]
+pub fn capture_sigil_caller_fp(fp: *const usize) {
+    CAPTURED_SIGIL_CALLER_FP.with(|c| c.set(fp));
+}
+
+/// Clear the captured FP. Called by `sigil_alloc` AFTER the
+/// allocation returns, so a subsequent GC triggered from
+/// non-Sigil code (e.g., a runtime worker that allocated) sees
+/// `null` and short-circuits the walker.
+#[inline]
+pub fn clear_sigil_caller_fp() {
+    CAPTURED_SIGIL_CALLER_FP.with(|c| c.set(std::ptr::null()));
+}
+
 extern "C" fn push_sigil_thread_precise_roots() {
     // Chain to Boehm's prior push_other_roots first. Per
     // `gc_mark.h`, "A client supplied procedure should also
@@ -434,20 +524,40 @@ extern "C" fn push_sigil_thread_precise_roots() {
         prior();
     }
 
-    // The precise-root walking body is intentionally a no-op
-    // for Task 11 — the walker SIGSEGVs when invoked from
-    // inside libgc's mark phase (libgc may compile without
-    // frame pointers; walking the FP chain through libgc
-    // frames yields garbage). Task 12 replaces this with
-    // `walk_for_gc_with_callback_from(captured_fp, …)` once
-    // `sigil_alloc`'s `GC_do_blocking` boundary captures the
-    // user-level FP outside libgc's call chain. Until then,
-    // chaining to the prior proc is the load-bearing work
-    // here.
-    //
-    // Task 12 stub: the body will read `IS_SIGIL_THREAD` and
-    // gate the walk on it. Today there's nothing to gate (the
-    // walk is empty), so the read is omitted.
+    // Plan E2 Phase 3 Task 12 — walk the Sigil thread's stack
+    // precisely. Gate on `IS_SIGIL_THREAD` AND the captured FP
+    // being non-null: the callback fires once per mark phase
+    // on whichever thread holds the GC lock, and that thread
+    // may or may not be a Sigil thread + may or may not have
+    // an alloc in progress.
+    let is_sigil = IS_SIGIL_THREAD.with(Cell::get);
+    if !is_sigil {
+        return;
+    }
+    let captured_fp = CAPTURED_SIGIL_CALLER_FP.with(Cell::get);
+    if captured_fp.is_null() {
+        // No alloc in progress on this thread — nothing to
+        // walk. This happens at process startup (before the
+        // first sigil_alloc) and during teardown.
+        return;
+    }
+    // Walk from the captured FP — outside libgc's call chain,
+    // so frame-pointer-omitted libgc frames are not on the
+    // traversal path. The walker yields each precise root via
+    // the closure, which calls `GC_push_all_eager` (mark-stack-
+    // safe, no allocation) per root.
+    crate::stackmap::walk_for_gc_with_callback_from(captured_fp, |r| {
+        // SAFETY: the stack range [r.addr, r.addr + 8) lives on
+        // the calling thread's stack. Inside `GC_do_blocking`
+        // the thread is in "inactive" state but not suspended;
+        // Boehm reads the range as a conservative root range
+        // (1 word) but our descriptor-emitted roots are heap
+        // pointer slots, so Boehm's mark-stack tracks each via
+        // the typed-malloc descriptors.
+        let bottom = r.addr as *mut c_void;
+        let top = (r.addr.wrapping_add(8)) as *mut c_void;
+        unsafe { GC_push_all_eager(bottom, top) };
+    });
 }
 
 #[cfg(test)]

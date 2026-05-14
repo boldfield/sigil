@@ -18726,3 +18726,170 @@ fn cross_check_state_runs_cleanly() {
     );
     assert_no_cross_check_abort("state.sigil", &stderr, code);
 }
+
+// ===== Plan E2 Phase 3 Task 12 — deep recursion + GC stress ===============
+//
+// Task 12 drops Boehm's conservative stack scan on Sigil program threads
+// (via `GC_do_blocking` wrapping `sigil_run_loop`) and substitutes the
+// precise stackmap-driven walker installed at
+// `GC_set_push_other_roots`. The walker is invoked from inside Boehm's
+// mark phase with a captured FP that points into sigil_alloc's frame,
+// then iterates UP the FP chain yielding precise roots for every
+// stackmap entry along the way.
+//
+// The compiled binary runs with the production wiring active
+// (`#[cfg(not(test))]`); these e2e tests are how we exercise the
+// integrated path. The pre-existing `cross_check_tree_stress_*` tests
+// (above) cover GC pressure ×depth-12-15 with the cross-check
+// asserting precise/conservative parity per safepoint. The tests
+// below add the *deep recursion axis* — pinning that the walker
+// correctly traverses a long Sigil call chain (~200+ frames) and
+// preserves every per-frame heap root across whatever GC events
+// Boehm decides to schedule.
+//
+// Why focus on depth rather than alloc volume:
+//   - Volume coverage exists (tree_stress_repeat_large ≈ 983k allocs).
+//   - The walker's per-frame correctness scales linearly with depth;
+//     a depth-200 traversal exercises 200 distinct stackmap lookups,
+//     200 distinct FP-chain hops, and 200 frames of live-root
+//     preservation across any GC that fires during the run.
+//   - A walker bug that silently drops every Nth frame's roots would
+//     surface as a wrong sum or crash in these tests, even if the
+//     existing depth-15 tree workload happened to mask it.
+
+#[test]
+fn precise_walker_deep_build_sum_chain() {
+    // Builds a 200-deep linked list (200 frames of `build` recursion,
+    // each frame holds the partial list as a live root via `acc`),
+    // then folds it back (200 frames of `sum_list` recursion, each
+    // frame holds the tail pointer as a live root via `rest`). Every
+    // safepoint in either recursion must have its heap root walked
+    // correctly by the Task 12 precise walker — a missed root in any
+    // single frame loses the partial list and produces a wrong sum
+    // (or, more likely, a crash via free-while-reachable).
+    //
+    // Sum of 1..200 = 200 * 201 / 2 = 20100.
+    let source = "import std.io\n\
+                  type Cons = | Nil | C(Int, Cons)\n\
+                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                    match n {\n    \
+                      0 => acc,\n    \
+                      _ => build(n - 1, C(n, acc)),\n  \
+                    }\n\
+                  }\n\
+                  fn sum_list(c: Cons) -> Int ![] {\n  \
+                    match c {\n    \
+                      Nil => 0,\n    \
+                      C(v, rest) => v + sum_list(rest),\n  \
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n  \
+                    let xs: Cons = build(200, Nil);\n  \
+                    perform IO.println(int_to_string(sum_list(xs)));\n  \
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "precise_walker_deep_build_sum_chain");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 0, "deep build-sum chain must exit 0");
+    assert_eq!(stdout.trim_end(), "20100");
+}
+
+#[test]
+fn precise_walker_deep_chain_with_gc_pressure() {
+    // Deep recursion + alloc volume in one workload: build a 100-deep
+    // list, sum it, repeat 50 rounds. Per round = 100 cons cells; total
+    // 5,000 allocations. Each `iter` frame holds the running `total`
+    // (an Int — not a GC root, but the per-round `xs` heap pointer is).
+    // The recursion in `iter` adds another depth axis on top of
+    // `build`/`sum_list`.
+    //
+    // With the Task 12 wrapping in place the precise walker must:
+    //   - Find `acc` at every frame of the 100-deep `build` chain.
+    //   - Find `rest` at every frame of the 100-deep `sum_list` chain.
+    //   - Find `xs` at the calling `iter` frame across all 50 rounds.
+    //   - Walk all of the above from the captured FP without dipping
+    //     into libgc's internal frames (PR #170's SIGSEGV root cause).
+    //
+    // Per round sum = 100 * 101 / 2 = 5050. 50 rounds = 252_500.
+    let source = "import std.io\n\
+                  type Cons = | Nil | C(Int, Cons)\n\
+                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                    match n {\n    \
+                      0 => acc,\n    \
+                      _ => build(n - 1, C(n, acc)),\n  \
+                    }\n\
+                  }\n\
+                  fn sum_list(c: Cons) -> Int ![] {\n  \
+                    match c {\n    \
+                      Nil => 0,\n    \
+                      C(v, rest) => v + sum_list(rest),\n  \
+                    }\n\
+                  }\n\
+                  fn iter(rounds: Int, depth: Int, total: Int) -> Int ![] {\n  \
+                    match rounds {\n    \
+                      0 => total,\n    \
+                      _ => {\n      \
+                        let xs: Cons = build(depth, Nil);\n      \
+                        iter(rounds - 1, depth, total + sum_list(xs))\n    \
+                      },\n  \
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n  \
+                    let total: Int = iter(50, 100, 0);\n  \
+                    perform IO.println(int_to_string(total));\n  \
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) =
+        compile_and_run(source, "precise_walker_deep_chain_with_gc_pressure");
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert_eq!(code, 0, "deep chain with GC pressure must exit 0");
+    assert_eq!(stdout.trim_end(), "252500");
+}
+
+#[test]
+fn precise_walker_deep_chain_under_cross_check() {
+    // Same shape as `precise_walker_deep_build_sum_chain`, but with
+    // `SIGIL_GC_CROSS_CHECK=1`. The cross-check fires at every
+    // `sigil_alloc` and asserts that every precise root the stackmap
+    // walker yields is (a) inside the calling thread's stack range
+    // and (b) heap-pointer-shaped per Boehm's view. A walker bug
+    // that surfaces a stale FP or a wrong frame_sp would diverge
+    // here on every safepoint along the 200-deep chain.
+    let source = "import std.io\n\
+                  type Cons = | Nil | C(Int, Cons)\n\
+                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                    match n {\n    \
+                      0 => acc,\n    \
+                      _ => build(n - 1, C(n, acc)),\n  \
+                    }\n\
+                  }\n\
+                  fn sum_list(c: Cons) -> Int ![] {\n  \
+                    match c {\n    \
+                      Nil => 0,\n    \
+                      C(v, rest) => v + sum_list(rest),\n  \
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n  \
+                    let xs: Cons = build(200, Nil);\n  \
+                    perform IO.println(int_to_string(sum_list(xs)));\n  \
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = {
+        let src_path = std::env::temp_dir().join(format!(
+            "sigil_e2e_{}_{}.sigil",
+            "precise_walker_deep_chain_under_cross_check",
+            std::process::id()
+        ));
+        std::fs::write(&src_path, source).expect("write source");
+        let out = compile_file_and_run_with_env(
+            &src_path,
+            "precise_walker_deep_chain_under_cross_check",
+            &[("SIGIL_GC_CROSS_CHECK", "1")],
+        );
+        let _ = std::fs::remove_file(&src_path);
+        out
+    };
+    assert_no_cross_check_abort("deep_chain.sigil", &stderr, code);
+    assert_eq!(stdout.trim_end(), "20100");
+    assert_eq!(code, 0);
+}

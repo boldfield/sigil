@@ -2204,6 +2204,20 @@ pub struct TerminalResult {
 /// by any `CALL` step must satisfy the CPS calling convention.
 /// `out` must be either null or a valid pointer to a writable
 /// 8-byte-aligned `TerminalResult`.
+/// Plan E2 Phase 3 Task 12 — public `sigil_run_loop` entrypoint.
+/// Production builds wrap the trampoline body in `GC_do_blocking` so
+/// Boehm treats the Sigil call chain as "inactive" for conservative
+/// stack scan; the `push_other_roots` callback installed by
+/// `gc::threads::install_push_other_roots_once` supplies precise
+/// roots instead via the stackmap-driven walker.
+///
+/// `GC_do_blocking`'s C signature is
+/// `void *fn(void *cd)`, so the body fn is exposed as a trampoline
+/// (`sigil_run_loop_blocking_trampoline`) that threads the
+/// `(initial_step, out, result)` triple through a stack-local context.
+///
+/// In test builds the wrap is bypassed — `cargo test` workloads
+/// drive the trampoline in active GC state directly.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_run_loop(
     initial_step: *mut NextStep,
@@ -2214,6 +2228,67 @@ pub unsafe extern "C" fn sigil_run_loop(
         "sigil_run_loop: `out` pointer must be 8-byte aligned (got {:p})",
         out
     );
+
+    #[cfg(not(test))]
+    let result = {
+        let mut ctx = RunLoopBlockingCtx {
+            initial_step,
+            out,
+            result: 0,
+        };
+        // SAFETY: `GC_do_blocking` is documented as stack-disciplined
+        // (`gc.h:1626`). It transitions the calling thread to "GC-
+        // inactive" for the duration of the trampoline body, invokes
+        // the trampoline, and restores active state on return. The
+        // trampoline reads/writes `ctx` through the type-erased pointer
+        // we just took; the lifetime of `ctx` covers the whole call.
+        // Nested run_loop calls are safe — `GC_do_blocking` is stack-
+        // disciplined and may be re-entered.
+        unsafe {
+            crate::gc::GC_do_blocking(
+                sigil_run_loop_blocking_trampoline,
+                &mut ctx as *mut RunLoopBlockingCtx as *mut c_void,
+            );
+        }
+        ctx.result
+    };
+
+    // SAFETY: caller upholds the contract on `initial_step` and `out`
+    // (see fn-level safety doc on `sigil_run_loop_impl`).
+    #[cfg(test)]
+    let result = unsafe { sigil_run_loop_impl(initial_step, out) };
+
+    result
+}
+
+#[cfg(not(test))]
+#[repr(C)]
+struct RunLoopBlockingCtx {
+    initial_step: *mut NextStep,
+    out: *mut TerminalResult,
+    result: u64,
+}
+
+#[cfg(not(test))]
+extern "C" fn sigil_run_loop_blocking_trampoline(cd: *mut c_void) -> *mut c_void {
+    // SAFETY: `cd` is the `&mut RunLoopBlockingCtx` we constructed in
+    // `sigil_run_loop`; its lifetime extends through the
+    // `GC_do_blocking` call containing us. No other thread has access
+    // to this stack-local context.
+    let ctx = unsafe { &mut *(cd as *mut RunLoopBlockingCtx) };
+    // SAFETY: caller of `sigil_run_loop` upheld the contract on
+    // `initial_step` and `out`; we forward them unchanged.
+    ctx.result = unsafe { sigil_run_loop_impl(ctx.initial_step, ctx.out) };
+    std::ptr::null_mut()
+}
+
+/// Plan E2 Phase 3 Task 12 — the body of `sigil_run_loop`, factored
+/// out so the public entrypoint can wrap it in `GC_do_blocking`. The
+/// safety contract on `initial_step` / `out` is identical to
+/// `sigil_run_loop`'s — every doc detail on that function applies
+/// unchanged here.
+#[inline(never)]
+unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalResult) -> u64 {
     let mut current = initial_step;
     // Plotkin fix — install this run_loop's entry depth into the
     // single TLS `RUN_LOOP_ENTRY_DEPTH` Cell so

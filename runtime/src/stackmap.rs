@@ -644,13 +644,45 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
 /// root ranges via `GC_push_all_eager` is safe — it's the
 /// documented mark-phase root-supply mechanism.
 #[inline(never)]
-pub fn walk_for_gc_with_callback<F: FnMut(RootLocation)>(mut f: F) {
+pub fn walk_for_gc_with_callback<F: FnMut(RootLocation)>(f: F) {
+    let fp = current_caller_fp();
+    walk_for_gc_with_callback_from(fp, f);
+}
+
+/// Allocation-free variant that takes a STARTING FP rather than
+/// reading `current_caller_fp()`. Used by Plan E2 Phase 3
+/// Task 12's `push_sigil_thread_precise_roots` callback: the
+/// callback is invoked from inside Boehm's mark phase, where
+/// `current_caller_fp()` returns a frame INSIDE libgc (which
+/// may be compiled with `-fomit-frame-pointer`, making
+/// `*fp` reads through libgc frames yield garbage and the next
+/// `walk_frame` deref blow up with SIGSEGV — PR #170 surfaced
+/// this empirically).
+///
+/// The safe starting point is the runtime entry frame's own FP
+/// captured BEFORE the call into libgc (e.g., at sigil_alloc
+/// entry via `capture_caller_fp_for_walk`). Walking from there:
+/// the runtime frame itself has no stackmap (Rust code), so its
+/// saved-PC lookup misses harmlessly; the next iteration walks
+/// to the Sigil caller's frame and the return-PC points at the
+/// call-site inside the Sigil function, which DOES have stackmap
+/// entries — those roots get yielded. The chain continues
+/// upward through the Sigil call chain until reaching the Rust
+/// main shim / libc init frames where lookups miss again, then
+/// the walker stops at the standard "null-fp / backward-step"
+/// sentinel.
+///
+/// The closure must not allocate (the walker runs inside STW;
+/// allocation could deadlock against suspended threads holding
+/// libc malloc locks).
+#[inline(never)]
+pub fn walk_for_gc_with_callback_from<F: FnMut(RootLocation)>(starting_fp: *const usize, mut f: F) {
     let index = match init_index() {
         Some(i) => i,
         None => return,
     };
     let trace = xcheck_trace_enabled();
-    let mut fp = current_caller_fp();
+    let mut fp = starting_fp;
     let mut frame_idx = 0usize;
     let mut yielded: usize = 0;
     while !fp.is_null() {
@@ -756,9 +788,39 @@ unsafe fn walk_frame(fp: *const usize) -> Frame {
     }
 }
 
+/// Capture a frame pointer suitable for feeding to
+/// `walk_for_gc_with_callback_from`. Called from runtime entry
+/// points (sigil_alloc today, sigil_run_loop tomorrow) BEFORE
+/// any transition into libgc internals, so the captured FP
+/// references a frame that's still on the stack — and outside
+/// libgc's potentially `-fomit-frame-pointer`-compiled call
+/// chain — when the mark-phase callback later fires.
+///
+/// **Captured FP is the *caller's* FP.** That is, when called
+/// from `sigil_alloc`, the returned FP is `sigil_alloc`'s own
+/// frame pointer. The walker iterates upward from there: the
+/// first iteration's saved return-PC points at the call-site
+/// inside the SIGIL function that called sigil_alloc, which is
+/// where the stackmap lookup hits and where roots get yielded.
+/// If we instead returned the Sigil-function's FP (one too high),
+/// the walker would skip the Sigil function's own stackmap
+/// entries and yield only its caller's roots.
+///
+/// `#[inline(never)]` is load-bearing: it gives this function its
+/// own prologue, so reading rbp inside this function yields
+/// THIS frame's FP, and dereferencing gives the CALLER's saved
+/// rbp — which is the caller's FP. With `#[inline(always)]` (as
+/// on `current_caller_fp`), inlining into sigil_alloc would make
+/// rbp = sigil_alloc's FP and `*rbp` = sigil_alloc's caller's FP,
+/// missing one frame.
+#[inline(never)]
+pub fn capture_caller_fp_for_walk() -> *const usize {
+    current_caller_fp()
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn current_caller_fp() -> *const usize {
+pub fn current_caller_fp() -> *const usize {
     let fp: *const usize;
     // SAFETY: reading the current frame's saved rbp. With
     // `#[inline(never)]` on the caller (`walk_for_gc`), this fn has a
@@ -778,7 +840,7 @@ fn current_caller_fp() -> *const usize {
 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-fn current_caller_fp() -> *const usize {
+pub fn current_caller_fp() -> *const usize {
     let fp: *const usize;
     // SAFETY: reading the current frame's saved x29 (FP). Same shape
     // as the x86_64 path; aarch64 uses x29 as the frame pointer by
@@ -796,7 +858,7 @@ fn current_caller_fp() -> *const usize {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 #[inline(always)]
-fn current_caller_fp() -> *const usize {
+pub fn current_caller_fp() -> *const usize {
     std::ptr::null()
 }
 

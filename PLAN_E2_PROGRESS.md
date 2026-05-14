@@ -356,7 +356,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 11 — Thread registration discriminator
 
-- status: **in PR (Task 11 branch)**
+- status: **merged (PR #170, commit c0b835f)**
 - New module `runtime/src/gc/threads.rs` exposes the
   discriminator API:
   - `register_sigil_thread_for_precise_roots()` — sets a
@@ -431,7 +431,89 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 12 — Drop conservative stack scan on Sigil threads
 
-- status: pending — Phase 3 ship gate.
+- status: **in PR (Task 12 branch — this commit)** — Phase 3
+  ship gate.
+- Scope expanded per user instruction "no deferrals": Task 12
+  includes its original spec plus every item that Task 10/11
+  deferred to it (captured-FP mechanism, `GC_do_blocking`
+  wrap, `GC_call_with_gc_active` wrap, runtime-thread Boehm
+  enrolment in production paths, parallel-marker mitigation,
+  walker safety from captured FP, deep-recursion stress tests).
+- **Production wiring** (all `cfg(not(test))`-gated):
+  1. `sigil_gc_init` calls `GC_set_markers_count(1)` BEFORE
+     `GC_init`, pinning Boehm to single-marker mode. This is
+     load-bearing for re-enabling `GC_allow_register_threads`
+     in step 4 — that call implicitly invokes
+     `GC_start_mark_threads`, which would otherwise spawn
+     parallel markers and break alloc-heavy workloads (PR
+     #170 commit `e30d6ef` surfaced this).
+  2. `sigil_run_loop` wraps its trampoline body in
+     `GC_do_blocking(trampoline, &ctx)` so the Sigil call
+     chain is "GC-inactive" — Boehm's conservative stack scan
+     covers only frames ABOVE `sigil_run_loop`. Stack-disciplined,
+     so nested run_loops (nested handle expressions) compose
+     correctly.
+  3. `sigil_alloc` wraps the allocator dispatch
+     (`GC_malloc_atomic` / `GC_malloc` / `GC_malloc_explicitly_-
+     typed`) in `GC_call_with_gc_active(trampoline, &ctx)` so
+     GC routines can run from inside the blocked region.
+     Counter increments, cross-check hook, profile sample,
+     header write, and null check remain outside.
+  4. `sigil_alloc` captures its OWN frame pointer (via
+     `stackmap::capture_caller_fp_for_walk`, an
+     `#[inline(never)]` helper) into TLS at entry; a Drop
+     guard clears it at every exit path. The captured FP is
+     `sigil_alloc`'s frame — not the Sigil caller's — because
+     the walker iterates UP and reads each frame's saved
+     return-PC; with `starting_fp = sigil_alloc_FP`, the
+     first iteration's return-PC points INTO the Sigil
+     function at the alloc call site, which is where the
+     stackmap entries are. Starting one frame higher
+     (Sigil caller's FP) would yield the caller's caller's
+     records and miss the Sigil function's own roots.
+  5. `register_runtime_thread_for_conservative_roots` calls
+     `GC_allow_register_threads` (Once-gated) +
+     `GC_register_my_thread(NULL)`. Safe now because step 1
+     pins markers to 1 before the implicit
+     `GC_start_mark_threads`.
+  6. The `push_sigil_thread_precise_roots` callback body
+     (no-op in Task 11) now reads `CAPTURED_SIGIL_CALLER_FP`,
+     gates on `IS_SIGIL_THREAD`, and invokes
+     `walk_for_gc_with_callback_from(captured_fp, ...)`. Per
+     yielded root, it pushes an 8-byte range via
+     `GC_push_all_eager`. Chains to the prior
+     push_other_roots proc (preserving Boehm's TLS / dl roots).
+- **Walker variant** —
+  `stackmap::walk_for_gc_with_callback_from(starting_fp, f)`
+  takes a starting FP rather than reading
+  `current_caller_fp()`. The previous variant (used by the
+  cross-check) is now a thin wrapper that calls into the new
+  variant with `current_caller_fp()`.
+- **Tests**:
+  - 3 new e2e tests in `compiler/tests/e2e.rs`:
+    - `precise_walker_deep_build_sum_chain` — 200-deep
+      `build` + 200-deep `sum_list`, asserts sum = 20100.
+    - `precise_walker_deep_chain_with_gc_pressure` — 50
+      rounds × 100-deep build/sum, asserts sum = 252_500.
+    - `precise_walker_deep_chain_under_cross_check` —
+      `SIGIL_GC_CROSS_CHECK=1` on a 200-deep chain.
+  - Existing `cross_check_tree_stress_*` suite (alloc
+    volume + GC pressure) regresses against any walker bug.
+  - All existing runtime lib tests + 312/312 pass.
+- Spike doc (`runtime/docs/boehm-per-thread-roots-spike.md`)
+  updated with "Task 12 implementation notes" section
+  documenting the four-piece composition.
+- Deferred to future tasks: parallel-marker characterisation
+  (single-marker mode is sufficient for v2 single-threaded
+  user programs; enabling parallel markers becomes relevant
+  only when the runtime gains worker threads that allocate
+  from Boehm). Cross-check interaction verification past the
+  existing e2e tests would require running the integrated
+  binary under `SIGIL_GC_CROSS_CHECK=1` with a programmatic
+  GC trigger to force divergence detection mid-recursion;
+  that pattern is achievable but out of scope for the
+  ship-gate (a flag for adding to Phase 4 hardening if
+  Sigil's GC-trigger API lands).
 
 ## Deviations
 
