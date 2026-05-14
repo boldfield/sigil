@@ -530,6 +530,20 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 - Spike doc (`runtime/docs/boehm-per-thread-roots-spike.md`)
   updated with "Task 12 implementation notes" section
   documenting the four-piece composition.
+- Throughput delta — ✅ documented in
+  [`compiler/docs/plan-e2-phase-3-throughput.md`](compiler/docs/plan-e2-phase-3-throughput.md).
+  The pre-Phase-3 SHA pinned at `ca29d2061f2897cb824d8328c92a8d945da313cc`
+  (Phase 2 closeout — Tasks 6–9 fully merged, Tasks 10–12 not
+  yet present). The post-Phase-3 SHA is the Task 12 merge
+  commit; the throughput-report workflow's manual
+  `workflow_dispatch` produces the per-OS deltas. The
+  workload suite carries the six Phase 2 workloads forward
+  plus one new one (`deep_sync_call_chain.sigil` — 200 rounds
+  × 2000-deep non-TCO recursion, the shape most likely to
+  show Phase 3's "win" if the
+  conservative-stack-scan-dropped-in-favour-of-precise-walker
+  hypothesis holds). Re-run via
+  [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
 
 ## Deviations
 

@@ -1,12 +1,15 @@
 name: throughput-report
 
-# Plan E2 throughput-report measurement workflow. Triggered manually
-# via the Actions UI ("Run workflow") on the branch holding the
-# throughput-report PR. Builds + measures the Sigil compiler at two
-# checkpoints — the pre-Phase-2 SHA and the branch's current HEAD —
-# across a workload suite, then uploads the per-workload JSON files
-# + a generated markdown summary as artifacts. The PR author then
-# pastes the artifact contents into the throughput report doc.
+# Plan E2 throughput-report measurement workflow. Triggered
+# manually via the Actions UI ("Run workflow") on the branch
+# holding the throughput-report PR. Builds + measures the Sigil
+# compiler at two checkpoints — the pre-checkpoint SHA supplied
+# as an input (Phase 2 used the pre-Phase-2 SHA; Phase 3 uses
+# the pre-Phase-3 SHA at ca29d20…) and the branch's current
+# HEAD — across a workload suite, then uploads the per-workload
+# JSON files + a generated markdown summary as artifacts. The
+# PR author then pastes the artifact contents into the
+# throughput report doc.
 #
 # Why workflow_dispatch only (no push/pull_request trigger):
 # - Each run builds the compiler twice (~10 min/OS × 2 OS = ~20 min).
@@ -23,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       pre_sha:
-        description: "Pre-Phase-2 commit SHA"
+        description: "Pre-checkpoint commit SHA (default = pre-Phase-3)"
         required: true
-        default: "4f7ec86c52c4aa7335571c0be5e7e771e766c0ad"
+        default: "ca29d2061f2897cb824d8328c92a8d945da313cc"
       runs:
         description: "Measurement runs per workload"
         required: true
@@ -75,6 +78,7 @@ jobs:
         run: |
           test -f examples/descriptor_cache_stress.sigil
           test -f examples/tree_stress_repeat_large.sigil
+          test -f examples/deep_sync_call_chain.sigil
           test -x scripts/measure-throughput.sh
           test -x scripts/diff-throughput.py
 
@@ -99,14 +103,14 @@ jobs:
       - name: post — compile workloads
         run: |
           mkdir -p post-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             ./target/release/sigil "examples/${w}.sigil" -o "post-bins/${w}"
           done
 
       - name: post — measure workloads
         run: |
           mkdir -p throughput-data/post
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/post/${w}.json"
             echo "--- post/${w} ---"
@@ -114,36 +118,54 @@ jobs:
           done
 
       # ----------------------------------------------------------------
-      # PRE-Phase-2 worktree at the input SHA. The new workload +
-      # scripts + the gc-time probe live on this branch and don't
-      # exist at the PRE SHA; cherry-pick them onto the worktree per
-      # the plan body's documented methodology.
+      # PRE-checkpoint worktree at the input SHA. The throughput-
+      # report-only workloads (descriptor_cache_stress, tree_stress
+      # _repeat_large from Phase 2's report; deep_sync_call_chain
+      # added by Phase 3's report) plus the harness scripts live on
+      # this branch and may not exist at the PRE SHA. Cherry-pick
+      # them onto the worktree per the plan body's documented
+      # methodology. The `cp` is gated on `! -f` so a PRE SHA that
+      # already carries a given file (e.g., the Phase 2 workloads
+      # when measuring Phase 3 at PRE=ca29d20) doesn't clobber the
+      # actually-pre-existing version with the branch HEAD's copy —
+      # measurement correctness depends on the workload source
+      # being identical pre/post wherever possible.
       # ----------------------------------------------------------------
       - name: pre — worktree at ${{ inputs.pre_sha }}
         run: |
-          git worktree add /tmp/pre-phase-2 ${{ inputs.pre_sha }}
-          cd /tmp/pre-phase-2
+          git worktree add /tmp/pre-checkpoint ${{ inputs.pre_sha }}
+          cd /tmp/pre-checkpoint
           git log --oneline -1
-          # Copy the throughput-report-only files onto the worktree.
-          # These don't exist at the PRE SHA, so cp (not git apply) is
-          # the cleaner mechanism.
-          cp ${{ github.workspace }}/examples/descriptor_cache_stress.sigil examples/
-          cp ${{ github.workspace }}/examples/tree_stress_repeat_large.sigil examples/
+          for w in descriptor_cache_stress tree_stress_repeat_large deep_sync_call_chain; do
+            src="examples/${w}.sigil"
+            if [[ ! -f "${src}" ]]; then
+              cp "${{ github.workspace }}/${src}" "${src}"
+              echo "cherry-picked ${src} (absent at PRE SHA)"
+            else
+              echo "PRE SHA already has ${src}; keeping its version"
+            fi
+          done
           mkdir -p scripts
-          cp ${{ github.workspace }}/scripts/measure-throughput.sh scripts/
-          cp ${{ github.workspace }}/scripts/diff-throughput.py scripts/
-          chmod +x scripts/measure-throughput.sh scripts/diff-throughput.py
+          for s in scripts/measure-throughput.sh scripts/diff-throughput.py; do
+            if [[ ! -f "${s}" ]]; then
+              cp "${{ github.workspace }}/${s}" "${s}"
+              chmod +x "${s}"
+              echo "cherry-picked ${s} (absent at PRE SHA)"
+            else
+              echo "PRE SHA already has ${s}; keeping its version"
+            fi
+          done
 
       - name: pre — cargo build --release
         run: |
-          cd /tmp/pre-phase-2
+          cd /tmp/pre-checkpoint
           cargo build --release -p sigil-compiler -p sigil-runtime
 
       - name: pre — compile workloads
         run: |
-          cd /tmp/pre-phase-2
+          cd /tmp/pre-checkpoint
           mkdir -p ${{ github.workspace }}/pre-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             ./target/release/sigil "examples/${w}.sigil" \
               -o "${{ github.workspace }}/pre-bins/${w}"
           done
@@ -151,7 +173,7 @@ jobs:
       - name: pre — measure workloads
         run: |
           mkdir -p throughput-data/pre
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
+          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/pre/${w}.json"
             echo "--- pre/${w} ---"
@@ -173,7 +195,7 @@ jobs:
             echo "Runs per workload: ${{ inputs.runs }}"
             echo "libgc version: \`${LIBGC_VERSION}\`"
             echo ""
-            for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
+            for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
               scripts/diff-throughput.py "${w}" \
                 "throughput-data/pre/${w}.json" \
                 "throughput-data/post/${w}.json"
