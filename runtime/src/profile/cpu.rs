@@ -247,20 +247,20 @@ extern "C" fn sigprof_handler(
 /// samples into the global `SAMPLES` vec. Exits cleanly when
 /// [`DRAINER_STOP`] is set.
 fn drainer_loop() {
-    // Plan E2 Phase 3 Task 11: explicit "runtime-internal,
-    // conservative roots" registration. The drainer doesn't
-    // touch GC-managed memory today (it shuffles `Vec<Sample>`
-    // between a Rust SPSC ring and a `Mutex<Vec<Sample>>`), so
-    // un-registered would also work for the current shape;
-    // explicit registration is the discriminator the
-    // `gc::threads` module surfaces, and it ensures Boehm
-    // suspends the drainer during STW so a future worker that
-    // grows heap-pointer-shaped values on its stack stays
-    // safe under conservative scan.
+    // Plan E2 Phase 3 Task 11: register as "runtime-internal,
+    // conservative roots" via the `gc::threads` discriminator.
+    // The call is a no-op on Boehm state today (the drainer
+    // doesn't allocate from Boehm; the API doesn't enroll the
+    // thread until Task 12 chooses to) but pre-warms the
+    // process-wide push_other_roots install + stackmap
+    // initialisers exactly once per process regardless of
+    // which thread (Sigil or runtime) registers first.
     //
     // **Constraint** (see `runtime/src/gc/threads.rs` module
     // doc → "Runtime invariant"): runtime-internal threads
-    // MUST NOT call `sigil_alloc`. The drainer obeys this; any
+    // MUST NOT call `sigil_alloc`. The drainer obeys this
+    // (shuffles `Vec<Sample>` between a Rust SPSC ring and a
+    // `Mutex<Vec<Sample>>` via the system allocator only); any
     // future worker added here must too. If a future worker
     // needs heap allocation, the `gc::threads` design needs a
     // multi-Sigil-thread registry walk before that worker

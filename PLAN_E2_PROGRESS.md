@@ -360,16 +360,23 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 - New module `runtime/src/gc/threads.rs` exposes the
   discriminator API:
   - `register_sigil_thread_for_precise_roots()` — sets a
-    thread-local marker (`IS_SIGIL_THREAD`); does NOT call
-    `GC_register_my_thread` (per `gc.h:1561` "should never be
-    called from the main thread, where it is always done
-    implicitly"; Sigil today is single-Sigil-threaded, running
-    on the main thread).
-  - `register_runtime_thread_for_conservative_roots()` — calls
-    `GC_allow_register_threads` (Once-gated) +
-    `GC_register_my_thread(NULL)` so Boehm suspends the
-    thread during STW + scans its stack conservatively. Does
-    NOT set the precise-marker flag.
+    thread-local marker (`IS_SIGIL_THREAD`); installs the
+    push_other_roots callback (Once-gated); pre-warms the
+    stackmap module's lazy initialisers so they never run
+    inside STW. Does NOT call `GC_register_my_thread` (per
+    `gc.h:1561` "should never be called from the main
+    thread, where it is always done implicitly"; Sigil today
+    is single-Sigil-threaded, running on the main thread).
+  - `register_runtime_thread_for_conservative_roots()` —
+    pre-warms the same process-wide state; sets no flag.
+    Does NOT call `GC_register_my_thread` either (the
+    drainer doesn't allocate from Boehm; the docs-required
+    `GC_allow_register_threads` precondition has a side
+    effect of starting parallel marker threads, which PR
+    #170 CI surfaced as breaking the marker for single-
+    threaded user programs). Task 12 reintroduces the
+    enrolment when the empirical work to characterise the
+    parallel-marker interaction lands.
 - `GC_set_push_other_roots(push_sigil_thread_precise_roots)` is
   installed at the first registration call (`Once`-gated;
   satisfies `gc_mark.h:309`'s "external synchronization
