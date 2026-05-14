@@ -78,6 +78,17 @@ jobs:
           test -x scripts/measure-throughput.sh
           test -x scripts/diff-throughput.py
 
+      - name: capture libgc version
+        # Pin the libgc version observed at measurement time into an
+        # env var so the report doc's reproducibility section can name
+        # the exact runtime version. Different libgc versions can have
+        # different mark-phase + allocator-pacing behaviour; this is
+        # the cross-checkpoint comparability guardrail.
+        run: |
+          LIBGC_VERSION=$(pkg-config --modversion bdw-gc)
+          echo "LIBGC_VERSION=${LIBGC_VERSION}" >> "$GITHUB_ENV"
+          echo "libgc ${LIBGC_VERSION} (observed at ${{ matrix.os }})"
+
       # ----------------------------------------------------------------
       # POST-Phase-2 build + measure (current branch HEAD).
       # ----------------------------------------------------------------
@@ -96,7 +107,7 @@ jobs:
         run: |
           mkdir -p throughput-data/post
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
-            scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs || '5' }}" \
+            scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/post/${w}.json"
             echo "--- post/${w} ---"
             cat "throughput-data/post/${w}.json"
@@ -108,9 +119,9 @@ jobs:
       # exist at the PRE SHA; cherry-pick them onto the worktree per
       # the plan body's documented methodology.
       # ----------------------------------------------------------------
-      - name: pre — worktree at ${{ inputs.pre_sha || '4f7ec86c52c4aa7335571c0be5e7e771e766c0ad' }}
+      - name: pre — worktree at ${{ inputs.pre_sha }}
         run: |
-          git worktree add /tmp/pre-phase-2 ${{ inputs.pre_sha || '4f7ec86c52c4aa7335571c0be5e7e771e766c0ad' }}
+          git worktree add /tmp/pre-phase-2 ${{ inputs.pre_sha }}
           cd /tmp/pre-phase-2
           git log --oneline -1
           # Copy the throughput-report-only files onto the worktree.
@@ -141,7 +152,7 @@ jobs:
         run: |
           mkdir -p throughput-data/pre
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
-            scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs || '5' }}" \
+            scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/pre/${w}.json"
             echo "--- pre/${w} ---"
             cat "throughput-data/pre/${w}.json"
@@ -157,9 +168,10 @@ jobs:
           {
             echo "## Deltas — ${{ matrix.os }}"
             echo ""
-            echo "Pre SHA: \`${{ inputs.pre_sha || '4f7ec86c52c4aa7335571c0be5e7e771e766c0ad' }}\`"
+            echo "Pre SHA: \`${{ inputs.pre_sha }}\`"
             echo "Post SHA: \`${{ github.sha }}\`"
-            echo "Runs per workload: ${{ inputs.runs || '5' }}"
+            echo "Runs per workload: ${{ inputs.runs }}"
+            echo "libgc version: \`${LIBGC_VERSION}\`"
             echo ""
             for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress; do
               scripts/diff-throughput.py "${w}" \

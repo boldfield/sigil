@@ -44,7 +44,9 @@ def pct_delta(pre, post) -> str:
 def abs_delta(pre, post) -> str:
     if pre is None or post is None:
         return "n/a"
-    return f"{post - pre:+d}"
+    # `:+g` (vs `:+d`) gracefully handles any future probe that
+    # emits a float — :+d would TypeError on non-int values.
+    return f"{post - pre:+g}"
 
 
 def fmt_scalar(v) -> str:

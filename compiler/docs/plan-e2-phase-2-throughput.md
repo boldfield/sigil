@@ -15,7 +15,8 @@ under sustained alloc pressure:
 - **`descriptor_cache_stress`** (5M allocs across 10 shapes):
   +21% wall-clock on ubuntu-24.04 (140ms → 170ms);
   +86% on macos-14 (70ms → 130ms).
-  Per-alloc cost increase: ~6ns (ubuntu) / ~12ns (macos).
+  Per-alloc cost increase: 30 ms / 5,000,000 allocs = **6 ns/alloc
+  on ubuntu**; 60 ms / 5,000,000 = **12 ns/alloc on macos**.
   Attributable to the new path: `descriptor::get_or_create`
   (`BTreeMap` lookup under `RwLock` read) + the descriptor
   passed through `GC_malloc_explicitly_typed` instead of plain
@@ -49,6 +50,33 @@ sustain enough heap pressure to trigger a full collection.
 |---|---|---|
 | Pre-Phase-2 | `4f7ec86c52c4aa7335571c0be5e7e771e766c0ad` | Plan E2 Phase 2 Tasks 6 + 7 merged (Boehm precise-mode API spike + descriptor cache). Task 8 (the dispatch flip from `GC_malloc` to `GC_malloc_explicitly_typed`) NOT yet applied — every non-zero-bitmap object still routes through plain `GC_malloc` for conservative full-payload scan. |
 | Post-Phase-2 | `270f6b14e8b8eaf3c1ff9aaa28b8d0f6` (`270f6b1`) | Plan E2 Phase 2 Tasks 6–9 fully merged. `sigil_alloc` routes through the three-branch dispatch (atomic / conservative-by-count / precise typed-malloc). The descriptor cache holds one `GC_descr` per shape. The false-retention reproducer (`runtime/src/gc.rs::tests::false_retention_reproducer_precise_marker_drops_aliased_address`) is the load-bearing precision proof. |
+
+**Phase 2 introduced zero compiler-side changes.** Verified via
+`git diff 4f7ec86 270f6b1 -- compiler/src` (empty output) at the
+time of measurement. The pre and post compilers produce identical
+native code for the workloads in this report; the measured delta
+is therefore attributable entirely to runtime-side cost
+(`sigil_alloc` dispatch + descriptor cache lookup + Boehm
+typed-malloc vs `GC_malloc`), not to codegen-emitted instruction
+differences. This is the cross-check that the two-checkpoint
+measurement compares apples to apples.
+
+**libgc version recording.** The measurement workflow runs
+`pkg-config --modversion bdw-gc` on each runner and emits the
+version into the per-OS `deltas-<os>.md` summary it uploads.
+This recording was added late in the report-PR cycle, so the
+data captured here (workflow run 25826188199, both lanes)
+predates the change — those JSON files do not carry a libgc
+version stamp. Future re-runs (and the Phase 3 throughput
+report) will. The Phase 2 numbers in this report should be
+interpreted as observing whatever libgc the GitHub Actions
+`ubuntu-24.04` + `macos-14` images were carrying on 2026-05-13
+(roughly libgc 8.2.x on both); a more precise version pin
+arrives with the next workflow run.
+
+Different libgc versions can have different mark-phase +
+allocator-pacing behaviour; the recording protects future
+cross-checkpoint comparisons from silent drift.
 
 ### Workloads
 
@@ -337,6 +365,14 @@ A pinned root-cause analysis is **out of scope for this report**
 (the report's job is documenting the delta; chasing the asymmetry
 is a separate plan if the macos cost becomes a blocker).
 
+**Escalation criterion.** If any real Sigil workload's hot path
+shows the macos / linux wall-clock asymmetry crossing 5×
+(rather than the current ~2× on this synthetic stress), file a
+follow-up plan to characterise the divergence and pin the root
+cause. The 2× synthetic gap is acceptable absent evidence it
+shows up on production workloads; 5× would mean an asymmetric
+runtime regression worth investigating in its own right.
+
 ### Allocation counts are identical, as expected
 
 Every workload shows pre = post on `alloc_count` and `alloc_bytes`.
@@ -371,24 +407,35 @@ scope for this report.
 
 The existing perf-floor gates (Plan B Task 60: 50ms x86 / 500ms
 aarch64 on `fib_cps_perf`; Plan A3 Task 44: 500ms aarch64 on
-`tree.sigil`) all pass on the post-Phase-2 checkpoint. Wall-clock
-on both lanes is at the 0-precision-floor for these workloads —
-they didn't slow down enough to even appear measurably.
+`tree.sigil`) continue to pass on the post-Phase-2 checkpoint —
+the gates are wired in `compiler/tests/e2e.rs` and PR #168's
+standard `ci.yml` lanes ran them green. The throughput workflow
+measured wall-clock for these workloads at the 0-precision-floor;
+that's a **non-measurement** (the workloads finish below
+`/usr/bin/time`'s ~10ms resolution), not a quantitative
+"no slowdown" guarantee.
 
-**No follow-up plan to widen / tighten any perf gate.** The
-+21–86% cost on `descriptor_cache_stress` is at the 5M-alloc
-scale; the existing perf-floor workloads operate at 6–80k allocs,
-where the absolute cost increase is ~0.5–5ms — well within the
-gates' headroom.
+**No follow-up plan to widen / tighten any perf gate.** This
+recommendation is an **inference** from the descriptor-cache cost
+shape, not a direct measurement against the gate workloads. The
+inference: at +21–86% on `descriptor_cache_stress` (5M allocs),
+the equivalent absolute cost increase on the perf-floor workloads
+(6–80k allocs) projects to ~0.5–5 ms — well within the gates'
+headroom. The `ci.yml` lanes on PR #168 confirmed the gates pass
+post-Phase-2, which is the load-bearing evidence here; the
+~0.5–5 ms projection is the explanatory model, not the
+verification.
 
 ## Stability / caveats
 
 - **Boehm version drift between checkpoints.** Both checkpoints use
   the system libgc, but if the CI image's libgc version changes
-  between runs of the workflow, the data is no longer comparable
-  across reports. Mitigation: each workflow run records the libgc
-  version it observed (`pkg-config --modversion bdw-gc`) and the
-  report should record it alongside the SHAs.
+  between runs of the workflow, the data is no longer strictly
+  comparable across reports. The workflow now records
+  `pkg-config --modversion bdw-gc` per lane and emits it into the
+  per-OS deltas summary (see Methodology → libgc version recording).
+  The Phase 2 data here predates the recording; the Phase 3 report
+  will carry it.
 - **GitHub Actions runner variability.** Wall-clock measurements on
   shared runners are noisy. The script reports IQR; readers should
   treat any delta < 1.5× IQR as noise.

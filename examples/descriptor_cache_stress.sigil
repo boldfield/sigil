@@ -9,14 +9,7 @@
 // (`runtime/src/gc/descriptor.rs`) holds exactly 10 entries by
 // the end of the run. The first allocation of each shape is a
 // cache miss (`GC_make_descriptor` called); the remaining 499,999
-// are cache hits.
-//
-// N has been bumped progressively from the plan body's initial
-// 100k → 1M → 5M after successive CI runs showed wall_clock_ms
-// at the edge of /usr/bin/time precision (~10ms floor). The
-// report needs > 100ms signal to distinguish a real delta from
-// runner noise (per the design doc's 1.5× IQR rejection
-// threshold). 5M allocs runs in ~150-300ms per checkpoint.
+// are cache hits. Wall-clock: ~150-300ms per checkpoint.
 //
 // Workload shape:
 //   - `Tree`: a shared heap-typed scratch value the 10 stress
@@ -36,18 +29,25 @@
 //     T8   = 4 ptrs            — count=4, bitmap=0b1111
 //     T9   = (Int, Tree, Int, Tree)   — count=4, bitmap=0b1010
 //     T10  = (Tree, Int, Tree, Int)   — count=4, bitmap=0b0101
-//   - The `alloc_t<n>` workers each tail-recurse 10,000 times,
+//   - The `alloc_t<n>` workers each tail-recurse 500,000 times,
 //     allocating one fresh `C<n>(...)` per iteration and adding
 //     1 to an accumulator so the allocations are not dead-code-
 //     eliminated. After all 10 workers run, `main` prints the
-//     total (always `100000`) and exits.
+//     total (always `5000000`) and exits.
 //
-// The workload intentionally does NOT retain the allocated
-// objects — each goes out of scope at the end of its recursive
-// step. This isolates the descriptor-cache + typed-malloc
-// alloc-path cost from mark-phase cost. (A retention-heavy
-// workload like `tree_stress_repeat.sigil` already covers
-// mark-phase cost via the existing perf suite.)
+// What this workload measures (and doesn't):
+//
+// The allocated objects are dropped from the stack at each
+// recursive step, but they are NOT collected during the run —
+// the report confirms `boehm_gc_time_ms = 0` post-Phase-2 (no
+// full GC fires under this workload). The 5M objects accumulate
+// in Boehm's heap and are reclaimed only by allocator pacing,
+// not by a mark phase. The measured delta is therefore
+// alloc-path cost only (descriptor cache lookup + typed-malloc
+// dispatch); mark-phase cost is NOT exercised at this heap
+// pressure. A workload that forces full GC under sustained
+// pressure would characterise the precise-marker mark-phase
+// savings — that's a Plan E2 follow-up, not this report.
 
 import std.io
 

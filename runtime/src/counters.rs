@@ -193,14 +193,21 @@ pub extern "C" fn sigil_counter_read(id: u32) -> u64 {
 }
 
 /// FFI — convenience for test drivers to print every counter in a canonical
-/// order to stderr. Returns the number of counters printed.
+/// order to stderr. Returns the number of **named counters** printed
+/// (`COUNTER_SLOTS`), NOT the total line count.
 ///
 /// Plan E2 Phase 2 closeout (throughput report) appends a single
-/// non-counter line `boehm_gc_time_ms=N` so the throughput script can
-/// extract GC wall-clock without needing a separate FFI entry point.
-/// The line is well-formed `key=value` so the parser stays grammar-
-/// compatible with the rest of the output. Reported value is `0`
-/// when the workload never triggered a full collection.
+/// non-counter sidecar line `boehm_gc_time_ms=N` after the named-
+/// counter loop so the throughput script can extract Boehm full-GC
+/// wall-clock without needing a separate FFI entry point. The
+/// sidecar line is well-formed `key=value` so the parser stays
+/// grammar-compatible with the rest of the output. The function's
+/// return value DOES NOT include the sidecar in its count — it's
+/// the count of named counter slots, exposed for FFI callers that
+/// want a fixed-shape value rather than a parse-the-stderr API.
+/// `boehm_gc_time_ms` reports `0` when the process never triggered
+/// a full collection (Boehm's `GC_get_full_gc_total_time` returns
+/// 0 in that case).
 #[no_mangle]
 pub extern "C" fn sigil_counter_print_all() -> u32 {
     let mut eprint = std::io::stderr().lock();

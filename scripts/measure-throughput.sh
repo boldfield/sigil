@@ -140,7 +140,13 @@ last_gc_time_ms=""
 for ((i = 1; i <= RUNS; i++)); do
     time_log="$(mktemp)"
     stderr_log="$(mktemp)"
-    if ! /usr/bin/time \
+    # `LC_ALL=C` pins the locale for /usr/bin/time's output. GNU
+    # time hardcodes the format strings in English regardless of
+    # locale (per `time(1)`'s source), but BSD time (macOS) is
+    # less explicit; setting C unifies the output shape across
+    # both hosts and protects against any future locale-driven
+    # format drift on either side.
+    if ! LC_ALL=C /usr/bin/time \
             $([[ "$OS_KIND" == "Linux" ]] && echo "-v" || echo "-l") \
             -o "$time_log" \
             env SIGIL_PRINT_STATS=1 "$BINARY" \
@@ -179,10 +185,16 @@ for ((i = 1; i <= RUNS; i++)); do
     wall_ms_values+=("$wall_ms")
     peak_rss_kb_values+=("$rss_kb")
 
-    # Counters from the child's stderr (last run wins). `boehm_gc_time_ms`
-    # is a Plan E2 Phase 2 closeout probe that doesn't exist on the
-    # pre-Phase-2 checkpoint; treat its absence as `null` (the report's
-    # diff tool renders the delta as "n/a" in that case).
+    # Counters from the child's stderr (last run wins). The
+    # `tail -1` after each grep is defensive: if a future runtime
+    # change ever emits the same counter line more than once per
+    # exit (e.g., a wrapper that calls sigil_counter_print_all
+    # twice), `tail -1` takes the last value rather than mixing
+    # multiple readings via shell word-splitting.
+    # `boehm_gc_time_ms` is a Plan E2 Phase 2 closeout probe that
+    # doesn't exist on the pre-Phase-2 checkpoint; treat its absence
+    # as `null` (the report's diff tool renders the delta as "n/a"
+    # in that case).
     if [[ $i -eq $RUNS ]]; then
         last_alloc_count=$(grep '^SIGIL_COUNTER_BOEHM_ALLOC_COUNT=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
