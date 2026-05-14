@@ -98,6 +98,20 @@ pub fn maybe_init() -> bool {
         let ring: &'static Ring = Box::leak(Box::new(Ring::new()));
         CPU_RING_PTR.store(ring as *const Ring as *mut Ring, Ordering::Release);
 
+        // Plan E2 Phase 3 Task 12 — prime the SIGPROF unwinder's
+        // safe-stack-range cache BEFORE installing the signal
+        // handler. `pthread_attr_getstack` / `pthread_get_stackaddr_np`
+        // are not async-signal-safe, so the cache must be populated
+        // on the main thread off the signal path. The unwinder then
+        // validates every `fp` it's about to dereference against the
+        // cached range — load-bearing post-Task 12 because
+        // `GC_do_blocking` puts libgc internals on the SIGPROF
+        // unwind path; libgc's `-fomit-frame-pointer` builds leak
+        // wild rbp values that would SEGV the unwinder's deref.
+        if let Some((lo, hi)) = crate::stackmap_xcheck::thread_stack_bounds() {
+            crate::profile::unwind::install_safe_stack_range(lo, hi);
+        }
+
         // Install SIGPROF handler via `sigaction(SA_SIGINFO|SA_RESTART)`
         // so the handler receives `ucontext_t*` for the interrupted
         // thread. We then read the saved frame pointer directly from

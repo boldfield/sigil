@@ -160,6 +160,32 @@ fn value_is_heap_pointer_shape(v: usize) -> bool {
     true
 }
 
+/// Calling-thread stack range `[stack_bottom, stack_base)` — the
+/// absolute address span of this thread's stack as known to pthread.
+/// `stack_bottom` is the lowest mapped stack address (`stackaddr`
+/// from `pthread_attr_getstack` on Linux, `stack_base - stacksize`
+/// on macOS); `stack_base` is the highest address (where the stack
+/// starts and grows down from).
+///
+/// Returns `None` when the host APIs aren't available or
+/// `pthread_attr_getstack` fails. Callers using this for signal-safe
+/// FP validation must cache the result OFF the signal path; pthread
+/// queries are not async-signal-safe.
+///
+/// Plan E2 Phase 3 Task 12 — exposed `pub(crate)` so
+/// `profile::cpu::maybe_init` can install the range into
+/// `profile::unwind`'s safe-stack-range cache before any SIGPROF
+/// can fire. The SIGPROF unwinder uses the cached range to validate
+/// every `fp` it's about to dereference, preventing a crash when
+/// SIGPROF interrupts libgc's `-fomit-frame-pointer` internals and
+/// `ucontext_fp` returns a wild value.
+pub(crate) fn thread_stack_bounds() -> Option<(usize, usize)> {
+    let base = thread_stack_base()?;
+    let size = thread_stack_size()?;
+    let bottom = base.checked_sub(size)?;
+    Some((bottom, base))
+}
+
 /// Calling-thread stack range `[sp, stack_base)` via libc's
 /// pthread bindings (PR #163 review N2 — replaces hand-rolled
 /// `pthread_attr_t` layout). The lower bound is the current stack
@@ -203,6 +229,16 @@ fn current_sp() -> usize {
 
 #[cfg(target_os = "linux")]
 fn thread_stack_base() -> Option<usize> {
+    linux_attr_getstack().map(|(addr, size)| addr.wrapping_add(size))
+}
+
+#[cfg(target_os = "linux")]
+fn thread_stack_size() -> Option<usize> {
+    linux_attr_getstack().map(|(_, size)| size)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_attr_getstack() -> Option<(usize, usize)> {
     use std::mem::MaybeUninit;
     let mut attr: MaybeUninit<libc::pthread_attr_t> = MaybeUninit::uninit();
     unsafe {
@@ -225,7 +261,7 @@ fn thread_stack_base() -> Option<usize> {
         // Linux pthread_attr_getstack returns the lowest stack
         // address + size. The stack base (highest addr) is
         // stackaddr + stacksize.
-        Some((stackaddr as usize).wrapping_add(stacksize))
+        Some((stackaddr as usize, stacksize))
     }
 }
 
@@ -243,8 +279,25 @@ fn thread_stack_base() -> Option<usize> {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn thread_stack_size() -> Option<usize> {
+    // SAFETY: pthread_get_stacksize_np returns the stack size in
+    // bytes for the calling thread on Darwin.
+    let size = unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) };
+    if size == 0 {
+        None
+    } else {
+        Some(size as usize)
+    }
+}
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn thread_stack_base() -> Option<usize> {
+    None
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn thread_stack_size() -> Option<usize> {
     None
 }
 
