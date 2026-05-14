@@ -6181,7 +6181,7 @@ impl Tc {
                 //      practice.
                 let plan_f1_resolved = self.resolve_qualified_or_use_scheme(name);
                 let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
-                // Plan F1 — compute the post-rewrite AST name. Three
+                // Plan F1 — compute the post-rewrite AST name. Four
                 // cases:
                 //
                 //   (a) Source form is dotted (user wrote
@@ -6192,13 +6192,25 @@ impl Tc {
                 //       qualified-path surface is purely a
                 //       resolver-time disambiguation.
                 //   (b) Source form is bare AND the name
-                //       collides (≥2 producing files) — rewrite
-                //       to the canonical form (`std.list.map`)
-                //       so codegen dispatches to the right
-                //       module's fn after the Item::Fn rename
-                //       pass mirrors `fn_schemes` onto the
-                //       canonical key.
-                //   (c) Otherwise (bare non-colliding, or dotted
+                //       collides (≥2 producing files) AND
+                //       resolved via a use-binding — rewrite to
+                //       the canonical form (`std.list.map`) so
+                //       codegen dispatches to the right module's
+                //       fn after the Item::Fn rename pass mirrors
+                //       `fn_schemes` onto the canonical key.
+                //   (c) Source form is bare AND the name
+                //       collides AND no use-binding (i.e. an
+                //       intra-file self-reference like the
+                //       recursive call to `map` inside `std.list`'s
+                //       `fn map`) — rewrite to the current file's
+                //       canonical form. Without this, the AST gets
+                //       rewritten by `same_file_rename` in the
+                //       post-pass but `pending_call_instantiations`
+                //       still carries the pre-rewrite bare name,
+                //       and monomorphize's `name == &inst.name`
+                //       equality guard fails, leaving the fn
+                //       unenqueued.
+                //   (d) Otherwise (bare non-colliding, or dotted
                 //       colliding) — no rewrite needed.
                 //
                 // `ast_name` is the name the AST will carry after
@@ -6206,12 +6218,12 @@ impl Tc {
                 // into `pending_call_instantiations` too so monomorphize's
                 // `name == &inst.name` equality guard still matches the
                 // (rewritten) Ident at the call site.
+                let bare_suffix = name.rsplit('.').next().unwrap_or(name).to_string();
+                let is_colliding = self
+                    .bare_name_origins
+                    .get(&bare_suffix)
+                    .is_some_and(|origins| origins.len() >= 2);
                 let ast_name: String = if let Some((_, ref canonical)) = plan_f1_resolved {
-                    let bare_suffix = name.rsplit('.').next().unwrap_or(name).to_string();
-                    let is_colliding = self
-                        .bare_name_origins
-                        .get(&bare_suffix)
-                        .is_some_and(|origins| origins.len() >= 2);
                     if name.contains('.') && !is_colliding {
                         // (a): dotted source, non-colliding bare
                         // suffix → AST goes bare.
@@ -6219,14 +6231,31 @@ impl Tc {
                             self.resolved_idents
                                 .insert(span.clone(), bare_suffix.clone());
                         }
-                        bare_suffix
+                        bare_suffix.clone()
                     } else if !name.contains('.') && is_colliding && canonical != name {
                         // (b): bare source, colliding → AST goes
                         // canonical.
                         self.resolved_idents.insert(span.clone(), canonical.clone());
                         canonical.clone()
                     } else {
-                        // (c): no rewrite.
+                        // (d): no rewrite.
+                        name.clone()
+                    }
+                } else if !name.contains('.') && is_colliding {
+                    // (c): bare source, colliding, no use-binding
+                    // — try the current file's canonical so
+                    // `pending_call_instantiations` matches the
+                    // canonical name that `same_file_rename` will
+                    // install on the AST.
+                    if let Some(current_file) = self.current_fn_file.clone() {
+                        let canonical = canonical_fn_key(&current_file, name, &self.stdlib_files);
+                        if canonical != *name && self.fn_schemes.contains_key(&canonical) {
+                            self.resolved_idents.insert(span.clone(), canonical.clone());
+                            canonical
+                        } else {
+                            name.clone()
+                        }
+                    } else {
                         name.clone()
                     }
                 } else {
