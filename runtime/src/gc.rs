@@ -28,6 +28,19 @@ use crate::header::{self, Header};
 #[link(name = "gc")]
 extern "C" {
     fn GC_init();
+    // Plan E2 Phase 3 Task 12 — pin Boehm to single-marker mode
+    // BEFORE GC_init runs. Per gc.h:111, `GC_set_markers_count`
+    // sets the total marker thread count (including the
+    // initiating one); zero means "the collector decides".
+    // Calling with 1 keeps Boehm single-marker even after
+    // `GC_allow_register_threads` (which the runtime-thread
+    // path now calls) would otherwise auto-spawn parallel
+    // marker threads. PR #170 surfaced that parallel markers
+    // break alloc-heavy workloads on previously-single-threaded
+    // user programs; single-marker mode preserves the pre-
+    // Phase-3 marker semantics while letting non-main threads
+    // enroll via `GC_register_my_thread`.
+    pub(crate) fn GC_set_markers_count(n: u32);
     // `GC_malloc_atomic` is used for objects whose pointer_bitmap is 0
     // (no GC-managed pointers in the payload — strings, byte arrays,
     // primitive scalar wrappers) so Boehm can skip scanning them
@@ -76,6 +89,14 @@ extern "C" {
     // `GC_gcollect` from such a thread triggers Boehm's "Collecting
     // from unknown thread" abort. Tests that need to force collection
     // must enrol their thread first.
+    //
+    // Plan E2 Phase 3 Task 12: production runtime threads (CPU /
+    // alloc profile drainers) do NOT need to enrol — they neither
+    // allocate from Boehm nor hold Boehm pointers on their stack.
+    // See `gc::threads::ensure_gc_process_state_initialised`'s
+    // doc + the `gc::threads` module doc's "Runtime threads
+    // don't enrol with Boehm" section for the rationale. So
+    // these symbols stay test-only.
     #[cfg(test)]
     pub(crate) fn GC_allow_register_threads();
     #[cfg(test)]
@@ -116,6 +137,33 @@ extern "C" {
     // once per type, not once per allocation." — Task 7's descriptor
     // cache is the structural enforcement of that contract.
     pub(crate) fn GC_make_descriptor(bitmap: *const usize, len_bits: usize) -> usize;
+
+    // Plan E2 Phase 3 Task 12 — `GC_do_blocking` opts the
+    // calling thread out of Boehm's conservative stack scan for
+    // the lifetime of the wrapped function. `sigil_run_loop`
+    // wraps its body in this so the Sigil call chain isn't
+    // scanned conservatively (the precise walker driven by the
+    // captured FP supplies the roots instead).
+    // `GC_call_with_gc_active` is the inverse: from inside a
+    // blocked region, switch back to active state so the user
+    // function (sigil_alloc's inner body) can safely call
+    // Boehm's allocation APIs per gc.h:1626-1636's "the user
+    // function is allowed to call any GC function".
+    // Symbols used only in `cfg(not(test))` production paths
+    // (sigil_run_loop wraps in GC_do_blocking; sigil_alloc wraps in
+    // GC_call_with_gc_active). In `cargo test` builds the wraps are
+    // bypassed, so the symbols look unused — silence the dead-code lint
+    // for the test config only.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn GC_do_blocking(
+        fn_: extern "C" fn(*mut c_void) -> *mut c_void,
+        cd: *mut c_void,
+    ) -> *mut c_void;
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn GC_call_with_gc_active(
+        fn_: extern "C" fn(*mut c_void) -> *mut c_void,
+        cd: *mut c_void,
+    ) -> *mut c_void;
 
     // Boehm typed allocator — Plan E2 Phase 2 Task 8. Allocates
     // `size_in_bytes` bytes from Boehm's heap and tags the block
@@ -167,6 +215,16 @@ static GC_INIT: Once = Once::new();
 #[no_mangle]
 pub extern "C" fn sigil_gc_init() {
     GC_INIT.call_once(|| {
+        // Plan E2 Phase 3 Task 12 — pin marker count to 1 BEFORE
+        // GC_init. Per gc.h:108, `GC_set_markers_count` "has no
+        // effect if called after GC initialization", so the
+        // order matters. Single-marker mode keeps Boehm's
+        // semantics single-threaded even when later
+        // `GC_allow_register_threads` calls (from the
+        // discriminator's runtime-thread path) would otherwise
+        // auto-spawn parallel markers — which PR #170 surfaced
+        // as breaking alloc-heavy workloads.
+        unsafe { GC_set_markers_count(1) };
         // SAFETY: `Once::call_once` guarantees exactly one invocation even
         // under concurrent entry, so Boehm's non-reentrant init runs on a
         // single thread.
@@ -217,6 +275,26 @@ pub extern "C" fn sigil_gc_init() {
         // push_other_roots callback (Once-gated); pre-warms the
         // stackmap module's lazy initialisers.
         crate::gc::threads::register_sigil_thread_for_precise_roots();
+
+        // Plan E2 Phase 3 Task 12 — prime the safe-stack-range
+        // cache for BOTH FP-chain walkers (the SIGPROF unwinder
+        // and the GC mark-phase precise walker) BEFORE either
+        // can fire. `pthread_attr_getstack` /
+        // `pthread_get_stackaddr_np` are not async-signal-safe
+        // for the SIGPROF case AND not STW-safe for the GC mark
+        // phase (the mark phase suspends other threads, and any
+        // libc malloc/lock the pthread queries might take could
+        // deadlock against a suspended thread holding malloc's
+        // internal lock). The cache MUST be populated off both
+        // paths. Doing it here (`sigil_gc_init`, on the main
+        // thread, before any worker spawns) is the canonical
+        // safe point. Both walkers validate FPs against the
+        // cached range to harden against
+        // `-fomit-frame-pointer`-compiled libgc internals
+        // leaking wild rbp values onto the unwind path.
+        if let Some((lo, hi)) = crate::stackmap_xcheck::thread_stack_bounds() {
+            crate::profile::unwind::install_safe_stack_range(lo, hi);
+        }
     }
 
     // v2 profile-data surface — gated by env vars. When neither
@@ -297,53 +375,24 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     crate::profile::alloc::maybe_sample_alloc(total as u64);
 
-    let h = Header(header);
-    // Allocator selection. Plan E2 Phase 2 Task 8 splits the bitmap
-    // dispatch into three branches based on what the Header's
-    // `(count, bitmap)` pair encodes:
+    // Plan E2 Phase 3 Task 12 — capture sigil_alloc's own FP so the
+    // `push_other_roots` callback (which fires from inside Boehm's
+    // mark phase) can walk the Sigil call chain from a frame that's
+    // safely on the stack and outside libgc's potentially `-fomit-
+    // frame-pointer`-compiled call chain. The Drop guard clears the
+    // TLS slot at every exit path (normal return + any
+    // panic-via-abort).
     //
-    //   - `bitmap == 0`                 → `GC_malloc_atomic`
-    //     No GC pointers anywhere in the payload. Boehm skips
-    //     scanning entirely — strictly better than precise marking.
-    //
-    //   - `bitmap != 0 && count == 0`   → `GC_malloc` (conservative)
-    //     The Sigil convention for "object too large for the
-    //     header's 6-bit count field to describe precisely" — arrays,
-    //     mut-arrays, the string-builder segments table. Count=0 is
-    //     the structural signal; bitmap=non-zero routes out of the
-    //     atomic path. These payloads are scanned conservatively;
-    //     element pointers survive GC because Boehm's mark phase
-    //     walks the whole block looking for pointer-shaped values.
-    //
-    //   - `bitmap != 0 && count >  0`   → `GC_malloc_explicitly_typed`
-    //     Precise marking via Boehm's typed-malloc. The descriptor
-    //     cache (Task 7) hands out one `GC_descr` per shape; first
-    //     observation of a `(bitmap, count)` shape builds the
-    //     descriptor via `GC_make_descriptor`, subsequent calls
-    //     reuse the cached handle. The precondition check lives in
-    //     `assert_precise_alloc_size` — see its doc-comment.
-    //
-    // The count==0 branch closes a silent correctness regression
-    // introduced by Task 8's initial drop of `GC_malloc`: a typed
-    // descriptor built from `(bitmap=1, count=0)` would have
-    // `len_bits = 1` describing only the header word; Boehm's
-    // tile-replication would then treat every element slot as a
-    // non-pointer, silently collecting any heap-bearing array
-    // elements that lacked an independent stack root.
-    let raw = if h.pointer_bitmap() == 0 {
-        unsafe { GC_malloc_atomic(total) as *mut u8 }
-    } else if h.payload_count() == 0 {
-        unsafe { GC_malloc(total) as *mut u8 }
-    } else {
-        let count = h.payload_count();
-        assert_precise_alloc_size(total, count, h.pointer_bitmap());
-        let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
-        // SAFETY: `descr` was built by `GC_make_descriptor` and is
-        // alive for the process lifetime (the cache never evicts).
-        // `total` meets the descriptor's `len_bits * sizeof(GC_word)`
-        // floor (debug_asserted above for non-release builds).
-        unsafe { GC_malloc_explicitly_typed(total, descr) as *mut u8 }
-    };
+    // Gated on `cfg(not(test))` to match the production-only wiring
+    // of the rest of Task 12 (GC_do_blocking + GC_call_with_gc_active
+    // hookup, push_other_roots install). The runtime unit tests
+    // exercise sigil_alloc in active GC state directly; the captured
+    // FP is unused by them (IS_SIGIL_THREAD is false on test threads,
+    // so the callback short-circuits before reading the FP).
+    #[cfg(not(test))]
+    let _fp_guard = SigilCallerFpGuard::capture();
+
+    let raw = alloc_dispatch_active(header, total);
 
     if raw.is_null() {
         // Boehm's default oom-handler aborts before returning null, so
@@ -365,6 +414,198 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
         hdr_ptr.write(header);
     }
     raw
+}
+
+/// Plan E2 Phase 3 Task 12 — branch sigil_alloc's allocator dispatch
+/// through `GC_call_with_gc_active` on production builds so the actual
+/// `GC_malloc_*` call runs in GC-active state even when sigil_run_loop
+/// has parked the thread via `GC_do_blocking`. In test builds the
+/// thread is already GC-active (sigil_run_loop is not on the call
+/// stack), so the wrapper is bypassed.
+///
+/// The split into a separate helper keeps the dispatch logic in one
+/// place — the production path threads parameters through
+/// `AllocActiveCtx` because `GC_call_with_gc_active`'s C ABI takes a
+/// `*mut c_void` `cd` pointer, but the dispatch itself is identical
+/// regardless of which path entered it.
+#[inline]
+fn alloc_dispatch_active(header: u64, total: usize) -> *mut u8 {
+    #[cfg(not(test))]
+    {
+        let mut ctx = AllocActiveCtx {
+            header,
+            total,
+            raw: std::ptr::null_mut(),
+        };
+        // SAFETY: GC_call_with_gc_active is documented as stack-
+        // disciplined and safe to invoke even from active state
+        // (per gc.h:1626). The trampoline reads/writes `ctx` only
+        // through the type-erased pointer we just took, the lifetime
+        // of `ctx` covers the call, and the trampoline's body does
+        // not retain the pointer past return.
+        unsafe {
+            GC_call_with_gc_active(
+                alloc_active_trampoline,
+                &mut ctx as *mut AllocActiveCtx as *mut c_void,
+            );
+        }
+        ctx.raw
+    }
+    #[cfg(test)]
+    {
+        alloc_dispatch(header, total)
+    }
+}
+
+#[cfg(not(test))]
+#[repr(C)]
+struct AllocActiveCtx {
+    header: u64,
+    total: usize,
+    raw: *mut u8,
+}
+
+#[cfg(not(test))]
+extern "C" fn alloc_active_trampoline(cd: *mut c_void) -> *mut c_void {
+    // SAFETY: `cd` is the `&mut AllocActiveCtx` we constructed in
+    // `alloc_dispatch_active`; its lifetime extends for the duration
+    // of the `GC_call_with_gc_active` call which contains us. No
+    // other thread has access to this stack-local context.
+    let ctx = unsafe { &mut *(cd as *mut AllocActiveCtx) };
+    ctx.raw = alloc_dispatch(ctx.header, ctx.total);
+    std::ptr::null_mut()
+}
+
+/// Allocator selection. Plan E2 Phase 2 Task 8 splits the bitmap
+/// dispatch into three branches based on what the Header's
+/// `(count, bitmap)` pair encodes:
+///
+///   - `bitmap == 0`                 → `GC_malloc_atomic`
+///     No GC pointers anywhere in the payload. Boehm skips
+///     scanning entirely — strictly better than precise marking.
+///
+///   - `bitmap != 0 && count == 0`   → `GC_malloc` (conservative)
+///     The Sigil convention for "object too large for the
+///     header's 6-bit count field to describe precisely" — arrays,
+///     mut-arrays, the string-builder segments table. Count=0 is
+///     the structural signal; bitmap=non-zero routes out of the
+///     atomic path. These payloads are scanned conservatively;
+///     element pointers survive GC because Boehm's mark phase
+///     walks the whole block looking for pointer-shaped values.
+///
+///   - `bitmap != 0 && count >  0`   → `GC_malloc_explicitly_typed`
+///     Precise marking via Boehm's typed-malloc. The descriptor
+///     cache (Task 7) hands out one `GC_descr` per shape; first
+///     observation of a `(bitmap, count)` shape builds the
+///     descriptor via `GC_make_descriptor`, subsequent calls
+///     reuse the cached handle.
+///
+/// The count==0 branch closes a silent correctness regression
+/// introduced by Task 8's initial drop of `GC_malloc`: a typed
+/// descriptor built from `(bitmap=1, count=0)` would have
+/// `len_bits = 1` describing only the header word; Boehm's
+/// tile-replication would then treat every element slot as a
+/// non-pointer, silently collecting any heap-bearing array
+/// elements that lacked an independent stack root.
+#[inline]
+fn alloc_dispatch(header: u64, total: usize) -> *mut u8 {
+    let h = Header(header);
+    if h.pointer_bitmap() == 0 {
+        unsafe { GC_malloc_atomic(total) as *mut u8 }
+    } else if h.payload_count() == 0 {
+        unsafe { GC_malloc(total) as *mut u8 }
+    } else {
+        let count = h.payload_count();
+        assert_precise_alloc_size(total, count, h.pointer_bitmap());
+        let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
+        // SAFETY: `descr` was built by `GC_make_descriptor` and is
+        // alive for the process lifetime (the cache never evicts).
+        // `total` meets the descriptor's `len_bits * sizeof(GC_word)`
+        // floor (debug_asserted above for non-release builds).
+        unsafe { GC_malloc_explicitly_typed(total, descr) as *mut u8 }
+    }
+}
+
+/// Plan E2 Phase 3 Task 12 — Drop guard that clears
+/// `CAPTURED_SIGIL_CALLER_FP` on any exit path from `sigil_alloc`.
+/// Constructed via `capture()`, which stashes the FP returned by
+/// `stackmap::capture_caller_fp_for_walk()` — i.e., sigil_alloc's
+/// own frame pointer, the correct starting point for the precise
+/// walker (which iterates UP and reads the saved-PC at each frame
+/// to look up stackmap entries for the FUNCTION THAT CALLED that
+/// frame, so starting at sigil_alloc's FP finds the Sigil caller's
+/// own stackmap entries — starting one frame higher would skip
+/// them).
+#[cfg(not(test))]
+struct SigilCallerFpGuard;
+
+#[cfg(not(test))]
+impl SigilCallerFpGuard {
+    /// `#[inline(always)]` is load-bearing in production code: the
+    /// FP must be captured from *sigil_alloc's* frame, not from
+    /// this helper's frame. With inlining, the call to
+    /// `capture_caller_fp_for_walk` (itself `#[inline(never)]`)
+    /// takes place in sigil_alloc's frame, so the helper's `*rbp`
+    /// deref yields sigil_alloc's FP.
+    ///
+    /// Sigil's build config pins this: `.cargo/config.toml` sets
+    /// `-C force-frame-pointers=yes` for both Linux and macOS
+    /// rustflags, and the workspace release profile inherits the
+    /// `opt-level = 3` that makes `#[inline(always)]` a strong
+    /// hint. A `debug_assert!` in `capture()` provides a
+    /// belt-and-suspenders runtime sanity check: the captured FP
+    /// must lie inside the calling thread's pthread-known stack
+    /// range when the cache is populated (post-`sigil_gc_init`).
+    /// If a future codegen change ever caused the inline to be
+    /// declined, an off-by-one frame would either crash the
+    /// walker (caught by the same stack-range gate added to
+    /// `walk_for_gc_with_callback_from`) or trip this assertion
+    /// in debug builds.
+    #[inline(always)]
+    fn capture() -> Self {
+        let fp = crate::stackmap::capture_caller_fp_for_walk();
+        debug_assert!(
+            captured_fp_looks_plausible(fp),
+            "sigil_alloc FP capture out of stack range: fp=0x{:x} \
+             (likely #[inline(always)] inlining declined; \
+             investigate runtime build flags)",
+            fp as usize,
+        );
+        crate::gc::threads::capture_sigil_caller_fp(fp);
+        SigilCallerFpGuard
+    }
+}
+
+/// Debug-only sanity check for the captured FP. Returns true when:
+/// (a) the safe-stack-range cache hasn't been populated yet
+///     (`sigil_gc_init` hasn't run, or pthread bounds weren't
+///     available — in both cases we have nothing to validate
+///     against and must accept whatever FP we got), OR
+/// (b) the FP is non-null AND falls inside the cached
+///     `[stack_lo, stack_hi)` range.
+///
+/// A `false` reading in production-mode debug builds indicates
+/// either an `#[inline(always)]` failure on
+/// `SigilCallerFpGuard::capture` (the helper produced its own
+/// frame's FP instead of sigil_alloc's) or a wild rbp value from
+/// a Rust codegen surprise. Either is a bug worth surfacing
+/// during development.
+#[cfg(not(test))]
+fn captured_fp_looks_plausible(fp: *const usize) -> bool {
+    let lo = crate::profile::unwind::SAFE_STACK_LO.load(std::sync::atomic::Ordering::Relaxed);
+    let hi = crate::profile::unwind::SAFE_STACK_HI.load(std::sync::atomic::Ordering::Relaxed);
+    if lo == 0 || hi <= lo {
+        return true;
+    }
+    let fp_addr = fp as usize;
+    fp_addr != 0 && fp_addr >= lo && fp_addr < hi
+}
+
+#[cfg(not(test))]
+impl Drop for SigilCallerFpGuard {
+    fn drop(&mut self) {
+        crate::gc::threads::clear_sigil_caller_fp();
+    }
 }
 
 /// Allocate and populate a Sigil `String` object from a byte slice.

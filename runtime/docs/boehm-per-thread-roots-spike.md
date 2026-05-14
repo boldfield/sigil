@@ -401,3 +401,101 @@ checked `GC_do_blocking`'s link surface + the
 `push_other_roots` install path; Task 12 should similarly
 exercise the captured-FP walk in test scaffolding before
 flipping production behavior.
+
+## Task 12 implementation notes (this PR)
+
+Task 12 ships the production wiring that drops Boehm's
+conservative stack scan on Sigil program threads. Three
+load-bearing pieces compose the boundary:
+
+1. **`GC_do_blocking` wrapping `sigil_run_loop`.** The public
+   entrypoint stages an `RunLoopBlockingCtx` on the stack and
+   routes the trampoline body through
+   `GC_do_blocking(trampoline, &ctx)`. Boehm transitions the
+   thread to "GC-inactive" state for the duration of the loop:
+   the conservative stack scan covers only the C-frame range
+   ABOVE `sigil_run_loop`'s captured stack base (Rust main
+   shim, libc init) — not the Sigil call chain. Nested
+   `sigil_run_loop` calls (nested handle expressions) are safe
+   because `GC_do_blocking` is stack-disciplined and
+   re-entrable.
+
+2. **`GC_call_with_gc_active` wrapping `sigil_alloc`'s
+   dispatch.** From inside the blocked region, calling
+   `GC_malloc` directly would be undefined behavior per gc.h.
+   `sigil_alloc` instead routes the allocator selection
+   (`GC_malloc_atomic` / `GC_malloc` / `GC_malloc_explicitly_-
+   typed`) through `GC_call_with_gc_active(trampoline, &ctx)`
+   so Boehm re-activates GC state for the allocation. The
+   counter increments, cross-check hook, allocation-profile
+   sample, FP capture, header write, and null check all run
+   OUTSIDE the active wrapper — only the actual `GC_malloc_*`
+   call needs to be inside.
+
+3. **Captured-FP walker entry-point semantics.** The
+   `push_other_roots` callback reads
+   `CAPTURED_SIGIL_CALLER_FP` (TLS) and feeds it to
+   `walk_for_gc_with_callback_from`. The captured FP must be
+   `sigil_alloc`'s own frame pointer — NOT the Sigil caller's
+   FP. This matters because the walker iterates UP the chain
+   and for each frame `fp` looks up the saved return-PC at
+   `*(fp+8)`. With `starting_fp = sigil_alloc_FP`, the first
+   iteration's return-PC points at the call site INSIDE the
+   Sigil caller — which is exactly where the stackmap has
+   entries. Starting one frame higher (Sigil caller's FP)
+   would yield the *caller's caller's* records and skip the
+   Sigil function's own roots at the alloc site. To get
+   sigil_alloc's own FP from inside sigil_alloc, the runtime
+   calls `stackmap::capture_caller_fp_for_walk()`: an
+   `#[inline(never)]` helper whose own prologue gives it a
+   frame; reading rbp inside that frame and dereferencing
+   yields the caller's saved FP = sigil_alloc's FP.
+
+4. **`GC_set_markers_count(1)` before `GC_init`.** Pinned to
+   single-marker mode. Finding 1 above describes how
+   `GC_allow_register_threads` would otherwise auto-spawn
+   parallel marker threads via its implicit
+   `GC_start_mark_threads` call; the count-1 pin neutralises
+   that side effect. Production paths in this PR don't call
+   `GC_allow_register_threads` themselves (see "Runtime
+   thread enrolment" note below), but the pin stays as
+   defense-in-depth: test_support's GC stress harness still
+   exercises that call path, and future production work
+   (multi-Sigil-thread Plan E3) will want the constraint
+   in place before any worker enrols.
+
+**Runtime thread enrolment — closed without action.**
+Task 11's deferral list named "runtime-thread Boehm
+enrolment in production paths" as a Task 12 item. The
+review against actual runtime threads (CPU-profile
+drainer, alloc-profile drainer) concluded the item is
+moot: neither thread allocates from Boehm or holds
+Boehm pointers on its stack, and `std::thread::spawn`
+doesn't route through `GC_pthread_create`'s auto-
+cleanup hook so an enrolled drainer would leak its
+registration on exit — which CI surfaced as a CPU-
+profile e2e crash before any Sigil output appeared.
+The function was also renamed from
+`register_runtime_thread_for_conservative_roots` (PR #170)
+to `ensure_gc_process_state_initialised` so the name matches
+the actual no-op-on-Boehm-state behaviour.
+
+The four pieces compose to a thread model where:
+- Boehm's STW conservatively scans ABOVE the
+  `GC_do_blocking` stack base + the `GC_call_with_gc_active`
+  re-active window (small C-frame ranges only).
+- The precise walker supplies roots for the Sigil call
+  chain via stackmap entries discovered along the FP chain
+  starting at `sigil_alloc`'s captured FP.
+- Chained `push_other_roots` preserves Boehm's internal
+  roots (TLS, dl_iterate_phdr) alongside our precise roots.
+
+Compile-time gating: all four pieces are
+`#[cfg(not(test))]`-gated. `cargo test` exercises the
+runtime in active GC state with the cross-check harness,
+which does not depend on the captured FP or the blocking
+boundary. End-to-end coverage comes from the
+`precise_walker_deep_*` e2e tests in `compiler/tests/e2e.rs`
+(deep recursion + GC stress) and the existing
+`cross_check_tree_stress_*` suite (alloc volume + GC
+pressure).

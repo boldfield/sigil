@@ -356,7 +356,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 11 — Thread registration discriminator
 
-- status: **in PR (Task 11 branch)**
+- status: **merged (PR #170, commit c0b835f)**
 - New module `runtime/src/gc/threads.rs` exposes the
   discriminator API:
   - `register_sigil_thread_for_precise_roots()` — sets a
@@ -431,7 +431,105 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 12 — Drop conservative stack scan on Sigil threads
 
-- status: pending — Phase 3 ship gate.
+- status: **in PR (Task 12 branch — this commit)** — Phase 3
+  ship gate.
+- Scope expanded per user instruction "no deferrals": Task 12
+  ships its original spec plus the items Task 10/11 deferred to
+  it (captured-FP mechanism, `GC_do_blocking` wrap,
+  `GC_call_with_gc_active` wrap, parallel-marker mitigation,
+  walker safety from captured FP, deep-recursion stress tests).
+  The Task-11-deferred "Boehm thread enrolment in production
+  paths" item was reviewed against the actual runtime threads
+  (CPU / alloc profile drainers) and determined NOT needed —
+  see step 5 below for the closure rationale.
+- **Production wiring** (all `cfg(not(test))`-gated):
+  1. `sigil_gc_init` calls `GC_set_markers_count(1)` BEFORE
+     `GC_init`, pinning Boehm to single-marker mode. PR #170
+     surfaced that `GC_allow_register_threads`'s implicit
+     `GC_start_mark_threads` would otherwise spawn parallel
+     markers and break alloc-heavy workloads. The pin keeps
+     marker semantics single-threaded.
+  2. `sigil_run_loop` wraps its trampoline body in
+     `GC_do_blocking(trampoline, &ctx)` so the Sigil call
+     chain is "GC-inactive" — Boehm's conservative stack scan
+     covers only frames ABOVE `sigil_run_loop`. Stack-disciplined,
+     so nested run_loops (nested handle expressions) compose
+     correctly.
+  3. `sigil_alloc` wraps the allocator dispatch
+     (`GC_malloc_atomic` / `GC_malloc` / `GC_malloc_explicitly_-
+     typed`) in `GC_call_with_gc_active(trampoline, &ctx)` so
+     GC routines can run from inside the blocked region.
+     Counter increments, cross-check hook, profile sample,
+     header write, and null check remain outside.
+  4. `sigil_alloc` captures its OWN frame pointer (via
+     `stackmap::capture_caller_fp_for_walk`, an
+     `#[inline(never)]` helper) into TLS at entry; a Drop
+     guard clears it at every exit path. The captured FP is
+     `sigil_alloc`'s frame — not the Sigil caller's — because
+     the walker iterates UP and reads each frame's saved
+     return-PC; with `starting_fp = sigil_alloc_FP`, the
+     first iteration's return-PC points INTO the Sigil
+     function at the alloc call site, which is where the
+     stackmap entries are. Starting one frame higher
+     (Sigil caller's FP) would yield the caller's caller's
+     records and miss the Sigil function's own roots.
+  5. `register_runtime_thread_for_conservative_roots` stays
+     a no-op on Boehm state (install_push_other_roots_once +
+     stackmap prewarm). Surveyed runtime threads (CPU /
+     alloc profile drainers) neither allocate from Boehm
+     nor hold Boehm pointers on their stack — they shuffle
+     POD `Sample` structs between a lock-free SPSC ring and
+     a `Vec<Sample>` on system malloc. Enrolment would
+     additionally leak on thread exit (std::thread::spawn
+     doesn't route through `GC_pthread_create`'s auto-
+     cleanup hook); CI surfaced this empirically as a
+     CPU-profile e2e crash before any Sigil output.
+  6. The `push_sigil_thread_precise_roots` callback body
+     (no-op in Task 11) now reads `CAPTURED_SIGIL_CALLER_FP`,
+     gates on `IS_SIGIL_THREAD`, and invokes
+     `walk_for_gc_with_callback_from(captured_fp, ...)`. Per
+     yielded root, it pushes an 8-byte range via
+     `GC_push_all_eager`. Chains to the prior
+     push_other_roots proc (preserving Boehm's TLS / dl roots).
+  7. SIGPROF unwinder hardening: `profile::cpu::maybe_init`
+     primes `profile::unwind::SAFE_STACK_{LO,HI}` from
+     `stackmap_xcheck::thread_stack_bounds()` BEFORE arming
+     SIGPROF (pthread queries are not async-signal-safe, so
+     the cache must be populated off the signal path). The
+     unwinder validates every `fp` against the cached range
+     before deref, and bails on hops > 4 MB. Defensive: had
+     the empty drainer enrolment not been the root cause of
+     the CI crash, libgc's `-fomit-frame-pointer` internals
+     could still leak wild rbp values into ucontext when
+     SIGPROF interrupts during a GC mark phase post-Task 12.
+- **Walker variant** —
+  `stackmap::walk_for_gc_with_callback_from(starting_fp, f)`
+  takes a starting FP rather than reading
+  `current_caller_fp()`. The previous variant (used by the
+  cross-check) is now a thin wrapper that calls into the new
+  variant with `current_caller_fp()`.
+- **Tests**:
+  - 3 new e2e tests in `compiler/tests/e2e.rs`. Each uses a
+    non-TCO `build_nontco(n) -> C(n, build_nontco(n - 1))` shape
+    so all 1000 frames remain on the C stack during allocation
+    (the constructor wrapper defeats TCO; sum_list is also
+    non-tail by construction).
+    - `precise_walker_deep_build_sum_chain` — 1000-deep
+      `build_nontco` + 1000-deep `sum_list`, asserts sum =
+      500_500.
+    - `precise_walker_deep_chain_with_gc_pressure` — 5 rounds ×
+      1000-deep `build_nontco`/`sum_list`, asserts sum =
+      2_502_500.
+    - `precise_walker_deep_chain_under_cross_check` —
+      `SIGIL_GC_CROSS_CHECK=1` on a 1000-deep chain (the
+      cross-check fires at every alloc, so the walker is
+      exercised at every depth from 1000 down to 1).
+  - Existing `cross_check_tree_stress_*` suite (alloc
+    volume + GC pressure) regresses against any walker bug.
+  - All existing runtime lib tests + 312/312 pass.
+- Spike doc (`runtime/docs/boehm-per-thread-roots-spike.md`)
+  updated with "Task 12 implementation notes" section
+  documenting the four-piece composition.
 
 ## Deviations
 

@@ -98,6 +98,22 @@ pub fn maybe_init() -> bool {
         let ring: &'static Ring = Box::leak(Box::new(Ring::new()));
         CPU_RING_PTR.store(ring as *const Ring as *mut Ring, Ordering::Release);
 
+        // Plan E2 Phase 3 Task 12 — re-prime the SIGPROF unwinder's
+        // safe-stack-range cache as a belt-and-suspenders measure.
+        // `sigil_gc_init` already populated it for the GC walker's
+        // benefit (see `gc.rs::sigil_gc_init`), and `install_safe_stack_range`
+        // is idempotent (atomic stores of the same bounds). This
+        // call kept here so the SIGPROF path remains self-contained:
+        // if a future refactor ever moves the unconditional install
+        // out of `sigil_gc_init`, this branch ensures the cache is
+        // still populated BEFORE `sigaction(SIGPROF)` arms the
+        // signal handler. `pthread_attr_getstack` /
+        // `pthread_get_stackaddr_np` are not async-signal-safe, so
+        // priming must happen off the signal path either way.
+        if let Some((lo, hi)) = crate::stackmap_xcheck::thread_stack_bounds() {
+            crate::profile::unwind::install_safe_stack_range(lo, hi);
+        }
+
         // Install SIGPROF handler via `sigaction(SA_SIGINFO|SA_RESTART)`
         // so the handler receives `ucontext_t*` for the interrupted
         // thread. We then read the saved frame pointer directly from
@@ -247,14 +263,13 @@ extern "C" fn sigprof_handler(
 /// samples into the global `SAMPLES` vec. Exits cleanly when
 /// [`DRAINER_STOP`] is set.
 fn drainer_loop() {
-    // Plan E2 Phase 3 Task 11: register as "runtime-internal,
-    // conservative roots" via the `gc::threads` discriminator.
-    // The call is a no-op on Boehm state today (the drainer
-    // doesn't allocate from Boehm; the API doesn't enroll the
-    // thread until Task 12 chooses to) but pre-warms the
-    // process-wide push_other_roots install + stackmap
-    // initialisers exactly once per process regardless of
-    // which thread (Sigil or runtime) registers first.
+    // Plan E2 Phase 3 — ensure the process-wide `push_other_roots`
+    // install + stackmap initialisers have fired regardless of
+    // which thread (Sigil or runtime) hits the path first. The
+    // call is a no-op on per-thread Boehm state by design — see
+    // `gc::threads::ensure_gc_process_state_initialised`'s doc
+    // and the module doc's "Runtime threads don't enrol with
+    // Boehm" section.
     //
     // **Constraint** (see `runtime/src/gc/threads.rs` module
     // doc → "Runtime invariant"): runtime-internal threads
@@ -265,7 +280,7 @@ fn drainer_loop() {
     // needs heap allocation, the `gc::threads` design needs a
     // multi-Sigil-thread registry walk before that worker
     // lands.
-    crate::gc::threads::register_runtime_thread_for_conservative_roots();
+    crate::gc::threads::ensure_gc_process_state_initialised();
 
     let ring_ptr = CPU_RING_PTR.load(Ordering::Acquire);
     if ring_ptr.is_null() {

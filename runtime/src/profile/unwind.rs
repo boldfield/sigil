@@ -108,6 +108,15 @@ pub unsafe fn capture_stack_from(start_fp: usize, buf: &mut [usize; MAX_DEPTH]) 
     let mut depth: usize = 0;
     let align = core::mem::align_of::<usize>();
 
+    // Plan E2 Phase 3 Task 12 — read the cached safe-stack range
+    // once. The cache is populated by `profile::cpu::maybe_init`
+    // (off the signal path) before SIGPROF is armed; if either
+    // bound is zero, no range was installed and we fall back to
+    // the alignment / hop-bound / inversion checks alone.
+    let safe_lo = SAFE_STACK_LO.load(Ordering::Relaxed);
+    let safe_hi = SAFE_STACK_HI.load(Ordering::Relaxed);
+    let safe_range_installed = safe_lo != 0 && safe_hi > safe_lo;
+
     while depth < MAX_DEPTH {
         if fp == 0 {
             break;
@@ -115,10 +124,23 @@ pub unsafe fn capture_stack_from(start_fp: usize, buf: &mut [usize; MAX_DEPTH]) 
         if !fp.is_multiple_of(align) {
             break;
         }
+        // Plan E2 Phase 3 Task 12 — reject `fp` values outside the
+        // calling thread's known stack range BEFORE dereferencing.
+        // Without this, SIGPROF firing inside libgc's
+        // `-fomit-frame-pointer` internals reads a wild rbp value
+        // from ucontext; the deref below SEGVs if the wild value
+        // points to unmapped memory. The hop-bound check below
+        // catches subsequent-iteration wild values; this check
+        // gates the FIRST iteration's read of `start_fp`.
+        if safe_range_installed && (fp < safe_lo || fp >= safe_hi) {
+            WALKER_TRUNCATED_OR_REJECTED.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         // SAFETY: the caller's contract is that `fp` is either 0
         // (already handled) or a valid frame-record pointer. We've
-        // checked alignment; reading two pointer-sized words is in-
-        // bounds for a well-formed frame record.
+        // checked alignment + stack-range membership; reading two
+        // pointer-sized words is in-bounds for a well-formed frame
+        // record on the thread's own stack.
         let frame: *const usize = fp as *const usize;
         let prev_fp = core::ptr::read_volatile(frame);
         let raw_ret = core::ptr::read_volatile(frame.add(1));
@@ -139,6 +161,22 @@ pub unsafe fn capture_stack_from(start_fp: usize, buf: &mut [usize; MAX_DEPTH]) 
         // higher address than the current fp. Bail on any inversion
         // (corrupted chain, end of stack region, anomaly).
         if prev_fp <= fp {
+            break;
+        }
+        // Stack-hop bound: a legitimate prev_fp is at most a few MB
+        // higher than fp — individual function frames are typically
+        // <1 KB and rarely exceed ~1 MB even for stack-heavy code.
+        // A larger hop is a strong signal we're reading FP-omitted
+        // intermediate frames (e.g., libgc internals on the SIGPROF
+        // unwind path post-Task 12, where SIGPROF fires during a
+        // GC mark phase and the walk crosses GC_do_blocking's
+        // library frames). Combined with the 16-byte alignment
+        // gate, this catches the common garbage patterns without
+        // requiring signal-unsafe pthread stack-range queries from
+        // the SIGPROF handler.
+        const STACK_HOP_MAX: usize = 4 * 1024 * 1024;
+        if prev_fp.wrapping_sub(fp) > STACK_HOP_MAX {
+            WALKER_TRUNCATED_OR_REJECTED.fetch_add(1, Ordering::Relaxed);
             break;
         }
         fp = prev_fp;
@@ -208,10 +246,44 @@ pub fn walk_from_here() -> ([usize; MAX_DEPTH], usize) {
 
 /// Telemetry counter for samples where the walker exited via a guard
 /// other than reaching the end of the chain (corrupted-fp inversion,
-/// misalignment, MAX_DEPTH truncation). Relaxed-atomic so the
-/// counter bump itself stays signal-safe; readers (Phase 3 / Phase 4
-/// drainers) get a coherent snapshot via `Ordering::Relaxed` loads.
+/// misalignment, MAX_DEPTH truncation, safe-stack-range rejection,
+/// hop-bound rejection). Relaxed-atomic so the counter bump itself
+/// stays signal-safe; readers (Phase 3 / Phase 4 drainers) get a
+/// coherent snapshot via `Ordering::Relaxed` loads.
 pub static WALKER_TRUNCATED_OR_REJECTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Plan E2 Phase 3 Task 12 — cached safe stack range for the
+/// SIGPROF unwinder. Populated by `profile::cpu::maybe_init` (off
+/// the signal path) before SIGPROF is armed. The unwinder
+/// validates every `fp` it's about to dereference against this
+/// range; out-of-range FPs are rejected (likely garbage read from
+/// libgc's `-fomit-frame-pointer` internals when SIGPROF
+/// interrupts during a GC mark phase).
+///
+/// Both atomics zero = "no range installed" — the unwinder falls
+/// back to alignment / hop-bound / inversion checks alone.
+pub static SAFE_STACK_LO: AtomicUsize = AtomicUsize::new(0);
+pub static SAFE_STACK_HI: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the calling thread's stack range into the unwinder's
+/// signal-safe cache. Call from a non-signal context BEFORE arming
+/// SIGPROF — `pthread_attr_getstack` / `pthread_get_stackaddr_np`
+/// are not async-signal-safe, so the cache must be primed before
+/// any signal can fire.
+///
+/// Idempotent: subsequent calls overwrite the stored bounds.
+/// Process-global, not thread-local: the cache holds ONE range,
+/// which is appropriate for Sigil's main-thread-only Sigil
+/// execution model (the profile drainer thread spends almost all
+/// its time sleeping, so SIGPROF delivery to it is rare; if it
+/// does fire there, the FP will fail the range check and the
+/// sample is dropped — preferable to a segfault).
+pub fn install_safe_stack_range(lo: usize, hi: usize) {
+    if hi > lo {
+        SAFE_STACK_LO.store(lo, Ordering::Relaxed);
+        SAFE_STACK_HI.store(hi, Ordering::Relaxed);
+    }
+}
 
 /// Convenience: snapshot the truncate/reject counter. Phase 3 / Phase 4
 /// can include this in their final-output summaries so a profile that
