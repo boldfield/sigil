@@ -724,6 +724,26 @@ fn xcheck_trace_enabled() -> bool {
     *TRACE.get_or_init(|| std::env::var_os("SIGIL_GC_XCHECK_TRACE").is_some())
 }
 
+/// Pre-warm every lazy initialiser this module owns so subsequent
+/// `walk_for_gc` / `walk_for_gc_with_callback` calls don't allocate.
+/// Called from `gc::threads::register_sigil_thread_for_precise_roots`
+/// at sigil_gc_init time, BEFORE any GC can fire — the
+/// `GC_set_push_other_roots` callback runs inside Boehm's STW
+/// mark phase, and any libc malloc invoked there can deadlock
+/// against a suspended thread holding malloc's internal lock.
+///
+/// Today this means:
+/// - `init_index()` builds the StackmapIndex BTreeMap.
+/// - `xcheck_trace_enabled()` reads + caches the env var.
+///
+/// Future lazy initialisers added to this module must extend
+/// this function or document why the new init is allocation-
+/// free + STW-safe.
+pub fn prewarm_for_stw() {
+    let _ = init_index();
+    let _ = xcheck_trace_enabled();
+}
+
 struct Frame {
     saved_fp: *const usize,
     return_pc: usize,

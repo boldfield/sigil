@@ -202,6 +202,16 @@ fn install_push_other_roots_once() {
 pub fn register_sigil_thread_for_precise_roots() {
     install_push_other_roots_once();
     allow_register_threads_once();
+    // Pre-warm every lazy initialiser the stackmap module owns
+    // BEFORE any GC can fire. The push_other_roots callback
+    // (`push_sigil_thread_precise_roots`) calls
+    // `stackmap::walk_for_gc_with_callback` from inside Boehm's
+    // STW mark phase; any libc malloc invoked from there can
+    // deadlock against a suspended thread holding malloc's
+    // internal lock. The `prewarm_for_stw` helper triggers
+    // every OnceLock the walk path traverses (StackmapIndex
+    // BTreeMap; SIGIL_GC_XCHECK_TRACE env var). Idempotent.
+    crate::stackmap::prewarm_for_stw();
     IS_SIGIL_THREAD.with(|f| f.set(true));
 }
 
