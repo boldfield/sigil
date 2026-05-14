@@ -1241,8 +1241,11 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // shadowable builtin types anymore. The remaining builtin_types
     // entries (Array, MutArray, ByteArray, MutByteArray, Int64,
     // Float, StringBuilder, Ref) are opaque (no variants) and are
-    // never user-shadowable.
-    let mut prelude_types: BTreeSet<String> = BTreeSet::new();
+    // never user-shadowable. The prior `prelude_types` shadow-tracking
+    // set + the second `is_prelude_shadow` ctor-pass were removed
+    // alongside the prelude; user redeclarations of `Option`/`Result`
+    // now hit the standard E0113 duplicate-type path against
+    // `std/option.sigil` / `std/result.sigil` after `import`.
     for builtin in builtin_types(&program.file) {
         types.insert(builtin.name.clone(), builtin);
     }
@@ -1273,12 +1276,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 ));
                 continue;
             }
-            // Auto-prelude shadowing (Option/Result): user-redeclarations
-            // of prelude type names silently override the builtin entry
-            // and the entry stops being prelude-resident — subsequent
-            // user types named the same fire E0113 normally.
-            let is_prelude_shadow = prelude_types.contains(&td.name);
-            if types.contains_key(&td.name) && !is_prelude_shadow {
+            if types.contains_key(&td.name) {
                 errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0113"),
@@ -1286,13 +1284,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     format!("duplicate type declaration `{}`", td.name),
                 ));
             } else {
-                if is_prelude_shadow {
-                    // User redeclaration retires the prelude entry —
-                    // the user's `type` becomes the source of truth
-                    // for both type and constructor lookups in this
-                    // program.
-                    prelude_types.remove(&td.name);
-                }
                 types.insert(td.name.clone(), (**td).clone());
             }
         }
@@ -1304,28 +1295,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // the colliding variant's name span. The first declaration wins in
     // the registry so downstream typing always picks a single canonical
     // constructor per name.
-    //
-    // Auto-prelude (Option/Result design — 2026-05-10): prelude
-    // constructors (`Some` / `None` / `Ok` / `Err`) are inserted in a
-    // *second* pass that silently skips when a user-defined ctor
-    // already claims the name. This lets user code declare
-    // `type Color = | Red | Green | None` without the prelude `None`
-    // triggering E0118 — the user's local `None` shadows the prelude
-    // in that file's scope, matching how Rust's `enum Color { None,
-    // ... }` shadows `Option::None`. Cross-user collisions still fire
-    // E0118 normally; only the prelude→user direction is silenced.
-    //
-    // The discriminator is `prelude_types` (an origin-flag set built
-    // during type registration), NOT a name comparison — a user
-    // `type Option = ...` retired its prelude entry above and now
-    // contributes ctors via the user pass with full E0118 checking.
     let mut ctors: BTreeMap<String, CtorInfo> = BTreeMap::new();
-    // Pass 1: user / non-prelude types — full E0118 cross-collision
-    // diagnostics.
     for td in types.values() {
-        if prelude_types.contains(&td.name) {
-            continue;
-        }
         for (idx, v) in td.variants.iter().enumerate() {
             if let Some(existing) = ctors.get(&v.name) {
                 errors.push(CompilerError::new(
@@ -1338,25 +1309,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     ),
                 ));
             } else {
-                ctors.insert(
-                    v.name.clone(),
-                    CtorInfo {
-                        type_name: td.name.clone(),
-                        variant_index: idx,
-                    },
-                );
-            }
-        }
-    }
-    // Pass 2: prelude-resident types (`Option` / `Result` not retired
-    // by user redeclaration). Skip silently when a user ctor already
-    // claimed the name.
-    for td in types.values() {
-        if !prelude_types.contains(&td.name) {
-            continue;
-        }
-        for (idx, v) in td.variants.iter().enumerate() {
-            if !ctors.contains_key(&v.name) {
                 ctors.insert(
                     v.name.clone(),
                     CtorInfo {
@@ -2138,7 +2090,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             &mut program,
             &tc.resolved_idents,
             &tc.bare_name_origins,
-            &mut tc.fn_schemes,
             &tc.stdlib_files,
         );
     }
@@ -2330,7 +2281,6 @@ fn rewrite_resolved_idents(
     program: &mut Program,
     resolved_idents: &BTreeMap<Span, String>,
     bare_name_origins: &BTreeMap<String, Vec<String>>,
-    _fn_schemes: &mut BTreeMap<String, Scheme>,
     stdlib_files: &BTreeSet<String>,
 ) {
     let mut collisions: BTreeSet<String> = BTreeSet::new();
@@ -2650,13 +2600,15 @@ const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
     ("sigil_ref_set", "state.sigil"),
     // builtin_fn_env / single-name builtins.
     ("int_to_string", "int.sigil"),
-    ("int_add_safe", "int.sigil"),
-    ("int_sub_safe", "int.sigil"),
     ("int_abs", "int.sigil"),
     ("sb_new", "string_builder.sigil"),
-    ("now", "clock.sigil"),
     ("clock_os_now", "clock.sigil"),
-    ("string_compare", "ordering.sigil"),
+    // Note: `now`, `string_compare`, `int_add_safe`, `int_sub_safe`
+    // are NOT compiler-injected — they're stdlib-source fns whose
+    // dual canonical-key entries land via the Item::Fn pre-pass at
+    // line ~1677. Don't list them here; the mirror loop just
+    // silently skips them, but the table would then overstate its
+    // coverage.
 ];
 
 /// Plan F1 — mirror every bare-key builtin fn_scheme onto its
@@ -5749,20 +5701,14 @@ impl Tc {
                 self.push_error(
                     "E0041",
                     f.span.clone(),
-                    "import std.io\n\
-               import std.raise\n\
-               use std.io.{IO};\n\
-               use std.raise.{ArithError};\n\
-               `fn main` must return `Int` (expected `fn main() -> Int ![IO]`, `fn main() -> Int ![ArithError]`, `fn main() -> Int ![IO, ArithError]`, or `fn main() -> Int ![]`)",
+                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]`, `fn main() -> Int ![ArithError]`, `fn main() -> Int ![IO, ArithError]`, or `fn main() -> Int ![]`)",
                 );
             }
             if !f.params.is_empty() {
                 self.push_error(
                     "E0041",
                     f.span.clone(),
-                    "import std.io\n\
-               use std.io.{IO};\n\
-               `fn main` takes no parameters (expected `fn main() -> Int ![IO]` or similar)",
+                    "`fn main` takes no parameters (expected `fn main() -> Int ![IO]` or similar)",
                 );
             }
             for effect in &f.effects {
