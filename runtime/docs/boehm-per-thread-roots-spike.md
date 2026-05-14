@@ -452,12 +452,31 @@ load-bearing pieces compose the boundary:
    yields the caller's saved FP = sigil_alloc's FP.
 
 4. **`GC_set_markers_count(1)` before `GC_init`.** Pinned to
-   single-marker mode. `GC_allow_register_threads` (now
-   called by `register_runtime_thread_for_conservative_roots`)
-   implicitly invokes `GC_start_mark_threads`, which would
-   spawn parallel markers on alloc-heavy workloads. Finding 1
-   above describes the breakage; setting markers count to 1
-   before `GC_init` preserves single-marker semantics.
+   single-marker mode. Finding 1 above describes how
+   `GC_allow_register_threads` would otherwise auto-spawn
+   parallel marker threads via its implicit
+   `GC_start_mark_threads` call; the count-1 pin neutralises
+   that side effect. Production paths in this PR don't call
+   `GC_allow_register_threads` themselves (see "Runtime
+   thread enrolment" note below), but the pin stays as
+   defense-in-depth: test_support's GC stress harness still
+   exercises that call path, and future production work
+   (multi-Sigil-thread Plan E3) will want the constraint
+   in place before any worker enrols.
+
+**Runtime thread enrolment — closed without action.**
+Task 11's deferral list named "runtime-thread Boehm
+enrolment in production paths" as a Task 12 item. The
+review against actual runtime threads (CPU-profile
+drainer, alloc-profile drainer) concluded the item is
+moot: neither thread allocates from Boehm or holds
+Boehm pointers on its stack, and `std::thread::spawn`
+doesn't route through `GC_pthread_create`'s auto-
+cleanup hook so an enrolled drainer would leak its
+registration on exit — which CI surfaced as a CPU-
+profile e2e crash before any Sigil output appeared.
+`register_runtime_thread_for_conservative_roots` stays
+a no-op on Boehm state.
 
 The four pieces compose to a thread model where:
 - Boehm's STW conservatively scans ABOVE the

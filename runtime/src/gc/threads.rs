@@ -192,34 +192,18 @@ use std::sync::Once;
 // `GC_set_push_other_roots` callback. Task 12 callback uses
 // it per precise root the walker yields.
 //
-// `GC_allow_register_threads` + `GC_register_my_thread` live
-// in `crate::gc`'s extern block (shared with `test_support`'s
-// per-test enrolment). The Task 12 production enrolment path
-// reaches them through that module via the `cfg(not(test))`
-// block in `register_runtime_thread_for_conservative_roots`.
+// `GC_allow_register_threads` + `GC_register_my_thread` are
+// declared in `crate::gc`'s extern block for use by
+// `test_support`'s per-test enrolment harness. Task 12 surveyed
+// the runtime threads (CPU-profile drainer, alloc-profile
+// drainer) and concluded none of them allocate from Boehm or
+// hold Boehm pointers, so none need to enrol — see
+// `register_runtime_thread_for_conservative_roots`'s doc.
 #[link(name = "gc")]
 extern "C" {
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
     fn GC_get_push_other_roots() -> Option<GcPushOtherRootsProc>;
     fn GC_push_all_eager(bottom: *mut c_void, top: *mut c_void);
-}
-
-#[cfg(not(test))]
-const GC_SUCCESS: i32 = 0;
-#[cfg(not(test))]
-const GC_DUPLICATE: i32 = 1;
-
-#[cfg(not(test))]
-static ALLOW_REGISTER_THREADS: Once = Once::new();
-
-#[cfg(not(test))]
-fn allow_register_threads_once() {
-    ALLOW_REGISTER_THREADS.call_once(|| {
-        // SAFETY: Once::call_once + GC_set_markers_count(1) at
-        // sigil_gc_init time keeps Boehm in single-marker mode
-        // so this call doesn't spawn parallel markers.
-        unsafe { crate::gc::GC_allow_register_threads() };
-    });
 }
 
 type GcPushOtherRootsProc = extern "C" fn();
@@ -399,35 +383,25 @@ pub fn register_sigil_thread_for_precise_roots() {
 pub fn register_runtime_thread_for_conservative_roots() {
     install_push_other_roots_once();
     crate::stackmap::prewarm_for_stw();
-    // Plan E2 Phase 3 Task 12 — enroll the calling thread with
-    // Boehm so STW suspends it and its stack is conservatively
-    // scanned. Safe to enable now because `sigil_gc_init` pinned
-    // marker count to 1 BEFORE `GC_init`, so
-    // `GC_allow_register_threads`'s implicit
-    // `GC_start_mark_threads()` call doesn't spawn parallel
-    // markers (the count-1 pin makes "additional" markers zero).
+    // Plan E2 Phase 3 Task 12 — DO NOT call `GC_register_my_thread`
+    // for runtime threads. The PR-#170 spike concluded the same
+    // for a separate reason (parallel markers), but the conclusion
+    // holds post-Task-12 for a clearer reason:
     //
-    // Production-only: cargo's per-test worker threads call this
-    // through `register_runtime_thread_does_not_set_sigil_flag`,
-    // but cargo's workers exit without `GC_unregister_my_thread`,
-    // leaking stale TLS ranges as Boehm roots and segfaulting
-    // process teardown on the next mark. Production runtime
-    // threads (CPU-profile drainer) are long-lived and process-
-    // scoped, so the leak doesn't apply there. Tests cover the
-    // discriminator surface (`IS_SIGIL_THREAD` stays false)
-    // independently of the Boehm enrolment.
-    #[cfg(not(test))]
-    {
-        allow_register_threads_once();
-        // SAFETY: NULL stack base = Boehm auto-detects; standard
-        // for threads not created via GC_pthread_create.
-        let rc = unsafe { crate::gc::GC_register_my_thread(std::ptr::null()) };
-        debug_assert!(
-            rc == GC_SUCCESS || rc == GC_DUPLICATE,
-            "GC_register_my_thread(NULL) returned rc={rc}"
-        );
-    }
-    // IS_SIGIL_THREAD stays at its default `false`.
+    //   The drainer thread does not allocate from Boehm and does
+    //   not hold Boehm pointers on its stack — its data is samples
+    //   (POD), `Vec<Sample>` on system malloc, and a lock-free
+    //   ring. Boehm's STW does not need to suspend it, and
+    //   Boehm's mark phase does not need to scan its stack.
+    //   Enrolling it would also leak the registration on thread
+    //   exit (the drainer is `std::thread::spawn`'d, which doesn't
+    //   route through `GC_pthread_create`'s auto-cleanup hook;
+    //   CI surfaced this empirically — CPU-profile e2e tests
+    //   crashed before printing anything, while alloc-profile
+    //   tests (whose drainer was never enrolled) passed cleanly).
+    //
+    // IS_SIGIL_THREAD stays at its default `false` so the precise
+    // walker callback short-circuits on this thread.
 }
 
 /// `GC_set_push_other_roots` callback. Boehm invokes this once

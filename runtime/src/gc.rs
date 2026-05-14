@@ -83,22 +83,21 @@ extern "C" {
     // is not pulled into release binaries.
     #[cfg(test)]
     pub(crate) fn GC_gcollect();
-    // Boehm thread enrolment. Used by:
-    //   - GC stress tests (`test_support` module): a Rust test
-    //     thread is not auto-registered with Boehm; calling
-    //     `GC_gcollect` from such a thread triggers Boehm's
-    //     "Collecting from unknown thread" abort. Tests that
-    //     need to force collection must enrol their thread first
-    //     and `GC_unregister_my_thread` on Drop.
-    //   - Plan E2 Phase 3 Task 12 production wiring
-    //     (`gc::threads::register_runtime_thread_for_conservative_roots`):
-    //     non-Sigil runtime threads (CPU-profile drainer, etc.)
-    //     enrol via `GC_register_my_thread(NULL)` so STW
-    //     suspends them and their stacks are conservatively
-    //     scanned. Production threads are long-lived /
-    //     process-scoped, so the corresponding
-    //     `GC_unregister_my_thread` lives in the test path only.
+    // Boehm thread enrolment used by GC stress tests in this crate. A
+    // Rust test thread is not auto-registered with Boehm (see
+    // `test_support` module for the historical context); calling
+    // `GC_gcollect` from such a thread triggers Boehm's "Collecting
+    // from unknown thread" abort. Tests that need to force collection
+    // must enrol their thread first.
+    //
+    // Plan E2 Phase 3 Task 12: production runtime threads (CPU /
+    // alloc profile drainers) do NOT need to enrol — they neither
+    // allocate from Boehm nor hold Boehm pointers on their stack.
+    // See `gc::threads::register_runtime_thread_for_conservative_roots`'s
+    // doc for the rationale. So these symbols stay test-only.
+    #[cfg(test)]
     pub(crate) fn GC_allow_register_threads();
+    #[cfg(test)]
     pub(crate) fn GC_register_my_thread(stack_base: *const c_void) -> i32;
     #[cfg(test)]
     pub(crate) fn GC_unregister_my_thread() -> i32;

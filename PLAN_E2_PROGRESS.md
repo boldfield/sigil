@@ -434,19 +434,21 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 - status: **in PR (Task 12 branch — this commit)** — Phase 3
   ship gate.
 - Scope expanded per user instruction "no deferrals": Task 12
-  includes its original spec plus every item that Task 10/11
-  deferred to it (captured-FP mechanism, `GC_do_blocking`
-  wrap, `GC_call_with_gc_active` wrap, runtime-thread Boehm
-  enrolment in production paths, parallel-marker mitigation,
+  ships its original spec plus the items Task 10/11 deferred to
+  it (captured-FP mechanism, `GC_do_blocking` wrap,
+  `GC_call_with_gc_active` wrap, parallel-marker mitigation,
   walker safety from captured FP, deep-recursion stress tests).
+  The Task-11-deferred "Boehm thread enrolment in production
+  paths" item was reviewed against the actual runtime threads
+  (CPU / alloc profile drainers) and determined NOT needed —
+  see step 5 below for the closure rationale.
 - **Production wiring** (all `cfg(not(test))`-gated):
   1. `sigil_gc_init` calls `GC_set_markers_count(1)` BEFORE
-     `GC_init`, pinning Boehm to single-marker mode. This is
-     load-bearing for re-enabling `GC_allow_register_threads`
-     in step 4 — that call implicitly invokes
-     `GC_start_mark_threads`, which would otherwise spawn
-     parallel markers and break alloc-heavy workloads (PR
-     #170 commit `e30d6ef` surfaced this).
+     `GC_init`, pinning Boehm to single-marker mode. PR #170
+     surfaced that `GC_allow_register_threads`'s implicit
+     `GC_start_mark_threads` would otherwise spawn parallel
+     markers and break alloc-heavy workloads. The pin keeps
+     marker semantics single-threaded.
   2. `sigil_run_loop` wraps its trampoline body in
      `GC_do_blocking(trampoline, &ctx)` so the Sigil call
      chain is "GC-inactive" — Boehm's conservative stack scan
@@ -471,11 +473,17 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
      stackmap entries are. Starting one frame higher
      (Sigil caller's FP) would yield the caller's caller's
      records and miss the Sigil function's own roots.
-  5. `register_runtime_thread_for_conservative_roots` calls
-     `GC_allow_register_threads` (Once-gated) +
-     `GC_register_my_thread(NULL)`. Safe now because step 1
-     pins markers to 1 before the implicit
-     `GC_start_mark_threads`.
+  5. `register_runtime_thread_for_conservative_roots` stays
+     a no-op on Boehm state (install_push_other_roots_once +
+     stackmap prewarm). Surveyed runtime threads (CPU /
+     alloc profile drainers) neither allocate from Boehm
+     nor hold Boehm pointers on their stack — they shuffle
+     POD `Sample` structs between a lock-free SPSC ring and
+     a `Vec<Sample>` on system malloc. Enrolment would
+     additionally leak on thread exit (std::thread::spawn
+     doesn't route through `GC_pthread_create`'s auto-
+     cleanup hook); CI surfaced this empirically as a
+     CPU-profile e2e crash before any Sigil output.
   6. The `push_sigil_thread_precise_roots` callback body
      (no-op in Task 11) now reads `CAPTURED_SIGIL_CALLER_FP`,
      gates on `IS_SIGIL_THREAD`, and invokes
@@ -483,6 +491,17 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
      yielded root, it pushes an 8-byte range via
      `GC_push_all_eager`. Chains to the prior
      push_other_roots proc (preserving Boehm's TLS / dl roots).
+  7. SIGPROF unwinder hardening: `profile::cpu::maybe_init`
+     primes `profile::unwind::SAFE_STACK_{LO,HI}` from
+     `stackmap_xcheck::thread_stack_bounds()` BEFORE arming
+     SIGPROF (pthread queries are not async-signal-safe, so
+     the cache must be populated off the signal path). The
+     unwinder validates every `fp` against the cached range
+     before deref, and bails on hops > 4 MB. Defensive: had
+     the empty drainer enrolment not been the root cause of
+     the CI crash, libgc's `-fomit-frame-pointer` internals
+     could still leak wild rbp values into ucontext when
+     SIGPROF interrupts during a GC mark phase post-Task 12.
 - **Walker variant** —
   `stackmap::walk_for_gc_with_callback_from(starting_fp, f)`
   takes a starting FP rather than reading
