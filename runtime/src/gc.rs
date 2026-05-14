@@ -125,6 +125,16 @@ extern "C" {
     // `size_in_bytes` must be `>= len_bits * sizeof(GC_word)` —
     // the descriptor's bitmap must cover the entire allocation.
     fn GC_malloc_explicitly_typed(size_in_bytes: usize, descr: usize) -> *mut c_void;
+
+    // Cumulative wall-clock time, in milliseconds, that Boehm has
+    // spent in full mark-sweep collections. Exposed for the
+    // throughput-report tooling (Plan E2 Phase 2 closeout) so
+    // `sigil --print-runtime-stats` can surface `boehm_gc_time_ms`
+    // alongside the alloc counters. Wraps around on overflow per
+    // gc.h; we treat wraparound as out of scope for the report
+    // workloads (the workloads run < 60s of wall-clock; far below
+    // unsigned-long ms wraparound).
+    pub(crate) fn GC_get_full_gc_total_time() -> std::os::raw::c_ulong;
 }
 
 pub(crate) mod descriptor;

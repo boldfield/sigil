@@ -193,7 +193,21 @@ pub extern "C" fn sigil_counter_read(id: u32) -> u64 {
 }
 
 /// FFI — convenience for test drivers to print every counter in a canonical
-/// order to stderr. Returns the number of counters printed.
+/// order to stderr. Returns the number of **named counters** printed
+/// (`COUNTER_SLOTS`), NOT the total line count.
+///
+/// Plan E2 Phase 2 closeout (throughput report) appends a single
+/// non-counter sidecar line `boehm_gc_time_ms=N` after the named-
+/// counter loop so the throughput script can extract Boehm full-GC
+/// wall-clock without needing a separate FFI entry point. The
+/// sidecar line is well-formed `key=value` so the parser stays
+/// grammar-compatible with the rest of the output. The function's
+/// return value DOES NOT include the sidecar in its count — it's
+/// the count of named counter slots, exposed for FFI callers that
+/// want a fixed-shape value rather than a parse-the-stderr API.
+/// `boehm_gc_time_ms` reports `0` when the process never triggered
+/// a full collection (Boehm's `GC_get_full_gc_total_time` returns
+/// 0 in that case).
 #[no_mangle]
 pub extern "C" fn sigil_counter_print_all() -> u32 {
     let mut eprint = std::io::stderr().lock();
@@ -202,6 +216,10 @@ pub extern "C" fn sigil_counter_print_all() -> u32 {
         let v = COUNTERS[i].load(Ordering::Relaxed);
         let _ = writeln!(eprint, "{name}={v}");
     }
+    // SAFETY: `GC_get_full_gc_total_time` is a pure accessor over
+    // Boehm's process-wide stats; safe to call from any context.
+    let gc_ms = unsafe { crate::gc::GC_get_full_gc_total_time() };
+    let _ = writeln!(eprint, "boehm_gc_time_ms={gc_ms}");
     COUNTER_SLOTS as u32
 }
 
