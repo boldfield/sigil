@@ -490,30 +490,27 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   cross-check) is now a thin wrapper that calls into the new
   variant with `current_caller_fp()`.
 - **Tests**:
-  - 3 new e2e tests in `compiler/tests/e2e.rs`:
-    - `precise_walker_deep_build_sum_chain` — 200-deep
-      `build` + 200-deep `sum_list`, asserts sum = 20100.
-    - `precise_walker_deep_chain_with_gc_pressure` — 50
-      rounds × 100-deep build/sum, asserts sum = 252_500.
+  - 3 new e2e tests in `compiler/tests/e2e.rs`. Each uses a
+    non-TCO `build_nontco(n) -> C(n, build_nontco(n - 1))` shape
+    so all 1000 frames remain on the C stack during allocation
+    (the constructor wrapper defeats TCO; sum_list is also
+    non-tail by construction).
+    - `precise_walker_deep_build_sum_chain` — 1000-deep
+      `build_nontco` + 1000-deep `sum_list`, asserts sum =
+      500_500.
+    - `precise_walker_deep_chain_with_gc_pressure` — 5 rounds ×
+      1000-deep `build_nontco`/`sum_list`, asserts sum =
+      2_502_500.
     - `precise_walker_deep_chain_under_cross_check` —
-      `SIGIL_GC_CROSS_CHECK=1` on a 200-deep chain.
+      `SIGIL_GC_CROSS_CHECK=1` on a 1000-deep chain (the
+      cross-check fires at every alloc, so the walker is
+      exercised at every depth from 1000 down to 1).
   - Existing `cross_check_tree_stress_*` suite (alloc
     volume + GC pressure) regresses against any walker bug.
   - All existing runtime lib tests + 312/312 pass.
 - Spike doc (`runtime/docs/boehm-per-thread-roots-spike.md`)
   updated with "Task 12 implementation notes" section
   documenting the four-piece composition.
-- Deferred to future tasks: parallel-marker characterisation
-  (single-marker mode is sufficient for v2 single-threaded
-  user programs; enabling parallel markers becomes relevant
-  only when the runtime gains worker threads that allocate
-  from Boehm). Cross-check interaction verification past the
-  existing e2e tests would require running the integrated
-  binary under `SIGIL_GC_CROSS_CHECK=1` with a programmatic
-  GC trigger to force divergence detection mid-recursion;
-  that pattern is achievable but out of scope for the
-  ship-gate (a flag for adding to Phase 4 hardening if
-  Sigil's GC-trigger API lands).
 
 ## Deviations
 

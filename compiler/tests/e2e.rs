@@ -18759,22 +18759,25 @@ fn cross_check_state_runs_cleanly() {
 
 #[test]
 fn precise_walker_deep_build_sum_chain() {
-    // Builds a 200-deep linked list (200 frames of `build` recursion,
-    // each frame holds the partial list as a live root via `acc`),
-    // then folds it back (200 frames of `sum_list` recursion, each
-    // frame holds the tail pointer as a live root via `rest`). Every
-    // safepoint in either recursion must have its heap root walked
-    // correctly by the Task 12 precise walker — a missed root in any
-    // single frame loses the partial list and produces a wrong sum
-    // (or, more likely, a crash via free-while-reachable).
+    // Builds a 1000-deep linked list via non-tail-call recursion
+    // (1000 frames of `build_nontco` live on the C stack during the
+    // descent — wrapping the recursive call in the `C(n, ...)`
+    // constructor defeats TCO so the chain stays unfolded), then
+    // folds it back through a 1000-deep `sum_list` recursion (also
+    // non-tail by construction: the result `v + sum_list(rest)`
+    // combines after the call returns). Every safepoint in either
+    // recursion must have its heap root walked correctly by the
+    // Task 12 precise walker — a missed root in any single frame
+    // loses the partial list and produces a wrong sum or a crash
+    // via free-while-reachable.
     //
-    // Sum of 1..200 = 200 * 201 / 2 = 20100.
+    // Sum of 1..1000 = 1000 * 1001 / 2 = 500_500.
     let source = "import std.io\n\
                   type Cons = | Nil | C(Int, Cons)\n\
-                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                  fn build_nontco(n: Int) -> Cons ![] {\n  \
                     match n {\n    \
-                      0 => acc,\n    \
-                      _ => build(n - 1, C(n, acc)),\n  \
+                      0 => Nil,\n    \
+                      _ => C(n, build_nontco(n - 1)),\n  \
                     }\n\
                   }\n\
                   fn sum_list(c: Cons) -> Int ![] {\n  \
@@ -18784,39 +18787,41 @@ fn precise_walker_deep_build_sum_chain() {
                     }\n\
                   }\n\
                   fn main() -> Int ![IO] {\n  \
-                    let xs: Cons = build(200, Nil);\n  \
+                    let xs: Cons = build_nontco(1000);\n  \
                     perform IO.println(int_to_string(sum_list(xs)));\n  \
                     0\n\
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "precise_walker_deep_build_sum_chain");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(code, 0, "deep build-sum chain must exit 0");
-    assert_eq!(stdout.trim_end(), "20100");
+    assert_eq!(stdout.trim_end(), "500500");
 }
 
 #[test]
 fn precise_walker_deep_chain_with_gc_pressure() {
-    // Deep recursion + alloc volume in one workload: build a 100-deep
-    // list, sum it, repeat 50 rounds. Per round = 100 cons cells; total
-    // 5,000 allocations. Each `iter` frame holds the running `total`
-    // (an Int — not a GC root, but the per-round `xs` heap pointer is).
-    // The recursion in `iter` adds another depth axis on top of
-    // `build`/`sum_list`.
+    // Deep recursion + alloc volume in one workload: build a
+    // 1000-deep list via non-TCO recursion, sum it, repeat 5 rounds.
+    // Per round = 1000 cons cells across 1000 stack frames; total
+    // 5,000 cons allocations. The outer `iter` is tail-recursive so
+    // it stays O(1) on the C stack — the depth axis comes from
+    // `build_nontco`/`sum_list`.
     //
     // With the Task 12 wrapping in place the precise walker must:
-    //   - Find `acc` at every frame of the 100-deep `build` chain.
-    //   - Find `rest` at every frame of the 100-deep `sum_list` chain.
-    //   - Find `xs` at the calling `iter` frame across all 50 rounds.
+    //   - Find each build_nontco frame's in-flight live values at
+    //     every safepoint of the 1000-deep `build_nontco` chain.
+    //   - Find `rest` at every frame of the 1000-deep `sum_list`
+    //     chain.
+    //   - Find `xs` at the calling `iter` frame across all 5 rounds.
     //   - Walk all of the above from the captured FP without dipping
     //     into libgc's internal frames (PR #170's SIGSEGV root cause).
     //
-    // Per round sum = 100 * 101 / 2 = 5050. 50 rounds = 252_500.
+    // Per round sum = 1000 * 1001 / 2 = 500_500. 5 rounds = 2_502_500.
     let source = "import std.io\n\
                   type Cons = | Nil | C(Int, Cons)\n\
-                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                  fn build_nontco(n: Int) -> Cons ![] {\n  \
                     match n {\n    \
-                      0 => acc,\n    \
-                      _ => build(n - 1, C(n, acc)),\n  \
+                      0 => Nil,\n    \
+                      _ => C(n, build_nontco(n - 1)),\n  \
                     }\n\
                   }\n\
                   fn sum_list(c: Cons) -> Int ![] {\n  \
@@ -18829,13 +18834,13 @@ fn precise_walker_deep_chain_with_gc_pressure() {
                     match rounds {\n    \
                       0 => total,\n    \
                       _ => {\n      \
-                        let xs: Cons = build(depth, Nil);\n      \
+                        let xs: Cons = build_nontco(depth);\n      \
                         iter(rounds - 1, depth, total + sum_list(xs))\n    \
                       },\n  \
                     }\n\
                   }\n\
                   fn main() -> Int ![IO] {\n  \
-                    let total: Int = iter(50, 100, 0);\n  \
+                    let total: Int = iter(5, 1000, 0);\n  \
                     perform IO.println(int_to_string(total));\n  \
                     0\n\
                   }\n";
@@ -18843,24 +18848,27 @@ fn precise_walker_deep_chain_with_gc_pressure() {
         compile_and_run(source, "precise_walker_deep_chain_with_gc_pressure");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(code, 0, "deep chain with GC pressure must exit 0");
-    assert_eq!(stdout.trim_end(), "252500");
+    assert_eq!(stdout.trim_end(), "2502500");
 }
 
 #[test]
 fn precise_walker_deep_chain_under_cross_check() {
-    // Same shape as `precise_walker_deep_build_sum_chain`, but with
-    // `SIGIL_GC_CROSS_CHECK=1`. The cross-check fires at every
-    // `sigil_alloc` and asserts that every precise root the stackmap
-    // walker yields is (a) inside the calling thread's stack range
-    // and (b) heap-pointer-shaped per Boehm's view. A walker bug
-    // that surfaces a stale FP or a wrong frame_sp would diverge
-    // here on every safepoint along the 200-deep chain.
+    // Same shape as `precise_walker_deep_build_sum_chain` (1000-deep
+    // non-TCO recursion), but with `SIGIL_GC_CROSS_CHECK=1`. The
+    // cross-check fires at every `sigil_alloc` and asserts that
+    // every precise root the stackmap walker yields is (a) inside
+    // the calling thread's stack range and (b) heap-pointer-shaped
+    // per Boehm's view. A walker bug that surfaces a stale FP or a
+    // wrong frame_sp would diverge here on every safepoint along
+    // the 1000-deep chain — and because the cross-check fires at
+    // EVERY sigil_alloc (~1000 firings during the build), even a
+    // one-in-a-thousand walker bug surfaces deterministically.
     let source = "import std.io\n\
                   type Cons = | Nil | C(Int, Cons)\n\
-                  fn build(n: Int, acc: Cons) -> Cons ![] {\n  \
+                  fn build_nontco(n: Int) -> Cons ![] {\n  \
                     match n {\n    \
-                      0 => acc,\n    \
-                      _ => build(n - 1, C(n, acc)),\n  \
+                      0 => Nil,\n    \
+                      _ => C(n, build_nontco(n - 1)),\n  \
                     }\n\
                   }\n\
                   fn sum_list(c: Cons) -> Int ![] {\n  \
@@ -18870,7 +18878,7 @@ fn precise_walker_deep_chain_under_cross_check() {
                     }\n\
                   }\n\
                   fn main() -> Int ![IO] {\n  \
-                    let xs: Cons = build(200, Nil);\n  \
+                    let xs: Cons = build_nontco(1000);\n  \
                     perform IO.println(int_to_string(sum_list(xs)));\n  \
                     0\n\
                   }\n";
@@ -18890,6 +18898,6 @@ fn precise_walker_deep_chain_under_cross_check() {
         out
     };
     assert_no_cross_check_abort("deep_chain.sigil", &stderr, code);
-    assert_eq!(stdout.trim_end(), "20100");
+    assert_eq!(stdout.trim_end(), "500500");
     assert_eq!(code, 0);
 }
