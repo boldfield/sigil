@@ -16,6 +16,14 @@
 // outputs. Do not use for tokens, salts, session IDs, key material,
 // or any other security-relevant context.
 
+import std.int
+import std.int64
+import std.mem
+import std.mut_array
+use std.int.{int_abs, int_shl, int_shr, int_xor};
+use std.int64.{int64_to_int};
+use std.mem.{Mem};
+use std.mut_array.{mut_array_get, mut_array_new, mut_array_set};
 effect Random {
   rand_int: () -> Int,
 }

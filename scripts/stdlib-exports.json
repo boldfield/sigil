@@ -1,13 +1,52 @@
 {
   "std.array": [
+    "array_alloc",
+    "array_empty",
+    "array_get",
     "array_get_opt",
+    "array_length",
+    "array_set",
     "array_set_opt"
   ],
   "std.byte_array": [
+    "byte_array_alloc",
+    "byte_array_concat",
+    "byte_array_empty",
+    "byte_array_get",
     "byte_array_get_opt",
+    "byte_array_length",
+    "byte_array_slice",
     "byte_array_slice_opt",
     "byte_from_int",
-    "string_from_bytes"
+    "byte_in_range",
+    "byte_to_int",
+    "byte_truncate",
+    "string_byte_at",
+    "string_from_bytes",
+    "string_from_bytes_alloc",
+    "string_from_bytes_validate",
+    "string_length",
+    "string_to_bytes"
+  ],
+  "std.char": [
+    "char_eq",
+    "char_ge",
+    "char_gt",
+    "char_le",
+    "char_lt",
+    "char_to_int",
+    "char_to_string",
+    "int_to_char",
+    "is_ascii",
+    "is_ascii_alpha",
+    "is_ascii_alphanumeric",
+    "is_ascii_digit",
+    "is_ascii_whitespace",
+    "string_char_at",
+    "string_chars",
+    "string_from_chars",
+    "to_lower_ascii",
+    "to_upper_ascii"
   ],
   "std.choose": [
     "Choose",
@@ -18,6 +57,7 @@
   ],
   "std.clock": [
     "Clock",
+    "clock_os_now",
     "now",
     "run_frozen_clock",
     "run_os_clock"
@@ -28,7 +68,26 @@
     "env_vars"
   ],
   "std.float": [
-    "string_to_float"
+    "float_abs",
+    "float_add",
+    "float_ceil",
+    "float_div",
+    "float_eq",
+    "float_floor",
+    "float_from_int",
+    "float_ge",
+    "float_gt",
+    "float_le",
+    "float_lt",
+    "float_mul",
+    "float_neg",
+    "float_sqrt",
+    "float_sub",
+    "float_to_int",
+    "float_to_string",
+    "string_to_float",
+    "string_to_float_parse",
+    "string_to_float_validate"
   ],
   "std.format": [
     "ABool",
@@ -38,6 +97,11 @@
     "AInt64",
     "AString",
     "FormatArg",
+    "__arg_to_string",
+    "__fmt_close_brace",
+    "__fmt_flush_run",
+    "__fmt_open_brace",
+    "__fmt_walk",
     "format",
     "format1",
     "format2",
@@ -63,6 +127,7 @@
     "NotFound",
     "Other",
     "PermissionDenied",
+    "__tag_to_fs_error",
     "exists",
     "file_size",
     "is_dir",
@@ -75,10 +140,31 @@
     "write_file"
   ],
   "std.int": [
+    "int_abs",
     "int_add_safe",
     "int_max",
     "int_min",
-    "int_sub_safe"
+    "int_shl",
+    "int_shr",
+    "int_sub_safe",
+    "int_to_string",
+    "int_xor"
+  ],
+  "std.int64": [
+    "int64_add",
+    "int64_div",
+    "int64_eq",
+    "int64_from_int",
+    "int64_ge",
+    "int64_gt",
+    "int64_le",
+    "int64_lt",
+    "int64_mod",
+    "int64_mul",
+    "int64_neg",
+    "int64_sub",
+    "int64_to_int",
+    "int64_to_string"
   ],
   "std.io": [
     "IO"
@@ -96,6 +182,42 @@
     "JObject",
     "JString",
     "JValue",
+    "__json_at_eof",
+    "__json_byte_at_or_neg1",
+    "__json_is_digit",
+    "__json_is_keyword",
+    "__json_is_ws",
+    "__json_kw_len",
+    "__json_match_keyword_loop",
+    "__json_parse_array",
+    "__json_parse_array_body",
+    "__json_parse_array_elems",
+    "__json_parse_array_elems_tail",
+    "__json_parse_body",
+    "__json_parse_digits",
+    "__json_parse_negative_int",
+    "__json_parse_number",
+    "__json_parse_object",
+    "__json_parse_object_body",
+    "__json_parse_object_field_entry",
+    "__json_parse_object_field_value",
+    "__json_parse_object_fields",
+    "__json_parse_object_fields_tail",
+    "__json_parse_positive_int",
+    "__json_parse_string_inner",
+    "__json_parse_string_value",
+    "__json_parse_value",
+    "__json_print_array",
+    "__json_print_field",
+    "__json_print_list_head",
+    "__json_print_list_tail",
+    "__json_print_object",
+    "__json_print_object_head",
+    "__json_print_object_tail",
+    "__json_print_quoted",
+    "__json_print_value",
+    "__json_scan_string_end",
+    "__json_skip_ws",
     "json_parse",
     "json_render"
   ],
@@ -103,6 +225,15 @@
     "Cons",
     "List",
     "Nil",
+    "__array_to_list",
+    "__list_sort_split",
+    "__list_to_array",
+    "__list_to_array_acc",
+    "__merge",
+    "__merge_rev",
+    "__reverse_acc",
+    "__split",
+    "__split_walk",
     "append",
     "filter",
     "fold",
@@ -121,6 +252,28 @@
     "MapBranch",
     "MapLeaf",
     "MapNode",
+    "__map_decrease_level",
+    "__map_filter_acc",
+    "__map_fold_list",
+    "__map_from_list_acc",
+    "__map_get_node",
+    "__map_inorder",
+    "__map_insert_node",
+    "__map_keys_of",
+    "__map_level",
+    "__map_map_node",
+    "__map_max_branch",
+    "__map_min_branch",
+    "__map_rebalance_after_delete",
+    "__map_remove_at",
+    "__map_remove_node",
+    "__map_set_level",
+    "__map_skew",
+    "__map_skew_right_child",
+    "__map_skew_right_right_grandchild",
+    "__map_split",
+    "__map_split_right_child",
+    "__map_values_of",
     "map_char_keys",
     "map_contains",
     "map_empty",
@@ -139,15 +292,29 @@
     "map_to_list",
     "map_values"
   ],
+  "std.mem": [
+    "Mem"
+  ],
   "std.mut_array": [
+    "mut_array_get",
     "mut_array_get_opt",
+    "mut_array_length",
+    "mut_array_new",
+    "mut_array_set",
     "mut_array_set_opt"
   ],
   "std.mut_byte_array": [
+    "mut_byte_array_get",
     "mut_byte_array_get_opt",
+    "mut_byte_array_length",
+    "mut_byte_array_new",
+    "mut_byte_array_set",
     "mut_byte_array_set_opt"
   ],
   "std.option": [
+    "None",
+    "Option",
+    "Some",
     "and_then",
     "map",
     "unwrap_or"
@@ -157,6 +324,8 @@
     "Greater",
     "Less",
     "Ordering",
+    "__float_compare_non_nan",
+    "__string_compare_at",
     "bool_compare",
     "char_compare",
     "float_compare",
@@ -168,6 +337,10 @@
     "fst",
     "snd"
   ],
+  "std.panic": [
+    "assert",
+    "panic"
+  ],
   "std.process": [
     "NotFound",
     "Other",
@@ -177,6 +350,7 @@
     "run_list"
   ],
   "std.raise": [
+    "ArithError",
     "Raise",
     "catch",
     "raise"
@@ -184,17 +358,23 @@
   "std.random": [
     "Random",
     "random_int",
+    "random_pseudo_int",
     "run_pseudo_random",
     "run_seeded_random",
     "xorshift_step"
   ],
   "std.result": [
+    "Err",
+    "Ok",
+    "Result",
     "and_then",
     "map",
     "map_err"
   ],
   "std.set": [
     "Set",
+    "__set_from_list_acc",
+    "__set_subset_list",
     "set_char",
     "set_contains",
     "set_difference",
@@ -216,6 +396,7 @@
   ],
   "std.state": [
     "State",
+    "__set_then_arg",
     "run_state"
   ],
   "std.string": [
@@ -223,10 +404,26 @@
     "NonDecimal",
     "Overflow",
     "ParseError",
+    "__string_replace_acc",
+    "__string_split_acc",
     "string_byte_at_opt",
+    "string_concat",
+    "string_contains",
+    "string_ends_with",
+    "string_index_of",
     "string_replace",
     "string_split",
+    "string_starts_with",
+    "string_substring",
     "string_substring_opt",
-    "string_to_int"
+    "string_to_int",
+    "string_to_int_parse",
+    "string_to_int_validate",
+    "string_trim"
+  ],
+  "std.string_builder": [
+    "sb_append",
+    "sb_finalize",
+    "sb_new"
   ]
 }

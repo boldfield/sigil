@@ -65,7 +65,8 @@
 import std.array
 import std.list
 import std.result
-use std.list.{List};
+use std.list.{List, __list_to_array};
+use std.result.{Err, Ok, Result};
 
 type ProcessError =
   | NotFound

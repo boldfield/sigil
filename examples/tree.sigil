@@ -30,7 +30,9 @@
 // end-to-end run at 500ms on both CI hosts; the e2e test pins that
 // invariant alongside the stdout check.
 
+import std.int
 import std.io
+use std.int.{int_to_string};
 use std.io.{IO};
 
 type Tree = | Leaf | Node(Int, Tree, Tree)

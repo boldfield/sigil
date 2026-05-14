@@ -35,6 +35,10 @@
 //
 // Invariant: stdout reads `55\n` and the program exits 0.
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect Choose resumes: many { choose: (Int) -> Int }
 
 fn helper(seed: Int) -> Int ![Choose, IO] {

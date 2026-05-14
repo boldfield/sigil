@@ -20,11 +20,18 @@
 //     no recursive `let rec`. Adding either is a Plan-D-bridged
 //     extension; not blocking for the demo.
 
+import std.int
+import std.io
+import std.string
 import std.raise
 import std.result
 import std.ordering
+use std.int.{int_to_string};
+use std.io.{IO};
 use std.ordering.{Equal, string_compare};
 use std.raise.{Raise, catch, raise};
+use std.result.{Err, Ok, Result};
+use std.string.{string_concat};
 
 type Expr =
   | EVar(String)

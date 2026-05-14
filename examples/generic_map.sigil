@@ -50,7 +50,9 @@
 //   length(map(Cons(10, Cons(20, Cons(30, Nil)))))    = 3
 //   length(map(Cons("a", Cons("b", Nil))))            = 2
 
+import std.int
 import std.io
+use std.int.{int_to_string};
 use std.io.{IO};
 
 type List[A] = | Nil | Cons(A, List[A])

@@ -75,6 +75,7 @@
 // =====================================================================
 
 import std.option
+use std.option.{None, Option, Some};
 
 // `array_get_opt(arr, i)` returns `Some(elem)` if `i` is in range
 // (`0 <= i < length(arr)`) and `None` otherwise. Companion to the

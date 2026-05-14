@@ -61,9 +61,20 @@
 //   2 8 7 | 4 1 9 | 6 3 5
 //   3 4 5 | 2 8 6 | 1 7 9
 
+import std.int
+import std.io
+import std.mem
+import std.mut_array
+import std.raise
 import std.choose
 import std.option
-use std.choose.{Choose, first_choice, first_choice_helper};
+use std.choose.{Choose, first_choice};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.mem.{Mem};
+use std.mut_array.{mut_array_get, mut_array_new, mut_array_set};
+use std.option.{None, Option, Some};
+use std.raise.{ArithError};
 
 fn check_conflict(grid: MutArray[Int], target_idx: Int, i: Int, d: Int) -> Bool ![Mem, ArithError] {
   match i {
@@ -160,7 +171,11 @@ fn solve_with_undo(grid: MutArray[Int], idx: Int) -> Int ![Choose, Mem, IO, Arit
   let inner: Option[Int] = handle solve(grid, idx + 1) with {
     return(v) => Some(v),
     Choose.fail(k) => None,
-    Choose.choose(arg, k) => first_choice_helper(k, 0, arg),
+    // Crossing the `std.choose` abstraction boundary here: the
+    // helper is the inner loop of `first_choice`, exposed via
+    // qualified path so `solve_with_undo` can interpose its
+    // `mut_array_set` rollback between branch attempts.
+    Choose.choose(arg, k) => std.choose.first_choice_helper(k, 0, arg),
   };
   match inner {
     Some(v) => v,

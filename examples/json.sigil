@@ -13,12 +13,24 @@
 // `run_state(0, ...)` + `catch(...)` to discharge both effects,
 // returning `Result[JValue, String] ![]`.
 
+import std.byte_array
+import std.int
+import std.io
+import std.mem
+import std.string
 import std.string_builder
 import std.raise
 import std.result
 import std.state
+use std.byte_array.{byte_array_get, byte_array_length, byte_array_slice, byte_to_int, string_from_bytes_alloc, string_to_bytes};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.mem.{Mem};
 use std.raise.{Raise, catch, raise};
+use std.result.{Err, Ok, Result};
 use std.state.{State, run_state};
+use std.string.{string_concat};
+use std.string_builder.{sb_append, sb_finalize, sb_new};
 
 type JValue =
   | JNull

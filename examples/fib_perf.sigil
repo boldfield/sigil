@@ -26,7 +26,9 @@
 // with Plan B's effect handlers (which give us mutable-cell-style
 // patterns the Plan A2 language can't express).
 
+import std.int
 import std.io
+use std.int.{int_to_string};
 use std.io.{IO};
 
 fn fib(n: Int) -> Int ![] {

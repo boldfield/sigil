@@ -17,7 +17,9 @@
 //
 // Invariant: writes exactly "42\n-1\n" to stdout and exits 0.
 
+import std.int
 import std.io
+use std.int.{int_to_string};
 use std.io.{IO};
 
 type Option = | None | Some(Int)

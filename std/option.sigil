@@ -1,7 +1,10 @@
 // sigil: 0.1
 //
-// std/option.sigil — Plan C Task 62 + Option/Result prelude
-//                    (2026-05-10).
+// std/option.sigil — Plan C Task 62 + Plan F1 (2026-05-14).
+
+type Option[A] = | None | Some(A)
+
+// Plan C Task 62 + Option/Result prelude (2026-05-10):
 //
 // `Option[A]` represents an optional value: either `None` (absent)
 // or `Some(value)` (present). Sigil's nominal sum types make the

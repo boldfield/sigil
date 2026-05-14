@@ -1,7 +1,12 @@
+import std.int
+import std.io
 import std.state
 import std.raise
 import std.result
+use std.int.{int_to_string};
+use std.io.{IO};
 use std.raise.{Raise, catch};
+use std.result.{Err, Ok, Result};
 use std.state.{State, run_state};
 
 fn inner_body() -> Int ![State[Int], Raise[String]] {

@@ -299,13 +299,18 @@ mod tests {
 
     #[test]
     fn import_std_io_is_noop_via_skip_list() {
-        let src = "import std.io\nfn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n";
         let (resolved, errs) = pipeline_through_imports(src);
         assert!(errs.is_empty(), "errs: {errs:?}");
-        // Original Item::Import remains; nothing appended (io is in skip-list).
-        assert_eq!(resolved.items.len(), 2);
+        // Plan F1 — Import + Use + Fn = 3 items (was 2 pre-Plan-F1).
+        // `io.sigil` is on the skip-list so no stdlib items are
+        // appended; the user's own items are preserved.
+        assert_eq!(resolved.items.len(), 3);
         assert!(matches!(resolved.items[0], Item::Import(_)));
-        assert!(matches!(resolved.items[1], Item::Fn(_)));
+        assert!(matches!(resolved.items[1], Item::Use(_)));
+        assert!(matches!(resolved.items[2], Item::Fn(_)));
     }
 
     #[test]
@@ -330,11 +335,14 @@ mod tests {
         // path lookup against `io.sigil`. Since `io` is in the skip-list,
         // dedupe-vs-load isn't observable here; this test asserts the
         // skip-list covers duplicate-import too.
-        let src = "import std.io\nimport std.io\nfn main() -> Int ![IO] { 0 }\n";
+        let src = "import std.io\n\
+               import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { 0 }\n";
         let (resolved, errs) = pipeline_through_imports(src);
         assert!(errs.is_empty(), "errs: {errs:?}");
-        // Both Item::Imports remain; nothing appended.
-        assert_eq!(resolved.items.len(), 3);
+        // Plan F1 — Import + Import + Use + Fn = 4 items.
+        assert_eq!(resolved.items.len(), 4);
     }
 
     #[test]

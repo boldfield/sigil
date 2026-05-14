@@ -31,13 +31,72 @@ const SIGIL_KEYWORDS = new Set([
   "use", "as",
 ]);
 
-// Primitive / auto-prelude names — always available regardless of imports.
+// Primitive type names — always available regardless of imports.
+// Plan F1 (2026-05-14) removed Option/Result/Some/None/Ok/Err from
+// the auto-prelude — they now live in `std/option.sigil` and
+// `std/result.sigil` and require `import std.{option,result}` +
+// `use ...{names}` like every other stdlib name.
 const SIGIL_BUILTIN_NAMES = new Set([
   "Int", "Int64", "Float", "Bool", "String", "Char", "Byte", "Unit",
   "Array", "MutArray", "ByteArray", "MutByteArray", "StringBuilder",
   "Continuation",
-  "Option", "Result", "Some", "None", "Ok", "Err",
 ]);
+
+// Plan F1 — typecheck-injected builtin fns. Each is registered in
+// `compiler/src/typecheck.rs`'s `register_builtin_*` family; the
+// migration treats them as belonging to the matching doc-only stdlib
+// module (`std/X.sigil`) so the inserted `use std.X.{name};` line
+// resolves via the file-qualified scheme key the typechecker mirrors
+// onto these names. Keep in sync with
+// `compiler/src/typecheck.rs::BUILTIN_TO_MODULE_FILE`.
+const BUILTIN_FNS_BY_MODULE = {
+  "std.array": ["array_alloc", "array_empty", "array_length", "array_get", "array_set"],
+  "std.mut_array": ["mut_array_new", "mut_array_length", "mut_array_get", "mut_array_set"],
+  "std.byte_array": ["byte_array_alloc", "byte_array_empty", "byte_array_length",
+    "byte_array_get", "byte_array_concat", "byte_array_slice",
+    "string_to_bytes", "string_from_bytes_validate", "string_from_bytes_alloc",
+    "byte_in_range", "byte_truncate", "byte_to_int",
+    // string_byte_at / string_length are byte-level ops routed here
+    // to keep std.ordering off the std.string dep chain. See
+    // BUILTIN_TO_MODULE_FILE in compiler/src/typecheck.rs.
+    "string_byte_at", "string_length"],
+  "std.mut_byte_array": ["mut_byte_array_new", "mut_byte_array_length",
+    "mut_byte_array_get", "mut_byte_array_set"],
+  "std.int64": ["int64_from_int", "int64_neg", "int64_to_int", "int64_to_string",
+    "int64_add", "int64_sub", "int64_mul", "int64_div", "int64_mod",
+    "int64_eq", "int64_lt", "int64_le", "int64_gt", "int64_ge"],
+  "std.float": ["float_neg", "float_from_int", "float_to_int", "float_to_string",
+    "float_add", "float_sub", "float_mul", "float_div",
+    "float_eq", "float_lt", "float_le", "float_gt", "float_ge",
+    "float_abs", "float_floor", "float_ceil", "float_sqrt",
+    "string_to_float_validate", "string_to_float_parse"],
+  "std.char": ["char_to_int", "int_to_char", "char_to_string",
+    "char_eq", "char_lt", "char_le", "char_gt", "char_ge",
+    "is_ascii", "is_ascii_digit", "is_ascii_alpha",
+    "is_ascii_alphanumeric", "is_ascii_whitespace",
+    "to_lower_ascii", "to_upper_ascii",
+    "string_chars", "string_char_at", "string_from_chars"],
+  "std.string_builder": ["sb_new", "sb_append", "sb_finalize"],
+  "std.string": ["string_concat", "string_substring",
+    "string_starts_with", "string_ends_with", "string_contains",
+    "string_index_of", "string_trim",
+    "string_to_int_validate", "string_to_int_parse"],
+  "std.random": ["random_pseudo_int"],
+  "std.int": ["int_to_string", "int_add_safe", "int_sub_safe",
+    "int_xor", "int_shl", "int_shr", "int_abs"],
+  "std.clock": ["now", "clock_os_now"],
+  "std.panic": ["panic", "assert"],
+  // Effect names. The typechecker registers these in
+  // `builtin_effects()`; user code references them as `![IO]`,
+  // `![Mem]`, `![ArithError]`. Migration adds the corresponding
+  // `use` lines so the bare effect-row reference resolves.
+  "std.io": ["IO"],
+  "std.mem": ["Mem"],
+  "std.raise": ["ArithError"],
+  // Ref ops are file-gated to std/state.sigil; user code never
+  // references them so we don't list them here.
+  "std.ordering": ["string_compare"],
+};
 
 const IDENT_RE = /[A-Za-z_][A-Za-z0-9_]*/y;
 const IMPORT_RE = /^\s*import\s+([a-zA-Z0-9_.]+)(?:\s+as\s+([a-zA-Z_][a-zA-Z0-9_]*))?\s*;?\s*$/;
@@ -55,10 +114,18 @@ function stripLineComment(line) {
   return line.slice(0, idx);
 }
 
-// Walk `std/<X>.sigil` files and produce { byModule, byName }.
+// Walk `std/<X>.sigil` files and produce { byModule, byName }. Also
+// seeds the table with `BUILTIN_FNS_BY_MODULE` entries so typecheck-
+// injected builtins (which have no source declaration to scan) are
+// addressable by `use std.X.{name}` lines after the migration.
 function scanStdlib(repo) {
   const byModule = new Map();
   const byName = new Map();
+  for (const [module, names] of Object.entries(BUILTIN_FNS_BY_MODULE)) {
+    for (const name of names) {
+      addExport(byModule, byName, module, name);
+    }
+  }
   const stdDir = path.join(repo, "std");
   const files = fs.readdirSync(stdDir).filter((f) => f.endsWith(".sigil")).sort();
   for (const file of files) {
@@ -71,8 +138,14 @@ function scanStdlib(repo) {
       const mFn = FN_DECL_RE.exec(line);
       if (mFn) {
         inTypeBody = false;
-        const name = mFn[1];
-        if (!name.startsWith("__")) addExport(byModule, byName, module, name);
+        // Plan F1 includes `__`-prefixed (private-by-convention)
+        // fns in the exports table — cross-file references to them
+        // are an abstraction-boundary violation, but the migration
+        // shouldn't break the few historical sites that rely on it.
+        // The PR description / `__` convention itself is the
+        // existing soft warning; this script doesn't add a separate
+        // signal.
+        addExport(byModule, byName, module, mFn[1]);
         continue;
       }
       const mType = TYPE_DECL_RE.exec(line);
@@ -214,7 +287,43 @@ function extractIdentifiers(text) {
   return out;
 }
 
-// Idempotency probe: skip files that already contain a `use mod.{..};`.
+// Parse existing `use mod.{name1, name2 as alias};` lines into a
+// {module -> Set<localName>} map. The migration merges these with
+// computed bindings so re-running on already-migrated source is a
+// no-op.
+//
+// The regex matches both the single-brace form (the normal case)
+// and the doubled-brace form (`use mod.{{...}};` — what format!()
+// targets contain after migration's brace-escape pass). Without the
+// double-brace form, the strip step would miss those lines and the
+// migration would emit DUPLICATE use lines on re-run.
+const USE_LINE_PARSE_RE =
+  /^\s*use\s+([a-zA-Z0-9_.]+)\.\s*\{\{?([^}]*)\}\}?\s*;?\s*$/;
+function parseUseLines(text) {
+  const result = new Map();
+  for (const line of text.split("\n")) {
+    const m = USE_LINE_PARSE_RE.exec(line);
+    if (!m) continue;
+    const module = m[1];
+    const names = m[2]
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .map((s) => {
+        // Strip `name as alias` — we track local names but use the
+        // source name for the migration's bookkeeping.
+        const parts = s.split(/\s+as\s+/);
+        return parts[0];
+      });
+    if (!result.has(module)) result.set(module, new Set());
+    for (const n of names) result.get(module).add(n);
+  }
+  return result;
+}
+
+// True iff the file has any `use` line at all — kept for parity
+// with prior script versions; callers no longer treat this as a
+// hard skip.
 function alreadyMigrated(text) {
   for (const line of text.split("\n")) {
     if (USE_RE.test(line)) return true;
@@ -223,9 +332,97 @@ function alreadyMigrated(text) {
 }
 
 // Migrate a single .sigil source. Returns { text, manual }.
+//
+// Auto-import: bare references to names in `BUILTIN_FNS_BY_MODULE`
+// that don't yet have a corresponding `import std.X` line in the
+// file gain BOTH the import and the use binding, so e2e-test
+// fixtures that bare-reference `string_concat` / `int_to_string` /
+// etc. don't need to be hand-edited. The auto-import only kicks in
+// for unambiguous builtin names (the typecheck-injected fns whose
+// stdlib module is fixed by `BUILTIN_FNS_BY_MODULE`); user-fn
+// references still need an explicit import.
 function migrateSigilSource(text, exports, fileLabel) {
+  // Strip any existing `use` lines from the input so the migration
+  // produces fresh consolidated lines. Subsequent re-runs of the
+  // migration will then be no-ops (idempotent). Existing `use`s'
+  // local names are folded into the migration's name set via
+  // `parseUseLines` below so we don't lose user-meaningful bindings.
+  const existingUseBindings = parseUseLines(text);
+  text = text
+    .split("\n")
+    .filter((line) => !USE_LINE_PARSE_RE.test(line))
+    .join("\n");
+
   const imports = parseImports(text);
-  const importedModules = imports.map((i) => i.dotted);
+  const importedSetInitial = new Set(imports.map((i) => i.dotted));
+  // Self-import guard: a stdlib file `std/<X>.sigil` must not get an
+  // auto-injected `import std.X` (that's a circular self-import, E0033).
+  // The `fileLabel` carries the repo-relative path; derive the module
+  // name from `std/<name>.sigil` if applicable.
+  const m = /(?:^|[/\\])std[/\\]([^/\\]+)\.sigil(?:$|:)/.exec(fileLabel);
+  const selfModule = m ? `std.${m[1]}` : null;
+  // User-declared-name shadow detection: collect names declared as
+  // `fn X`, `type X`, `effect X`, or `type X = | A | B` (variants)
+  // in the source. The auto-import path skips names that collide
+  // with these so a user's local declaration keeps shadowing the
+  // stdlib version without forcing an explicit import / use line.
+  const userFnNames = new Set();
+  const FN_DECL_LINE_RE = /^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)/;
+  const TYPE_DECL_LINE_RE = /^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)/;
+  const EFFECT_DECL_LINE_RE = /^\s*effect\s+([A-Za-z_][A-Za-z0-9_]*)/;
+  const VARIANT_DECL_LINE_RE_G = /\|\s*([A-Z][A-Za-z0-9_]*)/g;
+  for (const line of text.split("\n")) {
+    const m2 = FN_DECL_LINE_RE.exec(line);
+    if (m2) userFnNames.add(m2[1]);
+    const mt = TYPE_DECL_LINE_RE.exec(line);
+    if (mt) userFnNames.add(mt[1]);
+    const me = EFFECT_DECL_LINE_RE.exec(line);
+    if (me) userFnNames.add(me[1]);
+    for (const v of line.matchAll(VARIANT_DECL_LINE_RE_G)) {
+      userFnNames.add(v[1]);
+    }
+  }
+  // Build a map from each name to its module — for unambiguous
+  // names — so bare references can auto-promote to an import + use.
+  // Includes both typecheck-injected builtins (BUILTIN_FNS_BY_MODULE)
+  // and stdlib-source fns scanned from `std/*.sigil`. Ambiguous
+  // names (multiple modules export them, e.g. `map`) are excluded
+  // here so the migration falls through to bucketing + manual review.
+  const builtinNameToModule = new Map();
+  for (const [module, names] of Object.entries(BUILTIN_FNS_BY_MODULE)) {
+    for (const name of names) builtinNameToModule.set(name, module);
+  }
+  for (const [name, mods] of exports.byName.entries()) {
+    if (mods.size === 1) {
+      const module = [...mods][0];
+      // Don't override builtins' module assignment.
+      if (!builtinNameToModule.has(name)) {
+        builtinNameToModule.set(name, module);
+      }
+    }
+  }
+
+  // Scan the body's bare identifiers first so we know which modules
+  // need to be auto-imported.
+  const allIdents = extractIdentifiers(text);
+  const seenForAutoImport = new Set();
+  const autoImports = new Set();
+  for (const tok of allIdents) {
+    if (seenForAutoImport.has(tok)) continue;
+    seenForAutoImport.add(tok);
+    if (SIGIL_BUILTIN_NAMES.has(tok)) continue;
+    // Don't auto-import for a builtin name that this file ALSO
+    // declares as a user fn — that's the explicit-shadow case
+    // (`fn int_to_string(s: String) -> String { s }` overriding
+    // the stdlib int_to_string).
+    if (userFnNames.has(tok)) continue;
+    const module = builtinNameToModule.get(tok);
+    if (module && module !== selfModule && !importedSetInitial.has(module)) {
+      autoImports.add(module);
+    }
+  }
+
+  const importedModules = [...imports.map((i) => i.dotted), ...autoImports];
   if (importedModules.length === 0) return { text, manual: [] };
   const importedSet = new Set(importedModules);
 
@@ -252,6 +449,11 @@ function migrateSigilSource(text, exports, fileLabel) {
   const useLinesByModule = new Map();
   const manual = [];
   for (const name of inOrder) {
+    // User-fn shadow: skip — the user has their own definition
+    // and adding a `use mod.{name}` line would either collide
+    // with the user fn (use-line E0147) or hijack their bare
+    // call to the stdlib version.
+    if (userFnNames.has(name)) continue;
     const producers = relevant.get(name);
     if (!producers) continue;
     if (producers.size === 1) {
@@ -265,7 +467,17 @@ function migrateSigilSource(text, exports, fileLabel) {
     }
   }
 
-  if (useLinesByModule.size === 0) return { text, manual };
+  // Note: we deliberately do NOT fold the original source's
+  // `existingUseBindings` back in. The bucketing above is the
+  // authoritative computation; preserving stale entries (e.g.,
+  // `use std.string.{string_length}` after `string_length`'s home
+  // moved to `std.byte_array`) would produce duplicate-use E0147
+  // errors. Names that aren't reachable via `extractIdentifiers` +
+  // bucketing weren't actually used by the file in any case.
+  void existingUseBindings;
+  if (useLinesByModule.size === 0 && autoImports.size === 0) {
+    return { text, manual };
+  }
 
   const newUseLines = [];
   for (const module of [...useLinesByModule.keys()].sort()) {
@@ -273,25 +485,65 @@ function migrateSigilSource(text, exports, fileLabel) {
     newUseLines.push(`use ${module}.{${names.join(", ")}};`);
   }
 
-  // Insert after the last `import` line.
+  // Build the import-injection prefix for modules we synthesised.
+  // Emit them at the top so they precede any existing imports; the
+  // `use` lines slot in after the last import below.
+  const newImportLines = [];
+  for (const module of [...autoImports].sort()) {
+    newImportLines.push(`import ${module}`);
+  }
+
+  // Insert auto-import lines at the top, then add use lines after
+  // the (possibly extended) last import line.
   const srcLines = text.split("\n");
-  // Note: trailing newline produces an empty final element with split.
-  let lastImportIdx = -1;
-  for (let idx = 0; idx < srcLines.length; idx++) {
-    if (IMPORT_RE.test(srcLines[idx])) lastImportIdx = idx;
+  // Find an insertion point for auto-imports. If the file starts
+  // with a `// sigil:` pragma or a doc comment block, insert AFTER
+  // them; otherwise insert at the top.
+  let insertImportsBefore = 0;
+  while (insertImportsBefore < srcLines.length) {
+    const l = srcLines[insertImportsBefore].trim();
+    if (l === "" || l.startsWith("//")) {
+      insertImportsBefore++;
+      continue;
+    }
+    break;
   }
-  if (lastImportIdx === -1) {
-    // No imports → unusual but possible. Emit at top.
-    return { text: newUseLines.join("\n") + "\n" + text, manual };
-  }
+  // Build the resulting line list.
   const out = [];
-  for (let idx = 0; idx < srcLines.length; idx++) {
+  let lastImportIdx = -1;
+  // Append auto-imports first, then resume from the original lines.
+  for (let idx = 0; idx < insertImportsBefore; idx++) {
     out.push(srcLines[idx]);
-    if (idx === lastImportIdx) {
-      for (const u of newUseLines) out.push(u);
+  }
+  for (const imp of newImportLines) {
+    out.push(imp);
+    lastImportIdx = out.length - 1;
+  }
+  // Walk the rest of the original file, tracking the absolute index
+  // of any existing import line in the output for the `use`-insert
+  // pass below.
+  for (let idx = insertImportsBefore; idx < srcLines.length; idx++) {
+    out.push(srcLines[idx]);
+    if (IMPORT_RE.test(srcLines[idx])) {
+      lastImportIdx = out.length - 1;
     }
   }
-  return { text: out.join("\n"), manual };
+  if (newUseLines.length === 0) {
+    return { text: out.join("\n"), manual };
+  }
+  if (lastImportIdx === -1) {
+    // No imports at all (auto or pre-existing). Emit use lines at
+    // the top.
+    return { text: newUseLines.join("\n") + "\n" + out.join("\n"), manual };
+  }
+  const final = [];
+  for (let idx = 0; idx < out.length; idx++) {
+    final.push(out[idx]);
+    if (idx === lastImportIdx) {
+      for (const u of newUseLines) final.push(u);
+    }
+  }
+  return { text: final.join("\n"), manual };
 }
 
 // Naive raw / plain Rust-string-literal scanner. We look for raw
@@ -414,14 +666,11 @@ function migrateE2eSource(text, exports, fileLabel) {
   text = walkRustStrings(text, (kind, body) => {
     if (!looksLikeSigil(body)) return null;
     // Format-string heuristic: bodies containing `{{` or `}}` are
-    // almost certainly `format!()` / `println!()` arguments. Inserting
-    // `use std.X.{name};` would be interpreted as a format placeholder
-    // by Rust at compile time. Plan: log to manual-review so the
-    // author edits the format string by hand.
-    if (body.includes("{{") || body.includes("}}")) {
-      manual.push(`${fileLabel}: ${kind}-string looks like a format!()/println!() target (contains \`{{\` / \`}}\`) — migrate manually`);
-      return null;
-    }
+    // `format!()` / `println!()` arguments. We still process them
+    // but emit the inserted `use mod.{name};` lines with their
+    // braces ALREADY escaped (`{{` / `}}`), so the format!()
+    // macro sees literal braces instead of placeholders.
+    const isFormatTarget = body.includes("{{") || body.includes("}}");
     let decoded;
     if (kind === "raw") {
       decoded = body;
@@ -457,7 +706,9 @@ function migrateE2eSource(text, exports, fileLabel) {
       }
       decoded = s;
     }
-    if (alreadyMigrated(decoded)) return null;
+    // alreadyMigrated check is intentionally omitted here:
+    // `migrateSigilSource` strips and re-emits use lines so the
+    // operation is idempotent on already-migrated literals.
     let newDecoded;
     try {
       const result = migrateSigilSource(
@@ -470,22 +721,63 @@ function migrateE2eSource(text, exports, fileLabel) {
       return null;
     }
     if (newDecoded === decoded) return null;
+    if (isFormatTarget) {
+      // The newly-added use lines need their braces escaped so the
+      // surrounding `format!()` / `println!()` macro doesn't
+      // interpret `{name}` as a positional placeholder. The body
+      // we got from `migrateSigilSource` has the new use lines
+      // appended with single-brace forms; locate them and double
+      // the braces. The body's pre-existing `{{` / `}}` (literal-
+      // brace escapes) stay untouched because they're not in the
+      // newly-added lines.
+      //
+      // Strategy: scan line-by-line, double-brace every line that
+      // begins with `use ` and contains `{`/`}`. Existing user
+      // `use` lines (rare in format!() targets) already had
+      // `{{` / `}}` if they were format-escaped, so doubling the
+      // single-brace form is the right call here.
+      const bodyLines = newDecoded.split("\n");
+      const escaped = bodyLines.map((l) => {
+        const trimmed = l.trimStart();
+        if (trimmed.startsWith("use ") && (l.includes("{") || l.includes("}"))) {
+          return l.replace(/\{/g, "{{").replace(/\}/g, "}}");
+        }
+        return l;
+      });
+      newDecoded = escaped.join("\n");
+    }
     if (kind === "raw") return newDecoded;
-    // Re-encode plain string. Escape backslash, double-quote, and
-    // newline. For multi-line bodies, emit Rust's line-continuation
-    // form `\n\<NL>               ` so the test source stays readable.
-    // The 15-space indent matches the typical `let src =` indent the
-    // e2e.rs tests use.
+    // Re-encode plain string. Escape backslash and double-quote
+    // first; then emit each newline as `\n` (preserving the
+    // original count) plus a Rust line-continuation `\<NL>...`
+    // EXCEPT for the trailing-content newline, which gets a plain
+    // `\n` so the decoded body doesn't gain or lose a final
+    // newline relative to the original.
     const escaped = newDecoded
       .replace(/\\/g, "\\\\")
       .replace(/"/g, '\\"');
     if (!escaped.includes("\n")) {
-      return escaped.replace(/\n/g, "\\n");
+      return escaped;
     }
     const lines = escaped.split("\n");
-    return lines
-      .map((line, idx) => (idx === lines.length - 1 ? line : line + "\\n\\\n               "))
-      .join("");
+    // `lines.length - 1` newline positions. For each position i:
+    //   - if i == lines.length - 2 AND lines[lines.length - 1] is
+    //     empty (i.e., the original body ended with `\n`), emit
+    //     just `\n` (trailing newline preserved).
+    //   - otherwise emit `\n\<NL>               ` (continuation).
+    const out = [];
+    for (let idx = 0; idx < lines.length; idx++) {
+      out.push(lines[idx]);
+      if (idx === lines.length - 1) break;
+      const isTrailingNewline =
+        idx === lines.length - 2 && lines[lines.length - 1] === "";
+      if (isTrailingNewline) {
+        out.push("\\n");
+      } else {
+        out.push("\\n\\\n               ");
+      }
+    }
+    return out.join("");
   });
   return { text, manual };
 }
@@ -542,10 +834,8 @@ function main() {
   let rewrites = 0;
   for (const p of sigilFiles) {
     const original = fs.readFileSync(p, "utf8");
-    if (alreadyMigrated(original)) {
-      if (args.verbose) console.log(`skip (already migrated): ${path.relative(repo, p)}`);
-      continue;
-    }
+    // alreadyMigrated short-circuit removed: migrateSigilSource is
+    // idempotent (strips + re-emits use lines).
     const { text: newText, manual } = migrateSigilSource(
       original, exports, path.relative(repo, p),
     );
@@ -557,25 +847,58 @@ function main() {
     }
   }
 
-  // e2e.rs pass.
-  const e2ePath = path.join(repo, "compiler", "tests", "e2e.rs");
-  let e2eRewrites = 0;
-  if (fs.existsSync(e2ePath)) {
-    const original = fs.readFileSync(e2ePath, "utf8");
+  // Rust-source-with-inline-Sigil pass. Walks every `.rs` file in
+  // `compiler/src/` and `compiler/tests/` that contains an `import
+  // std.` token (the cheap pre-filter for Sigil-source-bearing
+  // files) and applies the same migration to every string literal
+  // whose body looks like Sigil.
+  //
+  // `compiler/src/parser.rs` and `compiler/src/lexer.rs` are skipped
+  // because their inline Sigil literals are parser-specific test
+  // fixtures (e.g. `"use std.list.{map};\nfn main() ..."` testing
+  // the use-decl grammar) — the migration's strip-and-re-emit
+  // would erase the test-data shape we're trying to assert.
+  const SKIP_RUST_FILES = new Set([
+    "compiler/src/parser.rs",
+    "compiler/src/lexer.rs",
+    "compiler/src/resolve.rs",
+    "compiler/src/imports.rs",
+    // typecheck.rs holds the unit-test corpus: many tests
+    // deliberately omit imports to assert unknown-name / missing-
+    // effect diagnostics. The migration would re-add the imports
+    // and defeat the test premise; the few inline Sigil sources
+    // that DO want migration are intra-file edited.
+    "compiler/src/typecheck.rs",
+  ]);
+  const rustCandidates = [];
+  for (const sub of ["compiler/src", "compiler/tests"]) {
+    const dir = path.join(repo, sub);
+    if (!fs.existsSync(dir)) continue;
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.endsWith(".rs")) continue;
+      const rel = path.relative(repo, path.join(dir, f));
+      if (SKIP_RUST_FILES.has(rel)) continue;
+      rustCandidates.push(path.join(dir, f));
+    }
+  }
+  let rustRewrites = 0;
+  for (const p of rustCandidates) {
+    const original = fs.readFileSync(p, "utf8");
+    if (!original.includes("import std.")) continue;
     const { text: newText, manual } = migrateE2eSource(
-      original, exports, path.relative(repo, e2ePath),
+      original, exports, path.relative(repo, p),
     );
     for (const m of manual) manualAll.push(m);
     if (newText !== original) {
-      if (!args.dryRun) fs.writeFileSync(e2ePath, newText);
-      e2eRewrites = 1;
+      if (!args.dryRun) fs.writeFileSync(p, newText);
+      rustRewrites++;
     }
   }
 
   console.log("");
   console.log("=== migration report ===");
   console.log(`.sigil files touched: ${rewrites}`);
-  console.log(`e2e.rs touched: ${e2eRewrites}`);
+  console.log(`Rust-source files touched: ${rustRewrites}`);
   console.log(`manual-review entries: ${manualAll.length}`);
   if (manualAll.length > 0) {
     console.log("");

@@ -134,8 +134,11 @@ Things to notice (Plan F1): the `import` line names the module
 without binding any of its symbols; a separate `use mod.{name1,
 name2};` line opts specific names into the bare namespace of this
 file. Names not opt'd in can still be called qualified
-(`std.raise.raise(...)`). `Option`, `Result`, `Some`, `None`,
-`Ok`, `Err` are auto-prelude — always available without a `use`.
+(`std.raise.raise(...)`). There is no prelude — `Option`, `Result`,
+`Some`, `None`, `Ok`, `Err` come from `std.option` / `std.result`
+and require an explicit `import` + `use`. Primitive type names
+(`Int`, `String`, `Bool`, `Char`, `Float`, `Unit`, etc.) are the
+only globally-available names.
 
 Things to notice: `parse_pos`'s signature declares `![Raise]` — the
 type tells callers it can fail. `catch[A]` discharges `Raise` and
@@ -197,13 +200,14 @@ Without the `use` line, the call site must qualify:
 
 Two `use` lines in the same file that collide on a local name fire
 E0147; the fix is to alias one (`use std.option.{map as option_map}`)
-or remove one. There is no prelude beyond auto-injected
-`Option`/`Some`/`None`/`Result`/`Ok`/`Err` and primitive type names
-(`Int`, `String`, `Bool`, etc.) — every other symbol in a file
-must come from an `import` + `use` line, or be qualified at the
-call site. Wildcard `use mod.*;` is not supported (E0034): it
-would re-introduce the cross-module bare-name ambiguity that this
-design is built to close.
+or remove one. There is no prelude — primitive type names (`Int`,
+`String`, `Bool`, `Char`, `Float`, `Unit`, opaque `Array`, `MutArray`,
+`ByteArray`, `MutByteArray`, `Int64`, `StringBuilder`) are the only
+globally-available names. Every other symbol in a file must come
+from an `import` + `use` line, or be qualified at the call site.
+Wildcard `use mod.*;` is not supported (E0034): it would re-introduce
+the cross-module bare-name ambiguity that this design is built to
+close.
 
 ## What sigil deliberately is not
 

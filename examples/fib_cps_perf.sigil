@@ -66,6 +66,10 @@
 // See `[DEVIATION Task 60]` in `boldfield/designs/PLAN_B_DEVIATIONS.md`
 // for the architectural framing.
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect State { get: () -> Int, set: (Int) -> Int }
 
 fn fib(n: Int) -> Int ![State, IO] {

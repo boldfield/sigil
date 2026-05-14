@@ -51,7 +51,9 @@
 import std.array
 import std.list
 import std.result
-use std.list.{List};
+use std.array.{array_length};
+use std.list.{List, __array_to_list};
+use std.result.{Err, Ok, Result};
 
 // `FsError` variants — keep ordered so variant index N corresponds
 // to runtime tag N (NotFound = variant 0 = tag 1, etc.). Note: the

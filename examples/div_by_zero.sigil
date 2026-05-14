@@ -21,6 +21,8 @@
 // can assert the default arm fn fires. Do not run it from
 // `smoke.sh` as a success-path example; it is expected to abort.
 
+import std.raise
+use std.raise.{ArithError};
 fn main() -> Int ![ArithError] {
   let a: Int = 10;
   let b: Int = 0;

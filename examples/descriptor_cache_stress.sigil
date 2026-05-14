@@ -49,7 +49,9 @@
 // pressure would characterise the precise-marker mark-phase
 // savings — that's a Plan E2 follow-up, not this report.
 
+import std.int
 import std.io
+use std.int.{int_to_string};
 use std.io.{IO};
 
 type Tree = | Leaf | Node(Int, Tree, Tree)

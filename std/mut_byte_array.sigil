@@ -82,7 +82,10 @@
 // Pure-Sigil source-level wrappers (stdlib fallible-ops audit)
 // =====================================================================
 
+import std.mem
 import std.option
+use std.mem.{Mem};
+use std.option.{None, Option, Some};
 
 // `mut_byte_array_get_opt(ba, i)` returns `Some(byte)` if `i` is in
 // range and `None` otherwise. Companion to the panic-on-OOB

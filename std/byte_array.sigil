@@ -115,6 +115,7 @@
 // =====================================================================
 
 import std.option
+use std.option.{None, Option, Some};
 
 // `byte_from_int(n)` returns `Some(b)` for `0 <= n < 256` and
 // `None` otherwise. Bounds-checked companion to the unchecked

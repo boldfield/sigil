@@ -38,6 +38,7 @@ import std.option
 import std.list
 import std.ordering
 use std.list.{Cons, List, Nil};
+use std.option.{None, Option, Some};
 use std.ordering.{Equal, Greater, Less, Ordering, char_compare, int_compare, string_compare};
 
 // AA-tree node. `MapLeaf` is the empty subtree (its implicit

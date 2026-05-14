@@ -1,7 +1,10 @@
 // sigil: 0.1
 //
-// std/result.sigil — Plan C Task 63 + Option/Result prelude
-//                    (2026-05-10).
+// std/result.sigil — Plan C Task 63 + Plan F1 (2026-05-14).
+
+type Result[A, E] = | Ok(A) | Err(E)
+
+// Plan C Task 63 + Option/Result prelude (2026-05-10):
 //
 // `Result[A, E]` represents either a successful value (`Ok(value)`)
 // or an error (`Err(reason)`). Sigil's nominal sum types make the
