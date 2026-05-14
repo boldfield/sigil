@@ -54,21 +54,29 @@ The plan body's Tasks 11 + 12 will:
    `GC_push_all_eager(addr, addr + 8)`. This is the
    stackmap-driven precise root supply for the marker.
 
-3. **`sigil_alloc` does NOT need to flip back to active.** The
-   plan body's "thread registration discriminator" model is
-   simpler: while inside `GC_do_blocking`, Boehm marks the
-   thread's frames as inactive; allocations from
-   `GC_call_with_gc_active(sigil_alloc, ...)` work transparently
-   because `GC_malloc_explicitly_typed` doesn't require the
-   thread to be active — it just allocates. The precise walker
-   provides the roots; the alloc path does its work.
+3. **The `sigil_alloc`-from-blocked-thread shape is OPEN — Task
+   11 picks empirically.** Two design choices Task 11 must
+   choose between:
 
-   (Open question that Task 11's spike will resolve: whether
-   `sigil_alloc` needs to be wrapped in `GC_call_with_gc_active`
-   at all, or whether allocations from a "blocked" thread are
-   already permitted by libgc 8.x. The docs imply the latter via
-   `GC_do_blocking`'s caveat "the thread is not suspended", which
-   reads as "the thread can still call into the runtime".)
+   - **Option A: wrap `sigil_alloc` in
+     `GC_call_with_gc_active`.** Documented-safe per `gc.h`
+     line 1626-1636: *"the user function is allowed to call any
+     GC function and/or manipulate pointers to the garbage
+     collected heap."* Cost: every alloc pays the
+     active-state-switch overhead.
+   - **Option B: allow `sigil_alloc` to call from blocked
+     state.** Has no documented backing in `gc.h` — `GC_do_blocking`
+     says the thread "is not suspended" (which is about STW
+     signal handling, NOT about which GC entry points are safe
+     to call). Whether `GC_malloc_explicitly_typed` is safe
+     from a blocked thread is undocumented, so empirical
+     verification is the only path.
+
+   Phase 3's correctness hinges on this choice — Task 11 must
+   verify before committing. The most likely outcome is Option
+   A (cost is small + documented-stable), but a measured
+   comparison via the runtime test suite + the Phase 2 throughput
+   workloads is the discriminator.
 
 4. **Runtime-internal threads stay conservative.** The Plan E1
    profile drainer thread (`runtime/src/profile/cpu.rs`) is NOT
@@ -83,13 +91,21 @@ every thread; only the do_blocking wrapping differs.
 
 ## API reference (the surface Phase 3 will touch)
 
+The Sigil FFI uses `*const c_void` for `GC_stack_base *` rather
+than defining a Rust mirror of the struct, because every Sigil
+caller passes `NULL` and lets Boehm auto-detect the stack base
+via `GC_get_stack_base`. The `*const c_void` typing is how the
+existing `runtime/src/test_support.rs::GcThreadEnrolment` and
+the Phase 2 spike already declare the symbol; the spec below
+preserves that convention.
+
 ```rust
 // gc.h
 extern "C" {
     // Register the calling thread. Stack base auto-detected via
     // GC_get_stack_base(); we already use `GC_register_my_thread(NULL)`
     // in the runtime's test_support.
-    pub fn GC_register_my_thread(sb: *const GC_stack_base) -> i32;
+    pub fn GC_register_my_thread(sb: *const c_void) -> i32;
 
     // Run fn(cd) with the calling thread in "inactive" state.
     // The thread's frames belonging to fn are not scanned.
@@ -176,22 +192,39 @@ targets.
   Option 1 is the right shape. Task 11's deliverable will
   introduce the thread registry.
 
-- How the precise / conservative split interacts with
-  `SIGIL_GC_CROSS_CHECK` (the Plan E2 Phase 1 cross-check
-  harness). The cross-check walks the same stackmap data but
+- **TODO for Task 11/12:** the precise / conservative split
+  interacts with `SIGIL_GC_CROSS_CHECK` (Plan E2 Phase 1's
+  cross-check harness). The harness walks the stackmap and
   asserts every precise root address is heap-pointer-shaped
-  per Boehm's conservative recogniser. Post-Phase-3, when
-  Boehm no longer scans the Sigil-thread stack, the cross-check
-  is the only structure verifying the precise walker matches
-  the conservative-equivalent answer. Tasks 11 + 12 should
-  ensure the cross-check stays meaningful in this regime —
-  likely by running it explicitly via a debug-mode
-  `GC_call_with_gc_active` wrapper around the cross-check
-  itself, so Boehm sees the same stack frames the precise
-  walker reads.
+  per Boehm's conservative recogniser; post-Phase-3, when
+  Boehm no longer scans the Sigil-thread stack, the harness is
+  the only structure verifying the precise walker matches the
+  conservative-equivalent answer. Tasks 11/12 must explicitly
+  decide:
+  1. Whether the cross-check stays in production (it's already
+     `SIGIL_GC_CROSS_CHECK=1`-gated, so leaving it as-is is
+     option (a) — opt-in for debug runs).
+  2. Whether running it requires Boehm to see the Sigil-thread
+     frames (probably yes, otherwise the stackmap-derived
+     addresses can't be cross-validated against Boehm's view of
+     the stack). If yes, the harness needs to wrap its call site
+     in `GC_call_with_gc_active` so the active-state stack scan
+     re-engages briefly.
+
+  No design commitment here — Task 11's first iteration must
+  pick one of (1)/(2) and document the rationale.
 
 ## Stability
 
+- **`GC_set_push_other_roots` / `GC_get_push_other_roots` are
+  not internally synchronised.** Per `gc_mark.h:309`: *"Note that
+  both the setter and getter require some external synchronization
+  to avoid data race."* Sigil's mitigation: install the callback
+  exactly once, at runtime init, BEFORE any worker thread spawns.
+  Task 11 must document the discipline at the install site;
+  re-installation from a runtime worker thread (e.g., a future
+  profile-data hook) would race against the marker reading the
+  proc pointer during STW.
 - libgc 8.x exposes `GC_do_blocking`, `GC_call_with_gc_active`,
   and `GC_set_push_other_roots` as documented stable surface.
   No deprecation path through 8.x; these APIs trace back to

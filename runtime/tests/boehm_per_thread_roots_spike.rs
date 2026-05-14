@@ -30,19 +30,15 @@
 //
 // # What this spike does NOT test
 //
-// Validating that `GC_push_all_eager` actually keeps a pushed
-// range alive across GC requires that range to live somewhere
-// Boehm does NOT already auto-scan (data segment + registered
-// thread stacks + GC_add_roots ranges). A first cut of this
-// spike used a `static mut` as the "shadow root"; that's in
-// the data segment, so Boehm's auto-scan already covered it
-// and the test passed trivially without actually exercising
-// the callback. The cleaner verification — heap-alloc the
-// shadow root via libc `malloc`, register the callback to
-// push that range — is Task 11 territory where we have actual
-// stack frames excluded via `GC_do_blocking` and a real
-// stackmap walker to plumb in. For Task 10 (an API spike), the
-// "callback IS invoked" check is the load-bearing assertion.
+// See `runtime/docs/boehm-per-thread-roots-spike.md` →
+// "What this spike does NOT decide" for the canonical list.
+// Short version: the keep-alive contract of
+// `GC_push_all_eager` is Task 11's territory (it requires the
+// pushed range to live outside Boehm's auto-scan, which means
+// `GC_do_blocking` excluding the stack — Phase 3
+// implementation work). This spike's load-bearing assertion is
+// "the callback IS invoked from the marker"; everything else
+// is documented in the spike doc.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +67,22 @@ extern "C" {
     /// teardown step + by callbacks that want to chain to a
     /// previously-installed proc.
     fn GC_get_push_other_roots() -> Option<GcPushOtherRootsProc>;
+
+    // Per-thread state-toggle APIs (gc.h:1623, 1635). Tasks
+    // 11/12 use `GC_do_blocking` to opt Sigil program threads
+    // out of conservative stack scan; `GC_call_with_gc_active`
+    // is the documented inverse for re-entry. This spike
+    // link-checks the symbols on both target hosts so Task 11
+    // finds drift at spike-merge time, not at implementation
+    // time.
+    fn GC_do_blocking(
+        fn_: extern "C" fn(*mut c_void) -> *mut c_void,
+        cd: *mut c_void,
+    ) -> *mut c_void;
+    fn GC_call_with_gc_active(
+        fn_: extern "C" fn(*mut c_void) -> *mut c_void,
+        cd: *mut c_void,
+    ) -> *mut c_void;
 }
 
 type GcPushOtherRootsProc = extern "C" fn();
@@ -223,8 +235,13 @@ fn push_other_roots_getter_round_trips_setter() {
     };
 
     // Pointer-equality check: the proc Boehm hands back should
-    // be the one we installed. (Function pointer equality is
-    // well-defined across `extern "C"` callbacks.)
+    // be the one we installed. `fn_addr_eq`'s docstring warns
+    // about LTO dedup, but the comparison here is post-FFI-
+    // round-trip — Boehm stored the pointer; we read it back
+    // and compare against the original. The LTO-dedup caveat
+    // is about two distinct fn items potentially having the
+    // same address; round-tripping a known proc through C
+    // storage doesn't cross that boundary.
     assert!(
         std::ptr::fn_addr_eq(read_back, count_invocations as GcPushOtherRootsProc),
         "GC_get_push_other_roots returned a different proc than installed"
@@ -237,4 +254,99 @@ fn push_other_roots_getter_round_trips_setter() {
 extern "C" fn noop_push() {
     // No-op marker proc; used by the teardown steps + by
     // `push_other_roots_getter_round_trips_setter`'s teardown.
+}
+
+/// Sentinel value the do_blocking + call_with_gc_active smoke
+/// tests pass through their FFI round-trip; the test asserts the
+/// return value matches the input, proving the call path
+/// completed.
+const SMOKE_SENTINEL: usize = 0xDEAD_BEEF_C0DE_F00D;
+
+extern "C" fn smoke_returns_sentinel(cd: *mut c_void) -> *mut c_void {
+    // The smoke fn ignores its client-data argument and returns
+    // a known sentinel that the test asserts on. The argument
+    // is still validated as a round-trip below.
+    let _ = cd;
+    SMOKE_SENTINEL as *mut c_void
+}
+
+#[test]
+fn gc_do_blocking_resolves_and_returns() {
+    // Link-and-call smoke for `GC_do_blocking`. Confirms the
+    // symbol resolves on both target hosts (ubuntu-24.04 +
+    // macos-14) and that the trivial call path completes
+    // without crashing. Tasks 11 + 12 use `GC_do_blocking`
+    // to opt Sigil program threads out of conservative scan;
+    // discovering a link-time / runtime issue here is cheaper
+    // than discovering it during Task 11 implementation.
+    if !in_spike_subprocess() {
+        run_spike_in_subprocess("gc_do_blocking_resolves_and_returns");
+        return;
+    }
+    enrol_gc();
+
+    // SAFETY: smoke_returns_sentinel is `extern "C" fn` with the
+    // signature GC_do_blocking expects. The cd argument is not
+    // dereferenced by the callee.
+    let ret = unsafe { GC_do_blocking(smoke_returns_sentinel, std::ptr::null_mut()) };
+    assert_eq!(
+        ret as usize, SMOKE_SENTINEL,
+        "GC_do_blocking did not return the inner fn's value"
+    );
+}
+
+#[test]
+fn gc_call_with_gc_active_resolves_and_returns() {
+    // Link-and-call smoke for `GC_call_with_gc_active`. Same
+    // rationale as `gc_do_blocking_resolves_and_returns` — pin
+    // the symbol's presence on both target hosts so Task 11's
+    // first compile catches drift, not a deferred test failure.
+    //
+    // The interesting Task 11 case (do_blocking → run sigil
+    // code → call_with_gc_active wrapping sigil_alloc) is NOT
+    // exercised here — that's the empirical question Task 11
+    // resolves. This test only proves the symbol is callable
+    // standalone.
+    if !in_spike_subprocess() {
+        run_spike_in_subprocess("gc_call_with_gc_active_resolves_and_returns");
+        return;
+    }
+    enrol_gc();
+
+    // SAFETY: same as above; the smoke fn ignores its argument
+    // and returns SMOKE_SENTINEL.
+    let ret = unsafe { GC_call_with_gc_active(smoke_returns_sentinel, std::ptr::null_mut()) };
+    assert_eq!(
+        ret as usize, SMOKE_SENTINEL,
+        "GC_call_with_gc_active did not return the inner fn's value"
+    );
+}
+
+#[test]
+fn gc_do_blocking_passes_client_data_through() {
+    // Verify the cd argument round-trips correctly. Tasks 11 +
+    // 12 will pass closure-state pointers via cd to the
+    // do_blocking entry; a broken round-trip here would
+    // surface as silently-zero closure state in the production
+    // path.
+    if !in_spike_subprocess() {
+        run_spike_in_subprocess("gc_do_blocking_passes_client_data_through");
+        return;
+    }
+    enrol_gc();
+
+    extern "C" fn echo_cd(cd: *mut c_void) -> *mut c_void {
+        // Return the cd pointer unchanged so the test can verify
+        // round-trip correctness.
+        cd
+    }
+
+    let payload = 0x1234_5678_ABCD_EF01_usize as *mut c_void;
+    // SAFETY: echo_cd treats cd as opaque; the test passes a
+    // fabricated address that's never dereferenced.
+    let ret = unsafe { GC_do_blocking(echo_cd, payload) };
+    assert_eq!(
+        ret as usize, payload as usize,
+        "GC_do_blocking did not round-trip the cd argument"
+    );
 }
