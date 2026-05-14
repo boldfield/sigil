@@ -6182,22 +6182,40 @@ impl Tc {
                 let plan_f1_resolved = self.resolve_qualified_or_use_scheme(name);
                 let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
                 if let Some((_, ref canonical)) = plan_f1_resolved {
-                    // Record the canonical key for the AST rewrite
-                    // pass — but ONLY when the bare name actually
-                    // collides across files (≥2 origins). For
-                    // single-origin names like `int_to_string`, the
-                    // canonical key (`std.int.int_to_string`) is
-                    // computed for resolver use only — the AST
-                    // keeps the bare name so monomorphize / codegen
-                    // lookups by Expr::Ident continue to hit the
-                    // bare-key entry. Without this gate, ~498 e2e
-                    // tests trip the codegen `unreachable!` because
-                    // single-origin builtins get pointlessly mangled.
+                    // Plan F1 — record a rewrite target for the AST
+                    // post-pass. Three cases:
+                    //
+                    //   (a) Source form is dotted (user wrote
+                    //       `std.list.map(...)`) AND the bare suffix
+                    //       is non-colliding — rewrite the AST to the
+                    //       BARE suffix. Codegen / monomorphize keep
+                    //       their bare-keyed registries; the
+                    //       qualified-path surface is purely a
+                    //       resolver-time disambiguation.
+                    //   (b) Source form is bare AND the name
+                    //       collides (≥2 producing files) — rewrite
+                    //       to the canonical form (`std.list.map`)
+                    //       so codegen dispatches to the right
+                    //       module's fn after the Item::Fn rename
+                    //       pass mirrors `fn_schemes` onto the
+                    //       canonical key.
+                    //   (c) Otherwise (bare non-colliding, or dotted
+                    //       colliding) — no rewrite needed.
+                    let bare_suffix = name.rsplit('.').next().unwrap_or(name).to_string();
                     let is_colliding = self
                         .bare_name_origins
-                        .get(name)
+                        .get(&bare_suffix)
                         .is_some_and(|origins| origins.len() >= 2);
-                    if canonical != name && is_colliding {
+                    if name.contains('.') && !is_colliding {
+                        // (a): dotted source, non-colliding bare
+                        // suffix → AST goes bare.
+                        if bare_suffix != *name {
+                            self.resolved_idents
+                                .insert(span.clone(), bare_suffix.clone());
+                        }
+                    } else if !name.contains('.') && is_colliding && canonical != name {
+                        // (b): bare source, colliding → AST goes
+                        // canonical.
                         self.resolved_idents.insert(span.clone(), canonical.clone());
                     }
                 }

@@ -559,9 +559,9 @@ function migrateSigilSource(text, exports, fileLabel) {
 // "import std." inside backtick-quoted code suggestions).
 //
 // The heuristic requires both:
-//   - `import std.` or `fn ` near the start (after leading
-//     whitespace / line continuations) — Sigil programs lead with
-//     imports or fn decls.
+//   - A Sigil top-level form (`import std.`, `use `, `fn `,
+//     `type `, `effect `) near the start of the body, after any
+//     leading whitespace / line continuations.
 //   - A `\\n` escape (i.e., the Rust-source representation of a
 //     newline) somewhere in the body. Single-line strings — even
 //     ones containing `fn main()` as a documentation snippet —
@@ -582,17 +582,108 @@ function looksLikeSigil(body) {
     break;
   }
   const head = body.slice(i, i + 40);
-  return head.startsWith("import std.") || head.startsWith("fn ");
+  return (
+    head.startsWith("import std.") ||
+    head.startsWith("use ") ||
+    head.startsWith("fn ") ||
+    head.startsWith("type ") ||
+    head.startsWith("effect ")
+  );
 }
 
 // Walk Rust source character-by-character, applying `bodyTransform` to
 // the body of every string literal (plain `"..."`, raw `r"..."`,
 // raw-with-hashes `r#"..."#`). Comments, character literals, and
 // non-string code pass through verbatim. The transform receives the
-// raw body (with escapes intact for plain strings) and returns the
-// replacement body; it may also return `null` to indicate "leave the
-// literal untouched." Comments are skipped first so a `///` doc line
-// containing `"import std..."` doesn't masquerade as a string.
+// raw body (with escapes intact for plain strings), a `kind` of
+// `"raw"` or `"plain"`, a hash count for raw strings, AND an
+// `isFormatTarget` flag (true if the string is the first argument
+// of a Rust format-style macro like `format!()` / `println!()` /
+// `eprintln!()` / `write!()` / `writeln!()` / `panic!()`).
+// Comments are skipped first so a `///` doc line containing
+// `"import std..."` doesn't masquerade as a string.
+
+// Recognise the format-macro context by looking back from the
+// string-literal start for `<macro>!(...)` opener. The string is a
+// format target iff the macro name is one of the formatting macros
+// listed below and the literal is the FIRST argument (no preceding
+// `, ` between the `(` and the `"` start).
+const FORMAT_MACROS = new Set([
+  "format",
+  "println",
+  "print",
+  "eprintln",
+  "eprint",
+  "write",
+  "writeln",
+  "panic",
+  "todo",
+  "unimplemented",
+  "unreachable",
+  "format_args",
+  "assert",
+  "assert_eq",
+  "assert_ne",
+  "debug_assert",
+  "debug_assert_eq",
+  "debug_assert_ne",
+]);
+function isFormatMacroContext(text, stringStartIdx) {
+  // Walk backwards from stringStartIdx, skipping whitespace and any
+  // immediately preceding `,` (so the literal can be a non-first
+  // arg too — `format!(verb, "{x} hello")`).
+  let i = stringStartIdx - 1;
+  // First skip whitespace.
+  while (i >= 0 && /\s/.test(text[i])) i--;
+  if (i < 0) return false;
+  // For `format!("...")`, we must have `(` here (the macro's open
+  // paren) — direct adjacency means we're the first arg.
+  // For `format!(name = "...")` or `format!(other_arg, "...")`, we
+  // skip back past the previous arg + `,` + the `(`.
+  // The simplest sound check: walk back to find the nearest `!`
+  // followed by `(` with only commas and balanced parens / strings
+  // between, then take the identifier preceding `!`.
+  let depth = 0;
+  while (i >= 0) {
+    const c = text[i];
+    if (c === ")") {
+      depth++;
+      i--;
+      continue;
+    }
+    if (c === "(") {
+      if (depth === 0) {
+        // Found the opening paren of the enclosing call.
+        i--;
+        if (i >= 0 && text[i] === "!") {
+          // Macro call. Read the identifier preceding `!`.
+          i--;
+          let end = i;
+          while (i >= 0 && /[A-Za-z0-9_]/.test(text[i])) i--;
+          const name = text.slice(i + 1, end + 1);
+          return FORMAT_MACROS.has(name);
+        }
+        return false;
+      }
+      depth--;
+      i--;
+      continue;
+    }
+    // String literal — skip over it backwards crudely. Find the
+    // opening quote.
+    if (c === '"') {
+      let j = i - 1;
+      while (j >= 0 && !(text[j] === '"' && (j === 0 || text[j - 1] !== "\\"))) {
+        j--;
+      }
+      i = j - 1;
+      continue;
+    }
+    i--;
+  }
+  return false;
+}
+
 function walkRustStrings(text, bodyTransform) {
   const out = [];
   let i = 0;
@@ -648,7 +739,8 @@ function walkRustStrings(text, bodyTransform) {
               while (close < hashes && text[m] === "#") { close++; m++; }
               if (close === hashes) {
                 const body = text.slice(bodyStart, k);
-                const newBody = bodyTransform("raw", body, hashes);
+                const isFormatTarget = isFormatMacroContext(text, i);
+                const newBody = bodyTransform("raw", body, hashes, isFormatTarget);
                 const hash = "#".repeat(hashes);
                 if (newBody === null || newBody === body) {
                   out.push(text.slice(i, m));
@@ -677,7 +769,8 @@ function walkRustStrings(text, bodyTransform) {
       }
       if (k >= n) { out.push(text.slice(i)); break; }
       const body = text.slice(bodyStart, k);
-      const newBody = bodyTransform("plain", body, 0);
+      const isFormatTarget = isFormatMacroContext(text, i);
+      const newBody = bodyTransform("plain", body, 0, isFormatTarget);
       if (newBody === null || newBody === body) {
         out.push(text.slice(i, k + 1));
       } else {
@@ -694,14 +787,18 @@ function walkRustStrings(text, bodyTransform) {
 
 function migrateE2eSource(text, exports, fileLabel) {
   const manual = [];
-  text = walkRustStrings(text, (kind, body) => {
+  text = walkRustStrings(text, (kind, body, _hashes, isFormatTarget) => {
     if (!looksLikeSigil(body)) return null;
-    // Format-string heuristic: bodies containing `{{` or `}}` are
-    // `format!()` / `println!()` arguments. We still process them
-    // but emit the inserted `use mod.{name};` lines with their
-    // braces ALREADY escaped (`{{` / `}}`), so the format!()
-    // macro sees literal braces instead of placeholders.
-    const isFormatTarget = body.includes("{{") || body.includes("}}");
+    // `isFormatTarget` is true iff the surrounding Rust macro is a
+    // formatting macro (`format!()`, `println!()`, etc.). When set,
+    // the inserted `use mod.{name};` lines emit `{{` / `}}` so the
+    // macro sees literal braces instead of `{name}` placeholders.
+    //
+    // The pre-Plan-F1 heuristic checked the body content for `{{` /
+    // `}}` patterns — false-positives on plain Sigil source with
+    // adjacent `}}` from nested match arms. The new heuristic
+    // inspects the wrapping macro context (via
+    // `isFormatMacroContext` in `walkRustStrings`).
     let decoded;
     if (kind === "raw") {
       decoded = body;
