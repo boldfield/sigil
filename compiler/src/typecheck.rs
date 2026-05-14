@@ -2330,7 +2330,7 @@ fn rewrite_resolved_idents(
     program: &mut Program,
     resolved_idents: &BTreeMap<Span, String>,
     bare_name_origins: &BTreeMap<String, Vec<String>>,
-    fn_schemes: &mut BTreeMap<String, Scheme>,
+    _fn_schemes: &mut BTreeMap<String, Scheme>,
     stdlib_files: &BTreeSet<String>,
 ) {
     let mut collisions: BTreeSet<String> = BTreeSet::new();
@@ -2367,15 +2367,23 @@ fn rewrite_resolved_idents(
                 // is the same string the user would type to
                 // qualify the call.
                 let mangled = canonical_fn_key(&f.span.file, &f.name, stdlib_files);
-                // Mirror the bare-name scheme onto the mangled key
-                // so monomorphize / codegen lookups by the rewritten
-                // Ident name resolve. The dual-insert at fn
-                // registration already populated this key for the
-                // typical case; the insert here covers the post-
-                // rename path explicitly.
-                if let Some(scheme) = fn_schemes.get(&f.name).cloned() {
-                    fn_schemes.insert(mangled.clone(), scheme);
-                }
+                // Plan F1 (2026-05-14, re-review #4) — the previous
+                // "mirror the bare-name scheme onto the mangled key"
+                // step was REMOVED. The bare-name `fn_schemes` entry
+                // is last-wins across colliding fns, so for `map`
+                // with both `std.list` ([A, B]) and `generic_map`
+                // ([A]) declared, copying the bare scheme would
+                // overwrite the file-specific canonical entries
+                // with one fn's scheme — leaking the wrong arity
+                // into monomorphize's `fn_subst` and producing
+                // un-substituted `Ty::Var` survivors downstream.
+                //
+                // The dual-key insert at fn-registration time
+                // (`tc.fn_schemes.insert(qualified_key, scheme)`
+                // around line 1677) already writes each fn's own
+                // scheme to its canonical key, so no mirroring is
+                // needed here — every colliding fn already has the
+                // right entry under its `<module>.<name>` form.
                 same_file_rename.insert((f.span.file.clone(), f.name.clone()), mangled);
             }
         }
