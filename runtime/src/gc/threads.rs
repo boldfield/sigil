@@ -140,12 +140,15 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::Once;
 
-use crate::stackmap;
+// `crate::stackmap` is used only by Task 11's *future* callback
+// body (Task 12 fills it in). The current no-op callback doesn't
+// touch the stackmap walker; the qualified-path call to
+// `crate::stackmap::prewarm_for_stw()` is the only present
+// dependency. Keep the `use` removed until Task 12 reinstates it.
 
-// `GC_set_push_other_roots` + `GC_push_all_eager` are Phase 3-
-// specific; declared here. Tasks 12+ may fold them into the
-// parent extern block once production callers exist outside
-// this module.
+// `GC_set_push_other_roots` is Phase 3-specific; declared here.
+// Task 12 may fold it into the parent extern block once
+// production callers exist outside this module.
 //
 // `GC_allow_register_threads` + `GC_register_my_thread` are
 // intentionally NOT used by this module today — see the doc
@@ -154,6 +157,13 @@ use crate::stackmap;
 // when the empirical interaction with the marker is
 // characterised + sigil_alloc gains the `GC_do_blocking`
 // wrapping that makes the precise walker load-bearing.
+//
+// `GC_push_all_eager` is the call the precise walker WILL make
+// once Task 12 re-enables the walker body. Task 11's callback
+// is a no-op (see `push_sigil_thread_precise_roots` doc),
+// so the symbol isn't used yet — but the declaration stays
+// here so Task 12's diff is the callback body change only.
+#[allow(dead_code)]
 #[link(name = "gc")]
 extern "C" {
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
@@ -272,56 +282,59 @@ pub fn register_runtime_thread_for_conservative_roots() {
 }
 
 /// `GC_set_push_other_roots` callback. Boehm invokes this once
-/// per mark phase, from whatever thread holds the GC lock
-/// (typically the thread whose alloc triggered GC).
+/// per mark phase, from whatever thread holds the GC lock.
 ///
-/// For Sigil threads: walk the calling thread's stack via Plan
-/// E2 Phase 1's stackmap walker and push each precise root
-/// location as an 8-byte range via `GC_push_all_eager`. Uses
-/// the [`stackmap::walk_for_gc_with_callback`] closure variant,
-/// NOT the `Vec`-returning `walk_for_gc`: this callback runs
-/// inside Boehm's STW with all enrolled threads suspended; if
-/// `Vec::push` triggered a libc `malloc` and a suspended thread
-/// happened to hold libc's internal allocator lock, we'd
-/// deadlock. The closure variant streams roots without
-/// allocating.
+/// **Task 11's callback is intentionally a no-op for now.** PR
+/// #170 CI surfaced that walking the FP chain from inside this
+/// callback SIGSEGVs alloc-heavy workloads (`tree.sigil` exit
+/// code -1 with empty stdout). Root cause: the walker reads
+/// `current_caller_fp` then traverses the chain via
+/// `*fp` (saved_fp) reads (`stackmap::walk_for_gc_with_callback`).
+/// When this callback is invoked from inside Boehm's mark
+/// phase, the call chain passes through libgc internal
+/// functions — and libgc 8.x on both target hosts is compiled
+/// with optimisations that may omit frame pointers from
+/// internal frames. Walking through a frame-pointer-omitted
+/// libgc frame reads garbage as the next `saved_fp` value, and
+/// the subsequent `walk_frame` call dereferences an arbitrary
+/// address → SIGSEGV.
 ///
-/// For non-Sigil threads (runtime drainer; cargo-test workers
-/// in our integration-test process): no-op. The stackmap walker
-/// would either find no matching safepoint records (because the
-/// thread isn't running Sigil-emitted code) or produce garbage
-/// (if a runtime function's PC happened to coincide with a
-/// safepoint range — vanishingly unlikely but the gate is the
-/// principled mitigation).
+/// The Phase 3 design's `GC_do_blocking` + `GC_call_with_gc_active`
+/// boundary is the safe re-entry point: `sigil_alloc` would
+/// capture the user-level FP at the active-state boundary
+/// (where Sigil-emitted frames are still on top of the
+/// call chain, with conventional FP layout), and this
+/// callback would walk from THAT captured FP rather than
+/// `current_caller_fp` (which is somewhere inside libgc when
+/// the callback fires). That boundary is Task 12's territory
+/// — it ships the `GC_do_blocking` wrapping the captured-FP
+/// mechanism needs.
 ///
-/// **Single-Sigil-thread limitation.** This callback only walks
-/// the *calling* thread's stack. With Sigil today as
-/// single-Sigil-threaded + the runtime invariant that only
-/// Sigil threads call `sigil_alloc` (see module doc), GC always
-/// fires from the Sigil thread, which is the calling thread.
-/// If a future runtime worker calls `sigil_alloc` (and triggers
-/// GC), the callback runs on the worker — `IS_SIGIL_THREAD =
-/// false` — and Sigil's roots never get pushed. After Task 12
-/// disables conservative scan on the Sigil thread, that would
-/// silently collect live Sigil objects. The constraint
-/// "non-Sigil threads MUST NOT allocate from Boehm" is the
-/// runtime-side mitigation; see module doc.
+/// Until then, this callback is a no-op. The runtime side
+/// effect of Task 11 is therefore:
+/// - The discriminator API (`IS_SIGIL_THREAD` thread-local,
+///   the `register_*` functions) exists for Task 12 to
+///   build on.
+/// - The push_other_roots callback IS installed via
+///   `Once`-gated setter, so Task 12's wiring doesn't need
+///   to repeat the `gc_mark.h:309` external-sync mitigation.
+/// - The stackmap module's lazy initialisers ARE pre-warmed
+///   so future STW-time walks don't lazy-init inside the
+///   mark phase (the prewarm fix from commit 620a891 stays).
+///
+/// When Task 12 adds the captured-FP mechanism, the body of
+/// this function changes to read the captured FP + invoke
+/// `stackmap::walk_for_gc_with_callback_from(fp, …)` (a
+/// follow-up variant that takes the starting FP as a
+/// parameter instead of reading the current one). The
+/// boundary outside libgc → libgc internal frames don't get
+/// walked.
 extern "C" fn push_sigil_thread_precise_roots() {
-    let is_sigil = IS_SIGIL_THREAD.with(Cell::get);
-    if !is_sigil {
-        return;
-    }
-    stackmap::walk_for_gc_with_callback(|r| {
-        // SAFETY: the stack range [r.addr, r.addr + 8) lives on
-        // the calling thread's stack, which is suspended by
-        // Boehm's STW for the duration of the mark phase. Boehm
-        // owns the read. `GC_push_all_eager` does not allocate
-        // (it appends to Boehm's internal mark stack via lock-
-        // free updates).
-        let bottom = r.addr as *mut c_void;
-        let top = (r.addr.wrapping_add(8)) as *mut c_void;
-        unsafe { GC_push_all_eager(bottom, top) };
-    });
+    let _is_sigil = IS_SIGIL_THREAD.with(Cell::get);
+    // No-op — see fn doc-comment. Task 12 replaces the body
+    // with `walk_for_gc_with_callback_from(captured_fp, …)`
+    // once `sigil_alloc`'s `GC_do_blocking` boundary captures
+    // the user-level FP.
 }
 
 #[cfg(test)]

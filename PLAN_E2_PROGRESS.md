@@ -377,6 +377,25 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
     threaded user programs). Task 12 reintroduces the
     enrolment when the empirical work to characterise the
     parallel-marker interaction lands.
+- **`push_sigil_thread_precise_roots` callback is installed
+  but its body is a no-op.** PR #170 CI surfaced a second
+  failure mode: calling `stackmap::walk_for_gc_with_callback`
+  from inside the mark phase SIGSEGVs alloc-heavy workloads
+  (`tree.sigil` exit -1). Root cause: the walker reads
+  `current_caller_fp` and walks the chain via `*fp` reads;
+  when invoked from inside Boehm's mark phase, the call
+  chain passes through libgc internal frames that may be
+  compiled with `-fomit-frame-pointer`, so reading saved_fp
+  from those frames yields garbage and `walk_frame`
+  dereferences invalid memory. The Phase 3 design's
+  `GC_do_blocking` + `GC_call_with_gc_active` boundary
+  resolves this by capturing the user-level FP at the
+  active-state boundary (where Sigil-emitted frames are
+  still on top, with conventional FP layout); the callback
+  walks from THAT captured FP rather than `current_caller_fp`
+  (somewhere inside libgc when the callback fires). Task 12
+  ships the captured-FP mechanism + the callback body that
+  uses it.
 - `GC_set_push_other_roots(push_sigil_thread_precise_roots)` is
   installed at the first registration call (`Once`-gated;
   satisfies `gc_mark.h:309`'s "external synchronization

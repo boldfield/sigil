@@ -213,24 +213,9 @@ pub extern "C" fn sigil_gc_init() {
 
         // Plan E2 Phase 3 Task 11: register the calling thread
         // (the Sigil program's main thread) for precise stack
-        // roots. Sets the `IS_SIGIL_THREAD` thread-local +
-        // installs the `GC_set_push_other_roots` walker
-        // callback (Once-gated, runs exactly once per process
-        // before any worker thread spawns).
-        //
-        // No behaviour change YET — the precise walker pushes
-        // roots that are also covered by Boehm's conservative
-        // stack scan (still on). Task 12 disables conservative
-        // scan for Sigil threads, at which point the precise
-        // walker becomes the load-bearing root supply.
-        //
-        // Test-mode skip rationale matches the existing
-        // handler/arena registration above: under `cargo test`
-        // each #[test] runs on a fresh OS thread that gets
-        // torn down between tests; the per-thread state Boehm
-        // and the runtime accumulate would leak across tests
-        // without a symmetric drop. Tests that need the
-        // discriminator opt in via `gc::threads`'s test surface.
+        // roots. Sets IS_SIGIL_THREAD; installs the
+        // push_other_roots callback (Once-gated); pre-warms the
+        // stackmap module's lazy initialisers.
         crate::gc::threads::register_sigil_thread_for_precise_roots();
     }
 
