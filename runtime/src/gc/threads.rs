@@ -34,6 +34,37 @@
 //!   discipline is the project's mitigation — install before any
 //!   worker thread spawns, never re-install.
 //!
+//! # Runtime invariant — non-Sigil threads MUST NOT allocate from Boehm
+//!
+//! `push_sigil_thread_precise_roots` walks the calling thread's
+//! stack. Boehm invokes the callback once per mark phase, on
+//! whichever thread holds the GC lock — typically the thread
+//! whose alloc triggered GC. So if a non-Sigil thread allocates
+//! and triggers GC:
+//!
+//! 1. The callback runs on the non-Sigil thread.
+//! 2. `IS_SIGIL_THREAD = false` on that thread → callback
+//!    short-circuits, pushes no roots.
+//! 3. Post-Task-12 (when conservative scan is disabled on Sigil
+//!    threads), Sigil's stack roots are then pushed by NEITHER
+//!    Boehm's auto-scan (off for the Sigil thread) nor the
+//!    callback (running on the wrong thread).
+//! 4. Live Sigil heap objects are silently collected.
+//!
+//! Today the constraint is naturally satisfied: the only
+//! runtime-internal thread is the Plan E1 profile drainer
+//! (`runtime/src/profile/cpu.rs`), which never calls
+//! `sigil_alloc` — it shuffles `Vec<Sample>` between a Rust
+//! SPSC ring and a `Mutex<Vec<Sample>>` using the system
+//! allocator only. Any future runtime worker added to the
+//! codebase MUST preserve this invariant — or this design
+//! needs a multi-Sigil-thread registry walk (see "What this
+//! module does NOT do" below) before that worker lands.
+//!
+//! Surface the constraint at the drainer's registration site
+//! (`runtime/src/profile/cpu.rs::drainer_loop`) and at any
+//! future runtime worker's spawn site.
+//!
 //! # What this module does NOT do
 //!
 //! - **Does not flip Boehm's conservative stack scan off.** That's
@@ -52,14 +83,14 @@
 //!
 //! - **Does not multi-thread the registry.** Sigil today is
 //!   single-threaded; the registry is implicitly single-entry
-//!   (the main thread). When Sigil grows multi-threaded (post-
-//!   Plan-E2), this module's `IS_SIGIL_THREAD` thread-local +
-//!   `push_sigil_thread_precise_roots` callback together generalise:
-//!   each Sigil thread sets its TLS flag at registration; the
-//!   callback walks the calling thread's stack when invoked.
-//!   The cross-thread case (callback invoked on thread A wants to
-//!   walk thread B's stack) is a follow-up plan when multi-Sigil-
-//!   threading lands.
+//!   (the main thread). The "callback walks calling thread"
+//!   shape works because the runtime invariant above pins GC
+//!   to fire from the Sigil thread. A registry walk
+//!   (`Mutex<Vec<RegisteredSigilThread>>` iterated under the
+//!   callback, walking each Sigil thread's suspended-FP
+//!   snapshot) is the structural fix when either (a) Sigil
+//!   grows multiple program threads or (b) a runtime worker
+//!   needs to call `sigil_alloc`.
 
 use std::cell::Cell;
 use std::ffi::c_void;
@@ -67,19 +98,18 @@ use std::sync::Once;
 
 use crate::stackmap;
 
-// Boehm FFI surface this module touches. The
-// `GC_set_push_other_roots` + `GC_push_all_eager` symbols are
-// declared here rather than in `gc.rs`'s extern block because
-// they are Phase 3-specific; folding them into the parent
-// extern block stays an option once Tasks 11 + 12 have stable
-// callers. `GC_allow_register_threads` + `GC_register_my_thread`
-// are also already declared in `gc.rs`'s extern block (cfg(test)
-// only), but we need them outside test mode here for the
-// drainer-thread registration path.
+// Reuse `GC_allow_register_threads` + `GC_register_my_thread`
+// from the parent module's extern block (single source of
+// truth — duplicate declarations across modules would let
+// signature drift link to one or the other silently).
+// `GC_set_push_other_roots` + `GC_push_all_eager` are Phase 3-
+// specific; declared here. Tasks 12+ may fold them into the
+// parent extern block once production callers exist outside
+// this module.
+use super::{GC_allow_register_threads, GC_register_my_thread};
+
 #[link(name = "gc")]
 extern "C" {
-    fn GC_allow_register_threads();
-    fn GC_register_my_thread(stack_base: *const c_void) -> i32;
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
     fn GC_push_all_eager(bottom: *mut c_void, top: *mut c_void);
 }
@@ -142,7 +172,9 @@ fn install_push_other_roots_once() {
 
 /// Register the calling thread as a Sigil program thread. Sets
 /// the thread-local discriminator + ensures the precise-walker
-/// callback is installed.
+/// callback is installed + ensures `GC_allow_register_threads`
+/// has fired (so subsequent runtime-thread registrations on
+/// other threads can call `GC_register_my_thread` safely).
 ///
 /// **No `GC_register_my_thread` call.** Per `gc.h:1561-1562`,
 /// "This should never be called from the main thread, where it
@@ -151,13 +183,25 @@ fn install_push_other_roots_once() {
 /// register with Boehm — the implicit registration covers it.
 /// (When Sigil goes multi-threaded post-Plan-E2, this entry
 /// point will need to branch on "main vs not" and call
-/// `GC_register_my_thread` for non-main Sigil threads, after
-/// `GC_allow_register_threads`.)
+/// `GC_register_my_thread` for non-main Sigil threads.)
+///
+/// **Why `GC_allow_register_threads` fires here, not in the
+/// runtime-thread entry point:** per `gc.h:1547-1552`, the
+/// allow call must be made "from the main (or any previously
+/// registered) thread between the collector initialization and
+/// the first explicit registering of a thread (it should be
+/// called as late as possible)." Sigil's runtime structure
+/// guarantees `sigil_gc_init` (which calls this registration)
+/// runs on the main thread before any worker thread spawns,
+/// so the allow call lands on the main thread. Calling it
+/// later from the drainer would technically violate the docs,
+/// even though libgc 8.x tolerates it in practice.
 ///
 /// Idempotent: calling more than once is a no-op (the TLS flag
-/// is already set; the `Once` already fired).
+/// is already set; the `Once`s already fired).
 pub fn register_sigil_thread_for_precise_roots() {
     install_push_other_roots_once();
+    allow_register_threads_once();
     IS_SIGIL_THREAD.with(|f| f.set(true));
 }
 
@@ -199,8 +243,15 @@ pub fn register_runtime_thread_for_conservative_roots() {
 /// (typically the thread whose alloc triggered GC).
 ///
 /// For Sigil threads: walk the calling thread's stack via Plan
-/// E2 Phase 1's `stackmap::walk_for_gc()` and push each precise
-/// root location as an 8-byte range via `GC_push_all_eager`.
+/// E2 Phase 1's stackmap walker and push each precise root
+/// location as an 8-byte range via `GC_push_all_eager`. Uses
+/// the [`stackmap::walk_for_gc_with_callback`] closure variant,
+/// NOT the `Vec`-returning `walk_for_gc`: this callback runs
+/// inside Boehm's STW with all enrolled threads suspended; if
+/// `Vec::push` triggered a libc `malloc` and a suspended thread
+/// happened to hold libc's internal allocator lock, we'd
+/// deadlock. The closure variant streams roots without
+/// allocating.
 ///
 /// For non-Sigil threads (runtime drainer; cargo-test workers
 /// in our integration-test process): no-op. The stackmap walker
@@ -209,21 +260,35 @@ pub fn register_runtime_thread_for_conservative_roots() {
 /// (if a runtime function's PC happened to coincide with a
 /// safepoint range — vanishingly unlikely but the gate is the
 /// principled mitigation).
+///
+/// **Single-Sigil-thread limitation.** This callback only walks
+/// the *calling* thread's stack. With Sigil today as
+/// single-Sigil-threaded + the runtime invariant that only
+/// Sigil threads call `sigil_alloc` (see module doc), GC always
+/// fires from the Sigil thread, which is the calling thread.
+/// If a future runtime worker calls `sigil_alloc` (and triggers
+/// GC), the callback runs on the worker — `IS_SIGIL_THREAD =
+/// false` — and Sigil's roots never get pushed. After Task 12
+/// disables conservative scan on the Sigil thread, that would
+/// silently collect live Sigil objects. The constraint
+/// "non-Sigil threads MUST NOT allocate from Boehm" is the
+/// runtime-side mitigation; see module doc.
 extern "C" fn push_sigil_thread_precise_roots() {
     let is_sigil = IS_SIGIL_THREAD.with(Cell::get);
     if !is_sigil {
         return;
     }
-    let roots = stackmap::walk_for_gc();
-    for r in &roots {
+    stackmap::walk_for_gc_with_callback(|r| {
         // SAFETY: the stack range [r.addr, r.addr + 8) lives on
         // the calling thread's stack, which is suspended by
         // Boehm's STW for the duration of the mark phase. Boehm
-        // owns the read.
+        // owns the read. `GC_push_all_eager` does not allocate
+        // (it appends to Boehm's internal mark stack via lock-
+        // free updates).
         let bottom = r.addr as *mut c_void;
         let top = (r.addr.wrapping_add(8)) as *mut c_void;
         unsafe { GC_push_all_eager(bottom, top) };
-    }
+    });
 }
 
 #[cfg(test)]
@@ -285,6 +350,16 @@ mod tests {
         // even under --test-threads=1); without an explicit
         // register call, `IS_SIGIL_THREAD` should remain `false`.
         // No Boehm interaction → no subprocess needed.
+        //
+        // **Assumption**: every test in this module that calls
+        // `register_sigil_thread_for_precise_roots` runs in
+        // subprocess mode, so the flag never persists into a
+        // reused cargo-test worker thread. If a future test
+        // sets the flag without subprocess isolation, this test
+        // would non-deterministically fail when scheduled on
+        // the same worker. Future test additions: keep the
+        // discipline (subprocess-wrap any flag-setting test) OR
+        // run THIS test in a subprocess too.
         assert!(!is_sigil_thread());
     }
 

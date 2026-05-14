@@ -76,9 +76,14 @@ extern "C" {
     // `GC_gcollect` from such a thread triggers Boehm's "Collecting
     // from unknown thread" abort. Tests that need to force collection
     // must enrol their thread first.
-    #[cfg(test)]
+    // Plan E2 Phase 3 Task 11: thread enrolment is now production
+    // code (the discriminator in `gc::threads` calls these from
+    // both Sigil-thread and runtime-thread paths under cfg(not(test))).
+    // The `#[cfg(test)]` gate that was previously here would have
+    // caused link errors on the production runtime staticlib once
+    // the discriminator's runtime-thread path called
+    // `GC_register_my_thread` from `runtime/src/profile/cpu.rs`.
     pub(crate) fn GC_allow_register_threads();
-    #[cfg(test)]
     pub(crate) fn GC_register_my_thread(stack_base: *const c_void) -> i32;
     #[cfg(test)]
     pub(crate) fn GC_unregister_my_thread() -> i32;

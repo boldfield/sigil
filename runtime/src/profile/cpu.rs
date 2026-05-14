@@ -251,12 +251,20 @@ fn drainer_loop() {
     // conservative roots" registration. The drainer doesn't
     // touch GC-managed memory today (it shuffles `Vec<Sample>`
     // between a Rust SPSC ring and a `Mutex<Vec<Sample>>`), so
-    // un-registered would also work; this future-proofs against
-    // a runtime worker that DOES touch heap memory and needs
-    // STW suspension + conservative stack scan. The call also
-    // ensures the Phase 3 `push_other_roots` walker is installed
-    // (idempotent / Once-gated) regardless of which thread
-    // registers first.
+    // un-registered would also work for the current shape;
+    // explicit registration is the discriminator the
+    // `gc::threads` module surfaces, and it ensures Boehm
+    // suspends the drainer during STW so a future worker that
+    // grows heap-pointer-shaped values on its stack stays
+    // safe under conservative scan.
+    //
+    // **Constraint** (see `runtime/src/gc/threads.rs` module
+    // doc → "Runtime invariant"): runtime-internal threads
+    // MUST NOT call `sigil_alloc`. The drainer obeys this; any
+    // future worker added here must too. If a future worker
+    // needs heap allocation, the `gc::threads` design needs a
+    // multi-Sigil-thread registry walk before that worker
+    // lands.
     crate::gc::threads::register_runtime_thread_for_conservative_roots();
 
     let ring_ptr = CPU_RING_PTR.load(Ordering::Acquire);
