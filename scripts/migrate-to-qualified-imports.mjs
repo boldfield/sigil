@@ -582,13 +582,26 @@ function looksLikeSigil(body) {
     break;
   }
   const head = body.slice(i, i + 40);
-  return (
+  const looksLikeShape = (
     head.startsWith("import std.") ||
     head.startsWith("use ") ||
     head.startsWith("fn ") ||
     head.startsWith("type ") ||
     head.startsWith("effect ")
   );
+  if (!looksLikeShape) return false;
+  // Fragment-skip: a helper-style string fragment (`fn print_ints(...)
+  // { ... }`) with no `fn main` is meant to be concatenated INTO
+  // another test's `format!()` source via `{helper}` interpolation.
+  // Auto-injecting `import` and `use` lines into the fragment produces
+  // duplicate-use diagnostics (E0147) on concat, since the host
+  // source also has its own `use` lines for the same names. Skip
+  // these — the host test's own migration handles its bare names;
+  // the host author adds the fragment's incremental needs by hand.
+  // Detection: looks-like-Sigil shape AND no `fn main(` in body.
+  const hasMain = /\bfn\s+main\s*\(/.test(body);
+  if (!hasMain) return false;
+  return true;
 }
 
 // Walk Rust source character-by-character, applying `bodyTransform` to
@@ -707,17 +720,48 @@ function walkRustStrings(text, bodyTransform) {
       i = eol;
       continue;
     }
-    // Char literal `'x'` / `'\n'` / `'\\'`. Always 3-4 chars; we
-    // scan minimally to find the closing `'`.
+    // Char literal `'x'` / `'\n'` / `'\\'` / `'\u{1F600}'` — and
+    // Rust LIFETIMES like `&'static str`, `'a`, `'b` which use the
+    // same apostrophe sigil but are NOT delimited pairs. Without the
+    // lifetime branch the walker scans forward looking for the next
+    // `'` and eats through whatever code (including string literals)
+    // is between. e2e.rs hit this on `fn int_list_print_helper() ->
+    // &'static str` — the walker engulfed every later `let src =
+    // "..."` test source until the next `'` somewhere downstream,
+    // which is exactly the surface every "test source not migrated"
+    // failure pinned to.
     if (c === "'") {
-      const start = i;
-      i++;
-      while (i < n && text[i] !== "'") {
-        if (text[i] === "\\" && i + 1 < n) i += 2;
-        else i++;
+      // Probe the shape after the apostrophe to decide char vs
+      // lifetime. A valid Rust char literal is one of:
+      //   - `'X'`              (any single char other than `\` or `'`)
+      //   - `'\X'`             (one-char escape: `\n`, `\t`, `\0`, `\\`, `\'`, `\"`, `\r`)
+      //   - `'\xNN'`           (byte escape)
+      //   - `'\u{...}'`        (unicode escape)
+      // Anything else (`'static`, `'a`, `'_foo`) is treated as a
+      // lifetime — we emit just the apostrophe and move on so the
+      // walker keeps tracking strings correctly.
+      const next = text[i + 1];
+      let matched = -1;
+      if (next === "\\") {
+        if (text[i + 2] === "u" && text[i + 3] === "{") {
+          const close = text.indexOf("}", i + 4);
+          if (close !== -1 && text[close + 1] === "'") matched = close + 2;
+        } else if (text[i + 2] === "x" && /[0-9A-Fa-f]/.test(text[i + 3]) && /[0-9A-Fa-f]/.test(text[i + 4]) && text[i + 5] === "'") {
+          matched = i + 6;
+        } else if (text[i + 3] === "'") {
+          matched = i + 4;
+        }
+      } else if (next !== undefined && next !== "'" && text[i + 2] === "'") {
+        matched = i + 3;
       }
-      if (i < n) i++; // consume closing `'`
-      out.push(text.slice(start, i));
+      if (matched !== -1) {
+        out.push(text.slice(i, matched));
+        i = matched;
+        continue;
+      }
+      // Lifetime (or stray apostrophe). Consume just this char.
+      out.push(c);
+      i++;
       continue;
     }
     // Raw string `r"..."` / `r#"..."#` / `r##"..."##` etc.

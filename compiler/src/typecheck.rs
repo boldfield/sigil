@@ -6181,26 +6181,32 @@ impl Tc {
                 //      practice.
                 let plan_f1_resolved = self.resolve_qualified_or_use_scheme(name);
                 let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
-                if let Some((_, ref canonical)) = plan_f1_resolved {
-                    // Plan F1 — record a rewrite target for the AST
-                    // post-pass. Three cases:
-                    //
-                    //   (a) Source form is dotted (user wrote
-                    //       `std.list.map(...)`) AND the bare suffix
-                    //       is non-colliding — rewrite the AST to the
-                    //       BARE suffix. Codegen / monomorphize keep
-                    //       their bare-keyed registries; the
-                    //       qualified-path surface is purely a
-                    //       resolver-time disambiguation.
-                    //   (b) Source form is bare AND the name
-                    //       collides (≥2 producing files) — rewrite
-                    //       to the canonical form (`std.list.map`)
-                    //       so codegen dispatches to the right
-                    //       module's fn after the Item::Fn rename
-                    //       pass mirrors `fn_schemes` onto the
-                    //       canonical key.
-                    //   (c) Otherwise (bare non-colliding, or dotted
-                    //       colliding) — no rewrite needed.
+                // Plan F1 — compute the post-rewrite AST name. Three
+                // cases:
+                //
+                //   (a) Source form is dotted (user wrote
+                //       `std.list.map(...)`) AND the bare suffix
+                //       is non-colliding — rewrite the AST to the
+                //       BARE suffix. Codegen / monomorphize keep
+                //       their bare-keyed registries; the
+                //       qualified-path surface is purely a
+                //       resolver-time disambiguation.
+                //   (b) Source form is bare AND the name
+                //       collides (≥2 producing files) — rewrite
+                //       to the canonical form (`std.list.map`)
+                //       so codegen dispatches to the right
+                //       module's fn after the Item::Fn rename
+                //       pass mirrors `fn_schemes` onto the
+                //       canonical key.
+                //   (c) Otherwise (bare non-colliding, or dotted
+                //       colliding) — no rewrite needed.
+                //
+                // `ast_name` is the name the AST will carry after
+                // `rewrite_resolved_idents` runs; it must be threaded
+                // into `pending_call_instantiations` too so monomorphize's
+                // `name == &inst.name` equality guard still matches the
+                // (rewritten) Ident at the call site.
+                let ast_name: String = if let Some((_, ref canonical)) = plan_f1_resolved {
                     let bare_suffix = name.rsplit('.').next().unwrap_or(name).to_string();
                     let is_colliding = self
                         .bare_name_origins
@@ -6213,12 +6219,19 @@ impl Tc {
                             self.resolved_idents
                                 .insert(span.clone(), bare_suffix.clone());
                         }
+                        bare_suffix
                     } else if !name.contains('.') && is_colliding && canonical != name {
                         // (b): bare source, colliding → AST goes
                         // canonical.
                         self.resolved_idents.insert(span.clone(), canonical.clone());
+                        canonical.clone()
+                    } else {
+                        // (c): no rewrite.
+                        name.clone()
                     }
-                }
+                } else {
+                    name.clone()
+                };
                 // Plan F1 — strict qualified-imports resolution. Bare
                 // names without a `use` binding only resolve when they
                 // refer to an intra-file fn (`<current_fn_file>::<name>`).
@@ -6272,8 +6285,14 @@ impl Tc {
                     // non-generic case; recording it uniformly lets
                     // monomorphize key all top-level-fn references the
                     // same way regardless of genericity.
+                    //
+                    // Plan F1 — push the *post-rewrite* AST name so
+                    // monomorphize's `name == &inst.name` equality
+                    // guard matches the rewritten Ident at the call
+                    // site. The AST name was determined above by the
+                    // (a)/(b)/(c) rewrite decision.
                     self.pending_call_instantiations
-                        .push((span.clone(), name.clone(), fresh_ids));
+                        .push((span.clone(), ast_name, fresh_ids));
                     return Some(ty);
                 }
                 // Plan F1 — fn_env bare-name fallback removed.

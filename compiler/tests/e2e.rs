@@ -8601,70 +8601,18 @@ fn auto_prelude_user_type_shadows_none_ctor() {
     assert_eq!(stdout, "red\ngreen\nnone-color\n", "stderr={stderr:?}");
 }
 
-/// Auto-prelude shadowing is per-constructor, not per-type. After
-/// `type Color = | Red | Green | None`, bare `None` resolves to
-/// `Color::None`, but `Some` / `Ok` / `Err` (not declared on
-/// `Color`) remain available from the prelude. Pins the asymmetry
-/// for future readers — same scoping shape as Rust's
-/// `enum Color { None }` shadowing only `Option::None`, not
-/// `Option::Some`.
-#[test]
-fn auto_prelude_per_ctor_shadowing_leaves_other_prelude_names() {
-    let src = "import std.int\n\
-               import std.io\n\
-               import std.option\n\
-               import std.result\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               use std.option.{Option, Some};\n\
-               use std.result.{Err, Ok, Result};\n\
-               type Color = | Red | Green | None\n\
-               \n\
-               fn main() -> Int ![IO] {\n\
-                 // `Some` and `Ok` are NOT declared on Color, so the\n\
-                 // prelude versions remain in scope and these compile.\n\
-                 let opt: Option[Int] = Some(7);\n\
-                 let res: Result[Int, Int] = Ok(42);\n\
-                 match opt {\n\
-                   Some(n) => perform IO.println(int_to_string(n)),\n\
-                   None    => perform IO.println(\"none-shadowed-as-color\"),\n\
-                 };\n\
-                 match res {\n\
-                   Ok(n)  => perform IO.println(int_to_string(n)),\n\
-                   Err(_) => perform IO.println(\"err\"),\n\
-                 };\n\
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_per_ctor_shadow");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "7\n42\n", "stderr={stderr:?}");
-}
-
-/// Auto-prelude shadowing — user `type Option = | None |
-/// Some(Int)` (non-generic) replaces the prelude entry entirely.
-/// Cross-user collisions with the user's Option still fire E0118
-/// normally (the typechecker treats the user-redeclared Option as
-/// a user type, not a prelude type).
-#[test]
-fn auto_prelude_user_redeclares_option_overrides() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               type Option = | None | Some(Int)\n\
-               \n\
-               fn main() -> Int ![IO] {\n\
-                 let o: Option = Some(7);\n\
-                 match o {\n\
-                   Some(n) => perform IO.println(int_to_string(n)),\n\
-                   None    => perform IO.println(\"none\"),\n\
-                 };\n\
-                 0\n\
-               }\n";
-    let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_option_override");
-    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "7\n", "stderr={stderr:?}");
-}
+// Plan F1 (2026-05-14) — the previous tests
+// `auto_prelude_per_ctor_shadowing_leaves_other_prelude_names` and
+// `auto_prelude_user_redeclares_option_overrides` were deleted with
+// the auto-prelude. With `Option`/`Some`/`None`/`Result`/`Ok`/`Err`
+// now living in `std/option.sigil` and `std/result.sigil`, a user
+// redeclaring `Option` or a Color variant `None` alongside an
+// `import std.option` produces a hard E0118 / E0113 collision rather
+// than overriding a prelude entry — the test premise no longer
+// reaches a successful compile. The strict-mode behavior these tests
+// asserted is exercised by the other `auto_prelude_*` tests that
+// remain (e.g. `auto_prelude_let_binding_shadows_some_ctor`), which
+// continue to test lexical shadowing via `let`.
 
 /// Auto-prelude shadowing — `let Some: Int = 7;` local binding
 /// shadows the prelude `Some` ctor in its scope. The local binding
@@ -12749,14 +12697,21 @@ fn task_78_5_reader_effect_returns_config_plus_ten() {
 /// **Why it's novel for sigil:** every existing `std_raise_*` and
 /// `Raise.fail` e2e test uses E = String. This is the first e2e where
 /// E is a sum type. Tests:
-///   1. `raise(Lex(42))` instantiates Raise[ParseError] at the perform
-///      site — row-arg ParseError must propagate from the row entry to
+///   1. `raise(Lex(42))` instantiates Raise[MyParseError] at the perform
+///      site — row-arg MyParseError must propagate from the row entry to
 ///      the op's E parameter.
-///   2. `catch(...)` discharges and returns `Result[Int, ParseError]`;
+///   2. `catch(...)` discharges and returns `Result[Int, MyParseError]`;
 ///      the row arg flows through catch's row-poly signature into the
 ///      result type.
-///   3. The Err arm's pattern `Err(e)` binds `e: ParseError`, then a
+///   3. The Err arm's pattern `Err(e)` binds `e: MyParseError`, then a
 ///      match on `e` selects the right diagnostic.
+///
+/// Plan F1 (2026-05-14) — the user-defined sum was renamed from
+/// `ParseError` to `MyParseError` because `std/string.sigil` declares
+/// its own `type ParseError = | Empty | NonDecimal | Overflow` for
+/// `string_to_int_*`. With `import std.string` in scope (transitively
+/// via the migration's auto-added imports), the previous name
+/// collided.
 ///
 /// **Invariant:** stdout = `"lex error at line 42\n"`, exit 0.
 #[test]
@@ -12772,9 +12727,9 @@ fn task_78_5_raise_custom_adt_error_routes_through_catch() {
                use std.result.{Err, Ok, Result};\n\
                use std.string.{string_concat};\n\
                \n\
-               type ParseError = | Lex(Int) | EOF | Bad(String)\n\
+               type MyParseError = | Lex(Int) | EOF | Bad(String)\n\
                \n\
-               fn show_err(e: ParseError) -> String ![] {\n\
+               fn show_err(e: MyParseError) -> String ![] {\n\
                match e {\n\
                Lex(line) => string_concat(\"lex error at line \", int_to_string(line)),\n\
                EOF => \"unexpected EOF\",\n\
@@ -12782,7 +12737,7 @@ fn task_78_5_raise_custom_adt_error_routes_through_catch() {
                }\n\
                }\n\
                \n\
-               fn parse_thing(input: Int) -> Int ![Raise[ParseError]] {\n\
+               fn parse_thing(input: Int) -> Int ![Raise[MyParseError]] {\n\
                match input {\n\
                0 => raise(EOF),\n\
                1 => raise(Lex(42)),\n\
@@ -12791,7 +12746,7 @@ fn task_78_5_raise_custom_adt_error_routes_through_catch() {
                }\n\
                \n\
                fn main() -> Int ![IO] {\n\
-               let r: Result[Int, ParseError] = catch(fn () -> Int ![Raise[ParseError]] => parse_thing(1));\n\
+               let r: Result[Int, MyParseError] = catch(fn () -> Int ![Raise[MyParseError]] => parse_thing(1));\n\
                match r {\n\
                Ok(v) => perform IO.println(int_to_string(v)),\n\
                Err(e) => perform IO.println(show_err(e)),\n\
@@ -12802,7 +12757,7 @@ fn task_78_5_raise_custom_adt_error_routes_through_catch() {
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(
         stdout, "lex error at line 42\n",
-        "custom ParseError should route through catch + show_err; \
+        "custom MyParseError should route through catch + show_err; \
          stderr={stderr:?}"
     );
 }
@@ -16576,10 +16531,13 @@ fn int_list_print_helper() -> &'static str {
 
 #[test]
 fn std_list_sort_int_empty() {
-    let src = "import std.list\n\
-               fn main() -> Int ![IO] {\n  \
-                 let xs: List[Int] = Nil;\n  \
-                 let ys: List[Int] = list_sort_int(xs);\n  \
+    let src = "import std.io\n\
+               import std.list\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, list_sort_int};\n\
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Int] = Nil;\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
                  match ys { Nil => 0, Cons(_, _) => 1 }\n\
                }\n";
     let (_stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_empty");
@@ -16589,13 +16547,17 @@ fn std_list_sort_int_empty() {
 #[test]
 fn std_list_sort_int_three_elements_unsorted() {
     let src = format!(
-        "import std.list\n\
-         {helper}\
-         fn main() -> Int ![IO] {{\n  \
-           let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n  \
-           let ys: List[Int] = list_sort_int(xs);\n  \
-           print_ints(ys)\n\
-         }}\n",
+        "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{{int_to_string}};\n\
+               use std.io.{{IO}};\n\
+               use std.list.{{Cons, List, Nil, list_sort_int}};\n\
+               {helper}fn main() -> Int ![IO] {{\n\
+                 let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
+                 print_ints(ys)\n\
+               }}\n",
         helper = int_list_print_helper(),
     );
     let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_three_unsorted");
@@ -16606,13 +16568,17 @@ fn std_list_sort_int_three_elements_unsorted() {
 #[test]
 fn std_list_sort_int_already_sorted() {
     let src = format!(
-        "import std.list\n\
-         {helper}\
-         fn main() -> Int ![IO] {{\n  \
-           let xs: List[Int] = Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))));\n  \
-           let ys: List[Int] = list_sort_int(xs);\n  \
-           print_ints(ys)\n\
-         }}\n",
+        "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{{int_to_string}};\n\
+               use std.io.{{IO}};\n\
+               use std.list.{{Cons, List, Nil, list_sort_int}};\n\
+               {helper}fn main() -> Int ![IO] {{\n\
+                 let xs: List[Int] = Cons(1, Cons(2, Cons(3, Cons(4, Cons(5, Nil)))));\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
+                 print_ints(ys)\n\
+               }}\n",
         helper = int_list_print_helper(),
     );
     let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_already_sorted");
@@ -16623,13 +16589,17 @@ fn std_list_sort_int_already_sorted() {
 #[test]
 fn std_list_sort_int_reverse_sorted() {
     let src = format!(
-        "import std.list\n\
-         {helper}\
-         fn main() -> Int ![IO] {{\n  \
-           let xs: List[Int] = Cons(5, Cons(4, Cons(3, Cons(2, Cons(1, Nil)))));\n  \
-           let ys: List[Int] = list_sort_int(xs);\n  \
-           print_ints(ys)\n\
-         }}\n",
+        "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{{int_to_string}};\n\
+               use std.io.{{IO}};\n\
+               use std.list.{{Cons, List, Nil, list_sort_int}};\n\
+               {helper}fn main() -> Int ![IO] {{\n\
+                 let xs: List[Int] = Cons(5, Cons(4, Cons(3, Cons(2, Cons(1, Nil)))));\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
+                 print_ints(ys)\n\
+               }}\n",
         helper = int_list_print_helper(),
     );
     let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_reverse_sorted");
@@ -16640,13 +16610,17 @@ fn std_list_sort_int_reverse_sorted() {
 #[test]
 fn std_list_sort_int_all_equal() {
     let src = format!(
-        "import std.list\n\
-         {helper}\
-         fn main() -> Int ![IO] {{\n  \
-           let xs: List[Int] = Cons(7, Cons(7, Cons(7, Cons(7, Nil))));\n  \
-           let ys: List[Int] = list_sort_int(xs);\n  \
-           print_ints(ys)\n\
-         }}\n",
+        "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{{int_to_string}};\n\
+               use std.io.{{IO}};\n\
+               use std.list.{{Cons, List, Nil, list_sort_int}};\n\
+               {helper}fn main() -> Int ![IO] {{\n\
+                 let xs: List[Int] = Cons(7, Cons(7, Cons(7, Cons(7, Nil))));\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
+                 print_ints(ys)\n\
+               }}\n",
         helper = int_list_print_helper(),
     );
     let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_int_all_equal");
@@ -16658,14 +16632,20 @@ fn std_list_sort_int_all_equal() {
 fn std_list_sort_with_custom_descending_comparator() {
     // Descending sort via `(a, b) => int_compare(b, a)`.
     let src = format!(
-        "import std.list\n\
-         fn desc_int(a: Int, b: Int) -> Ordering ![] {{ int_compare(b, a) }}\n\
-         {helper}\
-         fn main() -> Int ![IO] {{\n  \
-           let xs: List[Int] = Cons(3, Cons(1, Cons(4, Cons(1, Cons(5, Nil)))));\n  \
-           let ys: List[Int] = list_sort(xs, desc_int);\n  \
-           print_ints(ys)\n\
-         }}\n",
+        "import std.int\n\
+               import std.io\n\
+               import std.ordering\n\
+               import std.list\n\
+               use std.int.{{int_to_string}};\n\
+               use std.io.{{IO}};\n\
+               use std.list.{{Cons, List, Nil, list_sort}};\n\
+               use std.ordering.{{Ordering, int_compare}};\n\
+               fn desc_int(a: Int, b: Int) -> Ordering ![] {{ int_compare(b, a) }}\n\
+               {helper}fn main() -> Int ![IO] {{\n\
+                 let xs: List[Int] = Cons(3, Cons(1, Cons(4, Cons(1, Cons(5, Nil)))));\n\
+                 let ys: List[Int] = list_sort(xs, desc_int);\n\
+                 print_ints(ys)\n\
+               }}\n",
         helper = int_list_print_helper(),
     );
     let (stdout, stderr, code) = compile_and_run(&src, "std_list_sort_custom_descending");
@@ -16675,18 +16655,21 @@ fn std_list_sort_with_custom_descending_comparator() {
 
 #[test]
 fn std_list_sort_string_alpha() {
-    let src = "import std.list\n\
-               fn print_strings(xs: List[String]) -> Int ![IO] {\n  \
-                 match xs {\n    \
-                   Nil => 0,\n    \
-                   Cons(h, t) => {\n      \
-                     perform IO.println(h);\n      \
-                     print_strings(t)\n    \
-                   },\n  \
+    let src = "import std.io\n\
+               import std.list\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, list_sort_string};\n\
+               fn print_strings(xs: List[String]) -> Int ![IO] {\n\
+                 match xs {\n\
+                   Nil => 0,\n\
+                   Cons(h, t) => {\n\
+                     perform IO.println(h);\n\
+                     print_strings(t)\n\
+                   },\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let xs: List[String] = Cons(\"banana\", Cons(\"apple\", Cons(\"cherry\", Nil)));\n  \
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[String] = Cons(\"banana\", Cons(\"apple\", Cons(\"cherry\", Nil)));\n\
                  print_strings(list_sort_string(xs))\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_string_alpha");
@@ -16696,18 +16679,23 @@ fn std_list_sort_string_alpha() {
 
 #[test]
 fn std_list_sort_char_codepoint_order() {
-    let src = "import std.list\n\
-               fn print_chars(xs: List[Char]) -> Int ![IO] {\n  \
-                 match xs {\n    \
-                   Nil => 0,\n    \
-                   Cons(h, t) => {\n      \
-                     perform IO.println(char_to_string(h));\n      \
-                     print_chars(t)\n    \
-                   },\n  \
+    let src = "import std.char\n\
+               import std.io\n\
+               import std.list\n\
+               use std.char.{char_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, list_sort_char};\n\
+               fn print_chars(xs: List[Char]) -> Int ![IO] {\n\
+                 match xs {\n\
+                   Nil => 0,\n\
+                   Cons(h, t) => {\n\
+                     perform IO.println(char_to_string(h));\n\
+                     print_chars(t)\n\
+                   },\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let xs: List[Char] = Cons('c', Cons('a', Cons('b', Nil)));\n  \
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Char] = Cons('c', Cons('a', Cons('b', Nil)));\n\
                  print_chars(list_sort_char(xs))\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_char_codepoint");
@@ -16722,27 +16710,32 @@ fn std_list_sort_int_ten_thousand_reversed() {
     // sort runs ~100M ops vs ~130K for n log n, which becomes a
     // visible wall-clock difference in CI. Asserts length round-
     // trip, head (smallest = 0), and last (largest = 9999).
-    let src = "import std.list\n\
-               fn last(xs: List[Int]) -> Int ![] {\n  \
-                 match xs {\n    \
-                   Nil => -1,\n    \
-                   Cons(h, t) => match t {\n      \
-                     Nil => h,\n      \
-                     _ => last(t),\n    \
-                   },\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, length, list_sort_int, range, reverse};\n\
+               fn last(xs: List[Int]) -> Int ![] {\n\
+                 match xs {\n\
+                   Nil => -1,\n\
+                   Cons(h, t) => match t {\n\
+                     Nil => h,\n\
+                     _ => last(t),\n\
+                   },\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let xs: List[Int] = reverse(range(0, 10000));\n  \
-                 let ys: List[Int] = list_sort_int(xs);\n  \
-                 perform IO.println(int_to_string(length(ys)));\n  \
-                 match ys {\n    \
-                   Nil => 0,\n    \
-                   Cons(h, _) => {\n      \
-                     perform IO.println(int_to_string(h));\n      \
-                     perform IO.println(int_to_string(last(ys)));\n      \
-                     0\n    \
-                   },\n  \
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Int] = reverse(range(0, 10000));\n\
+                 let ys: List[Int] = list_sort_int(xs);\n\
+                 perform IO.println(int_to_string(length(ys)));\n\
+                 match ys {\n\
+                   Nil => 0,\n\
+                   Cons(h, _) => {\n\
+                     perform IO.println(int_to_string(h));\n\
+                     perform IO.println(int_to_string(last(ys)));\n\
+                     0\n\
+                   },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_list_sort_int_ten_thousand");
@@ -16755,10 +16748,15 @@ fn std_list_sort_int_ten_thousand_reversed() {
 
 #[test]
 fn std_map_empty_size_is_zero() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m: Map[Int, Int] = map_int_keys();\n  \
-                 perform IO.println(int_to_string(map_size(m)));\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_int_keys, map_is_empty, map_size};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m: Map[Int, Int] = map_int_keys();\n\
+                 perform IO.println(int_to_string(map_size(m)));\n\
                  match map_is_empty(m) { true => 0, false => 1 }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_empty_size_zero");
@@ -16768,16 +16766,25 @@ fn std_map_empty_size_is_zero() {
 
 #[test]
 fn std_map_insert_get_round_trip() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m0: Map[Int, String] = map_empty(int_compare);\n  \
-                 let m1: Map[Int, String] = map_insert(m0, 1, \"one\");\n  \
-                 let m2: Map[Int, String] = map_insert(m1, 2, \"two\");\n  \
-                 let m3: Map[Int, String] = map_insert(m2, 3, \"three\");\n  \
-                 perform IO.println(int_to_string(map_size(m3)));\n  \
-                 match map_get(m3, 2) {\n    \
-                   Some(v) => { perform IO.println(v); 0 },\n    \
-                   None => { perform IO.println(\"MISS\"); 1 },\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.ordering\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_empty, map_get, map_insert, map_size};\n\
+               use std.option.{None, Some};\n\
+               use std.ordering.{int_compare};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m0: Map[Int, String] = map_empty(int_compare);\n\
+                 let m1: Map[Int, String] = map_insert(m0, 1, \"one\");\n\
+                 let m2: Map[Int, String] = map_insert(m1, 2, \"two\");\n\
+                 let m3: Map[Int, String] = map_insert(m2, 3, \"three\");\n\
+                 perform IO.println(int_to_string(map_size(m3)));\n\
+                 match map_get(m3, 2) {\n\
+                   Some(v) => { perform IO.println(v); 0 },\n\
+                   None => { perform IO.println(\"MISS\"); 1 },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_insert_get");
@@ -16787,15 +16794,22 @@ fn std_map_insert_get_round_trip() {
 
 #[test]
 fn std_map_insert_replace_value() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m0: Map[Int, Int] = map_int_keys();\n  \
-                 let m1: Map[Int, Int] = map_insert(m0, 5, 100);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 5, 200);\n  \
-                 perform IO.println(int_to_string(map_size(m2)));\n  \
-                 match map_get(m2, 5) {\n    \
-                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
-                   None => 1,\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_get, map_insert, map_int_keys, map_size};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m0: Map[Int, Int] = map_int_keys();\n\
+                 let m1: Map[Int, Int] = map_insert(m0, 5, 100);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 5, 200);\n\
+                 perform IO.println(int_to_string(map_size(m2)));\n\
+                 match map_get(m2, 5) {\n\
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n\
+                   None => 1,\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_insert_replace");
@@ -16806,9 +16820,14 @@ fn std_map_insert_replace_value() {
 
 #[test]
 fn std_map_get_missing_returns_none() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
+    let src = "import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_get, map_insert, map_int_keys};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
                  match map_get(m, 999) { Some(_) => 1, None => 0 }\n\
                }\n";
     let (_stdout, stderr, code) = compile_and_run(src, "std_map_get_missing_none");
@@ -16817,11 +16836,14 @@ fn std_map_get_missing_returns_none() {
 
 #[test]
 fn std_map_contains_existing_and_missing() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m: Map[Int, Int] = map_insert(map_int_keys(), 7, 70);\n  \
-                 perform IO.println(match map_contains(m, 7) { true => \"yes\", false => \"no\" });\n  \
-                 perform IO.println(match map_contains(m, 999) { true => \"yes\", false => \"no\" });\n  \
+    let src = "import std.io\n\
+               import std.map\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_contains, map_insert, map_int_keys};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m: Map[Int, Int] = map_insert(map_int_keys(), 7, 70);\n\
+                 perform IO.println(match map_contains(m, 7) { true => \"yes\", false => \"no\" });\n\
+                 perform IO.println(match map_contains(m, 999) { true => \"yes\", false => \"no\" });\n\
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_contains");
@@ -16831,15 +16853,22 @@ fn std_map_contains_existing_and_missing() {
 
 #[test]
 fn std_map_remove_existing_decreases_size() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
-                 let m3: Map[Int, Int] = map_remove(m2, 1);\n  \
-                 perform IO.println(int_to_string(map_size(m3)));\n  \
-                 match map_get(m3, 1) {\n    \
-                   Some(_) => { perform IO.println(\"PRESENT\"); 1 },\n    \
-                   None => { perform IO.println(\"GONE\"); 0 },\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_get, map_insert, map_int_keys, map_remove, map_size};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n\
+                 let m3: Map[Int, Int] = map_remove(m2, 1);\n\
+                 perform IO.println(int_to_string(map_size(m3)));\n\
+                 match map_get(m3, 1) {\n\
+                   Some(_) => { perform IO.println(\"PRESENT\"); 1 },\n\
+                   None => { perform IO.println(\"GONE\"); 0 },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_remove_existing");
@@ -16849,11 +16878,16 @@ fn std_map_remove_existing_decreases_size() {
 
 #[test]
 fn std_map_remove_absent_is_noop() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
-                 let m2: Map[Int, Int] = map_remove(m1, 999);\n  \
-                 perform IO.println(int_to_string(map_size(m2)));\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_insert, map_int_keys, map_remove, map_size};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
+                 let m2: Map[Int, Int] = map_remove(m1, 999);\n\
+                 perform IO.println(int_to_string(map_size(m2)));\n\
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_remove_absent");
@@ -16864,19 +16898,26 @@ fn std_map_remove_absent_is_noop() {
 #[test]
 fn std_map_keys_returned_sorted() {
     // Insert in scrambled order; keys come back ascending.
-    let src = "import std.map\n\
-               fn print_ints(xs: List[Int]) -> Int ![IO] {\n  \
-                 match xs {\n    \
-                   Nil => 0,\n    \
-                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil};\n\
+               use std.map.{Map, map_insert, map_int_keys, map_keys};\n\
+               fn print_ints(xs: List[Int]) -> Int ![IO] {\n\
+                 match xs {\n\
+                   Nil => 0,\n\
+                   Cons(h, t) => { perform IO.println(int_to_string(h)); print_ints(t) },\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 30);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 1, 10);\n  \
-                 let m3: Map[Int, Int] = map_insert(m2, 5, 50);\n  \
-                 let m4: Map[Int, Int] = map_insert(m3, 2, 20);\n  \
-                 let m5: Map[Int, Int] = map_insert(m4, 4, 40);\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 30);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 1, 10);\n\
+                 let m3: Map[Int, Int] = map_insert(m2, 5, 50);\n\
+                 let m4: Map[Int, Int] = map_insert(m3, 2, 20);\n\
+                 let m5: Map[Int, Int] = map_insert(m4, 4, 40);\n\
                  print_ints(map_keys(m5))\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_keys_sorted");
@@ -16886,17 +16927,28 @@ fn std_map_keys_returned_sorted() {
 
 #[test]
 fn std_map_to_list_round_trip() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 300);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 1, 100);\n  \
-                 let m3: Map[Int, Int] = map_insert(m2, 2, 200);\n  \
-                 let pairs: List[(Int, Int)] = map_to_list(m3);\n  \
-                 let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n  \
-                 perform IO.println(int_to_string(map_size(m4)));\n  \
-                 match map_get(m4, 2) {\n    \
-                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
-                   None => 1,\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               import std.option\n\
+               import std.ordering\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{List};\n\
+               use std.map.{Map, map_from_list, map_get, map_insert, map_int_keys, map_size, map_to_list};\n\
+               use std.option.{None, Some};\n\
+               use std.ordering.{int_compare};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 3, 300);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 1, 100);\n\
+                 let m3: Map[Int, Int] = map_insert(m2, 2, 200);\n\
+                 let pairs: List[(Int, Int)] = map_to_list(m3);\n\
+                 let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n\
+                 perform IO.println(int_to_string(map_size(m4)));\n\
+                 match map_get(m4, 2) {\n\
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n\
+                   None => 1,\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_to_list_round_trip");
@@ -16906,13 +16958,18 @@ fn std_map_to_list_round_trip() {
 
 #[test]
 fn std_map_fold_sums_all_values() {
-    let src = "import std.map\n\
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_fold, map_insert, map_int_keys};\n\
                fn add_value(acc: Int, _k: Int, v: Int) -> Int ![] { acc + v }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
-                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
-                 perform IO.println(int_to_string(map_fold(m3, 0, add_value)));\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n\
+                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n\
+                 perform IO.println(int_to_string(map_fold(m3, 0, add_value)));\n\
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_fold_sum");
@@ -16922,15 +16979,22 @@ fn std_map_fold_sums_all_values() {
 
 #[test]
 fn std_map_map_transforms_values_keeps_keys() {
-    let src = "import std.map\n\
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_get, map_insert, map_int_keys, map_map};\n\
+               use std.option.{None, Some};\n\
                fn double(v: Int) -> Int ![] { v + v }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
-                 let m3: Map[Int, Int] = map_map(m2, double);\n  \
-                 match map_get(m3, 2) {\n    \
-                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
-                   None => 1,\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n\
+                 let m3: Map[Int, Int] = map_map(m2, double);\n\
+                 match map_get(m3, 2) {\n\
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n\
+                   None => 1,\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_map_values");
@@ -16940,14 +17004,21 @@ fn std_map_map_transforms_values_keeps_keys() {
 
 #[test]
 fn std_map_filter_keeps_pred_true_entries() {
-    let src = "import std.map\n\
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_filter, map_get, map_insert, map_int_keys, map_size};\n\
+               use std.option.{None, Some};\n\
                fn keep_big(_k: Int, v: Int) -> Bool ![] { v > 15 }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n  \
-                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
-                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
-                 let m4: Map[Int, Int] = map_filter(m3, keep_big);\n  \
-                 perform IO.println(int_to_string(map_size(m4)));\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m1: Map[Int, Int] = map_insert(map_int_keys(), 1, 10);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n\
+                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n\
+                 let m4: Map[Int, Int] = map_filter(m3, keep_big);\n\
+                 perform IO.println(int_to_string(map_size(m4)));\n\
                  match map_get(m4, 1) { Some(_) => 1, None => 0 }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_filter");
@@ -16958,14 +17029,21 @@ fn std_map_filter_keeps_pred_true_entries() {
 
 #[test]
 fn std_map_string_keys_constructor_round_trip() {
-    let src = "import std.map\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m0: Map[String, Int] = map_string_keys();\n  \
-                 let m1: Map[String, Int] = map_insert(m0, \"alpha\", 1);\n  \
-                 let m2: Map[String, Int] = map_insert(m1, \"beta\", 2);\n  \
-                 match map_get(m2, \"beta\") {\n    \
-                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n    \
-                   None => 1,\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_get, map_insert, map_string_keys};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![IO] {\n\
+                 let m0: Map[String, Int] = map_string_keys();\n\
+                 let m1: Map[String, Int] = map_insert(m0, \"alpha\", 1);\n\
+                 let m2: Map[String, Int] = map_insert(m1, \"beta\", 2);\n\
+                 match map_get(m2, \"beta\") {\n\
+                   Some(v) => { perform IO.println(int_to_string(v)); 0 },\n\
+                   None => 1,\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_string_keys");
@@ -16982,22 +17060,27 @@ fn std_map_ten_thousand_inserts_then_lookups() {
     // O(log n) — slow enough to surface in CI wall-clock if a
     // regression slips in. Assertion verifies size after fill
     // and hit-count over the same key range.
-    let src = "import std.map\n\
-               fn fill(m: Map[Int, Int], i: Int, n: Int) -> Map[Int, Int] ![] {\n  \
-                 if i >= n { m }\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_contains, map_insert, map_int_keys, map_size};\n\
+               fn fill(m: Map[Int, Int], i: Int, n: Int) -> Map[Int, Int] ![] {\n\
+                 if i >= n { m }\n\
                  else { fill(map_insert(m, i, i + 1000), i + 1, n) }\n\
                }\n\
-               fn count_hits(m: Map[Int, Int], i: Int, n: Int, acc: Int) -> Int ![] {\n  \
-                 if i >= n { acc }\n  \
-                 else {\n    \
-                   let next: Int = match map_contains(m, i) { true => acc + 1, false => acc };\n    \
-                   count_hits(m, i + 1, n, next)\n  \
+               fn count_hits(m: Map[Int, Int], i: Int, n: Int, acc: Int) -> Int ![] {\n\
+                 if i >= n { acc }\n\
+                 else {\n\
+                   let next: Int = match map_contains(m, i) { true => acc + 1, false => acc };\n\
+                   count_hits(m, i + 1, n, next)\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m: Map[Int, Int] = fill(map_int_keys(), 0, 10000);\n  \
-                 perform IO.println(int_to_string(map_size(m)));\n  \
-                 perform IO.println(int_to_string(count_hits(m, 0, 10000, 0)));\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m: Map[Int, Int] = fill(map_int_keys(), 0, 10000);\n\
+                 perform IO.println(int_to_string(map_size(m)));\n\
+                 perform IO.println(int_to_string(count_hits(m, 0, 10000, 0)));\n\
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_ten_thousand_inserts");
@@ -17012,22 +17095,29 @@ fn std_map_with_user_defined_record_comparator() {
     // Construct a record `Point { x, y }` and a comparator that
     // compares by `x` only. Build a Map keyed on Point and assert
     // round-trip lookup.
-    let src = "import std.map\n\
+    let src = "import std.io\n\
+               import std.option\n\
+               import std.ordering\n\
+               import std.map\n\
+               use std.io.{IO};\n\
+               use std.map.{Map, map_empty, map_get, map_insert};\n\
+               use std.option.{None, Some};\n\
+               use std.ordering.{Ordering, int_compare};\n\
                type Point = { x: Int, y: Int }\n\
-               fn point_cmp(a: Point, b: Point) -> Ordering ![] {\n  \
-                 match a {\n    \
-                   Point { x: ax, y: _ } => match b {\n      \
-                     Point { x: bx, y: _ } => int_compare(ax, bx),\n    \
-                   },\n  \
+               fn point_cmp(a: Point, b: Point) -> Ordering ![] {\n\
+                 match a {\n\
+                   Point { x: ax, y: _ } => match b {\n\
+                     Point { x: bx, y: _ } => int_compare(ax, bx),\n\
+                   },\n\
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n  \
-                 let m0: Map[Point, String] = map_empty(point_cmp);\n  \
-                 let m1: Map[Point, String] = map_insert(m0, Point { x: 1, y: 100 }, \"first\");\n  \
-                 let m2: Map[Point, String] = map_insert(m1, Point { x: 2, y: 200 }, \"second\");\n  \
-                 match map_get(m2, Point { x: 2, y: 999 }) {\n    \
-                   Some(v) => { perform IO.println(v); 0 },\n    \
-                   None => 1,\n  \
+               fn main() -> Int ![IO] {\n\
+                 let m0: Map[Point, String] = map_empty(point_cmp);\n\
+                 let m1: Map[Point, String] = map_insert(m0, Point { x: 1, y: 100 }, \"first\");\n\
+                 let m2: Map[Point, String] = map_insert(m1, Point { x: 2, y: 200 }, \"second\");\n\
+                 match map_get(m2, Point { x: 2, y: 999 }) {\n\
+                   Some(v) => { perform IO.println(v); 0 },\n\
+                   None => 1,\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_map_user_defined_cmp");
@@ -17041,10 +17131,15 @@ fn std_map_with_user_defined_record_comparator() {
 
 #[test]
 fn std_set_empty_and_size_zero() {
-    let src = "import std.set\n\
-               fn main() -> Int ![IO] {\n  \
-                 let s: Set[Int] = set_int();\n  \
-                 perform IO.println(int_to_string(set_size(s)));\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.set\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.set.{Set, set_int, set_is_empty, set_size};\n\
+               fn main() -> Int ![IO] {\n\
+                 let s: Set[Int] = set_int();\n\
+                 perform IO.println(int_to_string(set_size(s)));\n\
                  match set_is_empty(s) { true => 0, false => 1 }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_set_empty_size_zero");
@@ -17054,13 +17149,20 @@ fn std_set_empty_and_size_zero() {
 
 #[test]
 fn std_set_insert_round_trip() {
-    let src = "import std.set\n\
-               fn main() -> Int ![IO] {\n  \
-                 let s0: Set[Int] = set_empty(int_compare);\n  \
-                 let s1: Set[Int] = set_insert(s0, 1);\n  \
-                 let s2: Set[Int] = set_insert(s1, 2);\n  \
-                 let s3: Set[Int] = set_insert(s2, 3);\n  \
-                 perform IO.println(int_to_string(set_size(s3)));\n  \
+    let src = "import std.int\n\
+               import std.io\n\
+               import std.ordering\n\
+               import std.set\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.ordering.{int_compare};\n\
+               use std.set.{Set, set_contains, set_empty, set_insert, set_size};\n\
+               fn main() -> Int ![IO] {\n\
+                 let s0: Set[Int] = set_empty(int_compare);\n\
+                 let s1: Set[Int] = set_insert(s0, 1);\n\
+                 let s2: Set[Int] = set_insert(s1, 2);\n\
+                 let s3: Set[Int] = set_insert(s2, 3);\n\
+                 perform IO.println(int_to_string(set_size(s3)));\n\
                  match set_contains(s3, 2) { true => 0, false => 1 }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_set_insert_round_trip");
