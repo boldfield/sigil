@@ -35,6 +35,12 @@
 // return type — Int (v1 simplification) instead of Never` in
 // `boldfield/designs/PLAN_B_DEVIATIONS.md`.
 
+import std.int
+import std.io
+import std.raise
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.raise.{ArithError};
 fn safe_divide(a: Int, b: Int) -> Int ![ArithError] {
   a / b
 }

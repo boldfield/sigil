@@ -73,6 +73,10 @@
 // landing inside a single arm is deferred to a future Slice C
 // captures-bearing extension).
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect Choose resumes: many { choose: (Int) -> Int }
 
 fn helper(seed: Int) -> Int ![Choose, IO] {

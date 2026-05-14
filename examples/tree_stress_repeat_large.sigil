@@ -21,7 +21,10 @@
 //
 // Per-round sum: 2^14 - 1 = 16,383. Total: 30 × 16,383 = 491,490.
 
+import std.int
 import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 
 type Tree = | Leaf | Node(Int, Tree, Tree)
 

@@ -47,6 +47,10 @@
 //
 // Invariant: stdout reads `11\n` (one line, exit 0).
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect State resumes: many { get: () -> Int, set: (Int) -> Int }
 
 fn comp() -> Int ![State] {

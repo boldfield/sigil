@@ -111,6 +111,7 @@ Algebraic effects with handlers (Plan B + Plan C stdlib):
 ```sigil
 import std.raise
 import std.result
+use std.raise.{Raise, catch, raise};
 
 fn parse_pos(n: Int) -> Int ![Raise] {
   match n {
@@ -129,6 +130,16 @@ fn main() -> Int ![IO] {
 }
 ```
 
+Things to notice (Plan F1): the `import` line names the module
+without binding any of its symbols; a separate `use mod.{name1,
+name2};` line opts specific names into the bare namespace of this
+file. Names not opt'd in can still be called qualified
+(`std.raise.raise(...)`). There is no prelude — `Option`, `Result`,
+`Some`, `None`, `Ok`, `Err` come from `std.option` / `std.result`
+and require an explicit `import` + `use`. Primitive type names
+(`Int`, `String`, `Bool`, `Char`, `Float`, `Unit`, etc.) are the
+only globally-available names.
+
 Things to notice: `parse_pos`'s signature declares `![Raise]` — the
 type tells callers it can fail. `catch[A]` discharges `Raise` and
 returns `Result[A, String] ![]`. Effect operations use
@@ -143,6 +154,7 @@ Stateful computation with `State[S]` + multi-effect rows:
 
 ```sigil
 import std.state
+use std.state.{State, run_state};
 
 fn counter() -> Int ![State[Int]] {
   let _: Int = perform State.set(10);
@@ -173,6 +185,29 @@ tree-walking interpreter using `Raise` + `catch`, and
 [`examples/json.sigil`](examples/json.sigil) for a JSON pretty-printer
 + recursive-descent parser using `State[Int]` cursor + `Raise[String]`
 short-circuit, discharged via `run_state` + `catch`.
+
+## Imports and `use`
+
+> **Rule.** Names from imports need a path. To use a name bare,
+> write `use module.path.{name}`.
+
+`import std.list` makes the `std.list` module addressable but binds
+no symbols. To call `map(xs, f)` bare, add `use std.list.{map};`.
+Without the `use` line, the call site must qualify:
+`std.list.map(xs, f)`. Module aliasing is supported on `import`:
+`import std.option as O;` makes `O.map(opt, f)` a synonym for
+`std.option.map(opt, f)`.
+
+Two `use` lines in the same file that collide on a local name fire
+E0147; the fix is to alias one (`use std.option.{map as option_map}`)
+or remove one. There is no prelude — primitive type names (`Int`,
+`String`, `Bool`, `Char`, `Float`, `Unit`, opaque `Array`, `MutArray`,
+`ByteArray`, `MutByteArray`, `Int64`, `StringBuilder`) are the only
+globally-available names. Every other symbol in a file must come
+from an `import` + `use` line, or be qualified at the call site.
+Wildcard `use mod.*;` is not supported (E0034): it would re-introduce
+the cross-module bare-name ambiguity that this design is built to
+close.
 
 ## What sigil deliberately is not
 

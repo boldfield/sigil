@@ -30,7 +30,10 @@
 // even when the per-alloc and per-frame-walk costs are
 // individually below that floor.
 
+import std.int
 import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 
 type Cons = | Nil | C(Int, Cons)
 

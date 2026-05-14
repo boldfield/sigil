@@ -80,6 +80,7 @@
 // =====================================================================
 
 import std.option
+use std.option.{None, Option, Some};
 
 // `string_to_float(s)` parses `s` as an IEEE 754 f64.
 // Returns `Some(f)` on success; `None` on parse failure (empty

@@ -39,6 +39,7 @@
 // ## Range constants
 
 import std.option
+use std.option.{None, Option, Some};
 
 // `int_max()` returns `2^62 - 1`, the largest representable `Int`.
 fn int_max() -> Int ![] {

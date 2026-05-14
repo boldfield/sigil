@@ -682,7 +682,10 @@ mod tests {
     fn hello_world_is_identity() {
         // Hello-world has no Stage-2 shapes; elaborate should produce
         // an AST indistinguishable in shape from its input.
-        let src = "import std.io\nfn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n\
+               ";
         let p = elab(src);
         let body = main_body(&p);
         assert_eq!(count_synthetic_lets(body), 0, "unexpected hoisting");
@@ -909,10 +912,15 @@ mod tests {
         // codegen un-desugared and tripped the
         // `unreachable!("Expr::If should have been desugared by elaborate")`
         // arm in `lower_expr`.
-        let src = "fn main() -> Int ![IO] {\n\
-                     perform IO.println(int_to_string(if true { 1 } else { 2 }));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+               perform IO.println(int_to_string(if true { 1 } else { 2 }));\n\
+                 0\n\
+               }\n\
+               ";
         let p = elab(src);
         let body = main_body(&p);
         let mut found_match = false;
@@ -942,12 +950,17 @@ mod tests {
         // bug. Before E0134 lifted, `Expr::Handle` short-circuited in
         // elaborate; with the gate lifted in Phase 2, body+arm bodies
         // need real elaboration.
-        let src = "effect E_eff { op: () -> Int }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle (if true { 1 } else { 2 }) with { E_eff.op(k) => 0 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E_eff { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle (if true { 1 } else { 2 }) with { E_eff.op(k) => 0 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let p = elab(src);
         let body = main_body(&p);
         // Find the let n: ... = handle ... binding and check that the

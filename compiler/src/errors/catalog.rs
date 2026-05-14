@@ -125,6 +125,31 @@ pub const CATALOG: &[ErrorEntry] = &[
         fix_example: "// Stdlib bug. No user-side fix. Report with the cycle named in the diagnostic.",
     },
     ErrorEntry {
+        code: "E0034",
+        short: "wildcard `use` is not supported",
+        long: "Sigil's `use` declaration is intentionally selective: each `use` line \
+               names every symbol it brings into the file's bare namespace. Wildcards \
+               (`use std.list.*;`) would re-introduce the cross-module bare-name \
+               ambiguity class (E0147) that qualified-only imports were designed to \
+               close: as the stdlib grows, names like `map`, `fold`, `filter`, and \
+               `length` collide across `std.list`, `std.option`, `std.result`, and \
+               others. Listing names explicitly keeps each file self-describing — a \
+               reader (human or LLM) sees in one place which symbols are in scope.",
+        fix_example: "// Wrong:\n// use std.list.*;\n\n\
+                      // Right (list every name you want bare):\nuse std.list.{map, fold, filter};",
+    },
+    ErrorEntry {
+        code: "E0035",
+        short: "empty `use` binding list",
+        long: "A `use` declaration must name at least one symbol. `use mod.{};` is \
+               always dead code — it imports nothing, parses with no effect, and is \
+               almost certainly a typo for the intended binding list. Either delete \
+               the `use` line entirely, or fill in the symbols it should bring \
+               bare.",
+        fix_example: "// Wrong:\n// use std.list.{};\n\n\
+                      // Right:\nuse std.list.{map, fold};",
+    },
+    ErrorEntry {
         code: "E0040",
         short: "program has no `fn main`",
         long: "Every Sigil program is a standalone executable and must declare a \
@@ -1012,37 +1037,40 @@ pub const CATALOG: &[ErrorEntry] = &[
     },
     ErrorEntry {
         code: "E0147",
-        short: "ambiguous bare name — multiple imported modules export it",
-        long: "Plan C addendum (Tier 1): when a user file imports two \
-               or more stdlib modules that each define a top-level \
-               function with the same bare name (e.g., `import std.list; \
-               import std.option;` — both export `map`), bare-name \
-               function calls (`map(xs, f)`) are silent-wrong-dispatch \
-               territory: the compiler resolves to whichever module \
-               registered the name most recently, which depends on \
-               import order and transitive load order.\n\n\
-               The fix is to remove all but one of the conflicting \
-               imports, or rename the call sites to avoid the bare \
-               name. Until v2 ships qualified-call syntax \
-               (`std.list.map(xs, f)`), there is no in-language \
-               disambiguation surface.\n\n\
-               Builtins (registered by the compiler — `int_to_string`, \
-               `string_concat`, etc.) do not participate in this check; \
-               only user-fn-from-stdlib registrations contribute to \
-               the ambiguity tracking.",
-        fix_example: "// Wrong (both modules define `map`):\n\
+        short: "duplicate `use` of name — two modules brought it bare",
+        long: "Plan F1 (qualified imports): two `use` lines in the same \
+               file bring symbols into the bare namespace under the \
+               same local name. `use std.list.{map}` and \
+               `use std.option.{map}` both want `map` bare — there is \
+               no single answer for what `map(xs, f)` should mean \
+               inside the file, so the compiler rejects the second \
+               `use` line and points at both contributors.\n\n\
+               The fix is to alias one of the bindings \
+               (`use std.option.{map as option_map}`), or remove one \
+               of the `use` lines entirely and qualify call sites that \
+               need the other module (`std.option.map(opt, f)`).\n\n\
+               This is the new meaning of E0147: pre-Plan-F1 the same \
+               code emitted E0147 at the call site (\"ambiguous bare \
+               name `map`\"), at every use site. The qualified-imports \
+               rewrite moves the diagnostic to a single fixed location \
+               (the `use` line) where the resolution decision is \
+               actually made.",
+        fix_example: "// Wrong (two `use` lines compete for `map`):\n\
                       import std.list\n\
                       import std.option\n\
-                      fn main() -> Int ![] {\n  \
-                        let _ys: List[Int] = map(Cons(1, Nil), fn (x: Int) -> Int ![] => x);\n  \
-                        // E0147: ambiguous bare name `map`\n  \
-                        0\n\
-                      }\n\n\
-                      // Right (drop the unused import):\n\
+                      use std.list.{map};\n\
+                      use std.option.{map};  // E0147\n\n\
+                      // Right (alias one):\n\
                       import std.list\n\
-                      fn main() -> Int ![] {\n  \
-                        let _ys: List[Int] = map(Cons(1, Nil), fn (x: Int) -> Int ![] => x);\n  \
-                        0\n\
+                      import std.option\n\
+                      use std.list.{map};\n\
+                      use std.option.{map as option_map};\n\n\
+                      // Or right (drop one `use`, qualify the other):\n\
+                      import std.list\n\
+                      import std.option\n\
+                      use std.list.{map};\n\
+                      fn example(opt: Option[Int]) -> Option[Int] ![] {\n  \
+                        std.option.map(opt, fn (x: Int) -> Int ![] => x + 1)\n\
                       }",
     },
     ErrorEntry {

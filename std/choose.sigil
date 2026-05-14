@@ -77,6 +77,8 @@
 
 import std.list
 import std.option
+use std.list.{Cons, List, Nil, append};
+use std.option.{None, Option, Some};
 
 effect Choose resumes: many {
   choose: (Int) -> Int,

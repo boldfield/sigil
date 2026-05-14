@@ -1,5 +1,6 @@
 // sigil: 0.1
 import std.io
+use std.io.{IO};
 
 fn main() -> Int ![IO] {
   perform IO.println("hello, world");

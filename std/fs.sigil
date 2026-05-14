@@ -51,6 +51,9 @@
 import std.array
 import std.list
 import std.result
+use std.array.{array_length};
+use std.list.{List};
+use std.result.{Err, Ok, Result};
 
 // `FsError` variants — keep ordered so variant index N corresponds
 // to runtime tag N (NotFound = variant 0 = tag 1, etc.). Note: the
@@ -110,7 +113,10 @@ fn mkdir(p: String) -> Result[Unit, FsError] ![Fs] {
 // path component each, no recursive walk; symlinks followed).
 fn read_dir(p: String) -> Result[List[String], FsError] ![Fs] {
   match perform Fs.read_dir(p) {
-    (0, arr, _) => Ok(__array_to_list(arr, 0, array_length(arr))),
+    // `__array_to_list` is a `std.list` internal helper (`__`
+    // prefix marks it private-by-convention); referenced via
+    // qualified path rather than a `use` line.
+    (0, arr, _) => Ok(std.list.__array_to_list(arr, 0, array_length(arr))),
     (t, _, msg) => Err(__tag_to_fs_error(t, msg)),
   }
 }

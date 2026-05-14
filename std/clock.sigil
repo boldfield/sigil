@@ -17,6 +17,8 @@
 // since-epoch value. The 63-bit range covers ~292 years past 1970,
 // sufficient through year 2262 for v1 use.
 
+import std.int64
+use std.int64.{int64_to_int};
 effect Clock {
   now: () -> Int,
 }

@@ -718,7 +718,7 @@ pub(crate) fn contains_apply_or_generic_ref(program: &crate::ast::Program) -> bo
                     }
                 }
             }
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan B Task 55 — `effect Name { op: ... }` declarations
             // emit no codegen output (they only populate the
             // typecheck-time effect registry consulted by `perform`
@@ -1104,7 +1104,7 @@ pub(crate) fn unsupported_handle_construct(program: &crate::ast::Program) -> Opt
             crate::ast::Item::Effect(e) => {
                 effects_resumes_many.insert(e.name.clone(), e.resumes_many);
             }
-            crate::ast::Item::Import(_) => {}
+            crate::ast::Item::Import(_) | crate::ast::Item::Use(_) => {}
         }
     }
     globals.insert("int_to_string".to_string());
@@ -32556,13 +32556,18 @@ mod tests {
         // helper has a single tail-position perform; row contains
         // non-IO effect → intrinsic CPS color. Body shape matches
         // `is_simple_tail_perform_with_pure_args_body`. Combined: Cps.
-        let src = "effect E { op: () -> Int }\n\
-                   fn helper() -> Int ![E] { perform E.op() }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(k) => 42 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(k) => 42 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         assert_eq!(
@@ -32585,13 +32590,18 @@ mod tests {
         // ABI (the conservative default — main keeps the
         // synchronous-`run_loop` shape until the lambda-lifting
         // commit covers complex bodies).
-        let src = "effect E { op: () -> Int }\n\
-                   fn helper() -> Int ![E] { perform E.op() }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(k) => 42 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] { perform E.op() }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(k) => 42 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let main_body = body_of(&prog, "main");
         // Sanity-check: main IS classified CPS by the colorer (bridge).
@@ -32826,13 +32836,18 @@ mod tests {
         // forwards it to the perform's args buffer; the wrapper at
         // call sites packs the user arg before the trailing
         // (k_closure, k_fn) pair.
-        let src = "effect E { op: (Int) -> Int }\n\
-                   fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         let helper_params = params_of(&prog, "helper");
@@ -32867,13 +32882,18 @@ mod tests {
         // gate rejected → Sync. Post-widening, the gate is gone
         // → Cps. The body emission packs the literal `7` into a
         // stack slot for `sigil_perform`.
-        let src = "effect E { op: (Int) -> Int }\n\
-                   fn helper() -> Int ![E] { perform E.op(7) }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(arg, k) => arg + 35 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E] { perform E.op(7) }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(arg, k) => arg + 35 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         let helper_params = params_of(&prog, "helper");
@@ -32916,16 +32936,21 @@ mod tests {
         // `threshold`, passes its pointer as `k_closure`; the
         // synth-cont reads `threshold` from `closure_ptr + 16` at
         // fn entry.
-        let src = "effect Raise { fail: () -> Int }\n\
-                   fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
-                     let x: Int = perform Raise.fail();\n  \
-                     x + threshold\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper(10) with { Raise.fail(k) => 42 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n\
+                 let x: Int = perform Raise.fail();\n\
+                 x + threshold\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper(10) with { Raise.fail(k) => 42 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let helper_body = body_of(&prog, "helper");
         let helper_params = params_of(&prog, "helper");
@@ -33146,25 +33171,30 @@ mod tests {
         // resolution in unit tests). Mirrors the iterate-Generator
         // shape: `match xs { Nil => 0, Cons(x, rest) => { let _ =
         // perform Gen.yield(x); iterate(rest) } }`.
-        let src = "effect Gen { yield: (Int) -> Int }\n\
-                   type IntList = | Nil | Cons(Int, IntList)\n\
-                   fn iterate(xs: IntList) -> Int ![Gen] {\n  \
-                     match xs {\n    \
-                       Nil => 0,\n    \
-                       Cons(x, rest) => {\n      \
-                         let _: Int = perform Gen.yield(x);\n      \
-                         iterate(rest)\n    \
-                       },\n  \
-                     }\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let xs: IntList = Cons(1, Cons(2, Nil));\n  \
-                     let n: Int = handle iterate(xs) with {\n    \
-                       Gen.yield(x, k) => k(0),\n  \
-                     };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect Gen { yield: (Int) -> Int }\n\
+               type IntList = | Nil | Cons(Int, IntList)\n\
+               fn iterate(xs: IntList) -> Int ![Gen] {\n\
+                 match xs {\n\
+                   Nil => 0,\n\
+                   Cons(x, rest) => {\n\
+                     let _: Int = perform Gen.yield(x);\n\
+                     iterate(rest)\n\
+                   },\n\
+                 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let xs: IntList = Cons(1, Cons(2, Nil));\n\
+                 let n: Int = handle iterate(xs) with {\n\
+                   Gen.yield(x, k) => k(0),\n\
+                 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let (prog, colored) = colored_from_src(src);
         let iterate_body = body_of(&prog, "iterate");
         // Sanity: colorer marks iterate as CPS (non-IO Gen perform in

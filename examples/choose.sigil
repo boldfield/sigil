@@ -36,6 +36,10 @@
 //
 // Invariant: stdout reads `10\n` and the program exits 0.
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect Choose resumes: many { flip: () -> Bool }
 
 fn outcome() -> Int ![Choose, IO] {

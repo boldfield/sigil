@@ -252,7 +252,9 @@ pub fn convert(mut colored: ColoredProgram) -> ClosureConvertedProgram {
     let mut new_items: Vec<Item> = Vec::with_capacity(original_items.len());
     for item in original_items {
         match item {
-            Item::Import(_) | Item::Type(_) | Item::Effect(_) => new_items.push(item),
+            Item::Import(_) | Item::Use(_) | Item::Type(_) | Item::Effect(_) => {
+                new_items.push(item)
+            }
             Item::Fn(mut f) => {
                 let param_names: BTreeSet<String> =
                     f.params.iter().map(|p| p.name.clone()).collect();

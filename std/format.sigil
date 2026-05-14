@@ -81,9 +81,21 @@
 // case. This is the form LLMs reach for ~80% of the time in
 // practice.
 
+import std.byte_array
+import std.char
+import std.float
+import std.int
+import std.int64
 import std.list
 import std.option
 import std.string
+use std.byte_array.{byte_to_int, string_byte_at, string_length};
+use std.char.{char_to_string};
+use std.float.{float_to_string};
+use std.int.{int_to_string};
+use std.int64.{int64_to_string};
+use std.list.{Cons, List, Nil};
+use std.string.{string_concat, string_substring};
 
 // `FormatArg` is the sum of every primitive type the formatter
 // can stringify. Constructors mirror the Sigil v1 primitive set:

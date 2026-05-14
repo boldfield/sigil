@@ -65,6 +65,8 @@
 import std.array
 import std.list
 import std.result
+use std.list.{List};
+use std.result.{Err, Ok, Result};
 
 type ProcessError =
   | NotFound
@@ -91,5 +93,9 @@ fn run(cmd: String, args: Array[String]) -> Result[(Int, String, String), Proces
 // cleaner than the immutable `array_alloc` + sequential `array_set`
 // dance, and List composes with `env_args()` / `map` / `filter`.
 fn run_list(cmd: String, args: List[String]) -> Result[(Int, String, String), ProcessError] ![Process] {
-  run(cmd, __list_to_array(args, ""))
+  // `__list_to_array` is a `std.list` internal helper (the `__`
+  // prefix marks it private-by-convention); reference it via the
+  // qualified path so the abstraction-boundary crossing is
+  // explicit, rather than threading the name into a `use` line.
+  run(cmd, std.list.__list_to_array(args, ""))
 }

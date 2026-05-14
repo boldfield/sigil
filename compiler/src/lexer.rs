@@ -25,6 +25,13 @@
 //!   matched contextually by `parse_effect_decl` — reserving them would
 //!   break user code that legitimately wants `let resumes = 5` etc.
 //!
+//! Plan F1 additions (qualified imports):
+//! - Keywords: `use`, `as`. Reserved across the whole grammar (unlike
+//!   `resumes` / `many` which are contextual). `use` introduces a
+//!   selective bare-binding list (`use std.list.{map, fold};`); `as`
+//!   renames either a module import (`import std.option as O;`) or a
+//!   single `use` binding (`use std.list.{map as list_map};`).
+//!
 //! Unknown characters produce `E0010` at the position of the offending byte.
 //! Every token carries a `Span` back to the source.
 
@@ -49,6 +56,9 @@ pub enum TokenKind {
     Effect,
     Handle,
     With,
+    // Qualified-imports (Plan F1 — `use mod.path.{names}` + `import ... as alias`).
+    Use,
+    As,
 
     // atoms
     Ident(String),
@@ -141,6 +151,8 @@ pub fn lex(file: &str, src: &str) -> (Vec<Token>, Vec<CompilerError>) {
                 "effect" => TokenKind::Effect,
                 "handle" => TokenKind::Handle,
                 "with" => TokenKind::With,
+                "use" => TokenKind::Use,
+                "as" => TokenKind::As,
                 _ => TokenKind::Ident(ident),
             };
             tokens.push(Token {
@@ -898,6 +910,17 @@ mod tests {
         assert!(ks.contains(&StringLit("hello, world".into())));
         assert!(ks.contains(&IntLit(0)));
         assert!(ks.contains(&Eof));
+    }
+
+    #[test]
+    fn use_and_as_are_reserved() {
+        let (toks, errs) = lex("x.sigil", "use as foo");
+        assert!(errs.is_empty(), "unexpected errors: {errs:?}");
+        let ks = kinds(&toks);
+        use TokenKind::*;
+        assert!(ks.contains(&Use), "expected Use token, got {ks:?}");
+        assert!(ks.contains(&As), "expected As token, got {ks:?}");
+        assert!(ks.contains(&Ident("foo".into())));
     }
 
     #[test]

@@ -37,6 +37,10 @@
 // Invariant: stdout reads `0\n`, exit 0; e2e test asserts wall-
 // clock < 5s.
 
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
 effect Choose resumes: many { flip: () -> Bool }
 
 fn outcome() -> Int ![Choose, IO] {

@@ -44,6 +44,14 @@
 // want a numeric form can convert via
 // `match string_compare(a, b) { Less => -1, Equal => 0, Greater => 1 }`.
 
+import std.byte_array
+import std.char
+import std.float
+import std.int64
+use std.byte_array.{byte_to_int, string_byte_at, string_length};
+use std.char.{char_to_int};
+use std.float.{float_eq, float_lt};
+use std.int64.{int64_eq, int64_lt};
 type Ordering = | Less | Equal | Greater
 
 // `int_compare(a, b)` returns the three-way ordering of two

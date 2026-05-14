@@ -18,6 +18,8 @@
 //   boosted = half + rem + 3 = 26
 //   n is even, so the `if` selects `boosted` over `-boosted`.
 
+import std.raise
+use std.raise.{ArithError};
 fn main() -> Int ![ArithError] {
   let n: Int = 42;
   let half: Int = n / 2;

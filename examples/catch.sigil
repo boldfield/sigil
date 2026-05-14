@@ -33,7 +33,12 @@
 //
 // Invariant: stdout reads `42\n` and the program exits 0.
 
+import std.int
+import std.io
 import std.raise
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.raise.{Raise, raise};
 
 fn risky(input: Int) -> Int ![Raise[String]] {
   let result: Int = raise("attempt");

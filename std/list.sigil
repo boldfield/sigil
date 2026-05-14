@@ -44,7 +44,10 @@
 // and the `*_compare` fns through the resolver so callers of
 // `list_sort_*` get the convenience wrappers without writing a
 // second `import` line.
+import std.array
 import std.ordering
+use std.array.{array_alloc, array_get, array_set};
+use std.ordering.{Greater, Ordering, char_compare, float_compare, int_compare, string_compare};
 
 type List[A] = | Nil | Cons(A, List[A])
 

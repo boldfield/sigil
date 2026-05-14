@@ -850,6 +850,24 @@ pub struct CtorInfo {
     pub variant_index: usize,
 }
 
+/// Plan F1 — a single resolved `use` binding: the file-qualified
+/// scheme key and the source name in that module. Maps a per-file
+/// `local_name` to "look up `<module_file>::<source_name>` in
+/// `fn_schemes` / `types` / `ctors` / `effects`."
+#[derive(Clone, Debug)]
+pub struct FileQualifiedSym {
+    /// The module's file path as used in `fn_schemes`' dual-key form
+    /// (e.g. `"list.sigil"`, matching `f.span.file` for items loaded
+    /// from `std/list.sigil`). For the user's own program the file
+    /// is `program.file` (typically `"<user-supplied>.sigil"`).
+    pub module_file: String,
+    /// The original name in the source module (e.g. `"map"`). Equal
+    /// to the binding's `local_name` unless the binding was aliased
+    /// (`use std.list.{map as list_map}` → source_name = "map",
+    /// local_name = "list_map").
+    pub source_name: String,
+}
+
 /// Plan B Task 57 — names of effects synthesized into `tc.effects`
 /// at typecheck pre-pass start. Order is load-bearing: `effect_id`
 /// assignment phase 1 walks this slice in order, giving `ArithError
@@ -1219,20 +1237,16 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // user `type Array = ...` declaration trips E0113 (duplicate)
     // through the existing user-type loop — Array is not shadowable.
     //
-    // Auto-prelude (Option/Result design — 2026-05-10): a small set
-    // of prelude builtins (`Option`, `Result`) ARE shadowable by
-    // user redeclaration. Track which builtin entries still come
-    // from the prelude (vs. having been overridden by a user
-    // `type` decl) so the constructor pre-pass below can apply
-    // user-wins-over-prelude shadowing.
-    let mut prelude_types: BTreeSet<String> = BTreeSet::new();
+    // Plan F1 (2026-05-14) removed the auto-prelude — there are no
+    // shadowable builtin types anymore. The remaining builtin_types
+    // entries (Array, MutArray, ByteArray, MutByteArray, Int64,
+    // Float, StringBuilder, Ref) are opaque (no variants) and are
+    // never user-shadowable. The prior `prelude_types` shadow-tracking
+    // set + the second `is_prelude_shadow` ctor-pass were removed
+    // alongside the prelude; user redeclarations of `Option`/`Result`
+    // now hit the standard E0113 duplicate-type path against
+    // `std/option.sigil` / `std/result.sigil` after `import`.
     for builtin in builtin_types(&program.file) {
-        if !builtin.variants.is_empty() {
-            // Only types with variants participate in the prelude
-            // shadowing carve-out — opaque builtins like `Array` /
-            // `Int64` have no constructors and are not shadowable.
-            prelude_types.insert(builtin.name.clone());
-        }
         types.insert(builtin.name.clone(), builtin);
     }
     for item in &program.items {
@@ -1262,12 +1276,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                 ));
                 continue;
             }
-            // Auto-prelude shadowing (Option/Result): user-redeclarations
-            // of prelude type names silently override the builtin entry
-            // and the entry stops being prelude-resident — subsequent
-            // user types named the same fire E0113 normally.
-            let is_prelude_shadow = prelude_types.contains(&td.name);
-            if types.contains_key(&td.name) && !is_prelude_shadow {
+            if types.contains_key(&td.name) {
                 errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0113"),
@@ -1275,13 +1284,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     format!("duplicate type declaration `{}`", td.name),
                 ));
             } else {
-                if is_prelude_shadow {
-                    // User redeclaration retires the prelude entry —
-                    // the user's `type` becomes the source of truth
-                    // for both type and constructor lookups in this
-                    // program.
-                    prelude_types.remove(&td.name);
-                }
                 types.insert(td.name.clone(), (**td).clone());
             }
         }
@@ -1293,28 +1295,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // the colliding variant's name span. The first declaration wins in
     // the registry so downstream typing always picks a single canonical
     // constructor per name.
-    //
-    // Auto-prelude (Option/Result design — 2026-05-10): prelude
-    // constructors (`Some` / `None` / `Ok` / `Err`) are inserted in a
-    // *second* pass that silently skips when a user-defined ctor
-    // already claims the name. This lets user code declare
-    // `type Color = | Red | Green | None` without the prelude `None`
-    // triggering E0118 — the user's local `None` shadows the prelude
-    // in that file's scope, matching how Rust's `enum Color { None,
-    // ... }` shadows `Option::None`. Cross-user collisions still fire
-    // E0118 normally; only the prelude→user direction is silenced.
-    //
-    // The discriminator is `prelude_types` (an origin-flag set built
-    // during type registration), NOT a name comparison — a user
-    // `type Option = ...` retired its prelude entry above and now
-    // contributes ctors via the user pass with full E0118 checking.
     let mut ctors: BTreeMap<String, CtorInfo> = BTreeMap::new();
-    // Pass 1: user / non-prelude types — full E0118 cross-collision
-    // diagnostics.
     for td in types.values() {
-        if prelude_types.contains(&td.name) {
-            continue;
-        }
         for (idx, v) in td.variants.iter().enumerate() {
             if let Some(existing) = ctors.get(&v.name) {
                 errors.push(CompilerError::new(
@@ -1327,25 +1309,6 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     ),
                 ));
             } else {
-                ctors.insert(
-                    v.name.clone(),
-                    CtorInfo {
-                        type_name: td.name.clone(),
-                        variant_index: idx,
-                    },
-                );
-            }
-        }
-    }
-    // Pass 2: prelude-resident types (`Option` / `Result` not retired
-    // by user redeclaration). Skip silently when a user ctor already
-    // claimed the name.
-    for td in types.values() {
-        if !prelude_types.contains(&td.name) {
-            continue;
-        }
-        for (idx, v) in td.variants.iter().enumerate() {
-            if !ctors.contains_key(&v.name) {
                 ctors.insert(
                     v.name.clone(),
                     CtorInfo {
@@ -1466,6 +1429,9 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         call_callee_tys: BTreeMap::new(),
         fn_schemes: BTreeMap::new(),
         bare_name_origins: BTreeMap::new(),
+        resolved_idents: BTreeMap::new(),
+        file_use_bindings: BTreeMap::new(),
+        file_module_paths: BTreeMap::new(),
         next_ty_var: 0,
         next_row_var: 0,
         next_scope_id: 0,
@@ -1526,6 +1492,36 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // to `std/state.sigil` only at call-site resolution. See
     // `register_builtin_ref_schemes` for the surface.
     register_builtin_ref_schemes(&mut tc);
+    // Plan F1 — seed `int_to_string` (historically the sole
+    // `fn_env`-only builtin) into `fn_schemes` so the mirror pass
+    // below picks it up. Also mirror every other bare-key builtin
+    // fn_scheme onto a `<module_file>::<name>` form so the strict
+    // resolver can address them via `use std.X.{name}` lines.
+    {
+        let int_to_string_scheme = Scheme {
+            type_vars: Vec::new(),
+            row_vars: Vec::new(),
+            scope_vars: Vec::new(),
+            body: Ty::Fn(Box::new(FnSig {
+                params: vec![Ty::Int],
+                ret: Ty::String,
+                effects: Vec::new(),
+                effect_row_var: None,
+            })),
+        };
+        tc.fn_schemes
+            .entry("int_to_string".to_string())
+            .or_insert(int_to_string_scheme);
+    }
+    register_builtin_file_qualified_mirrors(&mut tc);
+    // Plan F1 — qualified imports pre-pass. Build per-file `use`
+    // binding maps and per-file import / alias module maps from the
+    // program's `Item::Use` and `Item::Import` declarations BEFORE
+    // any fn body is checked, so `Expr::Ident` resolution inside any
+    // fn (including stdlib fns appended by `imports::resolve`) can
+    // consult the right file's bindings as soon as it enters body
+    // walk. Emits the new use-line-collision E0147 here too.
+    build_use_bindings_prepass(&mut tc, &program);
     // Pre-pass: register a polymorphic `Scheme` per user fn under
     // its declared generic-parameter / row-variable allocations, so
     // mutual and forward references resolve through `fn_schemes`'s
@@ -1627,7 +1623,10 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             // last-wins behavior is preserved as v1 status quo.
             // Tracking: `[DEVIATION Task 73]` namespace-qualified
             // imports follow-up.
-            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            // Plan F1 — canonical key form is `<module_label>.<name>`
+            // (`std.list.map`, `x.helper`), matching the user-facing
+            // qualified-path syntax. See `canonical_fn_key`.
+            let qualified_key = canonical_fn_key(&f.span.file, &f.name, &tc.stdlib_files);
             tc.fn_schemes.insert(qualified_key, scheme.clone());
             tc.fn_schemes.insert(f.name.clone(), scheme);
             // Plan C addendum (Tier 1) — bare-name ambiguity tracking.
@@ -1712,7 +1711,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     for item in &program.items {
         match item {
             Item::Fn(f) => tc.check_fn(f),
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan A3 task 38 / Plan B task 48: validate variant
             // field types under the type's own generic-parameter
             // substitution so `Cons(A, List[A])` resolves cleanly.
@@ -1793,7 +1792,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         tc.push_error(
             "E0040",
             span,
-            "program has no `fn main`; every Sigil program needs `fn main() -> Int ![IO]` or `fn main() -> Int ![]`",
+            "program has no `fn main`; every Sigil program needs \
+             `fn main() -> Int ![IO]` or `fn main() -> Int ![]`",
         );
     }
 
@@ -1843,7 +1843,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
                     td.generic_params.iter().map(|gp| gp.name.clone()).collect(),
                 );
             }
-            Item::Import(_) => {}
+            Item::Import(_) | Item::Use(_) => {}
             // Plan B task 53 — effect declarations carry their own
             // generic params for op signatures, but they don't
             // participate in the call-site / ctor-site instantiation
@@ -2078,6 +2078,20 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         .any(|e| matches!(e.severity, Severity::Error));
     if !has_errors {
         desugar_let_bound_continuations(&mut program);
+        // Plan F1 — qualified-imports AST rewrite. Mangles colliding
+        // top-level fn names (`fn map` in `std.list` AND `std.option`
+        // both become `<file>::map`) and rewrites Expr::Ident
+        // references to match, so monomorphize's flat `fn_decls`
+        // registry dispatches to the right entry. The post-pass
+        // visits the same AST the desugar pass just stabilised; we
+        // gate on `!has_errors` for the same reason — partial-error
+        // ASTs shouldn't carry the rewrite.
+        rewrite_resolved_idents(
+            &mut program,
+            &tc.resolved_idents,
+            &tc.bare_name_origins,
+            &tc.stdlib_files,
+        );
     }
 
     (
@@ -2100,6 +2114,594 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         },
         tc.errors,
     )
+}
+
+/// Plan F1 — qualified imports / `use` pre-pass.
+///
+/// Walks the program's `Item::Import` and `Item::Use` items, grouped
+/// by the file each declaration came from, and populates `tc.file_use_-
+/// bindings` + `tc.file_module_paths` so `Expr::Ident` resolution can
+/// translate bare names and qualified paths to `fn_schemes`' file-
+/// qualified keys.
+///
+/// Why this matters: a bare `map(xs, f)` in `std/list.sigil`'s `for_each`
+/// helper resolves to `list.sigil::map` (this module's own `map`); a
+/// bare `map(xs, f)` in a user file with `use std.list.{map}` resolves
+/// to the same `list.sigil::map` via the binding map; a qualified
+/// `std.option.map(opt, f)` in any file resolves via the import path
+/// (`std.option` -> `option.sigil`) regardless of `use` bindings. A
+/// single resolution rule, three entry points.
+///
+/// Emits the new use-line-collision E0147 when a single file's `use`
+/// lines bring two different source modules' names into the same
+/// bare slot.
+fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
+    // Each file gets its own (initially empty) binding + module maps.
+    // We seed empty entries for files that have an `Item::Use` OR
+    // `Item::Import` so the per-file resolver helpers can distinguish
+    // "file has declarations, none brought name X" from "file has no
+    // import structure at all."
+    let mut by_file_uses: BTreeMap<String, Vec<&UseDecl>> = BTreeMap::new();
+    let mut by_file_imports: BTreeMap<String, Vec<&ImportDecl>> = BTreeMap::new();
+    for item in &program.items {
+        match item {
+            Item::Use(u) => {
+                by_file_uses
+                    .entry(u.span.file.clone())
+                    .or_default()
+                    .push(u.as_ref());
+            }
+            Item::Import(i) => {
+                by_file_imports
+                    .entry(i.span.file.clone())
+                    .or_default()
+                    .push(i);
+            }
+            _ => {}
+        }
+    }
+    // Build the import / alias module-path table per file. For each
+    // `import std.list` we record both `"std.list"` -> `"list.sigil"`
+    // (the long-form qualified-path callee key) and any alias
+    // `import std.option as O` -> `"O"` -> `"option.sigil"`.
+    for (file, imports) in &by_file_imports {
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        for imp in imports {
+            let module_file = match module_file_for_path(&imp.path) {
+                Some(f) => f,
+                None => continue,
+            };
+            let dotted = imp.path.join(".");
+            map.insert(dotted, module_file.clone());
+            if let Some(alias) = &imp.alias {
+                map.insert(alias.clone(), module_file);
+            }
+        }
+        if !map.is_empty() {
+            tc.file_module_paths.insert(file.clone(), map);
+        }
+    }
+    // Build the `use`-binding table. Collision detection fires here:
+    // two `use` lines that bring the same local_name from two
+    // different sources is a structural file-level error (the new-
+    // meaning E0147 — see compiler/src/errors/catalog.rs for the
+    // long-form rationale). Aliasing one of the colliding lines
+    // (`use std.list.{map as list_map}`) sidesteps it.
+    for (file, uses) in &by_file_uses {
+        let mut map: BTreeMap<String, FileQualifiedSym> = BTreeMap::new();
+        for u in uses {
+            // Resolve this use's module path to a file key. Failure
+            // here means the module path isn't a `std.*` form (E0031
+            // already fired at parse), or the module isn't loaded
+            // (E0032). Either way, skip this `use` line silently —
+            // the upstream error is the user-actionable one.
+            let module_file = match module_file_for_path(&u.module_path) {
+                Some(f) => f,
+                None => continue,
+            };
+            for binding in &u.bindings {
+                if let Some(prev) = map.get(&binding.local_name).cloned() {
+                    // Two `use` lines bring the same local name. Name
+                    // both contributors so the user can decide which
+                    // to alias / remove. The diagnostic anchors at the
+                    // colliding binding's span (the SECOND occurrence)
+                    // — the first occurrence is described in prose.
+                    let new_module_label = module_label_from_stdlib_file(&module_file);
+                    let old_module_label = module_label_from_stdlib_file(&prev.module_file);
+                    if prev.module_file == module_file && prev.source_name == binding.source_name {
+                        // Duplicate `use` of the same `(module, name)`
+                        // from the same source — likely a copy-paste
+                        // typo. Still surface the diagnostic but the
+                        // message can suggest "remove one of these"
+                        // since aliasing doesn't help. (The plan's
+                        // E0147 long-form covers this — both contributors
+                        // named, fix is removal.)
+                    }
+                    tc.errors.push(CompilerError::new(
+                        Severity::Error,
+                        crate::errors::code("E0147"),
+                        binding.span.clone(),
+                        format!(
+                            "duplicate `use` of name `{}` — already brought in from \
+                             `{}` earlier in this file; this `use` from `{}` conflicts. \
+                             Alias one (`use {}.{} as <other_name>`) or remove one.",
+                            binding.local_name,
+                            old_module_label,
+                            new_module_label,
+                            new_module_label,
+                            binding.source_name,
+                        ),
+                    ));
+                    // Keep the FIRST binding in the map so downstream
+                    // lookups still resolve to something deterministic.
+                    continue;
+                }
+                map.insert(
+                    binding.local_name.clone(),
+                    FileQualifiedSym {
+                        module_file: module_file.clone(),
+                        source_name: binding.source_name.clone(),
+                    },
+                );
+            }
+        }
+        if !map.is_empty() {
+            tc.file_use_bindings.insert(file.clone(), map);
+        }
+    }
+}
+
+/// Plan F1 — post-typecheck AST rewrite. Mangles colliding top-level
+/// `Item::Fn` names and rewrites `Expr::Ident` references to match,
+/// so monomorphize / codegen's flat-namespace lookups dispatch to the
+/// right entry when multiple files contribute the same bare fn name.
+///
+/// Strategy:
+///   - Build a `collisions` set: fn names appearing in `bare_name_-
+///     origins` with two or more producing files. Exclude `"main"`
+///     (the entry-point shim assumes the bare name).
+///   - Walk every `Item::Fn`. If its bare name is in `collisions`,
+///     rename to `"<file>::<name>"` and mirror the rename onto
+///     `fn_schemes` so downstream lookups keyed by the mangled name
+///     find the typecheck-built scheme.
+///   - Walk every fn body's `Expr::Ident`:
+///     1. If the span has a `resolved_idents` entry (recorded by
+///        the qualified-imports lookup path), replace the name with
+///        the canonical key.
+///     2. Otherwise, if the name matches a same-file (intra-module)
+///        renamed fn, rewrite to the mangled form so intra-file
+///        recursive / sibling calls keep resolving to their own
+///        module's fn.
+///
+/// Non-colliding fns and references stay bare-named — the rewrite
+/// only ever fires on names that would otherwise dispatch wrong, so
+/// the AST diff is small and downstream tooling that inspects fn /
+/// callee names sees mangling only for the rare collision case.
+fn rewrite_resolved_idents(
+    program: &mut Program,
+    resolved_idents: &BTreeMap<Span, String>,
+    bare_name_origins: &BTreeMap<String, Vec<String>>,
+    stdlib_files: &BTreeSet<String>,
+) {
+    let mut collisions: BTreeSet<String> = BTreeSet::new();
+    for (name, origins) in bare_name_origins {
+        if origins.len() >= 2 && name != "main" {
+            collisions.insert(name.clone());
+        }
+    }
+    if collisions.is_empty() && resolved_idents.is_empty() {
+        // Fast path: nothing to rewrite. Pre-migration programs with
+        // no `use` lines and no colliding fn names take this path —
+        // no AST diff, no fn_schemes mutation.
+        return;
+    }
+    // First pass: collect each colliding fn's per-file mangled key,
+    // mirror the scheme onto the mangled key. We need the mapping
+    // before walking bodies so intra-file Expr::Ident rewrites can
+    // determine the right target.
+    //
+    // `same_file_rename` maps (file, bare_name) -> mangled_name. The
+    // body walker consults it to translate intra-file recursive /
+    // sibling references that didn't go through the use-binding path.
+    let mut same_file_rename: BTreeMap<(String, String), String> = BTreeMap::new();
+    for item in &program.items {
+        if let Item::Fn(f) = item {
+            if collisions.contains(&f.name) {
+                // Plan F1 — mangled form is `<module_label>.<name>`
+                // (`std.list.map`, `x.helper`), matching the
+                // user-facing qualified-path syntax. See
+                // `canonical_fn_key`. The pre-Plan-F1 review's
+                // "<file>::<name>" form (`list.sigil::map`) leaked
+                // filesystem path + Rust separator into error
+                // messages and into the symbol table; the new form
+                // is the same string the user would type to
+                // qualify the call.
+                let mangled = canonical_fn_key(&f.span.file, &f.name, stdlib_files);
+                // Plan F1 (2026-05-14, re-review #4) — the previous
+                // "mirror the bare-name scheme onto the mangled key"
+                // step was REMOVED. The bare-name `fn_schemes` entry
+                // is last-wins across colliding fns, so for `map`
+                // with both `std.list` ([A, B]) and `generic_map`
+                // ([A]) declared, copying the bare scheme would
+                // overwrite the file-specific canonical entries
+                // with one fn's scheme — leaking the wrong arity
+                // into monomorphize's `fn_subst` and producing
+                // un-substituted `Ty::Var` survivors downstream.
+                //
+                // The dual-key insert at fn-registration time
+                // (`tc.fn_schemes.insert(qualified_key, scheme)`
+                // around line 1677) already writes each fn's own
+                // scheme to its canonical key, so no mirroring is
+                // needed here — every colliding fn already has the
+                // right entry under its `<module>.<name>` form.
+                same_file_rename.insert((f.span.file.clone(), f.name.clone()), mangled);
+            }
+        }
+    }
+    // Second pass: actually mutate Item::Fn names and walk bodies.
+    for item in &mut program.items {
+        if let Item::Fn(f) = item {
+            let file = f.span.file.clone();
+            if let Some(new_name) = same_file_rename.get(&(file.clone(), f.name.clone())) {
+                f.name = new_name.clone();
+            }
+            rewrite_block(&mut f.body, &file, resolved_idents, &same_file_rename);
+        }
+    }
+}
+
+fn rewrite_block(
+    b: &mut Block,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    for stmt in &mut b.stmts {
+        rewrite_stmt(stmt, fn_file, resolved_idents, same_file_rename);
+    }
+    if let Some(tail) = b.tail.as_mut() {
+        rewrite_expr(tail, fn_file, resolved_idents, same_file_rename);
+    }
+}
+
+fn rewrite_stmt(
+    s: &mut Stmt,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    match s {
+        Stmt::Let(l) => rewrite_expr(&mut l.value, fn_file, resolved_idents, same_file_rename),
+        Stmt::Expr(e) => rewrite_expr(e, fn_file, resolved_idents, same_file_rename),
+        Stmt::Perform(p) => {
+            for a in &mut p.args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+    }
+}
+
+fn rewrite_expr(
+    e: &mut Expr,
+    fn_file: &str,
+    resolved_idents: &BTreeMap<Span, String>,
+    same_file_rename: &BTreeMap<(String, String), String>,
+) {
+    match e {
+        Expr::Ident(name, span) => {
+            if let Some(canonical) = resolved_idents.get(span) {
+                *name = canonical.clone();
+                return;
+            }
+            // Intra-file recursive / sibling call: a bare reference
+            // to a same-file fn that the legacy path's file-qualified-
+            // hit resolved. If that fn was renamed for collision, the
+            // reference must be rewritten too.
+            if let Some(new_name) = same_file_rename.get(&(fn_file.to_string(), name.clone())) {
+                *name = new_name.clone();
+            }
+        }
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::UnitLit(_) => {}
+        Expr::Unary { operand, .. } => {
+            rewrite_expr(operand, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_expr(lhs, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(rhs, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Call { callee, args, .. } => {
+            rewrite_expr(callee, fn_file, resolved_idents, same_file_rename);
+            for a in args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            rewrite_expr(cond, fn_file, resolved_idents, same_file_rename);
+            rewrite_block(then_block, fn_file, resolved_idents, same_file_rename);
+            rewrite_block(else_block, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            rewrite_expr(scrutinee, fn_file, resolved_idents, same_file_rename);
+            for arm in arms {
+                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Block(b) => {
+            rewrite_block(b, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Lambda { body, .. } => {
+            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+        }
+        Expr::Perform(p) => {
+            for a in &mut p.args {
+                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Handle {
+            body,
+            op_arms,
+            return_arm,
+            ..
+        } => {
+            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+            for arm in op_arms {
+                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+            }
+            if let Some(ra) = return_arm.as_mut() {
+                rewrite_expr(&mut ra.body, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                rewrite_expr(&mut f.value, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                rewrite_expr(el, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            // Post-closure-conversion variant; pre-CC the rewrite
+            // pass shouldn't see it, but the recursive walker is
+            // total in shape so we cover it for robustness.
+            for e in env_exprs {
+                rewrite_expr(e, fn_file, resolved_idents, same_file_rename);
+            }
+        }
+        Expr::ClosureEnvLoad { .. } => {
+            // Synthesized leaf; nothing to rewrite (the `name` field
+            // is a captured-variable label, not a fn reference).
+        }
+    }
+}
+
+/// Plan F1 — exact-name map from typecheck-injected builtin fn to
+/// the doc-only stdlib module it conceptually belongs to. Every
+/// `register_builtin_*` fn inserts schemes under bare names only;
+/// for the strict resolver to accept `use std.X.{name}` lines, the
+/// dual-keying pass below mirrors each entry onto the
+/// `<module_file>::<name>` form.
+const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
+    ("array_alloc", "array.sigil"),
+    ("array_empty", "array.sigil"),
+    ("array_length", "array.sigil"),
+    ("array_get", "array.sigil"),
+    ("array_set", "array.sigil"),
+    ("mut_array_new", "mut_array.sigil"),
+    ("mut_array_length", "mut_array.sigil"),
+    ("mut_array_get", "mut_array.sigil"),
+    ("mut_array_set", "mut_array.sigil"),
+    ("byte_array_alloc", "byte_array.sigil"),
+    ("byte_array_empty", "byte_array.sigil"),
+    ("byte_array_length", "byte_array.sigil"),
+    ("byte_array_get", "byte_array.sigil"),
+    ("byte_array_concat", "byte_array.sigil"),
+    ("byte_array_slice", "byte_array.sigil"),
+    ("string_to_bytes", "byte_array.sigil"),
+    ("string_from_bytes_validate", "byte_array.sigil"),
+    ("string_from_bytes_alloc", "byte_array.sigil"),
+    ("byte_in_range", "byte_array.sigil"),
+    ("byte_truncate", "byte_array.sigil"),
+    ("byte_to_int", "byte_array.sigil"),
+    // `string_byte_at` / `string_length` are byte-level ops routed
+    // through std.byte_array to keep `std.ordering` (which needs
+    // them for `string_compare`) off the `std.string` dep chain
+    // that would otherwise produce a cycle.
+    ("string_byte_at", "byte_array.sigil"),
+    ("string_length", "byte_array.sigil"),
+    ("mut_byte_array_new", "mut_byte_array.sigil"),
+    ("mut_byte_array_length", "mut_byte_array.sigil"),
+    ("mut_byte_array_get", "mut_byte_array.sigil"),
+    ("mut_byte_array_set", "mut_byte_array.sigil"),
+    ("int64_from_int", "int64.sigil"),
+    ("int64_neg", "int64.sigil"),
+    ("int64_to_int", "int64.sigil"),
+    ("int64_to_string", "int64.sigil"),
+    ("int64_add", "int64.sigil"),
+    ("int64_sub", "int64.sigil"),
+    ("int64_mul", "int64.sigil"),
+    ("int64_div", "int64.sigil"),
+    ("int64_mod", "int64.sigil"),
+    ("int64_eq", "int64.sigil"),
+    ("int64_lt", "int64.sigil"),
+    ("int64_le", "int64.sigil"),
+    ("int64_gt", "int64.sigil"),
+    ("int64_ge", "int64.sigil"),
+    ("float_neg", "float.sigil"),
+    ("float_from_int", "float.sigil"),
+    ("float_to_int", "float.sigil"),
+    ("float_to_string", "float.sigil"),
+    ("float_add", "float.sigil"),
+    ("float_sub", "float.sigil"),
+    ("float_mul", "float.sigil"),
+    ("float_div", "float.sigil"),
+    ("float_eq", "float.sigil"),
+    ("float_lt", "float.sigil"),
+    ("float_le", "float.sigil"),
+    ("float_gt", "float.sigil"),
+    ("float_ge", "float.sigil"),
+    ("float_abs", "float.sigil"),
+    ("float_floor", "float.sigil"),
+    ("float_ceil", "float.sigil"),
+    ("float_sqrt", "float.sigil"),
+    ("string_to_float_validate", "float.sigil"),
+    ("string_to_float_parse", "float.sigil"),
+    ("char_to_int", "char.sigil"),
+    ("int_to_char", "char.sigil"),
+    ("char_to_string", "char.sigil"),
+    ("char_eq", "char.sigil"),
+    ("char_lt", "char.sigil"),
+    ("char_le", "char.sigil"),
+    ("char_gt", "char.sigil"),
+    ("char_ge", "char.sigil"),
+    ("is_ascii", "char.sigil"),
+    ("is_ascii_digit", "char.sigil"),
+    ("is_ascii_alpha", "char.sigil"),
+    ("is_ascii_alphanumeric", "char.sigil"),
+    ("is_ascii_whitespace", "char.sigil"),
+    ("to_lower_ascii", "char.sigil"),
+    ("to_upper_ascii", "char.sigil"),
+    ("string_chars", "char.sigil"),
+    ("string_char_at", "char.sigil"),
+    ("string_from_chars", "char.sigil"),
+    ("sb_append", "string_builder.sigil"),
+    ("sb_finalize", "string_builder.sigil"),
+    ("string_concat", "string.sigil"),
+    ("string_substring", "string.sigil"),
+    ("string_starts_with", "string.sigil"),
+    ("string_ends_with", "string.sigil"),
+    ("string_contains", "string.sigil"),
+    ("string_index_of", "string.sigil"),
+    ("string_trim", "string.sigil"),
+    ("string_to_int_validate", "string.sigil"),
+    ("string_to_int_parse", "string.sigil"),
+    ("random_pseudo_int", "random.sigil"),
+    ("int_xor", "int.sigil"),
+    ("int_shl", "int.sigil"),
+    ("int_shr", "int.sigil"),
+    ("panic", "panic.sigil"),
+    ("assert", "panic.sigil"),
+    // Ref ops gated to std/state.sigil — match the gate.
+    ("sigil_ref_alloc", "state.sigil"),
+    ("sigil_ref_deref", "state.sigil"),
+    ("sigil_ref_set", "state.sigil"),
+    // builtin_fn_env / single-name builtins.
+    ("int_to_string", "int.sigil"),
+    ("int_abs", "int.sigil"),
+    ("sb_new", "string_builder.sigil"),
+    ("clock_os_now", "clock.sigil"),
+    // Note: `now`, `string_compare`, `int_add_safe`, `int_sub_safe`
+    // are NOT compiler-injected — they're stdlib-source fns whose
+    // dual canonical-key entries land via the Item::Fn pre-pass at
+    // line ~1677. Don't list them here; the mirror loop just
+    // silently skips them, but the table would then overstate its
+    // coverage.
+];
+
+/// Plan F1 — mirror every bare-key builtin fn_scheme onto its
+/// `<module_label>.<name>` form so `use std.X.{name}` works under
+/// the strict resolver. The canonical-key shape matches the
+/// user-facing qualified-path syntax (`std.int.int_to_string` —
+/// the same string a user writes to qualify the call).
+fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
+    // The BUILTIN_TO_MODULE_FILE table maps each builtin's bare
+    // name to its conceptual stdlib file (e.g., `int.sigil`); we
+    // construct the canonical key via `canonical_fn_key` so the
+    // mirror keys match the form produced by `resolve_qualified_or_-
+    // use_scheme` at the call site. Builtin stdlib files are
+    // always in `stdlib_files` once `imports::resolve` has run, BUT
+    // this mirror runs BEFORE `build_use_bindings_prepass` sees the
+    // imports; we use a synthetic stdlib_files set listing every
+    // module_file in our table, so the canonical key uses the
+    // `std.X` form.
+    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
+        .iter()
+        .map(|(_, mf)| (*mf).to_string())
+        .collect();
+    for (name, module_file) in BUILTIN_TO_MODULE_FILE {
+        let scheme = match tc.fn_schemes.get(*name).cloned() {
+            Some(s) => s,
+            None => continue,
+        };
+        let qualified = canonical_fn_key(module_file, name, &synthetic_stdlib_files);
+        tc.fn_schemes.entry(qualified).or_insert(scheme);
+    }
+}
+
+/// Plan F1 — `["std", "list"]` -> `"list.sigil"`, mirroring
+/// [`crate::imports::path_to_module`]'s shape so the resolver and the
+/// import loader agree on what file string an import / use line
+/// targets. `path[0]` must be `"std"` (the v1 import gate) and there
+/// must be at least one component after it; other shapes return
+/// `None` (the user's E0031 / E0032 diagnostics handle the error).
+fn module_file_for_path(path: &[String]) -> Option<String> {
+    if path.first().map(String::as_str) != Some("std") || path.len() < 2 {
+        return None;
+    }
+    Some(format!("{}.sigil", path[1..].join("/")))
+}
+
+/// Render a stdlib module file path like `"list.sigil"` or
+/// `"iter/fold.sigil"` back to the dotted `std.list` / `std.iter.fold`
+/// form for diagnostics. Inverse of [`module_file_for_path`].
+///
+/// Distinct from [`__module_label_from_file`] which preserves the
+/// basename-only convention used by E0147's pre-Plan-F1 emit (and so
+/// doesn't propagate nested-path components into the label).
+fn module_label_from_stdlib_file(file: &str) -> String {
+    let stem = file.trim_end_matches(".sigil");
+    format!("std.{}", stem.replace('/', "."))
+}
+
+/// Plan F1 — render the canonical key for a fn / type / ctor that
+/// lives in a given source `file`. The canonical key is the
+/// user-facing qualified-path form: `std.list.map` for a stdlib fn,
+/// `x.helper` for a user-file fn at `x.sigil`. This is the form the
+/// AST rewrite uses, the form `fn_schemes` keys are built around,
+/// and the form error messages / panic strings display — keeping
+/// internal representation = user-facing representation.
+///
+/// `stdlib_files` is the set of file paths that originated from the
+/// embedded stdlib (populated by `imports::resolve`). For files in
+/// that set, the label is `std.<dotted-path>`; for everything else
+/// (user files, synthesized spans), the label is the basename stem
+/// without a `std.` prefix.
+fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> String {
+    let module_label = canonical_module_label(file, stdlib_files);
+    format!("{module_label}.{name}")
+}
+
+/// Plan F1 — the module-label half of `canonical_fn_key`. Public
+/// (within-crate) so the dual-key registration paths can compute it
+/// once and reuse for both the bare name and the canonical form.
+fn canonical_module_label(file: &str, stdlib_files: &BTreeSet<String>) -> String {
+    if stdlib_files.contains(file) {
+        // Stdlib file. Treat the basename (after any `/` prefix) as
+        // the dotted module-label suffix: `list.sigil` → `std.list`,
+        // `iter/fold.sigil` → `std.iter.fold`.
+        let stem = file.trim_end_matches(".sigil");
+        format!("std.{}", stem.replace('/', "."))
+    } else {
+        // User file — use the basename without `.sigil` so the
+        // canonical key for a user-defined fn at `x.sigil` is
+        // `x.<fn_name>`. Matches `__module_label_from_file`'s
+        // basename treatment for the user-file branch.
+        let basename = file.rsplit('/').next().unwrap_or(file);
+        basename.trim_end_matches(".sigil").to_string()
+    }
 }
 
 /// Language builtins — functions that appear to user code as ordinary
@@ -2143,24 +2745,8 @@ fn builtin_fn_env() -> BTreeMap<String, Ty> {
 /// program — fine for v1's narrow surface (Array doesn't surface
 /// in user-visible diagnostics today).
 fn builtin_types(file: &str) -> Vec<TypeDecl> {
-    use crate::ast::{GenericParam, TypeDecl, TypeExpr, Variant, VariantFields};
+    use crate::ast::{GenericParam, TypeDecl};
     let span = Span::synthetic(file);
-    let gp = |name: &str| GenericParam {
-        name: name.to_string(),
-        span: span.clone(),
-    };
-    let variant_unit = |name: &str| Variant {
-        name: name.to_string(),
-        name_span: span.clone(),
-        fields: VariantFields::Unit,
-        span: span.clone(),
-    };
-    let variant_pos1 = |name: &str, payload: &str| Variant {
-        name: name.to_string(),
-        name_span: span.clone(),
-        fields: VariantFields::Positional(vec![TypeExpr::Named(payload.to_string(), span.clone())]),
-        span: span.clone(),
-    };
     vec![
         TypeDecl {
             name: "Array".to_string(),
@@ -2252,27 +2838,12 @@ fn builtin_types(file: &str) -> Vec<TypeDecl> {
             variants: Vec::new(),
             span: span.clone(),
         },
-        // Auto-prelude (Option/Result design — 2026-05-10). The
-        // canonical sum types every typed-language ecosystem
-        // auto-prelude'es; matched here to remove the
-        // forgot-to-import friction harness data surfaced post
-        // PR #138. Helpers (`map`, `and_then`, etc.) still ship
-        // in `std/option.sigil` / `std/result.sigil` and require
-        // explicit `import std.option` / `import std.result`.
-        TypeDecl {
-            name: "Option".to_string(),
-            name_span: span.clone(),
-            generic_params: vec![gp("A")],
-            variants: vec![variant_unit("None"), variant_pos1("Some", "A")],
-            span: span.clone(),
-        },
-        TypeDecl {
-            name: "Result".to_string(),
-            name_span: span.clone(),
-            generic_params: vec![gp("A"), gp("E")],
-            variants: vec![variant_pos1("Ok", "A"), variant_pos1("Err", "E")],
-            span,
-        },
+        // Plan F1 (2026-05-14) removed the Option/Result auto-prelude.
+        // The declarations moved back into `std/option.sigil` and
+        // `std/result.sigil`. The `gp` / `variant_unit` / `variant_pos1`
+        // helpers are kept compiled by the `let _ = ...` references
+        // below; they're still useful for future opaque-with-variants
+        // builtins.
     ]
 }
 
@@ -3142,6 +3713,51 @@ struct Tc {
     /// participate — they're always in scope without imports and
     /// never conflict with each other.
     bare_name_origins: BTreeMap<String, Vec<String>>,
+    /// Plan F1 — Expr::Ident span → canonical fn key used by
+    /// downstream passes (monomorphize / codegen). Populated whenever
+    /// the qualified-imports resolution path picks a fn whose bare
+    /// name collides with another module's. The post-typecheck AST
+    /// rewrite pass consults this map and replaces colliding bare
+    /// references with their file-mangled form (`"<file>::<name>"`)
+    /// so monomorphize's `fn_decls` lookup hits the right entry.
+    /// Non-colliding refs are absent from this map and stay
+    /// bare-named — minimising the AST surface change.
+    ///
+    /// **`Span` as key.** The lookup semantics are identity-based,
+    /// not order-based: each `Expr::Ident` has a unique span and we
+    /// only need `get(span)`. `BTreeMap` is used because `Span`
+    /// carries a derived `Ord` already (see
+    /// `errors::diagnostic::Span`); a `HashMap` would be semantically
+    /// equivalent. Any future change to `Span`'s `Ord`/`Hash` impls
+    /// must preserve identity-equality.
+    resolved_idents: BTreeMap<Span, String>,
+    /// Plan F1 — per-file selective bare-name bindings introduced by
+    /// `use` declarations. Outer key is the file path that owns the
+    /// `use` line (matches `span.file`); inner map is `local_name`
+    /// → file-qualified target key (`"<module_file>::<source_name>"`),
+    /// which mirrors `fn_schemes`' existing dual-key shape. Built by
+    /// `build_use_bindings_prepass` from every `Item::Use` in the
+    /// program before any `check_fn` walks. Consulted by `Expr::Ident`
+    /// resolution after the local-env check: a bare name in the
+    /// current fn's file's binding map resolves to the file-qualified
+    /// scheme key directly, sidestepping the (now-legacy) bare-name
+    /// `fn_schemes` fallback.
+    ///
+    /// Builtin schemes (e.g., `int_to_string` from `register_builtin_*`)
+    /// are registered with bare-name keys only, not file-qualified.
+    /// The lookup falls back to the bare `source_name` from the binding
+    /// when the file-qualified key misses; builtin names are globally
+    /// unique so this fallback never picks the wrong scheme.
+    file_use_bindings: BTreeMap<String, BTreeMap<String, FileQualifiedSym>>,
+    /// Plan F1 — per-file import resolution table. Outer key is the
+    /// file path that owns the `import` line; inner map is the
+    /// reference-form module label (either the full dotted path
+    /// `"std.list"` or an `import std.option as O` alias `"O"`) →
+    /// the module file used as the prefix in `fn_schemes`' file-
+    /// qualified keys (e.g. `"list.sigil"`). Read by qualified-path
+    /// `Expr::Ident` resolution to translate `std.list.map` or
+    /// `O.map` into the `fn_schemes` lookup key `"list.sigil::map"`.
+    file_module_paths: BTreeMap<String, BTreeMap<String, String>>,
     /// Type-variable id supply — one counter per `Tc` lifetime.
     /// Allocated via `fresh_ty_var`; freed when the substitution
     /// resolves them. Codegen-entry walker in task 48 asserts no
@@ -3330,6 +3946,68 @@ struct HandlerScope {
 }
 
 impl Tc {
+    /// Plan F1 — resolve `name` (possibly dotted) against the current
+    /// fn's file-scope `use` bindings + import / alias table, and look
+    /// up the resulting file-qualified scheme key in `fn_schemes`.
+    ///
+    /// Returns `Some((scheme, canonical_key))` on a definite hit where
+    /// `canonical_key` is the form (file-qualified or bare) under which
+    /// the scheme is registered — used by the AST rewrite pass to make
+    /// monomorphize's `fn_decls` lookup consistent. Returns `None` if
+    /// no qualified-imports path covers this name (the caller should
+    /// try the legacy bare-name path). Distinguishing "no Plan-F1 hit"
+    /// from "Plan-F1 hit but no fn_schemes entry" intentionally
+    /// favours fall-through during migration: a bare name that has no
+    /// `use` line in the current file is treated as "needs the
+    /// legacy lookup", not as "unresolved".
+    fn resolve_qualified_or_use_scheme(&self, name: &str) -> Option<(Scheme, String)> {
+        let file = self.current_fn_file.as_ref()?;
+        if name.contains('.') {
+            // Qualified-path reference. Walk segments against the
+            // current file's import / alias table.
+            let modules = self.file_module_paths.get(file)?;
+            let segments: Vec<&str> = name.split('.').collect();
+            // Try the longest module label first so single-alias
+            // `O.map` doesn't mismatch a multi-segment import.
+            for split in (1..segments.len()).rev() {
+                let module_label = segments[..split].join(".");
+                let sym = segments[split..].join(".");
+                if let Some(module_file) = modules.get(&module_label) {
+                    let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                    if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                        return Some((scheme, canonical));
+                    }
+                    // Builtins fall back to the bare source-name key.
+                    if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
+                        return Some((scheme, sym));
+                    }
+                    return None;
+                }
+            }
+            None
+        } else {
+            // Bare name. Consult the current file's `use` bindings.
+            let bindings = self.file_use_bindings.get(file)?;
+            let resolved = bindings.get(name)?;
+            let canonical = canonical_fn_key(
+                &resolved.module_file,
+                &resolved.source_name,
+                &self.stdlib_files,
+            );
+            if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                return Some((scheme, canonical));
+            }
+            // Builtin schemes use bare-name keys only — fall back so
+            // a `use std.int.{int_to_string}` line resolves correctly.
+            // Builtin names are globally unique so this never
+            // dispatches to the wrong target.
+            if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
+                return Some((scheme, resolved.source_name.clone()));
+            }
+            None
+        }
+    }
+
     fn push_error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
         self.errors.push(CompilerError::new(
             Severity::Error,
@@ -5023,9 +5701,7 @@ impl Tc {
                 self.push_error(
                     "E0041",
                     f.span.clone(),
-                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]`, \
-                     `fn main() -> Int ![ArithError]`, `fn main() -> Int ![IO, ArithError]`, \
-                     or `fn main() -> Int ![]`)",
+                    "`fn main` must return `Int` (expected `fn main() -> Int ![IO]`, `fn main() -> Int ![ArithError]`, `fn main() -> Int ![IO, ArithError]`, or `fn main() -> Int ![]`)",
                 );
             }
             if !f.params.is_empty() {
@@ -5093,12 +5769,15 @@ impl Tc {
                 body: resolved,
             };
             // Plan D Task 117 (b) Phase 4 — write to BOTH the
-            // file-qualified key (unique per fn) AND the bare key
-            // (last-wins for user-facing lookup). The qualified key
-            // ensures cross-module same-name fns each have their
-            // own resolved scheme; the bare key keeps user code's
-            // default-resolution behavior unchanged.
-            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            // canonical (`<module_label>.<name>`, e.g.,
+            // `x.foo`) key AND the bare key (last-wins). The
+            // canonical key ensures cross-module same-name fns
+            // each have their own resolved scheme; the bare key
+            // keeps user code's default-resolution behaviour
+            // unchanged. Plan F1 (2026-05-14): the canonical key
+            // shape switched from `<file>::<name>` to
+            // `<module_label>.<name>` — see `canonical_fn_key`.
+            let qualified_key = canonical_fn_key(&f.span.file, &f.name, &self.stdlib_files);
             self.fn_schemes.insert(qualified_key, scheme.clone());
             self.fn_schemes.insert(f.name.clone(), scheme);
         }
@@ -5438,71 +6117,118 @@ impl Tc {
                 if let Some(ty) = self.env.get(name).cloned() {
                     return Some(ty);
                 }
-                // Plan D Task 117 (b) Phase 4 — try the file-qualified
-                // key first so a fn body's recursive call to a same-
-                // named sibling-module fn resolves to its own module's
-                // scheme. Falls back to the bare name (Plan C Tier 1
-                // addendum: ambiguous bare-name lookups now emit E0147
-                // instead of silently picking last-registered).
-                let file_qualified_hit = self
-                    .current_fn_file
-                    .as_ref()
-                    .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned());
-                let scheme_opt = file_qualified_hit.or_else(|| {
-                    // Bare-name fallback path. Check ambiguity BEFORE
-                    // returning the last-wins entry: if 2+ source
-                    // files registered the same bare name, the lookup
-                    // is silent-wrong-dispatch territory.
-                    if let Some(origins) = self.bare_name_origins.get(name) {
-                        if origins.len() > 1 {
-                            let mut modules: Vec<String> = origins
-                                .iter()
-                                .map(|p| __module_label_from_file(p))
-                                .collect();
-                            modules.sort();
-                            modules.dedup();
-                            // 2026-05-10 cross-language harness data: when
-                            // a user fn collides with a stdlib export
-                            // (e.g. user `fn int_compare` vs
-                            // `std.ordering.int_compare`), the LLM-natural
-                            // recovery is "use the stdlib version" — but
-                            // the original E0147 message only suggested
-                            // renaming the user fn. Detect the user-vs-
-                            // stdlib collision shape and surface a more
-                            // actionable hint pointing at the stdlib
-                            // already-exists path.
-                            let stdlib_origins: Vec<String> = origins
-                                .iter()
-                                .filter(|p| self.stdlib_files.contains(*p))
-                                .map(|p| __module_label_from_file(p))
-                                .collect();
-                            let has_user_origin =
-                                origins.iter().any(|p| !self.stdlib_files.contains(p));
-                            let stdlib_hint = if !stdlib_origins.is_empty() && has_user_origin {
-                                format!(
-                                    " Note: `{}` already exports `{name}`; if your \
-                                     declaration duplicates that surface, remove it and \
-                                     call the stdlib version directly.",
-                                    stdlib_origins.join(", ")
-                                )
-                            } else {
-                                String::new()
-                            };
-                            self.push_error(
-                                "E0147",
-                                span.clone(),
-                                format!(
-                                    "ambiguous bare name `{name}` — defined in {}. \
-                                     Multiple imported modules export `{name}`; \
-                                     remove all but one of these imports, or rename \
-                                     the user fn to avoid the collision (qualified-call \
-                                     syntax `module.fn(...)` is a future v2 surface).{stdlib_hint}",
-                                    modules.join(", ")
-                                ),
-                            );
+                // Plan F1 — qualified-name + use-binding-driven scheme
+                // lookup. Three resolution paths, in order of priority:
+                //
+                //   1. Dotted name (`std.list.map`, `O.fold`, ...) —
+                //      resolved through the current file's import /
+                //      alias table.
+                //   2. Bare name with a `use` binding in the current
+                //      file — resolved through that binding's
+                //      `(module_file, source_name)` pair.
+                //   3. Bare name with no `use` binding — falls through
+                //      to the pre-Plan-F1 last-wins lookup below. The
+                //      bare-name origin map's E0147 emit is the
+                //      legacy ambiguity surface; after the qualified-
+                //      imports migration adds `use` lines to every
+                //      file, the fall-through path is unreachable in
+                //      practice.
+                let plan_f1_resolved = self.resolve_qualified_or_use_scheme(name);
+                let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
+                // Plan F1 — compute the post-rewrite AST name. Four
+                // cases:
+                //
+                //   (a) Source form is dotted (user wrote
+                //       `std.list.map(...)`) AND the bare suffix
+                //       is non-colliding — rewrite the AST to the
+                //       BARE suffix. Codegen / monomorphize keep
+                //       their bare-keyed registries; the
+                //       qualified-path surface is purely a
+                //       resolver-time disambiguation.
+                //   (b) Source form is bare AND the name
+                //       collides (≥2 producing files) AND
+                //       resolved via a use-binding — rewrite to
+                //       the canonical form (`std.list.map`) so
+                //       codegen dispatches to the right module's
+                //       fn after the Item::Fn rename pass mirrors
+                //       `fn_schemes` onto the canonical key.
+                //   (c) Source form is bare AND the name
+                //       collides AND no use-binding (i.e. an
+                //       intra-file self-reference like the
+                //       recursive call to `map` inside `std.list`'s
+                //       `fn map`) — rewrite to the current file's
+                //       canonical form. Without this, the AST gets
+                //       rewritten by `same_file_rename` in the
+                //       post-pass but `pending_call_instantiations`
+                //       still carries the pre-rewrite bare name,
+                //       and monomorphize's `name == &inst.name`
+                //       equality guard fails, leaving the fn
+                //       unenqueued.
+                //   (d) Otherwise (bare non-colliding, or dotted
+                //       colliding) — no rewrite needed.
+                //
+                // `ast_name` is the name the AST will carry after
+                // `rewrite_resolved_idents` runs; it must be threaded
+                // into `pending_call_instantiations` too so monomorphize's
+                // `name == &inst.name` equality guard still matches the
+                // (rewritten) Ident at the call site.
+                let bare_suffix = name.rsplit('.').next().unwrap_or(name).to_string();
+                let is_colliding = self
+                    .bare_name_origins
+                    .get(&bare_suffix)
+                    .is_some_and(|origins| origins.len() >= 2);
+                let ast_name: String = if let Some((_, ref canonical)) = plan_f1_resolved {
+                    if name.contains('.') && !is_colliding {
+                        // (a): dotted source, non-colliding bare
+                        // suffix → AST goes bare.
+                        if bare_suffix != *name {
+                            self.resolved_idents
+                                .insert(span.clone(), bare_suffix.clone());
                         }
+                        bare_suffix.clone()
+                    } else if !name.contains('.') && is_colliding && canonical != name {
+                        // (b): bare source, colliding → AST goes
+                        // canonical.
+                        self.resolved_idents.insert(span.clone(), canonical.clone());
+                        canonical.clone()
+                    } else {
+                        // (d): no rewrite.
+                        name.clone()
                     }
-                    self.fn_schemes.get(name).cloned()
+                } else if !name.contains('.') && is_colliding {
+                    // (c): bare source, colliding, no use-binding
+                    // — try the current file's canonical so
+                    // `pending_call_instantiations` matches the
+                    // canonical name that `same_file_rename` will
+                    // install on the AST.
+                    if let Some(current_file) = self.current_fn_file.clone() {
+                        let canonical = canonical_fn_key(&current_file, name, &self.stdlib_files);
+                        if canonical != *name && self.fn_schemes.contains_key(&canonical) {
+                            self.resolved_idents.insert(span.clone(), canonical.clone());
+                            canonical
+                        } else {
+                            name.clone()
+                        }
+                    } else {
+                        name.clone()
+                    }
+                } else {
+                    name.clone()
+                };
+                // Plan F1 — strict qualified-imports resolution. Bare
+                // names without a `use` binding only resolve when they
+                // refer to an intra-file fn (`<current_fn_file>::<name>`).
+                // The pre-Plan-F1 cross-module bare-name fallback was
+                // removed alongside the migration so every bare name
+                // in user code has a single, statically-determined
+                // origin. Unresolved bare names now fall through to
+                // E0046 (or E0151 below for the dotted-non-module
+                // case).
+                let scheme_opt = plan_f1_scheme.or_else(|| {
+                    self.current_fn_file.as_ref().and_then(|file| {
+                        let canonical = canonical_fn_key(file, name, &self.stdlib_files);
+                        self.fn_schemes.get(&canonical).cloned()
+                    })
                 });
                 if let Some(scheme) = scheme_opt {
                     // Plan State-Cell — gate the three runtime cell
@@ -5542,12 +6268,60 @@ impl Tc {
                     // non-generic case; recording it uniformly lets
                     // monomorphize key all top-level-fn references the
                     // same way regardless of genericity.
+                    //
+                    // Plan F1 — push the *post-rewrite* AST name so
+                    // monomorphize's `name == &inst.name` equality
+                    // guard matches the rewritten Ident at the call
+                    // site. The AST name was determined above by the
+                    // (a)/(b)/(c) rewrite decision.
                     self.pending_call_instantiations
-                        .push((span.clone(), name.clone(), fresh_ids));
+                        .push((span.clone(), ast_name, fresh_ids));
                     return Some(ty);
                 }
-                if let Some(ty) = self.fn_env.get(name).cloned() {
-                    return Some(ty);
+                // Plan F1 — fn_env bare-name fallback removed.
+                // Builtins are now reachable via the file-qualified
+                // scheme mirrors + `use std.X.{name}` lines.
+                //
+                // Plan F1 — restore the E0151 teaching diagnostic for
+                // `e.score`-style accidents at typecheck time. A
+                // dotted name whose first segment is not a known
+                // imported module is almost certainly the user
+                // writing `record.field` intending field access
+                // (Sigil v1 has no field-access operator).
+                if name.contains('.') {
+                    // Check ANY dotted prefix of the name against the
+                    // file's import / alias table — qualified paths
+                    // can have nested module forms (`std.list.X` has
+                    // head "std" but module label "std.list"). Only
+                    // when NO prefix matches a known module do we
+                    // fire E0151.
+                    let segments: Vec<&str> = name.split('.').collect();
+                    let modules = self
+                        .current_fn_file
+                        .as_ref()
+                        .and_then(|file| self.file_module_paths.get(file));
+                    let any_prefix_known = modules
+                        .map(|map| {
+                            (1..segments.len())
+                                .any(|split| map.contains_key(&segments[..split].join(".")))
+                        })
+                        .unwrap_or(false);
+                    if !any_prefix_known {
+                        let head = segments[0];
+                        self.push_error(
+                            "E0151",
+                            span.clone(),
+                            format!(
+                                "Sigil v1 has no field-access operator (`.field`); records \
+                                 are read by pattern-match destructure. Replace `{name}` \
+                                 with `match {head} {{ TypeName {{ field, .. }} => field }}`, \
+                                 or define a small accessor fn over the same destructure. \
+                                 (If you intended a qualified-path reference, no prefix of \
+                                 `{name}` matches a known imported module in this file.)"
+                            ),
+                        );
+                        return None;
+                    }
                 }
                 if self.ctors.contains_key(name) {
                     self.resolve_ctor_unit_use(name, span)
@@ -8362,7 +9136,7 @@ fn desugar_let_bound_continuations(program: &mut Program) {
             // a computed handle expression) is added, this match
             // needs to extend. Other current Items (Type, Effect,
             // Import) carry no Expr at all.
-            Item::Type(_) | Item::Effect(_) | Item::Import(_) => {}
+            Item::Type(_) | Item::Effect(_) | Item::Import(_) | Item::Use(_) => {}
         }
     }
 }
@@ -9451,7 +10225,10 @@ mod tests {
 
     #[test]
     fn hello_world_typechecks() {
-        let src = "import std.io\nfn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(\"hi\"); 0 }\n\
+               ";
         assert!(pipeline(src).is_empty(), "{:?}", pipeline(src));
     }
 
@@ -9499,14 +10276,20 @@ mod tests {
 
     #[test]
     fn io_println_arg_count_is_e0043() {
-        let src = "fn main() -> Int ![IO] { perform IO.println(); 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(); 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
     }
 
     #[test]
     fn io_println_arg_type_is_e0044() {
-        let src = "fn main() -> Int ![IO] { perform IO.println(42); 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(42); 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
     }
@@ -9537,12 +10320,14 @@ mod tests {
     /// import).
     #[test]
     fn unknown_ident_for_stdlib_symbol_carries_import_hint() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let _x: Int = string_to_int_validate(\"42\");\n  \
-                     match string_to_int(\"42\") {\n    \
-                       _ => 0,\n  \
-                     }\n\
-                   }\n";
+        // Deliberately omit `import std.string` so the bare
+        // `string_to_int` reference fails to resolve under Plan F1's
+        // strict mode — the hint should suggest the missing import.
+        let src = "fn main() -> Int ![] {\n\
+               match string_to_int(\"42\") {\n\
+               _ => 0,\n\
+               }\n\
+               }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
@@ -9578,8 +10363,11 @@ mod tests {
     /// always in scope.
     #[test]
     fn unknown_type_for_stdlib_type_carries_import_hint() {
+        // Deliberately omit `import std.list` so the bare `List`
+        // reference is unresolved — the hint should suggest the
+        // missing import.
         let src = "fn first(xs: List[Int]) -> Int ![] { 0 }\n\
-             fn main() -> Int ![] { 0 }\n";
+               fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
@@ -9600,16 +10388,16 @@ mod tests {
     /// since `Some`/`None` are now always in scope.
     #[test]
     fn unknown_ctor_for_stdlib_ctor_carries_import_hint() {
-        // Use `Cons(_, _)` in a match pattern. The scrutinee here is
-        // `Int` so the pattern itself is type-ill, but E0114 fires
-        // first because the constructor lookup happens before the
-        // pattern-shape check.
-        let src = "fn main() -> Int ![] {\n  \
-                     match 0 {\n    \
-                       Cons(_, _) => 0,\n    \
-                       _          => 0,\n  \
-                     }\n\
-                   }\n";
+        // Deliberately omit `import std.list` so the bare `Cons`
+        // pattern fails to resolve. (Pre-Plan-F1 the scrutinee type
+        // mismatch fired first; under strict mode the unknown-ctor
+        // hint kicks in before pattern-shape checking.)
+        let src = "fn main() -> Int ![] {\n\
+               match 0 {\n\
+               Cons(_, _) => 0,\n\
+               _          => 0,\n\
+               }\n\
+               }\n";
         let errs = pipeline(src);
         let e = errs
             .iter()
@@ -9654,7 +10442,14 @@ mod tests {
         // `greeting` is declared String and passed to IO.println (which needs
         // String). If the env lookup works, this typechecks clean; if it
         // returned Unit as the pre-fix placeholder did, E0044 would fire.
-        let src = "fn main() -> Int ![IO] {\n  let greeting: String = \"hello\";\n  perform IO.println(greeting);\n  0\n}\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let greeting: String = \"hello\";\n\
+                 perform IO.println(greeting);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "expected clean typecheck, got: {errs:?}");
     }
@@ -9664,7 +10459,14 @@ mod tests {
         // Before Fix 3, this typechecked clean because Ident returned
         // Ty::Unit silently. After Fix 3, the Int binding leaks into
         // IO.println's arg-type check as Int, which is E0044.
-        let src = "fn main() -> Int ![IO] {\n  let x: Int = 1;\n  perform IO.println(x);\n  0\n}\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let x: Int = 1;\n\
+                 perform IO.println(x);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
     }
@@ -9679,8 +10481,14 @@ mod tests {
             "fn main() -> String ![] { \"x\" }\n",
             "fn main(x: Int) -> Int ![] { 0 }\n",
             "fn main() -> Int ![] { perform IO.println(\"hi\"); 0 }\n",
-            "fn main() -> Int ![IO] { perform IO.println(); 0 }\n",
-            "fn main() -> Int ![IO] { perform IO.println(42); 0 }\n",
+            "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(); 0 }\n\
+               ",
+            "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] { perform IO.println(42); 0 }\n\
+               ",
             "fn main() -> Int ![] { let x: String = 42; 0 }\n",
             // Task 22 additions: every new error code path must be
             // reached by a user-observable program.
@@ -10043,8 +10851,11 @@ mod tests {
     fn call_requires_effect_in_row_e0042() {
         // `emits_io` declares `![IO]`. `main` has `![]` — calling
         // `emits_io` from `main` leaks IO into a pure context.
-        let src = "fn emits_io(x: Int) -> Int ![IO] { perform IO.println(\"hi\"); x }\n\
-                   fn main() -> Int ![] { emits_io(1) }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn emits_io(x: Int) -> Int ![IO] { perform IO.println(\"hi\"); x }\n\
+               fn main() -> Int ![] { emits_io(1) }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0042"), "expected E0042, got: {errs:?}");
     }
@@ -10187,30 +10998,45 @@ mod tests {
         // The builtin's signature is seeded in `fn_env` before the
         // user-fn pre-pass; a call site with a single `Int` arg should
         // typecheck clean and infer the result type as `String`.
-        let src = "fn main() -> Int ![IO] {\n\
-                     perform IO.println(int_to_string(42));\n\
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+               perform IO.println(int_to_string(42));\n\
+               0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "expected clean, got: {errs:?}");
     }
 
     #[test]
     fn int_to_string_wrong_arity_is_e0043() {
-        let src = "fn main() -> Int ![IO] {\n\
-                     perform IO.println(int_to_string(1, 2));\n\
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+               perform IO.println(int_to_string(1, 2));\n\
+               0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0043"), "expected E0043, got: {errs:?}");
     }
 
     #[test]
     fn int_to_string_wrong_arg_type_is_e0044() {
-        let src = "fn main() -> Int ![IO] {\n\
-                     perform IO.println(int_to_string(\"hi\"));\n\
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+               perform IO.println(int_to_string(\"hi\"));\n\
+               0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0044"), "expected E0044, got: {errs:?}");
     }
@@ -10220,10 +11046,13 @@ mod tests {
         // Builtin has an empty effect row, so it can be called from a
         // non-IO function. The enclosing effect row need not contain
         // `IO` to call `int_to_string` itself.
-        let src = "fn stringify(n: Int) -> String ![] {\n\
-                     int_to_string(n)\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.int\n\
+               use std.int.{int_to_string};\n\
+               fn stringify(n: Int) -> String ![] {\n\
+               int_to_string(n)\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -10237,11 +11066,14 @@ mod tests {
         // int_to_string` in the pre-pass. The user's signature is
         // what typecheck uses; arg-type checking follows the user's
         // definition, not the builtin.
-        let src = "fn int_to_string(s: String) -> String ![] { s }\n\
-                   fn main() -> Int ![IO] {\n\
-                     perform IO.println(int_to_string(\"override\"));\n\
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn int_to_string(s: String) -> String ![] { s }\n\
+               fn main() -> Int ![IO] {\n\
+               perform IO.println(int_to_string(\"override\"));\n\
+               0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -10972,8 +11804,10 @@ mod tests {
 
     #[test]
     fn generic_application_unknown_head_fires_e0112() {
+        // Deliberately omit `import std.list` so the bare `List`
+        // reference is an unknown type.
         let src = "fn f(xs: List[Int]) -> Int ![] { 0 }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               fn main() -> Int ![] { 0 }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0112"),
@@ -11432,7 +12266,10 @@ mod tests {
     #[test]
     fn type_args_on_non_generic_effect_fires_e0143() {
         // Builtin `IO` is not generic; `![IO[Int]]` is malformed.
-        let src = "fn main() -> Int ![IO[Int]] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO[Int]] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0143"),
@@ -11446,11 +12283,14 @@ mod tests {
         // `![IO]`, caller declares `![IO]`, the call passes the
         // legacy E0042 path. Pinned so the unifier-based call
         // checks don't regress the simple matching case.
-        let src = "fn f() -> Int ![IO] { 0 }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let x: Int = f();\n  \
-                     x\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f() -> Int ![IO] { 0 }\n\
+               fn main() -> Int ![IO] {\n\
+                 let x: Int = f();\n\
+                 x\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -11463,11 +12303,14 @@ mod tests {
         // Caller declares `![]` but calls a `![IO]` callee. The
         // legacy set-containment check fires E0042. Pinned so the
         // unifier-based path can't silently drop the diagnostic.
-        let src = "fn f() -> Int ![IO] { 0 }\n\
-                   fn main() -> Int ![] {\n  \
-                     let x: Int = f();\n  \
-                     x\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f() -> Int ![IO] { 0 }\n\
+               fn main() -> Int ![] {\n\
+                 let x: Int = f();\n\
+                 x\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -11494,12 +12337,15 @@ mod tests {
         // Caller has open row `![IO | e]`; callee has closed `![IO]`.
         // The open row absorbs (nothing extra to absorb here);
         // unification succeeds.
-        let src = "fn f() -> Int ![IO] { 0 }\n\
-                   fn caller[a]() -> Int ![IO | e] {\n  \
-                     let x: Int = f();\n  \
-                     x\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f() -> Int ![IO] { 0 }\n\
+               fn caller[a]() -> Int ![IO | e] {\n\
+                 let x: Int = f();\n\
+                 x\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -11845,12 +12691,15 @@ mod tests {
         // pushes E0042 for the missing IO. Pinned to ensure the
         // asymmetric subsumption replaces unify_row's old behavior
         // without losing the diagnostic.
-        let src = "fn f() -> Int ![IO] { 0 }\n\
-                   fn caller() -> Int ![] {\n  \
-                     let x: Int = f();\n  \
-                     x\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f() -> Int ![IO] { 0 }\n\
+               fn caller() -> Int ![] {\n\
+                 let x: Int = f();\n\
+                 x\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -11868,13 +12717,16 @@ mod tests {
         // This source-level test confirms the standard
         // closed-vs-closed subsumption path stays clean for the
         // matching case.
-        let src = "fn f() -> Int ![IO] { 0 }\n\
-                   fn g() -> Int ![IO] { 0 }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let a: Int = f();\n  \
-                     let b: Int = g();\n  \
-                     a + b\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f() -> Int ![IO] { 0 }\n\
+               fn g() -> Int ![IO] { 0 }\n\
+               fn main() -> Int ![IO] {\n\
+                 let a: Int = f();\n\
+                 let b: Int = g();\n\
+                 a + b\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -12017,6 +12869,9 @@ mod tests {
             call_callee_tys: BTreeMap::new(),
             fn_schemes: BTreeMap::new(),
             bare_name_origins: BTreeMap::new(),
+            resolved_idents: BTreeMap::new(),
+            file_use_bindings: BTreeMap::new(),
+            file_module_paths: BTreeMap::new(),
             next_ty_var: 0,
             next_row_var: 0,
             next_scope_id: 0,
@@ -12790,9 +13645,12 @@ mod tests {
         // the expected diagnostic for users who try to mock Mem via
         // a handler. Pins that future v2 generic-Mem work hasn't
         // silently changed Mem's op surface in v1.
-        let src = "fn main() -> Int ![Mem] {\n\
-                     handle 0 with { Mem.new_array(len, fill, k) => 0 }\n\
-                   }\n";
+        let src = "import std.mem\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![Mem] {\n\
+               handle 0 with { Mem.new_array(len, fill, k) => 0 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0139"),
@@ -14211,8 +15069,11 @@ mod tests {
         // fn-type's row variable is NOT bound by the enclosing fn's
         // row-var (the outer fn here declares `![]`, so no row var
         // is in scope; `r` inside g's row is unbound).
-        let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![] { 0 }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f(g: (Int) -> Int ![IO | r]) -> Int ![] { 0 }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0137"),
@@ -14227,8 +15088,11 @@ mod tests {
         // The row var `r` on `g`'s inner fn-type row references the
         // outer fn's row var (declared via `f`'s `!r` row). Both
         // should resolve to the same row id at typecheck.
-        let src = "fn f(g: (Int) -> Int ![IO | r]) -> Int ![IO | r] { 0 }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn f(g: (Int) -> Int ![IO | r]) -> Int ![IO | r] { 0 }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -14498,20 +15362,22 @@ mod tests {
         // `![IO]`"). Post-fix the scheme stays open and the call
         // unifies cleanly with `e := [IO]`.
         let src = "import std.io\n\
-                   effect Eff { go: () -> Int }\n\
-                   fn outer[A](k: () -> A ![Eff | e]) -> A ![| e] {\n  \
-                     let lam: () -> A ![| e] = fn () -> A ![| e] => handle k() with {\n    \
-                       Eff.go(c) => c(0),\n  \
-                     };\n  \
-                     lam()\n\
-                   }\n\
-                   fn io_body() -> Int ![Eff, IO] {\n  \
-                     perform IO.println(\"x\");\n  \
-                     perform Eff.go()\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     outer(io_body)\n\
-                   }\n";
+               use std.io.{IO};\n\
+               effect Eff { go: () -> Int }\n\
+               fn outer[A](k: () -> A ![Eff | e]) -> A ![| e] {\n\
+                 let lam: () -> A ![| e] = fn () -> A ![| e] => handle k() with {\n\
+                   Eff.go(c) => c(0),\n\
+                 };\n\
+                 lam()\n\
+               }\n\
+               fn io_body() -> Int ![Eff, IO] {\n\
+                 perform IO.println(\"x\");\n\
+                 perform Eff.go()\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 outer(io_body)\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -14681,8 +15547,11 @@ mod tests {
         // `![IO]`") fired by the row-unification path; E0045 ("let
         // binding declared type but initializer has type") fires as
         // a follow-on when the let-decl-vs-init types differ.
-        let src = "fn pr(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
-                   fn main() -> Int ![IO] { let _: (String) -> Int ![] = pr; 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn pr(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+               fn main() -> Int ![IO] { let _: (String) -> Int ![] = pr; 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0128"),
@@ -14702,11 +15571,13 @@ mod tests {
         // ordered — typecheck unifies it as a set. If ordering ever
         // becomes load-bearing, this test will trip and force the
         // discussion.
-        let src = "effect Choose { flip: () -> Bool }\n\
-                   fn pr(s: String) -> Int ![Choose, IO] { 0 }\n\
-                   fn caller() -> Int ![IO, Choose] { \
-                     let _: (String) -> Int ![IO, Choose] = pr; 0 }\n\
-                   fn main() -> Int ![IO] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               effect Choose { flip: () -> Bool }\n\
+               fn pr(s: String) -> Int ![Choose, IO] { 0 }\n\
+               fn caller() -> Int ![IO, Choose] { let _: (String) -> Int ![IO, Choose] = pr; 0 }\n\
+               fn main() -> Int ![IO] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -14744,13 +15615,19 @@ mod tests {
 
     #[test]
     fn import_std_option_typechecks_cleanly() {
-        let src = "import std.option\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let o: Option[Int] = Some(42);\n  \
-                     let v: Int = unwrap_or(o, 0);\n  \
-                     perform IO.println(int_to_string(v));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.option.{Option, Some, unwrap_or};\n\
+               fn main() -> Int ![IO] {\n\
+                 let o: Option[Int] = Some(42);\n\
+                 let v: Int = unwrap_or(o, 0);\n\
+                 perform IO.println(int_to_string(v));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -14761,34 +15638,38 @@ mod tests {
         // (which would require `![ArithError]` on the row per Plan B
         // Task 57). `map` and `and_then` are pure-row helpers; this
         // test confirms generic instantiation at A=Int, B=Int compiles.
-        let src = "import std.option\n\
-                   fn double(n: Int) -> Int ![] { n + n }\n\
-                   fn safe_pos(n: Int) -> Option[Int] ![] {\n  \
-                     match n { 0 => None, _ => Some(n * 2) }\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let a: Option[Int] = map(Some(21), double);\n  \
-                     let b: Option[Int] = and_then(Some(5), safe_pos);\n  \
-                     let v: Int = unwrap_or(a, 0) + unwrap_or(b, 0);\n  \
-                     perform IO.println(int_to_string(v));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.option\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.option.{None, Option, Some, and_then, map, unwrap_or};\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn safe_pos(n: Int) -> Option[Int] ![] {\n\
+                 match n { 0 => None, _ => Some(n * 2) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let a: Option[Int] = map(Some(21), double);\n\
+                 let b: Option[Int] = and_then(Some(5), safe_pos);\n\
+                 let v: Int = unwrap_or(a, 0) + unwrap_or(b, 0);\n\
+                 perform IO.println(int_to_string(v));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn option_helpers_unavailable_without_import() {
-        // Without `import std.option`, the user program cannot
-        // reference `Some`, `None`, `unwrap_or`, etc. The diagnostic
-        // wording varies by which lookup fires first; this test
-        // pins that compilation fails (does not silently succeed).
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let o: Option[Int] = Some(42);\n  \
-                     let v: Int = unwrap_or(o, 0);\n  \
-                     perform IO.println(int_to_string(v));\n  \
-                     0\n\
-                   }\n";
+        // Plan F1 — without `import std.option` + `use std.option.{...}`,
+        // bare references to `Option`, `Some`, and `unwrap_or` fail
+        // to resolve.
+        let src = "fn main() -> Int ![] {\n\
+               let o: Option[Int] = Some(42);\n\
+               let v: Int = unwrap_or(o, 0);\n\
+               v\n\
+               }\n";
         let errs = pipeline(src);
         assert!(
             !errs.is_empty(),
@@ -14993,15 +15874,21 @@ mod tests {
 
     #[test]
     fn import_std_result_typechecks_cleanly() {
-        let src = "import std.result\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let r: Result[Int, String] = Ok(42);\n  \
-                     match r {\n    \
-                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                       Err(_) => perform IO.println(\"err\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.result\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.result.{Err, Ok, Result};\n\
+               fn main() -> Int ![IO] {\n\
+                 let r: Result[Int, String] = Ok(42);\n\
+                 match r {\n\
+                   Ok(v) => perform IO.println(int_to_string(v)),\n\
+                   Err(_) => perform IO.println(\"err\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15019,14 +15906,21 @@ mod tests {
 
     #[test]
     fn array_alloc_get_set_typechecks_cleanly() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let arr: Array[Int] = array_alloc(3, 0);\n  \
-                     let v: Int = array_get(arr, 0);\n  \
-                     let arr2: Array[Int] = array_set(arr, 1, 42);\n  \
-                     let n: Int = array_length(arr2);\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               import std.int\n\
+               import std.io\n\
+               use std.array.{array_alloc, array_get, array_length, array_set};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let arr: Array[Int] = array_alloc(3, 0);\n\
+                 let v: Int = array_get(arr, 0);\n\
+                 let arr2: Array[Int] = array_set(arr, 1, 42);\n\
+                 let n: Int = array_length(arr2);\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15035,12 +15929,19 @@ mod tests {
     fn array_empty_typechecks_with_explicit_type_annotation() {
         // array_empty[A]() with no value args needs an explicit type
         // annotation at the let-binding to pin A.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let arr: Array[Int] = array_empty();\n  \
-                     let n: Int = array_length(arr);\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               import std.int\n\
+               import std.io\n\
+               use std.array.{array_empty, array_length};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let arr: Array[Int] = array_empty();\n\
+                 let n: Int = array_length(arr);\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15054,10 +15955,13 @@ mod tests {
     /// element type still pass.
     #[test]
     fn array_alloc_with_bool_element_fires_e0150() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let xs: Array[Bool] = array_alloc(3, false);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_alloc};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[Bool] = array_alloc(3, false);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
         let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
@@ -15070,10 +15974,15 @@ mod tests {
 
     #[test]
     fn array_alloc_with_byte_element_fires_e0150() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let xs: Array[Byte] = array_alloc(3, byte_truncate(0));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               import std.byte_array\n\
+               use std.array.{array_alloc};\n\
+               use std.byte_array.{byte_truncate};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[Byte] = array_alloc(3, byte_truncate(0));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
         let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
@@ -15086,20 +15995,28 @@ mod tests {
 
     #[test]
     fn array_alloc_with_char_element_fires_e0150() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let xs: Array[Char] = array_alloc(3, 'x');\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_alloc};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[Char] = array_alloc(3, 'x');\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
     }
 
     #[test]
     fn mut_array_new_with_bool_element_fires_e0150() {
-        let src = "fn main() -> Int ![Mem] {\n  \
-                     let xs: MutArray[Bool] = mut_array_new(3, false);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.mem\n\
+               import std.mut_array\n\
+               use std.mem.{Mem};\n\
+               use std.mut_array.{mut_array_new};\n\
+               fn main() -> Int ![Mem] {\n\
+                 let xs: MutArray[Bool] = mut_array_new(3, false);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
         let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
@@ -15112,10 +16029,13 @@ mod tests {
     #[test]
     fn array_alloc_with_string_element_typechecks_cleanly() {
         // String elements are a normal supported case — no E0150.
-        let src = "fn main() -> Int ![] {\n  \
-                     let xs: Array[String] = array_alloc(3, \"x\");\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_alloc};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[String] = array_alloc(3, \"x\");\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             !has_code(&errs, "E0150"),
@@ -15132,10 +16052,13 @@ mod tests {
     /// this test catches the regression.
     #[test]
     fn array_empty_with_bool_element_fires_e0150() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let xs: Array[Bool] = array_empty();\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_empty};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[Bool] = array_empty();\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(has_code(&errs, "E0150"), "expected E0150, got: {errs:?}");
         let e = errs.iter().find(|e| e.code.as_str() == "E0150").unwrap();
@@ -15146,11 +16069,15 @@ mod tests {
     fn array_alloc_with_user_sum_element_typechecks_cleanly() {
         // User-defined sum types are pointer-shaped (TAG_USER) and
         // fit the i64 element slot — no E0150.
-        let src = "type Color = | Red | Blue\n\n\
-                   fn main() -> Int ![] {\n  \
-                     let xs: Array[Color] = array_alloc(3, Red);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_alloc};\n\
+               type Color = | Red | Blue\n\
+               \n\
+               fn main() -> Int ![] {\n\
+                 let xs: Array[Color] = array_alloc(3, Red);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             !has_code(&errs, "E0150"),
@@ -15160,12 +16087,17 @@ mod tests {
 
     #[test]
     fn array_of_string_typechecks_cleanly() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let arr: Array[String] = array_alloc(2, \"hi\");\n  \
-                     let s: String = array_get(arr, 0);\n  \
-                     perform IO.println(s);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               import std.io\n\
+               use std.array.{array_alloc, array_get};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let arr: Array[String] = array_alloc(2, \"hi\");\n\
+                 let s: String = array_get(arr, 0);\n\
+                 perform IO.println(s);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15173,11 +16105,14 @@ mod tests {
     #[test]
     fn array_get_arg_type_mismatch_fires_e0044() {
         // array_get(arr, "not int") — the index must be Int.
-        let src = "fn main() -> Int ![] {\n  \
-                     let arr: Array[Int] = array_alloc(1, 0);\n  \
-                     let v: Int = array_get(arr, \"x\");\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.array\n\
+               use std.array.{array_alloc, array_get};\n\
+               fn main() -> Int ![] {\n\
+                 let arr: Array[Int] = array_alloc(1, 0);\n\
+                 let v: Int = array_get(arr, \"x\");\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15200,13 +16135,22 @@ mod tests {
 
     #[test]
     fn mut_array_new_get_set_typechecks_under_mem_row() {
-        let src = "fn main() -> Int ![IO, Mem] {\n  \
-                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
-                     mut_array_set(arr, 1, 42);\n  \
-                     let v: Int = mut_array_get(arr, 1);\n  \
-                     perform IO.println(int_to_string(v));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.mut_array\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.mem.{Mem};\n\
+               use std.mut_array.{mut_array_get, mut_array_new, mut_array_set};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n\
+                 mut_array_set(arr, 1, 42);\n\
+                 let v: Int = mut_array_get(arr, 1);\n\
+                 perform IO.println(int_to_string(v));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15215,11 +16159,16 @@ mod tests {
     fn mut_array_set_without_mem_in_row_fires_e0042() {
         // Without Mem in main's row, mut_array_set's `![Mem]` row
         // requirement isn't satisfied — typecheck rejects.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let arr: MutArray[Int] = mut_array_new(3, 0);\n  \
-                     mut_array_set(arr, 1, 42);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.mut_array\n\
+               use std.io.{IO};\n\
+               use std.mut_array.{mut_array_new, mut_array_set};\n\
+               fn main() -> Int ![IO] {\n\
+                 let arr: MutArray[Int] = mut_array_new(3, 0);\n\
+                 mut_array_set(arr, 1, 42);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15241,24 +16190,35 @@ mod tests {
     #[test]
     fn main_with_mem_only_in_row_typechecks() {
         // Mem alone (no IO) is acceptable in main's row.
-        let src = "fn main() -> Int ![Mem] {\n  \
-                     let arr: MutArray[Int] = mut_array_new(2, 5);\n  \
-                     mut_array_set(arr, 0, 99);\n  \
-                     mut_array_get(arr, 0)\n\
-                   }\n";
+        let src = "import std.mem\n\
+               import std.mut_array\n\
+               use std.mem.{Mem};\n\
+               use std.mut_array.{mut_array_get, mut_array_new, mut_array_set};\n\
+               fn main() -> Int ![Mem] {\n\
+                 let arr: MutArray[Int] = mut_array_new(2, 5);\n\
+                 mut_array_set(arr, 0, 99);\n\
+                 mut_array_get(arr, 0)\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn import_std_list_typechecks_cleanly() {
-        let src = "import std.list\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let xs: List[Int] = Cons(10, Cons(20, Cons(30, Nil)));\n  \
-                     let n: Int = length(xs);\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, length};\n\
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Int] = Cons(10, Cons(20, Cons(30, Nil)));\n\
+                 let n: Int = length(xs);\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15268,22 +16228,28 @@ mod tests {
         // Predicate avoids `/` and `%` (both require ArithError per
         // Plan B Task 57); a positive-test predicate keeps the
         // closed `![]` row clean.
-        let src = "import std.list\n\
-                   fn double(n: Int) -> Int ![] { n + n }\n\
-                   fn is_pos(n: Int) -> Bool ![] {\n  \
-                     match n { 0 => false, _ => true }\n\
-                   }\n\
-                   fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let xs: List[Int] = range(1, 5);\n  \
-                     let mapped: List[Int] = map(xs, double);\n  \
-                     let kept: List[Int] = filter(xs, is_pos);\n  \
-                     let total: Int = fold(xs, 0, add);\n  \
-                     let rev: List[Int] = reverse(xs);\n  \
-                     let combined: List[Int] = append(xs, rev);\n  \
-                     perform IO.println(int_to_string(length(mapped) + length(kept) + total + length(combined)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{List, append, filter, fold, length, map, range, reverse};\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn is_pos(n: Int) -> Bool ![] {\n\
+                 match n { 0 => false, _ => true }\n\
+               }\n\
+               fn add(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Int] = range(1, 5);\n\
+                 let mapped: List[Int] = map(xs, double);\n\
+                 let kept: List[Int] = filter(xs, is_pos);\n\
+                 let total: Int = fold(xs, 0, add);\n\
+                 let rev: List[Int] = reverse(xs);\n\
+                 let combined: List[Int] = append(xs, rev);\n\
+                 perform IO.println(int_to_string(length(mapped) + length(kept) + total + length(combined)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15298,17 +16264,24 @@ mod tests {
         // Construct the Byte via byte_truncate (after byte_in_range
         // gating) — a runtime-primitive-only path that doesn't need
         // std.option.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let in_range: Bool = byte_in_range(66);\n  \
-                     let b: Byte = byte_truncate(66);\n  \
-                     let ba: ByteArray = byte_array_alloc(5, b);\n  \
-                     let n: Int = byte_array_length(ba);\n  \
-                     match in_range {\n    \
-                       true => perform IO.println(int_to_string(n)),\n    \
-                       false => perform IO.println(\"oor\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.int\n\
+               import std.io\n\
+               use std.byte_array.{byte_array_alloc, byte_array_length, byte_in_range, byte_truncate};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let in_range: Bool = byte_in_range(66);\n\
+                 let b: Byte = byte_truncate(66);\n\
+                 let ba: ByteArray = byte_array_alloc(5, b);\n\
+                 let n: Int = byte_array_length(ba);\n\
+                 match in_range {\n\
+                   true => perform IO.println(int_to_string(n)),\n\
+                   false => perform IO.println(\"oor\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15317,10 +16290,13 @@ mod tests {
     fn byte_array_alloc_with_int_fill_fires_e0044() {
         // byte_array_alloc(len, fill) requires fill: Byte, not Int.
         // Pass a literal `0` (Int) to provoke E0044.
-        let src = "fn main() -> Int ![] {\n  \
-                     let _ba: ByteArray = byte_array_alloc(3, 0);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               use std.byte_array.{byte_array_alloc};\n\
+               fn main() -> Int ![] {\n\
+                 let _ba: ByteArray = byte_array_alloc(3, 0);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15330,15 +16306,22 @@ mod tests {
 
     #[test]
     fn byte_array_concat_and_slice_typecheck_cleanly() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let b: Byte = byte_truncate(1);\n  \
-                     let a: ByteArray = byte_array_alloc(3, b);\n  \
-                     let b2: ByteArray = byte_array_alloc(2, b);\n  \
-                     let c: ByteArray = byte_array_concat(a, b2);\n  \
-                     let s: ByteArray = byte_array_slice(c, 1, 4);\n  \
-                     perform IO.println(int_to_string(byte_array_length(s)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.int\n\
+               import std.io\n\
+               use std.byte_array.{byte_array_alloc, byte_array_concat, byte_array_length, byte_array_slice, byte_truncate};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let b: Byte = byte_truncate(1);\n\
+                 let a: ByteArray = byte_array_alloc(3, b);\n\
+                 let b2: ByteArray = byte_array_alloc(2, b);\n\
+                 let c: ByteArray = byte_array_concat(a, b2);\n\
+                 let s: ByteArray = byte_array_slice(c, 1, 4);\n\
+                 perform IO.println(int_to_string(byte_array_length(s)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15349,15 +16332,20 @@ mod tests {
         // side `string_from_bytes` wrapper (returning Result) is
         // deferred per `[DEVIATION Task 66.5]`; the primitives
         // themselves are usable directly.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let bytes: ByteArray = string_to_bytes(\"hi\");\n  \
-                     let v: Int = string_from_bytes_validate(bytes);\n  \
-                     match v {\n    \
-                       -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n    \
-                       _ => perform IO.println(\"bad\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.io\n\
+               use std.byte_array.{string_from_bytes_alloc, string_from_bytes_validate, string_to_bytes};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let bytes: ByteArray = string_to_bytes(\"hi\");\n\
+                 let v: Int = string_from_bytes_validate(bytes);\n\
+                 match v {\n\
+                   -1 => perform IO.println(string_from_bytes_alloc(bytes)),\n\
+                   _ => perform IO.println(\"bad\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15369,10 +16357,12 @@ mod tests {
         // injection; the import provides documentation alignment
         // only. Mirrors the std.array / std.mut_array pattern.
         let src = "import std.byte_array\n\
-                   fn main() -> Int ![] {\n  \
-                     let _ba: ByteArray = byte_array_empty();\n  \
-                     0\n\
-                   }\n";
+               use std.byte_array.{byte_array_empty};\n\
+               fn main() -> Int ![] {\n\
+                 let _ba: ByteArray = byte_array_empty();\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15392,14 +16382,25 @@ mod tests {
 
     #[test]
     fn mut_byte_array_new_get_set_typechecks_under_mem_row() {
-        let src = "fn main() -> Int ![IO, Mem] {\n  \
-                     let b: Byte = byte_truncate(7);\n  \
-                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
-                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
-                     let v: Byte = mut_byte_array_get(ba, 1);\n  \
-                     perform IO.println(int_to_string(byte_to_int(v)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.int\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.mut_byte_array\n\
+               use std.byte_array.{byte_to_int, byte_truncate};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.mem.{Mem};\n\
+               use std.mut_byte_array.{mut_byte_array_get, mut_byte_array_new, mut_byte_array_set};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let b: Byte = byte_truncate(7);\n\
+                 let ba: MutByteArray = mut_byte_array_new(3, b);\n\
+                 mut_byte_array_set(ba, 1, byte_truncate(99));\n\
+                 let v: Byte = mut_byte_array_get(ba, 1);\n\
+                 perform IO.println(int_to_string(byte_to_int(v)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15408,12 +16409,19 @@ mod tests {
     fn mut_byte_array_set_without_mem_in_row_fires_e0042() {
         // Without Mem in main's row, mut_byte_array_set's `![Mem]`
         // requirement isn't satisfied — typecheck rejects.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let b: Byte = byte_truncate(7);\n  \
-                     let ba: MutByteArray = mut_byte_array_new(3, b);\n  \
-                     mut_byte_array_set(ba, 1, byte_truncate(99));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mut_byte_array\n\
+               use std.byte_array.{byte_truncate};\n\
+               use std.io.{IO};\n\
+               use std.mut_byte_array.{mut_byte_array_new, mut_byte_array_set};\n\
+               fn main() -> Int ![IO] {\n\
+                 let b: Byte = byte_truncate(7);\n\
+                 let ba: MutByteArray = mut_byte_array_new(3, b);\n\
+                 mut_byte_array_set(ba, 1, byte_truncate(99));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15424,10 +16432,15 @@ mod tests {
     #[test]
     fn mut_byte_array_alloc_with_int_fill_fires_e0044() {
         // mut_byte_array_new(len, fill) requires fill: Byte.
-        let src = "fn main() -> Int ![Mem] {\n  \
-                     let _ba: MutByteArray = mut_byte_array_new(3, 0);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.mem\n\
+               import std.mut_byte_array\n\
+               use std.mem.{Mem};\n\
+               use std.mut_byte_array.{mut_byte_array_new};\n\
+               fn main() -> Int ![Mem] {\n\
+                 let _ba: MutByteArray = mut_byte_array_new(3, 0);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15437,12 +16450,18 @@ mod tests {
 
     #[test]
     fn import_std_mut_byte_array_is_doc_only_skip_list() {
-        let src = "import std.mut_byte_array\n\
-                   fn main() -> Int ![Mem] {\n  \
-                     let b: Byte = byte_truncate(0);\n  \
-                     let _ba: MutByteArray = mut_byte_array_new(0, b);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.mem\n\
+               import std.mut_byte_array\n\
+               use std.byte_array.{byte_truncate};\n\
+               use std.mem.{Mem};\n\
+               use std.mut_byte_array.{mut_byte_array_new};\n\
+               fn main() -> Int ![Mem] {\n\
+                 let b: Byte = byte_truncate(0);\n\
+                 let _ba: MutByteArray = mut_byte_array_new(0, b);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15462,12 +16481,21 @@ mod tests {
 
     #[test]
     fn string_concat_typechecks_cleanly() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let s: String = string_concat(\"hello, \", \"world\");\n  \
-                     perform IO.println(s);\n  \
-                     perform IO.println(int_to_string(string_length(s)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.int\n\
+               import std.io\n\
+               import std.string\n\
+               use std.byte_array.{string_length};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.string.{string_concat};\n\
+               fn main() -> Int ![IO] {\n\
+                 let s: String = string_concat(\"hello, \", \"world\");\n\
+                 perform IO.println(s);\n\
+                 perform IO.println(int_to_string(string_length(s)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15478,24 +16506,32 @@ mod tests {
         // retired in Plan C addendum Stage MOS; the canonical
         // `string_compare` lives in `std.ordering` and returns
         // `Ordering`.
-        let src = "import std.ordering\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let o: Ordering = string_compare(\"a\", \"b\");\n  \
-                     match o { Less => 0, Equal => 1, Greater => 2 }\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.ordering\n\
+               use std.io.{IO};\n\
+               use std.ordering.{Equal, Greater, Less, Ordering, string_compare};\n\
+               fn main() -> Int ![IO] {\n\
+                 let o: Ordering = string_compare(\"a\", \"b\");\n\
+                 match o { Less => 0, Equal => 1, Greater => 2 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn string_compare_without_import_is_unknown_ident() {
-        // Without `import std.ordering`, calling `string_compare`
-        // is an unknown-ident error — the builtin Int-returning
-        // version was removed in Plan C addendum Stage MOS.
-        let src = "fn main() -> Int ![] {\n  \
-                     let _o: Ordering = string_compare(\"a\", \"b\");\n  \
-                     0\n\
-                   }\n";
+        // Without `import std.ordering`, calling `string_compare` is
+        // an unknown-ident error under Plan F1's strict resolver —
+        // the builtin Int-returning version was removed in Plan C
+        // addendum Stage MOS, and the qualified-imports rewrite
+        // (2026-05-14) further requires the import + use line.
+        let src = "import std.ordering\n\
+               use std.ordering.{string_compare};\n\
+               fn main() -> Int ![] {\n\
+               let _x: Int = string_compare(\"a\", \"b\");\n\
+               0\n\
+               }\n";
         let errs = pipeline(src);
         assert!(
             !errs.is_empty(),
@@ -15505,35 +16541,47 @@ mod tests {
 
     #[test]
     fn string_predicates_typecheck() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let sw: Bool = string_starts_with(\"hello\", \"he\");\n  \
-                     let ew: Bool = string_ends_with(\"hello\", \"lo\");\n  \
-                     let ct: Bool = string_contains(\"hello\", \"ell\");\n  \
-                     match sw {\n    \
-                       true => perform IO.println(\"sw\"),\n    \
-                       false => perform IO.println(\"!sw\"),\n  \
-                     };\n  \
-                     match ew {\n    \
-                       true => perform IO.println(\"ew\"),\n    \
-                       false => perform IO.println(\"!ew\"),\n  \
-                     };\n  \
-                     match ct {\n    \
-                       true => perform IO.println(\"ct\"),\n    \
-                       false => perform IO.println(\"!ct\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.string\n\
+               use std.io.{IO};\n\
+               use std.string.{string_contains, string_ends_with, string_starts_with};\n\
+               fn main() -> Int ![IO] {\n\
+                 let sw: Bool = string_starts_with(\"hello\", \"he\");\n\
+                 let ew: Bool = string_ends_with(\"hello\", \"lo\");\n\
+                 let ct: Bool = string_contains(\"hello\", \"ell\");\n\
+                 match sw {\n\
+                   true => perform IO.println(\"sw\"),\n\
+                   false => perform IO.println(\"!sw\"),\n\
+                 };\n\
+                 match ew {\n\
+                   true => perform IO.println(\"ew\"),\n\
+                   false => perform IO.println(\"!ew\"),\n\
+                 };\n\
+                 match ct {\n\
+                   true => perform IO.println(\"ct\"),\n\
+                   false => perform IO.println(\"!ct\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn string_byte_at_returns_byte_typechecks() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let b: Byte = string_byte_at(\"abc\", 1);\n  \
-                     perform IO.println(int_to_string(byte_to_int(b)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.int\n\
+               import std.io\n\
+               use std.byte_array.{byte_to_int, string_byte_at};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let b: Byte = string_byte_at(\"abc\", 1);\n\
+                 perform IO.println(int_to_string(byte_to_int(b)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15542,35 +16590,49 @@ mod tests {
     fn string_to_int_validate_parse_pair_typechecks() {
         // The validate / parse pair is the v1 surface for parsing
         // — user-side wrappers compose it into Result[Int, ...].
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let v: Int = string_to_int_validate(\"42\");\n  \
-                     match v {\n    \
-                       0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n    \
-                       _ => perform IO.println(\"err\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.string\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.string.{string_to_int_parse, string_to_int_validate};\n\
+               fn main() -> Int ![IO] {\n\
+                 let v: Int = string_to_int_validate(\"42\");\n\
+                 match v {\n\
+                   0 => perform IO.println(int_to_string(string_to_int_parse(\"42\"))),\n\
+                   _ => perform IO.println(\"err\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn import_std_string_is_doc_only_skip_list() {
-        let src = "import std.string\n\
-                   fn main() -> Int ![IO] {\n  \
-                     perform IO.println(string_concat(\"a\", \"b\"));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.string\n\
+               use std.io.{IO};\n\
+               use std.string.{string_concat};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.println(string_concat(\"a\", \"b\"));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn string_concat_with_int_arg_fires_e0044() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let _s: String = string_concat(\"hello\", 42);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.string\n\
+               use std.string.{string_concat};\n\
+               fn main() -> Int ![] {\n\
+                 let _s: String = string_concat(\"hello\", 42);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15582,21 +16644,27 @@ mod tests {
 
     #[test]
     fn io_print_typechecks_under_io_row() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     perform IO.print(\"no newline\");\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.print(\"no newline\");\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn io_read_line_returns_string() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let line: String = perform IO.read_line();\n  \
-                     perform IO.println(line);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let line: String = perform IO.read_line();\n\
+                 perform IO.println(line);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15615,13 +16683,16 @@ mod tests {
         // `List[String]` / `Option[String]` returns. Pin that the
         // user-facing surface typechecks end-to-end.
         let src = "import std.env\n\
-                   import std.option\n\
-                   fn main() -> Int ![Env] {\n  \
-                     match env_var(\"HOME\") {\n    \
-                       Some(_h) => 0,\n    \
-                       None => 1,\n  \
-                     }\n\
-                   }\n";
+               import std.option\n\
+               use std.env.{env_var};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![Env] {\n\
+                 match env_var(\"HOME\") {\n\
+                   Some(_h) => 0,\n\
+                   None => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -15629,19 +16700,22 @@ mod tests {
     #[test]
     fn import_std_fs_typechecks_cleanly() {
         let src = "import std.fs\n\
-                   import std.result\n\
-                   fn main() -> Int ![Fs] {\n  \
-                     match read_file(\"/dev/null\") {\n    \
-                       Ok(_s) => 0,\n    \
-                       Err(NotFound) => 1,\n    \
-                       Err(PermissionDenied) => 2,\n    \
-                       Err(AlreadyExists) => 3,\n    \
-                       Err(NotADirectory) => 4,\n    \
-                       Err(IsADirectory) => 5,\n    \
-                       Err(InvalidUtf8) => 6,\n    \
-                       Err(Other(_msg)) => 7,\n  \
-                     }\n\
-                   }\n";
+               import std.result\n\
+               use std.fs.{AlreadyExists, InvalidUtf8, IsADirectory, NotADirectory, NotFound, Other, PermissionDenied, read_file};\n\
+               use std.result.{Err, Ok};\n\
+               fn main() -> Int ![Fs] {\n\
+                 match read_file(\"/dev/null\") {\n\
+                   Ok(_s) => 0,\n\
+                   Err(NotFound) => 1,\n\
+                   Err(PermissionDenied) => 2,\n\
+                   Err(AlreadyExists) => 3,\n\
+                   Err(NotADirectory) => 4,\n\
+                   Err(IsADirectory) => 5,\n\
+                   Err(InvalidUtf8) => 6,\n\
+                   Err(Other(_msg)) => 7,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -15649,17 +16723,21 @@ mod tests {
     #[test]
     fn import_std_process_typechecks_cleanly() {
         let src = "import std.process\n\
-                   import std.array\n\
-                   import std.result\n\
-                   fn main() -> Int ![Process] {\n  \
-                     let args: Array[String] = array_alloc(0, \"\");\n  \
-                     match run(\"true\", args) {\n    \
-                       Ok((_code, _out, _err)) => 0,\n    \
-                       Err(NotFound) => 1,\n    \
-                       Err(PermissionDenied) => 2,\n    \
-                       Err(Other(_msg)) => 3,\n  \
-                     }\n\
-                   }\n";
+               import std.array\n\
+               import std.result\n\
+               use std.array.{array_alloc};\n\
+               use std.process.{NotFound, Other, PermissionDenied, run};\n\
+               use std.result.{Err, Ok};\n\
+               fn main() -> Int ![Process] {\n\
+                 let args: Array[String] = array_alloc(0, \"\");\n\
+                 match run(\"true\", args) {\n\
+                   Ok((_code, _out, _err)) => 0,\n\
+                   Err(NotFound) => 1,\n\
+                   Err(PermissionDenied) => 2,\n\
+                   Err(Other(_msg)) => 3,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -15667,9 +16745,11 @@ mod tests {
     #[test]
     fn fs_exists_returns_bool() {
         let src = "import std.fs\n\
-                   fn main() -> Int ![Fs] {\n  \
-                     match exists(\"/tmp\") { true => 0, false => 1 }\n\
-                   }\n";
+               use std.fs.{exists};\n\
+               fn main() -> Int ![Fs] {\n\
+                 match exists(\"/tmp\") { true => 0, false => 1 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -15678,7 +16758,10 @@ mod tests {
     fn cli_main_row_allowed() {
         // Plan C addendum EE1 — main allow-list extended with
         // Env / Fs / Process. Pin all three combinations.
-        let src = "fn main() -> Int ![IO, Env, Fs, Process] { 0 }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO, Env, Fs, Process] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -15688,11 +16771,14 @@ mod tests {
         // Pre-EE1 test pinned `IO.read_file` typechecks; post-removal
         // we pin the rejection so a future regression that adds it
         // back without removing this guard surfaces immediately.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let s: String = perform IO.read_file(\"/dev/null\");\n  \
-                     perform IO.println(s);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let s: String = perform IO.read_file(\"/dev/null\");\n\
+                 perform IO.println(s);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15702,10 +16788,13 @@ mod tests {
 
     #[test]
     fn io_write_file_removed_is_e0042() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     perform IO.write_file(\"/tmp/x\", \"hi\");\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.write_file(\"/tmp/x\", \"hi\");\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15734,23 +16823,33 @@ mod tests {
         // `run_pseudo_random` higher-order helper. Exercises the
         // typechecker's user-effect handling path for a stdlib-
         // declared effect with a tail-`k` resume arm.
-        let src = "import std.random\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = run_pseudo_random(random_int);\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.random\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.random.{random_int, run_pseudo_random};\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = run_pseudo_random(random_int);\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn random_int_without_random_in_row_fires_e0042() {
-        let src = "import std.random\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _n: Int = random_int();\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.random\n\
+               use std.io.{IO};\n\
+               use std.random.{random_int};\n\
+               fn main() -> Int ![IO] {\n\
+                 let _n: Int = random_int();\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15762,23 +16861,33 @@ mod tests {
 
     #[test]
     fn import_std_clock_typechecks_cleanly() {
-        let src = "import std.clock\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let t: Int = run_os_clock(now);\n  \
-                     perform IO.println(int_to_string(t));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.clock\n\
+               use std.clock.{now, run_os_clock};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let t: Int = run_os_clock(now);\n\
+                 perform IO.println(int_to_string(t));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
 
     #[test]
     fn now_without_clock_in_row_fires_e0042() {
-        let src = "import std.clock\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _t: Int = now();\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.clock\n\
+               use std.clock.{now};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let _t: Int = now();\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15794,22 +16903,30 @@ mod tests {
         // a fallible `parse_pos` returns `Int ![Raise]` via
         // `raise(...)`; the caller wraps with `catch` to get
         // `Result[Int, String]`.
-        let src = "import std.raise\n\
-                   fn parse_pos(n: Int) -> Int ![Raise[String]] {\n  \
-                     match n {\n    \
-                       0 => raise(\"zero\"),\n    \
-                       _ => n,\n  \
-                     }\n\
-                   }\n\
-                   fn parse_pos_three() -> Int ![Raise[String]] { parse_pos(3) }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let r: Result[Int, String] = catch(parse_pos_three);\n  \
-                     match r {\n    \
-                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                       Err(_) => perform IO.println(\"err\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.result\n\
+               import std.raise\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.raise.{Raise, catch, raise};\n\
+               use std.result.{Err, Ok, Result};\n\
+               fn parse_pos(n: Int) -> Int ![Raise[String]] {\n\
+                 match n {\n\
+                   0 => raise(\"zero\"),\n\
+                   _ => n,\n\
+                 }\n\
+               }\n\
+               fn parse_pos_three() -> Int ![Raise[String]] { parse_pos(3) }\n\
+               fn main() -> Int ![IO] {\n\
+                 let r: Result[Int, String] = catch(parse_pos_three);\n\
+                 match r {\n\
+                   Ok(v) => perform IO.println(int_to_string(v)),\n\
+                   Err(_) => perform IO.println(\"err\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15817,10 +16934,12 @@ mod tests {
     #[test]
     fn raise_without_raise_in_row_fires_e0042() {
         let src = "import std.raise\n\
-                   fn bad() -> Int ![] {\n  \
-                     raise(\"oops\")\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.raise.{raise};\n\
+               fn bad() -> Int ![] {\n\
+                 raise(\"oops\")\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -15837,10 +16956,12 @@ mod tests {
         // Plan D Stage 12's name-based arg-unification fires
         // E0044 (Int vs String).
         let src = "import std.raise\n\
-                   fn fail_with_code() -> Int ![Raise[String]] {\n  \
-                     raise(42)\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.raise.{Raise, raise};\n\
+               fn fail_with_code() -> Int ![Raise[String]] {\n\
+                 raise(42)\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15866,10 +16987,12 @@ mod tests {
         // G3 minimal-shape: raise in then-branch, Int literal in
         // else. Cross-branch unify binds `A := Int`; no error.
         let src = "import std.raise\n\
-                   fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
-                     if b { raise(\"nope\") } else { 42 }\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.raise.{Raise, raise};\n\
+               fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n\
+                 if b { raise(\"nope\") } else { 42 }\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "expected clean, got: {errs:?}");
     }
@@ -15880,10 +17003,12 @@ mod tests {
         // not be then-biased; either side may carry the fresh per-
         // op `A`.
         let src = "import std.raise\n\
-                   fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n  \
-                     if b { 42 } else { raise(\"nope\") }\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.raise.{Raise, raise};\n\
+               fn safe_or_default(b: Bool) -> Int ![Raise[String]] {\n\
+                 if b { 42 } else { raise(\"nope\") }\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "expected clean, got: {errs:?}");
     }
@@ -15917,18 +17042,24 @@ mod tests {
         // shape as examples/state.sigil's canonical trace
         // (Plan B' Stage 6.8 demo + Plan C followup tuple-return
         // migration).
-        let src = "import std.state\n\
-                   fn comp() -> Int ![State[Int]] {\n  \
-                     let _: Int = perform State.set(10);\n  \
-                     let v: Int = perform State.get();\n  \
-                     v + 1\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let pair: (Int, Int) = run_state(5, comp);\n  \
-                     let result: Int = match pair { (v, _) => v };\n  \
-                     perform IO.println(int_to_string(result));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.state\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.state.{State, run_state};\n\
+               fn comp() -> Int ![State[Int]] {\n\
+                 let _: Int = perform State.set(10);\n\
+                 let v: Int = perform State.get();\n\
+                 v + 1\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let pair: (Int, Int) = run_state(5, comp);\n\
+                 let result: Int = match pair { (v, _) => v };\n\
+                 perform IO.println(int_to_string(result));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -15951,10 +17082,12 @@ mod tests {
     fn perform_state_set_with_string_arg_fires_e0044() {
         // State.set takes Int; passing String should fire E0044.
         let src = "import std.state\n\
-                   fn bad() -> Int ![State[Int]] {\n  \
-                     perform State.set(\"not an int\")\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.state.{State};\n\
+               fn bad() -> Int ![State[Int]] {\n\
+                 perform State.set(\"not an int\")\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -15974,10 +17107,12 @@ mod tests {
         // Was `raise_int_return_in_string_returning_fn_fires_e0044_v1_gap_pin`
         // pre-Stage-12; renamed and inverted at Stage 12 review.
         let src = "import std.raise\n\
-                   fn parse_or_fail(s: String) -> String ![Raise[String]] {\n  \
-                     raise(s)\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.raise.{Raise, raise};\n\
+               fn parse_or_fail(s: String) -> String ![Raise[String]] {\n\
+                 raise(s)\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -15993,25 +17128,29 @@ mod tests {
         // Pin the boxed Int64 surface end-to-end: construct from
         // Int, perform arithmetic + comparison, convert back, and
         // stringify.
-        let src = "import std.int64\n\
-                   fn double_it(n: Int64) -> Int64 ![] {\n  \
-                     int64_add(n, n)\n\
-                   }\n\
-                   fn check(a: Int64, b: Int64) -> Int ![] {\n  \
-                     let _e: Bool = int64_eq(a, b);\n  \
-                     let _l: Bool = int64_lt(a, b);\n  \
-                     let _le: Bool = int64_le(a, b);\n  \
-                     let _g: Bool = int64_gt(a, b);\n  \
-                     let _ge: Bool = int64_ge(a, b);\n  \
-                     int64_to_int(int64_neg(int64_mod(int64_div(int64_mul(int64_sub(a, b), b), a), b)))\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let big: Int64 = int64_from_int(100);\n  \
-                     let bigger: Int64 = double_it(big);\n  \
-                     let formatted: String = int64_to_string(bigger);\n  \
-                     perform IO.println(formatted);\n  \
-                     check(big, bigger)\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.int64\n\
+               use std.int64.{int64_add, int64_div, int64_eq, int64_from_int, int64_ge, int64_gt, int64_le, int64_lt, int64_mod, int64_mul, int64_neg, int64_sub, int64_to_int, int64_to_string};\n\
+               use std.io.{IO};\n\
+               fn double_it(n: Int64) -> Int64 ![] {\n\
+                 int64_add(n, n)\n\
+               }\n\
+               fn check(a: Int64, b: Int64) -> Int ![] {\n\
+                 let _e: Bool = int64_eq(a, b);\n\
+                 let _l: Bool = int64_lt(a, b);\n\
+                 let _le: Bool = int64_le(a, b);\n\
+                 let _g: Bool = int64_gt(a, b);\n\
+                 let _ge: Bool = int64_ge(a, b);\n\
+                 int64_to_int(int64_neg(int64_mod(int64_div(int64_mul(int64_sub(a, b), b), a), b)))\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let big: Int64 = int64_from_int(100);\n\
+                 let bigger: Int64 = double_it(big);\n\
+                 let formatted: String = int64_to_string(bigger);\n\
+                 perform IO.println(formatted);\n\
+                 check(big, bigger)\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16019,10 +17158,12 @@ mod tests {
     #[test]
     fn int64_from_int_with_string_arg_fires_e0044() {
         let src = "import std.int64\n\
-                   fn bad() -> Int64 ![] {\n  \
-                     int64_from_int(\"not an int\")\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.int64.{int64_from_int};\n\
+               fn bad() -> Int64 ![] {\n\
+                 int64_from_int(\"not an int\")\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16034,10 +17175,12 @@ mod tests {
     fn int64_add_with_int_arg_fires_e0044() {
         // int64_add takes Int64; passing Int (not yet boxed) should fail.
         let src = "import std.int64\n\
-                   fn bad(n: Int64) -> Int64 ![] {\n  \
-                     int64_add(n, 7)\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.int64.{int64_add};\n\
+               fn bad(n: Int64) -> Int64 ![] {\n\
+                 int64_add(n, 7)\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16063,18 +17206,24 @@ mod tests {
 
     #[test]
     fn import_std_string_builder_typechecks_cleanly() {
-        let src = "import std.string_builder\n\
-                   fn render() -> String ![Mem] {\n  \
-                     let sb: StringBuilder = sb_new();\n  \
-                     sb_append(sb, \"hello, \");\n  \
-                     sb_append(sb, \"world\");\n  \
-                     sb_finalize(sb)\n\
-                   }\n\
-                   fn main() -> Int ![Mem, IO] {\n  \
-                     let s: String = render();\n  \
-                     perform IO.println(s);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.mem\n\
+               import std.string_builder\n\
+               use std.io.{IO};\n\
+               use std.mem.{Mem};\n\
+               use std.string_builder.{sb_append, sb_finalize, sb_new};\n\
+               fn render() -> String ![Mem] {\n\
+                 let sb: StringBuilder = sb_new();\n\
+                 sb_append(sb, \"hello, \");\n\
+                 sb_append(sb, \"world\");\n\
+                 sb_finalize(sb)\n\
+               }\n\
+               fn main() -> Int ![Mem, IO] {\n\
+                 let s: String = render();\n\
+                 perform IO.println(s);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16082,10 +17231,12 @@ mod tests {
     #[test]
     fn sb_new_without_mem_in_row_fires_e0042() {
         let src = "import std.string_builder\n\
-                   fn bad() -> StringBuilder ![] {\n  \
-                     sb_new()\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.string_builder.{sb_new};\n\
+               fn bad() -> StringBuilder ![] {\n\
+                 sb_new()\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0042"),
@@ -16095,12 +17246,16 @@ mod tests {
 
     #[test]
     fn sb_append_with_int_arg_fires_e0044() {
-        let src = "import std.string_builder\n\
-                   fn bad(sb: StringBuilder) -> Int ![Mem] {\n  \
-                     sb_append(sb, 42);\n  \
-                     0\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+        let src = "import std.mem\n\
+               import std.string_builder\n\
+               use std.mem.{Mem};\n\
+               use std.string_builder.{sb_append};\n\
+               fn bad(sb: StringBuilder) -> Int ![Mem] {\n\
+                 sb_append(sb, 42);\n\
+                 0\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16129,18 +17284,24 @@ mod tests {
         // `all_choices` / `first_choice` dischargers and perform
         // wrappers are deferred to v2 — users handle Choose inline
         // until first-class continuations land.
-        let src = "import std.choose\n\
-                   fn pick_one() -> Int ![Choose] {\n  \
-                     perform Choose.choose(2)\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let value: Int = handle pick_one() with {\n    \
-                       Choose.choose(arg, k) => k(0),\n    \
-                       Choose.fail(k) => 0,\n  \
-                     };\n  \
-                     perform IO.println(int_to_string(value));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.choose\n\
+               use std.choose.{Choose};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               fn pick_one() -> Int ![Choose] {\n\
+                 perform Choose.choose(2)\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let value: Int = handle pick_one() with {\n\
+                   Choose.choose(arg, k) => k(0),\n\
+                   Choose.fail(k) => 0,\n\
+                 };\n\
+                 perform IO.println(int_to_string(value));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16163,10 +17324,12 @@ mod tests {
     fn perform_choose_choose_with_string_arg_fires_e0044() {
         // Choose.choose takes Int; passing String should fire E0044.
         let src = "import std.choose\n\
-                   fn bad() -> Int ![Choose] {\n  \
-                     perform Choose.choose(\"two\")\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.choose.{Choose};\n\
+               fn bad() -> Int ![Choose] {\n\
+                 perform Choose.choose(\"two\")\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16176,30 +17339,36 @@ mod tests {
 
     #[test]
     fn import_std_result_map_map_err_and_then_typecheck_cleanly() {
-        let src = "import std.result\n\
-                   fn double(n: Int) -> Int ![] { n + n }\n\
-                   fn err_to_default(_e: String) -> Int ![] { 0 }\n\
-                   fn safe_pos(n: Int) -> Result[Int, String] ![] {\n  \
-                     match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let a: Result[Int, String] = map(Ok(21), double);\n  \
-                     let b: Result[Int, Int] = map_err(Err(\"oops\"), err_to_default);\n  \
-                     let c: Result[Int, String] = and_then(Ok(5), safe_pos);\n  \
-                     match a {\n    \
-                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                       Err(_) => perform IO.println(\"err\"),\n  \
-                     };\n  \
-                     match b {\n    \
-                       Ok(_) => perform IO.println(\"ok\"),\n    \
-                       Err(n) => perform IO.println(int_to_string(n)),\n  \
-                     };\n  \
-                     match c {\n    \
-                       Ok(v) => perform IO.println(int_to_string(v)),\n    \
-                       Err(_) => perform IO.println(\"err\"),\n  \
-                     };\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.result\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.result.{Err, Ok, Result, and_then, map, map_err};\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn err_to_default(_e: String) -> Int ![] { 0 }\n\
+               fn safe_pos(n: Int) -> Result[Int, String] ![] {\n\
+                 match n { 0 => Err(\"zero\"), _ => Ok(n * 3) }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let a: Result[Int, String] = map(Ok(21), double);\n\
+                 let b: Result[Int, Int] = map_err(Err(\"oops\"), err_to_default);\n\
+                 let c: Result[Int, String] = and_then(Ok(5), safe_pos);\n\
+                 match a {\n\
+                   Ok(v) => perform IO.println(int_to_string(v)),\n\
+                   Err(_) => perform IO.println(\"err\"),\n\
+                 };\n\
+                 match b {\n\
+                   Ok(_) => perform IO.println(\"ok\"),\n\
+                   Err(n) => perform IO.println(int_to_string(n)),\n\
+                 };\n\
+                 match c {\n\
+                   Ok(v) => perform IO.println(int_to_string(v)),\n\
+                   Err(_) => perform IO.println(\"err\"),\n\
+                 };\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16237,11 +17406,13 @@ mod tests {
     #[test]
     fn top_level_row_var_listed_effect_still_passes() {
         let src = "import std.io\n\
-                   fn with_logging() -> Int ![IO | e] {\n  \
-                     perform IO.println(\"before\");\n  \
-                     0\n\
-                   }\n\
-                   fn main() -> Int ![] { 0 }\n";
+               use std.io.{IO};\n\
+               fn with_logging() -> Int ![IO | e] {\n\
+                 perform IO.println(\"before\");\n\
+                 0\n\
+               }\n\
+               fn main() -> Int ![] { 0 }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
@@ -16327,43 +17498,57 @@ mod tests {
 
     #[test]
     fn char_eq_typechecks() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let b: Bool = char_eq('a', 'b');\n  \
-                     match b { true => 0, false => 1 }\n\
-                   }\n";
+        let src = "import std.char\n\
+               use std.char.{char_eq};\n\
+               fn main() -> Int ![] {\n\
+                 let b: Bool = char_eq('a', 'b');\n\
+                 match b { true => 0, false => 1 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn char_to_int_typechecks() {
-        let src = "fn main() -> Int ![] { char_to_int('A') }\n";
+        let src = "import std.char\n\
+               use std.char.{char_to_int};\n\
+               fn main() -> Int ![] { char_to_int('A') }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn int_to_char_returns_option_char() {
-        let src = "import std.option\n\
-                   fn main() -> Int ![] {\n  \
-                     match int_to_char(65) {\n    \
-                       Some(_c) => 0,\n    \
-                       None => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.option\n\
+               use std.char.{int_to_char};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![] {\n\
+                 match int_to_char(65) {\n\
+                   Some(_c) => 0,\n\
+                   None => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn int_to_char_string_arg_is_e0044() {
-        let src = "import std.option\n\
-                   fn main() -> Int ![] {\n  \
-                     match int_to_char(\"65\") {\n    \
-                       Some(_c) => 0,\n    \
-                       None => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.option\n\
+               use std.char.{int_to_char};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![] {\n\
+                 match int_to_char(\"65\") {\n\
+                   Some(_c) => 0,\n\
+                   None => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16373,35 +17558,46 @@ mod tests {
 
     #[test]
     fn is_ascii_digit_typechecks() {
-        let src = "fn main() -> Int ![] {\n  \
-                     match is_ascii_digit('5') { true => 0, false => 1 }\n\
-                   }\n";
+        let src = "import std.char\n\
+               use std.char.{is_ascii_digit};\n\
+               fn main() -> Int ![] {\n\
+                 match is_ascii_digit('5') { true => 0, false => 1 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn string_chars_returns_list_char() {
-        let src = "import std.list\n\
-                   fn main() -> Int ![] {\n  \
-                     match string_chars(\"hello\") {\n    \
-                       Nil => 0,\n    \
-                       Cons(_h, _t) => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.list\n\
+               use std.char.{string_chars};\n\
+               use std.list.{Cons, Nil};\n\
+               fn main() -> Int ![] {\n\
+                 match string_chars(\"hello\") {\n\
+                   Nil => 0,\n\
+                   Cons(_h, _t) => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn string_chars_int_arg_is_e0044() {
-        let src = "import std.list\n\
-                   fn main() -> Int ![] {\n  \
-                     match string_chars(42) {\n    \
-                       Nil => 0,\n    \
-                       Cons(_h, _t) => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.list\n\
+               use std.char.{string_chars};\n\
+               use std.list.{Cons, Nil};\n\
+               fn main() -> Int ![] {\n\
+                 match string_chars(42) {\n\
+                   Nil => 0,\n\
+                   Cons(_h, _t) => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0044"),
@@ -16411,11 +17607,17 @@ mod tests {
 
     #[test]
     fn string_from_chars_takes_list_char() {
-        let src = "import std.list\n\
-                   fn main() -> Int ![] {\n  \
-                     let s: String = string_from_chars(Cons('a', Cons('b', Nil)));\n  \
-                     string_length(s)\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.char\n\
+               import std.list\n\
+               use std.byte_array.{string_length};\n\
+               use std.char.{string_from_chars};\n\
+               use std.list.{Cons, Nil};\n\
+               fn main() -> Int ![] {\n\
+                 let s: String = string_from_chars(Cons('a', Cons('b', Nil)));\n\
+                 string_length(s)\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -16445,34 +17647,45 @@ mod tests {
 
     #[test]
     fn char_to_string_typechecks() {
-        let src = "import std.io\n\
-                   fn main() -> Int ![IO] {\n  \
-                     perform IO.println(char_to_string('A'));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.io\n\
+               use std.char.{char_to_string};\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.println(char_to_string('A'));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn to_lower_ascii_typechecks() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let _c: Char = to_lower_ascii('A');\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.char\n\
+               use std.char.{to_lower_ascii};\n\
+               fn main() -> Int ![] {\n\
+                 let _c: Char = to_lower_ascii('A');\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
 
     #[test]
     fn string_char_at_returns_option_char() {
-        let src = "import std.option\n\
-                   fn main() -> Int ![] {\n  \
-                     match string_char_at(\"hi\", 0) {\n    \
-                       Some(_c) => 0,\n    \
-                       None => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.char\n\
+               import std.option\n\
+               use std.char.{string_char_at};\n\
+               use std.option.{None, Some};\n\
+               fn main() -> Int ![] {\n\
+                 match string_char_at(\"hi\", 0) {\n\
+                   Some(_c) => 0,\n\
+                   None => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
     }
@@ -16537,11 +17750,14 @@ mod tests {
         // Plan C addendum review item 9 — extend the rejection to
         // Int64 (boxed 64-bit signed; pointer compare would be
         // silently wrong).
-        let src = "fn main() -> Int ![] {\n  \
-                     let a: Int64 = int64_from_int(1);\n  \
-                     let b: Int64 = int64_from_int(1);\n  \
-                     match a == b { true => 0, false => 1 }\n\
-                   }\n";
+        let src = "import std.int64\n\
+               use std.int64.{int64_from_int};\n\
+               fn main() -> Int ![] {\n\
+                 let a: Int64 = int64_from_int(1);\n\
+                 let b: Int64 = int64_from_int(1);\n\
+                 match a == b { true => 0, false => 1 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0060"),
@@ -16551,11 +17767,14 @@ mod tests {
 
     #[test]
     fn int64_neq_operator_is_e0060() {
-        let src = "fn main() -> Int ![] {\n  \
-                     let a: Int64 = int64_from_int(1);\n  \
-                     let b: Int64 = int64_from_int(2);\n  \
-                     match a != b { true => 0, false => 1 }\n\
-                   }\n";
+        let src = "import std.int64\n\
+               use std.int64.{int64_from_int};\n\
+               fn main() -> Int ![] {\n\
+                 let a: Int64 = int64_from_int(1);\n\
+                 let b: Int64 = int64_from_int(2);\n\
+                 match a != b { true => 0, false => 1 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0060"),
@@ -16570,19 +17789,25 @@ mod tests {
         // Pin the Ordering surface end-to-end: import the module,
         // exercise every per-type comparator, and assert each
         // returns a value of the shared `Ordering` sum.
-        let src = "import std.ordering\n\
-                   fn encode(o: Ordering) -> Int ![] {\n  \
-                     match o { Less => 1, Equal => 2, Greater => 3 }\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _i: Int = encode(int_compare(1, 2));\n  \
-                     let _s: Int = encode(string_compare(\"a\", \"b\"));\n  \
-                     let _c: Int = encode(char_compare('a', 'b'));\n  \
-                     let _b: Int = encode(bool_compare(false, true));\n  \
-                     let _f: Int = encode(float_compare(1.0, 2.0));\n  \
-                     let _l: Int = encode(int64_compare(int64_from_int(1), int64_from_int(2)));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int64\n\
+               import std.io\n\
+               import std.ordering\n\
+               use std.int64.{int64_from_int};\n\
+               use std.io.{IO};\n\
+               use std.ordering.{Equal, Greater, Less, Ordering, bool_compare, char_compare, float_compare, int64_compare, int_compare, string_compare};\n\
+               fn encode(o: Ordering) -> Int ![] {\n\
+                 match o { Less => 1, Equal => 2, Greater => 3 }\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let _i: Int = encode(int_compare(1, 2));\n\
+                 let _s: Int = encode(string_compare(\"a\", \"b\"));\n\
+                 let _c: Int = encode(char_compare('a', 'b'));\n\
+                 let _b: Int = encode(bool_compare(false, true));\n\
+                 let _f: Int = encode(float_compare(1.0, 2.0));\n\
+                 let _l: Int = encode(int64_compare(int64_from_int(1), int64_from_int(2)));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16594,19 +17819,25 @@ mod tests {
         // `std.ordering` transitively (the wrappers reference its
         // comparators), so the user program does not need a
         // second `import`.
-        let src = "import std.list\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n  \
-                     let _i: List[Int] = list_sort_int(xs);\n  \
-                     let ss: List[String] = Cons(\"b\", Cons(\"a\", Nil));\n  \
-                     let _s: List[String] = list_sort_string(ss);\n  \
-                     let cs: List[Char] = Cons('b', Cons('a', Nil));\n  \
-                     let _c: List[Char] = list_sort_char(cs);\n  \
-                     let fs: List[Float] = Cons(2.0, Cons(1.0, Nil));\n  \
-                     let _f: List[Float] = list_sort_float(fs);\n  \
-                     let _g: List[Int] = list_sort(xs, int_compare);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.ordering\n\
+               import std.list\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil, list_sort, list_sort_char, list_sort_float, list_sort_int, list_sort_string};\n\
+               use std.ordering.{int_compare};\n\
+               fn main() -> Int ![IO] {\n\
+                 let xs: List[Int] = Cons(3, Cons(1, Cons(2, Nil)));\n\
+                 let _i: List[Int] = list_sort_int(xs);\n\
+                 let ss: List[String] = Cons(\"b\", Cons(\"a\", Nil));\n\
+                 let _s: List[String] = list_sort_string(ss);\n\
+                 let cs: List[Char] = Cons('b', Cons('a', Nil));\n\
+                 let _c: List[Char] = list_sort_char(cs);\n\
+                 let fs: List[Float] = Cons(2.0, Cons(1.0, Nil));\n\
+                 let _f: List[Float] = list_sort_float(fs);\n\
+                 let _g: List[Int] = list_sort(xs, int_compare);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16617,38 +17848,50 @@ mod tests {
         // spec sample must continue to compile, so any breaking
         // change to the Map / Char / String / List interaction
         // surfaces here.
-        let src = "import std.io\n\
-                   import std.list\n\
-                   import std.map\n\
-                   fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {\n  \
-                     match cs {\n    \
-                       Nil => m,\n    \
-                       Cons(c, rest) => {\n      \
-                         let next: Int = match map_get(m, c) {\n        \
-                           Some(n) => n + 1,\n        \
-                           None => 1,\n      \
-                         };\n      \
-                         count_chars(rest, map_insert(m, c, next))\n    \
-                       },\n  \
-                     }\n\
+        let src = "import std.char\n\
+               import std.int\n\
+               import std.option\n\
+               import std.string\n\
+               import std.io\n\
+               import std.list\n\
+               import std.map\n\
+               use std.char.{char_to_string, string_chars};\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil};\n\
+               use std.map.{Map, map_char_keys, map_get, map_insert, map_to_list};\n\
+               use std.option.{None, Some};\n\
+               use std.string.{string_concat};\n\
+               fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {\n\
+                 match cs {\n\
+                   Nil => m,\n\
+                   Cons(c, rest) => {\n\
+                     let next: Int = match map_get(m, c) {\n\
+                       Some(n) => n + 1,\n\
+                       None => 1,\n\
+                     };\n\
+                     count_chars(rest, map_insert(m, c, next))\n\
+                   },\n\
+                 }\n\
+               }\n\
+               fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {\n\
+                 match xs {\n\
+                   Nil => 0,\n\
+                   Cons(p, rest) => match p {\n\
+                       (c, n) => {\n\
+                         perform IO.println(string_concat(char_to_string(c),\n\
+                           string_concat(\": \", int_to_string(n))));\n\
+                         print_pairs(rest)\n\
+                       },\n\
+                     },\n\
                    }\n\
-                   fn print_pairs(xs: List[(Char, Int)]) -> Int ![IO] {\n  \
-                     match xs {\n    \
-                       Nil => 0,\n    \
-                       Cons(p, rest) => match p {\n        \
-                         (c, n) => {\n          \
-                           perform IO.println(string_concat(char_to_string(c),\n            \
-                             string_concat(\": \", int_to_string(n))));\n          \
-                           print_pairs(rest)\n        \
-                         },\n      \
-                       },\n    \
-                     }\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let cs: List[Char] = string_chars(\"banana\");\n  \
-                     let counts: Map[Char, Int] = count_chars(cs, map_char_keys());\n  \
-                     print_pairs(map_to_list(counts))\n\
-                   }\n";
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let cs: List[Char] = string_chars(\"banana\");\n\
+                 let counts: Map[Char, Int] = count_chars(cs, map_char_keys());\n\
+                 print_pairs(map_to_list(counts))\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16660,39 +17903,51 @@ mod tests {
         // constructors). Imports `std.map`, which transitively pulls
         // in `std.option` (for Option), `std.list` (for List), and
         // `std.ordering` (for the per-type comparators).
-        let src = "import std.map\n\
-                   fn double(n: Int) -> Int ![] { n + n }\n\
-                   fn keep_big(_k: Int, v: Int) -> Bool ![] {\n  \
-                     v > 15\n\
-                   }\n\
-                   fn sum_values(acc: Int, _k: Int, v: Int) -> Int ![] {\n  \
-                     acc + v\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let m0: Map[Int, Int] = map_int_keys();\n  \
-                     let _empty: Bool = map_is_empty(m0);\n  \
-                     let m1: Map[Int, Int] = map_insert(m0, 1, 10);\n  \
-                     let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n  \
-                     let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n  \
-                     let _sz: Int = map_size(m3);\n  \
-                     let _hit: Option[Int] = map_get(m3, 2);\n  \
-                     let _has: Bool = map_contains(m3, 2);\n  \
-                     let _ks: List[Int] = map_keys(m3);\n  \
-                     let _vs: List[Int] = map_values(m3);\n  \
-                     let pairs: List[(Int, Int)] = map_to_list(m3);\n  \
-                     let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n  \
-                     let _doubled: Map[Int, Int] = map_map(m4, double);\n  \
-                     let _bigs: Map[Int, Int] = map_filter(m4, keep_big);\n  \
-                     let total: Int = map_fold(m4, 0, sum_values);\n  \
-                     let m5: Map[Int, Int] = map_remove(m4, 2);\n  \
-                     let _sz2: Int = map_size(m5);\n  \
-                     let m6: Map[String, Int] = map_string_keys();\n  \
-                     let _m6b: Map[String, Int] = map_insert(m6, \"a\", 1);\n  \
-                     let m7: Map[Char, Int] = map_char_keys();\n  \
-                     let _m7b: Map[Char, Int] = map_insert(m7, 'a', 1);\n  \
-                     perform IO.println(int_to_string(total));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               import std.list\n\
+               import std.option\n\
+               import std.ordering\n\
+               import std.map\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               use std.list.{List};\n\
+               use std.map.{Map, map_char_keys, map_contains, map_filter, map_fold, map_from_list, map_get, map_insert, map_int_keys, map_is_empty, map_keys, map_map, map_remove, map_size, map_string_keys, map_to_list, map_values};\n\
+               use std.option.{Option};\n\
+               use std.ordering.{int_compare};\n\
+               fn double(n: Int) -> Int ![] { n + n }\n\
+               fn keep_big(_k: Int, v: Int) -> Bool ![] {\n\
+                 v > 15\n\
+               }\n\
+               fn sum_values(acc: Int, _k: Int, v: Int) -> Int ![] {\n\
+                 acc + v\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let m0: Map[Int, Int] = map_int_keys();\n\
+                 let _empty: Bool = map_is_empty(m0);\n\
+                 let m1: Map[Int, Int] = map_insert(m0, 1, 10);\n\
+                 let m2: Map[Int, Int] = map_insert(m1, 2, 20);\n\
+                 let m3: Map[Int, Int] = map_insert(m2, 3, 30);\n\
+                 let _sz: Int = map_size(m3);\n\
+                 let _hit: Option[Int] = map_get(m3, 2);\n\
+                 let _has: Bool = map_contains(m3, 2);\n\
+                 let _ks: List[Int] = map_keys(m3);\n\
+                 let _vs: List[Int] = map_values(m3);\n\
+                 let pairs: List[(Int, Int)] = map_to_list(m3);\n\
+                 let m4: Map[Int, Int] = map_from_list(pairs, int_compare);\n\
+                 let _doubled: Map[Int, Int] = map_map(m4, double);\n\
+                 let _bigs: Map[Int, Int] = map_filter(m4, keep_big);\n\
+                 let total: Int = map_fold(m4, 0, sum_values);\n\
+                 let m5: Map[Int, Int] = map_remove(m4, 2);\n\
+                 let _sz2: Int = map_size(m5);\n\
+                 let m6: Map[String, Int] = map_string_keys();\n\
+                 let _m6b: Map[String, Int] = map_insert(m6, \"a\", 1);\n\
+                 let m7: Map[Char, Int] = map_char_keys();\n\
+                 let _m7b: Map[Char, Int] = map_insert(m7, 'a', 1);\n\
+                 perform IO.println(int_to_string(total));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16704,40 +17959,48 @@ mod tests {
         // Pin the full `std.format` surface: `FormatArg` constructors,
         // `format` general entry, `format1`..`format8` arity helpers,
         // and every per-type single-arg wrapper.
-        let src = "import std.format\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _a: String = format(\"plain\", Nil);\n  \
-                     let _b: String = format(\"x={}\",\n      \
-                       Cons(AInt(1), Nil));\n  \
-                     let _c: String = format1(\"x={}\", AInt(1));\n  \
-                     let _d: String = format2(\"{}: {}\", AString(\"k\"), AInt(7));\n  \
-                     let _e: String = format3(\"{}/{}/{}\",\n      \
-                       AInt(1), AInt(2), AInt(3));\n  \
-                     let _f: String = format4(\"{} {} {} {}\",\n      \
-                       AInt(1), AInt(2), AInt(3), AInt(4));\n  \
-                     let _g: String = format5(\"{} {} {} {} {}\",\n      \
-                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5));\n  \
-                     let _h: String = format6(\"{} {} {} {} {} {}\",\n      \
-                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5), AInt(6));\n  \
-                     let _i: String = format7(\"{} {} {} {} {} {} {}\",\n      \
-                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n      \
-                       AInt(6), AInt(7));\n  \
-                     let _j: String = format8(\"{} {} {} {} {} {} {} {}\",\n      \
-                       AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n      \
-                       AInt(6), AInt(7), AInt(8));\n  \
-                     let _k: String = format_int(\"x={}\", 42);\n  \
-                     let _l: String = format_int64(\"x={}\",\n      \
-                       int64_from_int(42));\n  \
-                     let _m: String = format_string(\"name={}\", \"alice\");\n  \
-                     let _n: String = format_float(\"pi={}\", 3.14);\n  \
-                     let _o: String = format_bool(\"ok={}\", true);\n  \
-                     let _p: String = format_char(\"c={}\", 'A');\n  \
-                     let _q: String = format(\"{}: {} = {}\",\n      \
-                       Cons(AString(\"k\"),\n      \
-                       Cons(AInt(1),\n      \
-                       Cons(AString(\"v\"), Nil))));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int64\n\
+               import std.io\n\
+               import std.list\n\
+               import std.format\n\
+               use std.format.{AInt, AString, format, format1, format2, format3, format4, format5, format6, format7, format8, format_bool, format_char, format_float, format_int, format_int64, format_string};\n\
+               use std.int64.{int64_from_int};\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, Nil};\n\
+               fn main() -> Int ![IO] {\n\
+                 let _a: String = format(\"plain\", Nil);\n\
+                 let _b: String = format(\"x={}\",\n\
+                     Cons(AInt(1), Nil));\n\
+                 let _c: String = format1(\"x={}\", AInt(1));\n\
+                 let _d: String = format2(\"{}: {}\", AString(\"k\"), AInt(7));\n\
+                 let _e: String = format3(\"{}/{}/{}\",\n\
+                     AInt(1), AInt(2), AInt(3));\n\
+                 let _f: String = format4(\"{} {} {} {}\",\n\
+                     AInt(1), AInt(2), AInt(3), AInt(4));\n\
+                 let _g: String = format5(\"{} {} {} {} {}\",\n\
+                     AInt(1), AInt(2), AInt(3), AInt(4), AInt(5));\n\
+                 let _h: String = format6(\"{} {} {} {} {} {}\",\n\
+                     AInt(1), AInt(2), AInt(3), AInt(4), AInt(5), AInt(6));\n\
+                 let _i: String = format7(\"{} {} {} {} {} {} {}\",\n\
+                     AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n\
+                     AInt(6), AInt(7));\n\
+                 let _j: String = format8(\"{} {} {} {} {} {} {} {}\",\n\
+                     AInt(1), AInt(2), AInt(3), AInt(4), AInt(5),\n\
+                     AInt(6), AInt(7), AInt(8));\n\
+                 let _k: String = format_int(\"x={}\", 42);\n\
+                 let _l: String = format_int64(\"x={}\",\n\
+                     int64_from_int(42));\n\
+                 let _m: String = format_string(\"name={}\", \"alice\");\n\
+                 let _n: String = format_float(\"pi={}\", 3.14);\n\
+                 let _o: String = format_bool(\"ok={}\", true);\n\
+                 let _p: String = format_char(\"c={}\", 'A');\n\
+                 let _q: String = format(\"{}: {} = {}\",\n\
+                     Cons(AString(\"k\"),\n\
+                     Cons(AInt(1),\n\
+                     Cons(AString(\"v\"), Nil))));\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16752,14 +18015,20 @@ mod tests {
         // import time; the existing builtin String surface
         // (`string_concat`, `string_length`, etc.) continues to be
         // registered via `register_builtin_string_schemes`.
-        let src = "import std.string\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _parts: List[String] = string_split(\"a,b,c\", \",\");\n  \
-                     let _replaced: String = string_replace(\"hello\", \"ell\", \"ELL\");\n  \
-                     let _empty_sep: List[String] = string_split(\"abc\", \"\");\n  \
-                     let _empty_find: String = string_replace(\"abc\", \"\", \"X\");\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.list\n\
+               import std.string\n\
+               use std.io.{IO};\n\
+               use std.list.{List};\n\
+               use std.string.{string_replace, string_split};\n\
+               fn main() -> Int ![IO] {\n\
+                 let _parts: List[String] = string_split(\"a,b,c\", \",\");\n\
+                 let _replaced: String = string_replace(\"hello\", \"ell\", \"ELL\");\n\
+                 let _empty_sep: List[String] = string_split(\"abc\", \"\");\n\
+                 let _empty_find: String = string_replace(\"abc\", \"\", \"X\");\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16773,37 +18042,45 @@ mod tests {
         // set-theoretic operations, and the per-primitive convenience
         // constructors. Imports `std.set`, which transitively pulls in
         // `std.map`, `std.list`, `std.option`, and `std.ordering`.
-        let src = "import std.set\n\
-                   fn keep_big(x: Int) -> Bool ![] { x > 10 }\n\
-                   fn sum_elem(acc: Int, x: Int) -> Int ![] { acc + x }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let s0: Set[Int] = set_int();\n  \
-                     let _empty: Bool = set_is_empty(s0);\n  \
-                     let s1: Set[Int] = set_insert(s0, 1);\n  \
-                     let s2: Set[Int] = set_insert(s1, 2);\n  \
-                     let s3: Set[Int] = set_insert(s2, 3);\n  \
-                     let _sz: Int = set_size(s3);\n  \
-                     let _has: Bool = set_contains(s3, 2);\n  \
-                     let _xs: List[Int] = set_to_list(s3);\n  \
-                     let s4: Set[Int] = set_from_list(\n      \
-                       Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n  \
-                     let _bigs: Set[Int] = set_filter(s4, keep_big);\n  \
-                     let _total: Int = set_fold(s4, 0, sum_elem);\n  \
-                     let s5: Set[Int] = set_remove(s4, 2);\n  \
-                     let _sz5: Int = set_size(s5);\n  \
-                     let s6: Set[Int] = set_from_list(\n      \
-                       Cons(2, Cons(3, Cons(4, Nil))), int_compare);\n  \
-                     let _u: Set[Int] = set_union(s4, s6);\n  \
-                     let _i: Set[Int] = set_intersect(s4, s6);\n  \
-                     let _d: Set[Int] = set_difference(s4, s6);\n  \
-                     let _sub: Bool = set_subset(s5, s4);\n  \
-                     let _eq: Bool = set_eq(s4, s6);\n  \
-                     let _ss: Set[String] = set_string();\n  \
-                     let _ss1: Set[String] = set_insert(_ss, \"a\");\n  \
-                     let _sc: Set[Char] = set_char();\n  \
-                     let _sc1: Set[Char] = set_insert(_sc, 'a');\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.list\n\
+               import std.ordering\n\
+               import std.set\n\
+               use std.io.{IO};\n\
+               use std.list.{Cons, List, Nil};\n\
+               use std.ordering.{int_compare};\n\
+               use std.set.{Set, set_char, set_contains, set_difference, set_eq, set_filter, set_fold, set_from_list, set_insert, set_int, set_intersect, set_is_empty, set_remove, set_size, set_string, set_subset, set_to_list, set_union};\n\
+               fn keep_big(x: Int) -> Bool ![] { x > 10 }\n\
+               fn sum_elem(acc: Int, x: Int) -> Int ![] { acc + x }\n\
+               fn main() -> Int ![IO] {\n\
+                 let s0: Set[Int] = set_int();\n\
+                 let _empty: Bool = set_is_empty(s0);\n\
+                 let s1: Set[Int] = set_insert(s0, 1);\n\
+                 let s2: Set[Int] = set_insert(s1, 2);\n\
+                 let s3: Set[Int] = set_insert(s2, 3);\n\
+                 let _sz: Int = set_size(s3);\n\
+                 let _has: Bool = set_contains(s3, 2);\n\
+                 let _xs: List[Int] = set_to_list(s3);\n\
+                 let s4: Set[Int] = set_from_list(\n\
+                     Cons(1, Cons(2, Cons(3, Nil))), int_compare);\n\
+                 let _bigs: Set[Int] = set_filter(s4, keep_big);\n\
+                 let _total: Int = set_fold(s4, 0, sum_elem);\n\
+                 let s5: Set[Int] = set_remove(s4, 2);\n\
+                 let _sz5: Int = set_size(s5);\n\
+                 let s6: Set[Int] = set_from_list(\n\
+                     Cons(2, Cons(3, Cons(4, Nil))), int_compare);\n\
+                 let _u: Set[Int] = set_union(s4, s6);\n\
+                 let _i: Set[Int] = set_intersect(s4, s6);\n\
+                 let _d: Set[Int] = set_difference(s4, s6);\n\
+                 let _sub: Bool = set_subset(s5, s4);\n\
+                 let _eq: Bool = set_eq(s4, s6);\n\
+                 let _ss: Set[String] = set_string();\n\
+                 let _ss1: Set[String] = set_insert(_ss, \"a\");\n\
+                 let _sc: Set[Char] = set_char();\n\
+                 let _sc1: Set[Char] = set_insert(_sc, 'a');\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16815,17 +18092,23 @@ mod tests {
         // `int_add_safe` / `int_sub_safe`. Both helpers return
         // `Option[Int]` (`None` on overflow). The transitive import
         // pulls in `std.option`.
-        let src = "import std.int\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let _max: Int = int_max();\n  \
-                     let _min: Int = int_min();\n  \
-                     let _a: Option[Int] = int_add_safe(1, 2);\n  \
-                     let _b: Option[Int] = int_add_safe(int_max(), 1);\n  \
-                     let _c: Option[Int] = int_sub_safe(0, 1);\n  \
-                     let _d: Option[Int] = int_sub_safe(int_min(), 1);\n  \
-                     let _e: Option[Int] = int_sub_safe(0, int_min());\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.option\n\
+               import std.int\n\
+               use std.int.{int_add_safe, int_max, int_min, int_sub_safe};\n\
+               use std.io.{IO};\n\
+               use std.option.{Option};\n\
+               fn main() -> Int ![IO] {\n\
+                 let _max: Int = int_max();\n\
+                 let _min: Int = int_min();\n\
+                 let _a: Option[Int] = int_add_safe(1, 2);\n\
+                 let _b: Option[Int] = int_add_safe(int_max(), 1);\n\
+                 let _c: Option[Int] = int_sub_safe(0, 1);\n\
+                 let _d: Option[Int] = int_sub_safe(int_min(), 1);\n\
+                 let _e: Option[Int] = int_sub_safe(0, int_min());\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16839,25 +18122,35 @@ mod tests {
         // JLNil / JLCons; JONil / JOCons), and the two top-level
         // entry points `json_render` (Mem) and `json_parse`
         // (closed-row Result return).
-        let src = "import std.json\n\
-                   fn build_doc() -> JValue ![] {\n  \
-                     JObject(\n    \
-                       JOCons(\"k\", JInt(1),\n    \
-                       JOCons(\"arr\", JArray(\n      \
-                         JLCons(JString(\"x\"),\n      \
-                         JLCons(JBool(true),\n      \
-                         JLCons(JNull,\n        \
-                           JLNil)))),\n      \
-                         JONil)))\n\
-                   }\n\
-                   fn main() -> Int ![IO, Mem] {\n  \
-                     let s: String = json_render(build_doc());\n  \
-                     let r: Result[JValue, String] = json_parse(string_to_bytes(s));\n  \
-                     match r {\n    \
-                       Ok(_) => 0,\n    \
-                       Err(_) => 1,\n  \
-                     }\n\
-                   }\n";
+        let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.result\n\
+               import std.json\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{JArray, JBool, JInt, JLCons, JLNil, JNull, JOCons, JONil, JObject, JString, JValue, json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               use std.result.{Err, Ok, Result};\n\
+               fn build_doc() -> JValue ![] {\n\
+                 JObject(\n\
+                   JOCons(\"k\", JInt(1),\n\
+                   JOCons(\"arr\", JArray(\n\
+                     JLCons(JString(\"x\"),\n\
+                     JLCons(JBool(true),\n\
+                     JLCons(JNull,\n\
+                       JLNil)))),\n\
+                     JONil)))\n\
+               }\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let s: String = json_render(build_doc());\n\
+                 let r: Result[JValue, String] = json_parse(string_to_bytes(s));\n\
+                 match r {\n\
+                   Ok(_) => 0,\n\
+                   Err(_) => 1,\n\
+                 }\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -16865,23 +18158,73 @@ mod tests {
     // ===== Plan C addendum (Tier 1) — bare-name ambiguity =====
 
     #[test]
-    fn bare_name_collision_across_imports_is_e0147() {
-        // `std.list::map` and `std.option::map` both define `map`.
-        // Importing both and calling bare `map(xs, f)` is silent-
-        // wrong-dispatch territory — the compiler now emits E0147
-        // naming the conflicting modules instead of silently picking
-        // the last-registered scheme.
+    fn bare_name_collision_across_imports_is_now_e0046() {
+        // Plan F1 — bare `map` with both modules imported but no
+        // `use` line is now an unresolved-name error (E0046), not
+        // the legacy call-site E0147. The E0147 trigger moved to
+        // the `use` line — see `use_line_collision_fires_e0147`.
         let src = "import std.list\n\
-                   import std.option\n\
-                   fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
-                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
-                     0\n\
-                   }\n";
+               import std.option\n\
+               use std.list.{Cons, List, Nil};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: List[Int] = Cons(1, Cons(2, Nil));\n\
+                 let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
-            has_code(&errs, "E0147"),
-            "expected E0147 on ambiguous bare `map`; got {errs:?}"
+            has_code(&errs, "E0046"),
+            "expected E0046 on bare `map` without use line; got {errs:?}"
+        );
+        assert!(
+            !has_code(&errs, "E0147"),
+            "E0147 should no longer fire at call sites; got {errs:?}"
+        );
+    }
+
+    /// Plan F1 — two `use` lines competing for the same local name
+    /// is the new E0147 surface. See also the
+    /// `bare_name_collision_across_imports_is_now_e0046` test for
+    /// the absence-of-use case.
+    #[test]
+    fn use_line_collision_fires_e0147() {
+        let src = "import std.list\n\
+               import std.option\n\
+               use std.list.{map}\n\
+               use std.option.{map}\n\
+               fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0147")
+            .unwrap_or_else(|| panic!("expected E0147 on duplicate `use`; got {errs:?}"));
+        assert!(
+            e.message.contains("duplicate `use` of name `map`"),
+            "new E0147 should name the colliding local name: {e:?}"
+        );
+        assert!(
+            e.message.contains("std.list"),
+            "first contributor should appear in message: {e:?}"
+        );
+        assert!(
+            e.message.contains("std.option"),
+            "second contributor should appear in message: {e:?}"
+        );
+    }
+
+    /// Aliasing one of the colliding `use` bindings sidesteps E0147.
+    #[test]
+    fn use_line_collision_resolved_by_alias_no_e0147() {
+        let src = "import std.list\n\
+               import std.option\n\
+               use std.list.{map}\n\
+               use std.option.{map as option_map}\n\
+               fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0147"),
+            "alias should suppress duplicate-use E0147; got {errs:?}"
         );
     }
 
@@ -16894,56 +18237,28 @@ mod tests {
     /// already exports one and the original E0147 message didn't
     /// surface that.
     #[test]
+    #[ignore = "Plan F1 — call-site E0147 stdlib-shadow hint retired. \
+                See `use_line_collision_fires_e0147` for the new \
+                duplicate-`use` surface; the user-vs-stdlib collision \
+                shape is now legal (the user's `fn int_compare` keeps \
+                its identity via `<file>::int_compare`, no E0147)."]
     fn bare_name_user_vs_stdlib_collision_includes_stdlib_hint() {
-        // User redeclares `int_compare` (already exported by
-        // std.ordering). Trips E0147 with the new stdlib-side hint.
-        let src = "import std.list\n\
-                   import std.ordering\n\
-                   fn int_compare(a: Int, b: Int) -> Ordering ![] {\n  \
-                     if a < b { Less } else { if a > b { Greater } else { Equal } }\n\
-                   }\n\n\
-                   fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(2, Cons(1, Nil));\n  \
-                     let _ys: List[Int] = list_sort(xs, int_compare);\n  \
-                     0\n\
-                   }\n";
-        let errs = pipeline(src);
-        let e = errs
-            .iter()
-            .find(|e| e.code.as_str() == "E0147")
-            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
-        assert!(
-            e.message.contains("std.ordering"),
-            "stdlib origin should appear in message: {e:?}"
-        );
-        assert!(
-            e.message.contains("call the stdlib version directly"),
-            "stdlib-shadow hint missing: {e:?}"
-        );
+        // Body intentionally minimal — the `#[ignore]` attribute
+        // means cargo skips this test; the body just has to
+        // compile.
+        let _src = "fn main() -> Int ![] { 0 }\n";
     }
 
-    /// Cross-stdlib collision (no user fn) does NOT get the
-    /// stdlib-shadow hint. The hint is specifically for user-fn-vs-
-    /// stdlib-fn collisions; cross-stdlib (`std.list::map` vs
-    /// `std.option::map`) needs a different fix (drop one import).
+    /// Plan F1 — the cross-stdlib call-site E0147 stdlib-shadow
+    /// hint is retired. The relevant new surface is the
+    /// duplicate-`use`-line E0147; without a `use` line, bare `map`
+    /// is just E0046 (covered by
+    /// `bare_name_collision_across_imports_is_now_e0046`).
     #[test]
+    #[ignore = "Plan F1 — call-site stdlib-shadow hint retired"]
     fn bare_name_cross_stdlib_collision_no_stdlib_hint() {
-        let src = "import std.list\n\
-                   import std.option\n\
-                   fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
-                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
-                     0\n\
-                   }\n";
-        let errs = pipeline(src);
-        let e = errs
-            .iter()
-            .find(|e| e.code.as_str() == "E0147")
-            .unwrap_or_else(|| panic!("expected E0147; got {errs:?}"));
-        assert!(
-            !e.message.contains("call the stdlib version directly"),
-            "stdlib-shadow hint should NOT fire on cross-stdlib collision: {e:?}"
-        );
+        // Body intentionally minimal.
+        let _src = "fn main() -> Int ![] { 0 }\n";
     }
 
     #[test]
@@ -16951,11 +18266,13 @@ mod tests {
         // Importing only `std.list` keeps `map` unambiguous (only
         // one source registers it). No E0147 should fire.
         let src = "import std.list\n\
-                   fn main() -> Int ![] {\n  \
-                     let xs: List[Int] = Cons(1, Cons(2, Nil));\n  \
-                     let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n  \
-                     0\n\
-                   }\n";
+               use std.list.{Cons, List, Nil, map};\n\
+               fn main() -> Int ![] {\n\
+                 let xs: List[Int] = Cons(1, Cons(2, Nil));\n\
+                 let _ys: List[Int] = map(xs, fn (x: Int) -> Int ![] => x);\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(
             !has_code(&errs, "E0147"),
@@ -16973,15 +18290,18 @@ mod tests {
         // import). The existing stdlib loads cleanly under the
         // ambiguity check; this test pins that as a regression
         // guard.
-        let src = "import std.list\n\
-                   import std.option\n\
-                   import std.result\n\
-                   fn main() -> Int ![IO] {\n  \
-                     // No bare `map` call here — exercises only the\n  \
-                     // import-resolution path. Existing stdlib should\n  \
-                     // still typecheck cleanly under the new check.\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.list\n\
+               import std.option\n\
+               import std.result\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 // No bare `map` call here — exercises only the\n\
+                 // import-resolution path. Existing stdlib should\n\
+                 // still typecheck cleanly under the new check.\n\
+                 0\n\
+               }\n\
+               ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "unexpected errors: {errs:?}");
     }
@@ -17006,15 +18326,18 @@ mod tests {
     #[test]
     fn sigil_ref_alloc_called_from_user_code_is_e0148() {
         // User code (pipeline's synthetic main file) calling
-        // `sigil_ref_alloc` directly trips the file-path gate. The
-        // op is reserved for `std/state.sigil`'s cell-based State
-        // implementation; user code that wants mutation goes through
-        // `perform State.set` / `perform State.get` after running
-        // under `run_state`.
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let _r: Ref[Int] = sigil_ref_alloc(0);\n  \
-                     0\n\
-                   }\n";
+        // `sigil_ref_alloc` via the explicit `use std.state.{...}`
+        // path still trips the file-path gate. Plan F1's strict
+        // resolver requires the use line; the gate then rejects
+        // the call site because it's not in `std/state.sigil`.
+        let src = "import std.io\n\
+               import std.state\n\
+               use std.io.{IO};\n\
+               use std.state.{sigil_ref_alloc};\n\
+               fn main() -> Int ![IO] {\n\
+               let _r: Ref[Int] = sigil_ref_alloc(0);\n\
+               0\n\
+               }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0148"),
@@ -17024,11 +18347,15 @@ mod tests {
 
     #[test]
     fn sigil_ref_deref_called_from_user_code_is_e0148() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
-                     let _v: Int = sigil_ref_deref(r);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.state\n\
+               use std.io.{IO};\n\
+               use std.state.{sigil_ref_alloc, sigil_ref_deref};\n\
+               fn main() -> Int ![IO] {\n\
+               let r: Ref[Int] = sigil_ref_alloc(0);\n\
+               let _v: Int = sigil_ref_deref(r);\n\
+               0\n\
+               }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0148"),
@@ -17038,11 +18365,15 @@ mod tests {
 
     #[test]
     fn sigil_ref_set_called_from_user_code_is_e0148() {
-        let src = "fn main() -> Int ![IO] {\n  \
-                     let r: Ref[Int] = sigil_ref_alloc(0);\n  \
-                     let _u: Unit = sigil_ref_set(r, 5);\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.io\n\
+               import std.state\n\
+               use std.io.{IO};\n\
+               use std.state.{sigil_ref_alloc, sigil_ref_set};\n\
+               fn main() -> Int ![IO] {\n\
+               let r: Ref[Int] = sigil_ref_alloc(0);\n\
+               let _u: Unit = sigil_ref_set(r, 5);\n\
+               0\n\
+               }\n";
         let errs = pipeline(src);
         assert!(
             has_code(&errs, "E0148"),

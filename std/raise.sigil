@@ -33,6 +33,7 @@
 //    `subsume_row` / `unify_row`.
 
 import std.result
+use std.result.{Err, Ok, Result};
 
 // `Raise[E]` is the exception-style effect parametric over the
 // error type. The single op `fail[A]` takes an E-typed error

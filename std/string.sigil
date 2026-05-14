@@ -121,9 +121,14 @@
 // Pure-Sigil source-level helpers (Tier 2 follow-up + canonical parse)
 // =====================================================================
 
+import std.byte_array
 import std.list
 import std.option
 import std.result
+use std.byte_array.{string_byte_at, string_length};
+use std.list.{Cons, List, Nil, reverse};
+use std.option.{None, Option, Some};
+use std.result.{Err, Ok, Result};
 
 // `ParseError` variants mirror the integer codes returned by
 // `string_to_int_validate` (1=Empty, 2=NonDecimal, 3=Overflow).

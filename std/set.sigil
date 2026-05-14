@@ -39,6 +39,9 @@ import std.map
 import std.list
 import std.option
 import std.ordering
+use std.list.{Cons, List, Nil};
+use std.map.{Map, map_contains, map_empty, map_filter, map_fold, map_insert, map_is_empty, map_keys, map_remove, map_size};
+use std.ordering.{Ordering, char_compare, int_compare, string_compare};
 
 // `Set[T]` is a record wrapping `Map[T, Unit]`. The wrapper
 // exists to give Set its own surface (every helper takes / returns

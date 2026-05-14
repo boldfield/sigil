@@ -86,10 +86,11 @@ fn build() -> BTreeMap<String, BTreeSet<String>> {
                         insert_if_public(&mut out, &v.name, &module);
                     }
                 }
-                Item::Import(_) | Item::Effect(_) => {
-                    // Imports don't declare names; effect names live in
-                    // their own diagnostic surface (E0138) which doesn't
-                    // route through this index.
+                Item::Import(_) | Item::Use(_) | Item::Effect(_) => {
+                    // Imports and `use` lines don't declare names (they
+                    // bind from other modules' declarations); effect
+                    // names live in their own diagnostic surface (E0138)
+                    // which doesn't route through this index.
                 }
             }
         }
@@ -156,27 +157,21 @@ mod tests {
     }
 
     #[test]
-    fn prelude_types_not_in_index() {
-        // After the Option/Result prelude (2026-05-10), the source-
-        // level type declarations were removed from std/option.sigil
-        // and std/result.sigil; the type+constructor decls now live
-        // in `typecheck::builtin_types`. The index walks stdlib
-        // sources, so it correctly returns empty for prelude names —
-        // this means the import-hint diagnostic does NOT fire for
-        // prelude names (because they're never "unknown" in the
-        // first place).
-        assert!(
-            modules_declaring("Option").is_empty(),
-            "Option is prelude — not in module index"
-        );
-        assert!(
-            modules_declaring("Result").is_empty(),
-            "Result is prelude — not in module index"
-        );
-        assert!(modules_declaring("Some").is_empty(), "Some is prelude");
-        assert!(modules_declaring("None").is_empty(), "None is prelude");
-        assert!(modules_declaring("Ok").is_empty(), "Ok is prelude");
-        assert!(modules_declaring("Err").is_empty(), "Err is prelude");
+    fn prelude_types_are_now_in_index() {
+        // Plan F1 (2026-05-14) restored the source-level `type Option`
+        // and `type Result` declarations to `std/option.sigil` and
+        // `std/result.sigil` (the 2026-05-10 auto-prelude shipped
+        // them via `typecheck::builtin_types` only; Plan F1's "no
+        // prelude" rule moved them back out). The stdlib-index now
+        // returns the owning module for these names, and the import-
+        // hint diagnostic correctly suggests `import std.option` /
+        // `import std.result`.
+        assert_eq!(modules_declaring("Option"), vec!["option"]);
+        assert_eq!(modules_declaring("Result"), vec!["result"]);
+        assert_eq!(modules_declaring("Some"), vec!["option"]);
+        assert_eq!(modules_declaring("None"), vec!["option"]);
+        assert_eq!(modules_declaring("Ok"), vec!["result"]);
+        assert_eq!(modules_declaring("Err"), vec!["result"]);
     }
 
     #[test]

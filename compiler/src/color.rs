@@ -922,6 +922,7 @@ mod tests {
         // handler doesn't unwind` correctness gap closes.
         let src = r#"
             import std.io
+use std.io.{IO};
             fn main() -> Int ![IO] {
                 perform IO.println("hi");
                 0
@@ -1370,16 +1371,21 @@ mod tests {
         // still works for callers with empty rows that call CPS
         // helpers — see `caller_with_empty_row_inherits_cps_via_-
         // bridge` for the dedicated bridge-coverage test.
-        let src = "effect E { op: () -> Int }\n\
-                   fn helper() -> Int ![E] {\n  \
-                     perform E.op();\n  \
-                     42\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(k) => 99 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n\
+                 perform E.op();\n\
+                 42\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(k) => 99 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let cp = color_from_src(src);
         assert_eq!(color_of(&cp, "helper"), Color::Cps);
         assert_eq!(reason_of(&cp, "helper"), "cps: row contains effect `E`");
@@ -2039,16 +2045,21 @@ mod tests {
         // a handle body. helper has row ![E] (intrinsic CPS); main
         // is CPS via SCC bridge. Verify the accessor returns true
         // for both.
-        let src = "effect E { op: () -> Int }\n\
-                   fn helper() -> Int ![E] {\n  \
-                     perform E.op();\n  \
-                     42\n\
-                   }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(k) => 99 };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n\
+                 perform E.op();\n\
+                 42\n\
+               }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(k) => 99 };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let cp = color_from_src(src);
         assert!(cp.needs_cps_transform("helper"));
         assert!(cp.needs_cps_transform("main"));
@@ -2056,17 +2067,22 @@ mod tests {
 
     #[test]
     fn cps_color_user_fns_lists_program_order_cps_only() {
-        let src = "effect E { op: () -> Int }\n\
-                   fn helper() -> Int ![E] {\n  \
-                     perform E.op();\n  \
-                     42\n\
-                   }\n\
-                   fn pure_helper(n: Int) -> Int ![] { n + 1 }\n\
-                   fn main() -> Int ![IO] {\n  \
-                     let n: Int = handle helper() with { E.op(k) => pure_helper(99) };\n  \
-                     perform IO.println(int_to_string(n));\n  \
-                     0\n\
-                   }\n";
+        let src = "import std.int\n\
+               import std.io\n\
+               use std.int.{int_to_string};\n\
+               use std.io.{IO};\n\
+               effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n\
+                 perform E.op();\n\
+                 42\n\
+               }\n\
+               fn pure_helper(n: Int) -> Int ![] { n + 1 }\n\
+               fn main() -> Int ![IO] {\n\
+                 let n: Int = handle helper() with { E.op(k) => pure_helper(99) };\n\
+                 perform IO.println(int_to_string(n));\n\
+                 0\n\
+               }\n\
+               ";
         let cp = color_from_src(src);
         let cps_fns = cp.cps_color_user_fns();
         // helper is intrinsic CPS; main is CPS via bridge to helper;
