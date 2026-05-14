@@ -1622,13 +1622,17 @@ bare namespace, so `Some(7)` and `map(opt, f)` work without a
 prefix.
 
 This is **strict by design** — Plan F1 (2026-05-14) removed the
-old auto-prelude. There are no globally-available names other
-than the primitive types (`Int`, `Bool`, `String`, `Char`, `Byte`,
-`Float`, `Int64`, `Unit`) and the opaque container types (`Array`,
-`MutArray`, `ByteArray`, `MutByteArray`, `StringBuilder`).
-`Option`, `Result`, `Some`, `None`, `Ok`, `Err`, `List`, `Cons`,
-`Nil` — every other name — must come from an `import` + `use`
-line, or be qualified at the call site.
+old auto-prelude. The only globally-available names are:
+
+- **Primitive type names:** `Int`, `Bool`, `String`, `Char`,
+  `Byte`, `Float`, `Int64`, `Unit`.
+- **Opaque container type names:** `Array`, `MutArray`,
+  `ByteArray`, `MutByteArray`, `StringBuilder`.
+
+Every other name — including `Option`, `Result`, `Some`, `None`,
+`Ok`, `Err`, `List`, `Cons`, `Nil`, and any stdlib fn like `map`,
+`int_to_string`, `string_concat`, `read_dir`, etc. — must come
+from an `import` + `use` line, or be qualified at the call site.
 
 **Module aliases.** `import` accepts an `as` alias for shorter
 qualified-call paths:
@@ -1639,8 +1643,13 @@ import std.option as O;
 let m: O.Option[Int] = O.map(O.Some(7), fn (x: Int) -> Int ![] => x + 1);
 ```
 
-This is purely a qualified-path alias — `O` itself is not a
-binding. To use names bare, still add `use O.{Option, Some, map};`.
+The alias `O` only applies to **qualified-path call sites**
+(`O.map(opt, f)`, `O.Some(7)`); it is not itself a binding and
+cannot appear on a `use` line. `use` declarations must always
+name the module's full `std.<name>` form (E0031: the `use`
+source must start with `std.`). To use names bare in this file,
+add `use std.option.{Option, Some, map};` alongside the aliased
+import.
 
 **Aliasing in `use`.** Two modules may export the same bare name
 (e.g., `map` is in `std.list`, `std.option`, `std.result`, and
@@ -1658,12 +1667,22 @@ that the qualified-imports design closes. Listing names
 explicitly keeps each file self-describing: a reader sees in one
 place which symbols are in scope.
 
-**Documentation-only modules.** The `std.io` / `std.mem` /
-`std.int64` / `std.string_builder` / `std.char` / `std.panic`
-modules are documentation-only — their types and operations are
-registered as compiler builtins. Their `import` is a no-op at
-the resolver (kept for documentary clarity); the matching `use`
-line still opts the names in (`use std.io.{IO};`, etc.).
+**Documentation-only modules.** Six stdlib modules ship as
+header-only files — every name they export is registered as a
+compiler builtin, with no source-level fn declarations:
+`std.io`, `std.mem`, `std.int64`, `std.string_builder`,
+`std.char`, `std.panic`. Their `import` line is a no-op at the
+resolver (kept for documentary clarity); the matching `use` line
+still opts the names in (`use std.io.{IO};`, etc.).
+
+Several other modules — `std.int`, `std.float`, `std.array`,
+`std.mut_array`, `std.byte_array`, `std.mut_byte_array` — are
+**mixed**: they ship some compiler-builtin entries (registered
+via `BUILTIN_TO_MODULE_FILE`) alongside source-level fn
+declarations. From the user's perspective the two categories are
+indistinguishable — both come into scope via the same `import` +
+`use` pair. The distinction matters only to the compiler's name
+registration machinery.
 
 **Resolver semantics.** Three resolution paths cover every Ident
 that names a top-level fn or type:
@@ -1681,9 +1700,12 @@ that names a top-level fn or type:
 
 A bare reference that matches none of the three is rejected with
 E0046 (`unknown identifier`). When the missing name is in the
-stdlib, the diagnostic attaches a hint pointing at the missing
-`import` (and, where the file already imports the module, the
-missing `use`).
+stdlib, the diagnostic attaches a hint pointing at the
+`import std.<module>` line that brings the declaring module into
+scope. v1's hint generator points at the import only; if the
+file already has the import, the user still needs to add a
+matching `use std.<module>.{name};` line — that step isn't
+suggested by the hint.
 
 **Migration.** The migration script
 [`scripts/migrate-to-qualified-imports.mjs`](../scripts/migrate-to-qualified-imports.mjs)
