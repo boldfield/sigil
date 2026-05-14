@@ -1,6 +1,6 @@
 # Boehm per-thread roots — spike findings
 
-## Status: spike complete, Plan E2 Phase 3 Task 10
+## Status: spike complete, Plan E2 Phase 3 Task 10. Updated with Task 11 findings (PR #170).
 
 This document pins the Boehm API surface Phase 3 will use to:
 - Mark Sigil program threads as "precise stack roots" (root
@@ -8,6 +8,12 @@ This document pins the Boehm API surface Phase 3 will use to:
   E2 Phase 1).
 - Keep runtime-internal threads (Plan E1's profile drainer; any
   future runtime-spawned thread) on conservative stack scan.
+
+**Task 11's PR #170 integration work surfaced three Boehm 8.x
+interaction constraints the spike did not anticipate. See
+[`# Task 11 follow-up findings (PR #170)`](#task-11-follow-up-findings-pr-170)
+at the bottom of this doc for the breadcrumbs; Task 12's
+implementer should read that section first.**
 
 The plan body posed it as a single question:
 
@@ -278,3 +284,120 @@ shape:
 
 **No escalation needed.** Every API is documented stable on
 libgc 8.x and exposed on both target hosts.
+
+## Task 11 follow-up findings (PR #170)
+
+Task 11's PR #170 attempted to wire the discriminator into
+production (sigil_gc_init calls
+`register_sigil_thread_for_precise_roots`; drainer calls
+`register_runtime_thread_for_conservative_roots`). The wiring
+went through five CI rounds before landing — each round
+diagnosed a Boehm 8.x interaction constraint the Task 10 spike
+didn't catch. Task 12's implementer needs these findings up
+front:
+
+### Finding 1: `GC_allow_register_threads` switches Boehm to parallel-marker mode
+
+Documented in `gc.h:1551`: *"Includes a `GC_start_mark_threads()`
+call."* Easily missed — the spike treated allow_register_threads
+as a benign "enable thread enrolment" call, but it has a
+load-bearing side effect: it spawns parallel marker threads
+that change Boehm's marker semantics process-wide.
+
+**Empirical failure:** PR #170 commit `e30d6ef` called
+`GC_allow_register_threads` from `register_sigil_thread_for_precise_roots`
+on the main thread (per the previous review's B1 prescription).
+On the next CI run, 7 e2e tests failed:
+
+- `tree_example_prints_32767_under_500ms` returned the wrong
+  sum (`6749` instead of `32767`) — live tree nodes collected
+  as garbage.
+- `cpu_profile_writes_folded_for_txt_extension` +
+  `cpu_profile_writes_pprof_when_env_set` had their compiled
+  binaries crash with empty stdout/stderr.
+- `std_list_sort_int_ten_thousand_reversed`,
+  `std_map_ten_thousand_inserts_then_lookups`,
+  `task_12_validation_profile_json_sigil_end_to_end`
+  similarly failed.
+
+The switch to parallel markers broke the marker for a
+previously-single-threaded user program. The Task 12 work
+needs to characterise this empirically before reinstating
+`GC_allow_register_threads`. Options: keep single-marker
+mode (call `GC_set_markers_count(1)` early?), figure out why
+parallel markers misbehave on Sigil's alloc pattern, or
+defer enrolment entirely until multi-Sigil-threading lands.
+
+### Finding 2: `walk_for_gc` SIGSEGVs from inside libgc's mark phase
+
+The Phase 1 stackmap walker reads `current_caller_fp()` via
+inline asm + walks the chain via `*fp` reads (`walk_frame`).
+That works fine when the walker is called from Rust code with
+conventional FP-saving prologues (e.g., cross_check_xchk's
+`sigil_alloc`-driven invocation).
+
+**But:** when the walker is invoked from inside Boehm's mark
+phase (via a `GC_set_push_other_roots` callback), the call
+chain passes through libgc internal frames. libgc 8.x on
+both target hosts is built with optimisations that may omit
+frame pointers from internal frames — so reading `saved_fp`
+from a libgc frame yields garbage, and the next `walk_frame`
+deref blows up with SIGSEGV.
+
+**Empirical failure:** PR #170 commit `9a9d7d5` removed
+`GC_allow_register_threads` from the production path
+(addressing Finding 1) but kept the walker active in the
+push_other_roots callback. `tree.sigil` SIGSEGVed (exit `-1`,
+empty stdout) — the walker died inside libgc.
+
+**Task 12 fix shape:** the captured-FP mechanism the spike's
+"Section 3" describes. `sigil_alloc` wraps its body in
+`GC_call_with_gc_active` (or equivalent) and captures the
+user-level FP — the top of the Sigil call chain, OUTSIDE
+libgc's internal frames — into a thread-local. The
+push_other_roots callback reads that captured FP and calls
+`walk_for_gc_with_callback_from(captured_fp, …)` (a new
+variant Task 12 introduces) — walking from a known-clean
+starting point.
+
+### Finding 3: `GC_set_push_other_roots` must chain to the prior proc
+
+Documented in `gc_mark.h`: *"A client supplied procedure
+should also call the original procedure."* Easily missed —
+the spike's Section 1 doc cited the setter/getter but didn't
+spell out the chaining contract.
+
+**Empirical failure:** PR #170 commit `7bd11b3` made the
+callback body a no-op (addressing Finding 2 by skipping the
+walker entirely). 7 e2e tests still SIGSEGVed:
+`tree.sigil`, `sudoku.sigil` (both variants),
+`std_list_sort_int_ten_thousand_reversed`,
+`std_map_ten_thousand_inserts_then_lookups`,
+`multishot_perf_example_under_5s`,
+`cross_check_tree_stress_drop_repeat_runs_cleanly`. All
+alloc-heavy workloads; all empty stderr.
+
+Diagnosis: setting our own proc REPLACED Boehm's internal
+push_other_roots proc, which Boehm uses for its own TLS root
++ dynamic-library root supply hooks. Without chaining, those
+roots vanish on every mark phase → live objects collected →
+later user-code derefs SIGSEGV.
+
+**Fix shape:** at install time, capture the prior proc via
+`GC_get_push_other_roots()` and invoke it from the wrapper
+before any custom body. PR #170 commit `a9875a3` lands this
+fix; the chaining structure stays through Task 12.
+
+### Implication for Task 12's spike-vs-production split
+
+Each of the three findings cost a CI round on PR #170 to
+discover. Task 12's `GC_do_blocking` + captured-FP boundary
+is an even more empirical problem (3-dimensional: blocking
+correctness, active-state re-entry, walker safety from the
+captured FP). A test-only spike PR that exercises each
+dimension in isolation BEFORE the production-wiring PR
+would amortise the discovery cost. The Task 10 spike
+checked `GC_do_blocking`'s link surface + the
+`push_other_roots` install path; Task 12 should similarly
+exercise the captured-FP walk in test scaffolding before
+flipping production behavior.

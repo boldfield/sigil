@@ -44,11 +44,21 @@
 //!
 //! # Runtime invariant — non-Sigil threads MUST NOT allocate from Boehm
 //!
-//! `push_sigil_thread_precise_roots` walks the calling thread's
-//! stack. Boehm invokes the callback once per mark phase, on
-//! whichever thread holds the GC lock — typically the thread
-//! whose alloc triggered GC. So if a non-Sigil thread allocates
-//! and triggers GC:
+//! **\[Forward-looking — Task 12\]:** the constraint below
+//! becomes load-bearing only when the callback's body lands
+//! in Task 12. Today the callback is a no-op (see the
+//! `push_sigil_thread_precise_roots` doc-comment), so there's
+//! nothing to short-circuit; the failure mode the invariant
+//! describes is dormant. The constraint is documented here
+//! so Task 12's implementer doesn't accidentally introduce a
+//! runtime worker that allocates before the registry-walk
+//! mitigation lands.
+//!
+//! `push_sigil_thread_precise_roots` will walk the calling
+//! thread's stack (post-Task-12). Boehm invokes the callback
+//! once per mark phase, on whichever thread holds the GC lock
+//! — typically the thread whose alloc triggered GC. So if a
+//! non-Sigil thread allocates and triggers GC:
 //!
 //! 1. The callback runs on the non-Sigil thread.
 //! 2. `IS_SIGIL_THREAD = false` on that thread → callback
@@ -111,13 +121,26 @@
 //!
 //! # What this module does NOT do
 //!
+//! - **Does not walk Sigil stacks for precise roots.** The
+//!   `push_sigil_thread_precise_roots` callback's body is a
+//!   no-op for Task 11 (it chains to Boehm's prior
+//!   push_other_roots proc + returns). The walker SIGSEGVs
+//!   when invoked from inside libgc's mark phase because
+//!   libgc may be compiled with `-fomit-frame-pointer`,
+//!   making `*fp` reads through libgc internal frames yield
+//!   garbage. Task 12 reinstates the walker once
+//!   `sigil_alloc`'s `GC_do_blocking` boundary captures the
+//!   user-level FP outside libgc's call chain.
+//!
 //! - **Does not flip Boehm's conservative stack scan off.** That's
-//!   Task 12's job. Until then, the precise walker's pushed roots
-//!   are *additional* to Boehm's auto-scan, which means Task 11
-//!   alone changes nothing observable: all the precise roots are
-//!   already being scanned conservatively. The Task 11 deliverable
-//!   is structural — install the discriminator + the callback so
-//!   Task 12 has a clean hook.
+//!   Task 12's job. Today's still-conservative scan finds
+//!   all the roots a precise walker would (the conservative
+//!   scan is a superset). Task 12's behavior change requires
+//!   the captured-FP walker above AND the empirical work to
+//!   characterise the parallel-marker interaction (PR #170
+//!   CI showed that `GC_allow_register_threads` switches
+//!   Boehm to parallel-marker mode, which breaks alloc-heavy
+//!   workloads on previously-single-threaded user programs).
 //!
 //! - **Does not resolve the "wrap `sigil_alloc` in
 //!   `GC_call_with_gc_active`?" question** that the Task 10 spike
@@ -167,11 +190,15 @@ use std::sync::Once;
 // is a no-op (see `push_sigil_thread_precise_roots` doc),
 // so the symbol isn't used yet — but the declaration stays
 // here so Task 12's diff is the callback body change only.
-#[allow(dead_code)]
 #[link(name = "gc")]
 extern "C" {
     fn GC_set_push_other_roots(p: GcPushOtherRootsProc);
     fn GC_get_push_other_roots() -> Option<GcPushOtherRootsProc>;
+    // Task 12 reinstates the walker body that calls
+    // `GC_push_all_eager` for each precise root the walker
+    // yields. Kept declared so the diff to enable the walker
+    // is body-only.
+    #[allow(dead_code)]
     fn GC_push_all_eager(bottom: *mut c_void, top: *mut c_void);
 }
 
@@ -210,6 +237,18 @@ static PRECISE_WALKER_INSTALLED: Once = Once::new();
 /// `Once`-gated install) and read by every callback invocation
 /// thereafter — no synchronisation needed beyond the Once's
 /// happens-before edge.
+///
+/// **Task 12 TODO — parallel-marker safety.** Today Boehm runs
+/// single-marker (Task 11 deliberately doesn't call
+/// `GC_allow_register_threads` to keep it that way), so the
+/// callback always fires on the install thread and the
+/// `static mut` read is data-race-free. When Task 12 reinstates
+/// enrolment and parallel markers become live, the callback may
+/// fire from any marker thread concurrent with the install (if
+/// the install ever moves after startup — it doesn't today, but
+/// future profile-data hooks or similar may push it). Migrate
+/// to `AtomicUsize` + `transmute` (or a `OnceLock` holding the
+/// proc pointer) when that happens.
 static mut PRIOR_PUSH_OTHER_ROOTS: Option<GcPushOtherRootsProc> = None;
 
 fn install_push_other_roots_once() {
@@ -305,6 +344,21 @@ pub fn register_sigil_thread_for_precise_roots() {
 /// That's a follow-up when such a worker exists; the
 /// "Runtime invariant" in the module doc spells out the
 /// constraint until then.
+///
+/// **Task 12 rename TODO.** The name maps to the future
+/// (post-Task-12) shape, when this function actually enrolls
+/// the calling thread for conservative scan via Boehm's API.
+/// Today the function body is pure Once-gated process-state
+/// initialisation — `ensure_gc_process_state_initialised()`
+/// would be the truer name. Kept as `register_*` to give Task
+/// 12 a stable call-site shape (`cpu.rs` already calls it;
+/// renaming today would mean renaming again at Task 12). When
+/// Task 12 reinstates the Boehm enrolment, fold this rename
+/// concern: either split (a) `ensure_gc_process_state_initialised`
+/// vs (b) `register_runtime_thread_for_conservative_roots`,
+/// where (a) is the process-wide bootstrap and (b) is the
+/// per-thread Boehm enrolment; OR keep the name and let it
+/// match its docs once enrolment is real.
 pub fn register_runtime_thread_for_conservative_roots() {
     install_push_other_roots_once();
     crate::stackmap::prewarm_for_stw();
@@ -390,7 +444,10 @@ extern "C" fn push_sigil_thread_precise_roots() {
     // user-level FP outside libgc's call chain. Until then,
     // chaining to the prior proc is the load-bearing work
     // here.
-    let _is_sigil = IS_SIGIL_THREAD.with(Cell::get);
+    //
+    // Task 12 stub: the body will read `IS_SIGIL_THREAD` and
+    // gate the walk on it. Today there's nothing to gate (the
+    // walk is empty), so the read is omitted.
 }
 
 #[cfg(test)]
