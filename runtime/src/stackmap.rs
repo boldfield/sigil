@@ -614,16 +614,45 @@ pub struct RootLocation {
 /// itself is excluded from the walk (its return-PC is back into Rust
 /// code, never a safepoint). Frames *above* the caller — i.e., the
 /// Sigil call chain — are inspected.
+///
+/// **Allocates a `Vec<RootLocation>` for the result.** That's
+/// fine for the cross-check harness (`stackmap_xcheck`) which
+/// runs outside Boehm's STW. For the Plan E2 Phase 3
+/// `GC_set_push_other_roots` callback (which DOES run inside
+/// STW), use [`walk_for_gc_with_callback`] instead — it
+/// streams root addresses through a closure and avoids the
+/// system-allocator round-trip that could deadlock against a
+/// suspended thread holding malloc's internal lock.
 #[inline(never)]
 pub fn walk_for_gc() -> Vec<RootLocation> {
+    let mut roots = Vec::new();
+    walk_for_gc_with_callback(|root| roots.push(root));
+    roots
+}
+
+/// Allocation-free variant of [`walk_for_gc`]: walks the same
+/// fp chain but invokes `f(root)` per root instead of pushing
+/// into a `Vec`. Intended for callers that run inside Boehm's
+/// STW mark phase (Plan E2 Phase 3 Task 11's
+/// `push_sigil_thread_precise_roots`), where allocating a
+/// `Vec` could deadlock against a suspended thread holding
+/// libc malloc's internal lock.
+///
+/// The closure must not allocate from libc (same deadlock
+/// risk) and must not call any function that re-enters Boehm
+/// (no `GC_malloc`, no triggering recursive marking). Pushing
+/// root ranges via `GC_push_all_eager` is safe — it's the
+/// documented mark-phase root-supply mechanism.
+#[inline(never)]
+pub fn walk_for_gc_with_callback<F: FnMut(RootLocation)>(mut f: F) {
     let index = match init_index() {
         Some(i) => i,
-        None => return Vec::new(),
+        None => return,
     };
     let trace = xcheck_trace_enabled();
-    let mut roots = Vec::new();
     let mut fp = current_caller_fp();
     let mut frame_idx = 0usize;
+    let mut yielded: usize = 0;
     while !fp.is_null() {
         let frame = unsafe { walk_frame(fp) };
         // Strip pointer-authentication code (PAC) bits from the
@@ -661,11 +690,12 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
                     );
                 }
                 for entry in &record.entries {
-                    roots.push(RootLocation {
+                    f(RootLocation {
                         addr: frame_sp.wrapping_add(entry.sp_offset as usize),
                         kind: entry.kind,
                         return_pc: frame.return_pc,
                     });
+                    yielded += 1;
                 }
             } else if trace {
                 eprintln!(
@@ -682,10 +712,9 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
         fp = frame.saved_fp;
         frame_idx += 1;
     }
-    if trace && !roots.is_empty() {
-        eprintln!("[stackmap] walk returning {} roots", roots.len());
+    if trace && yielded > 0 {
+        eprintln!("[stackmap] walk yielded {} roots", yielded);
     }
-    roots
 }
 
 /// Cached env-var lookup for SIGIL_GC_XCHECK_TRACE. Reads once and
@@ -693,6 +722,26 @@ pub fn walk_for_gc() -> Vec<RootLocation> {
 fn xcheck_trace_enabled() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
     *TRACE.get_or_init(|| std::env::var_os("SIGIL_GC_XCHECK_TRACE").is_some())
+}
+
+/// Pre-warm every lazy initialiser this module owns so subsequent
+/// `walk_for_gc` / `walk_for_gc_with_callback` calls don't allocate.
+/// Called from `gc::threads::register_sigil_thread_for_precise_roots`
+/// at sigil_gc_init time, BEFORE any GC can fire — the
+/// `GC_set_push_other_roots` callback runs inside Boehm's STW
+/// mark phase, and any libc malloc invoked there can deadlock
+/// against a suspended thread holding malloc's internal lock.
+///
+/// Today this means:
+/// - `init_index()` builds the StackmapIndex BTreeMap.
+/// - `xcheck_trace_enabled()` reads + caches the env var.
+///
+/// Future lazy initialisers added to this module must extend
+/// this function or document why the new init is allocation-
+/// free + STW-safe.
+pub fn prewarm_for_stw() {
+    let _ = init_index();
+    let _ = xcheck_trace_enabled();
 }
 
 struct Frame {

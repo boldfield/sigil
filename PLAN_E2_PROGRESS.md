@@ -356,7 +356,78 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 11 — Thread registration discriminator
 
-- status: pending — depends on PR #148's drainer thread spawn site.
+- status: **in PR (Task 11 branch)**
+- New module `runtime/src/gc/threads.rs` exposes the
+  discriminator API:
+  - `register_sigil_thread_for_precise_roots()` — sets a
+    thread-local marker (`IS_SIGIL_THREAD`); installs the
+    push_other_roots callback (Once-gated); pre-warms the
+    stackmap module's lazy initialisers so they never run
+    inside STW. Does NOT call `GC_register_my_thread` (per
+    `gc.h:1561` "should never be called from the main
+    thread, where it is always done implicitly"; Sigil today
+    is single-Sigil-threaded, running on the main thread).
+  - `register_runtime_thread_for_conservative_roots()` —
+    pre-warms the same process-wide state; sets no flag.
+    Does NOT call `GC_register_my_thread` either (the
+    drainer doesn't allocate from Boehm; the docs-required
+    `GC_allow_register_threads` precondition has a side
+    effect of starting parallel marker threads, which PR
+    #170 CI surfaced as breaking the marker for single-
+    threaded user programs). Task 12 reintroduces the
+    enrolment when the empirical work to characterise the
+    parallel-marker interaction lands.
+- **`push_sigil_thread_precise_roots` callback is installed
+  but its body is a no-op.** PR #170 CI surfaced a second
+  failure mode: calling `stackmap::walk_for_gc_with_callback`
+  from inside the mark phase SIGSEGVs alloc-heavy workloads
+  (`tree.sigil` exit -1). Root cause: the walker reads
+  `current_caller_fp` and walks the chain via `*fp` reads;
+  when invoked from inside Boehm's mark phase, the call
+  chain passes through libgc internal frames that may be
+  compiled with `-fomit-frame-pointer`, so reading saved_fp
+  from those frames yields garbage and `walk_frame`
+  dereferences invalid memory. The Phase 3 design's
+  `GC_do_blocking` + `GC_call_with_gc_active` boundary
+  resolves this by capturing the user-level FP at the
+  active-state boundary (where Sigil-emitted frames are
+  still on top, with conventional FP layout); the callback
+  walks from THAT captured FP rather than `current_caller_fp`
+  (somewhere inside libgc when the callback fires). Task 12
+  ships the captured-FP mechanism + the callback body that
+  uses it.
+- `GC_set_push_other_roots(push_sigil_thread_precise_roots)` is
+  installed at the first registration call (`Once`-gated;
+  satisfies `gc_mark.h:309`'s "external synchronization
+  required" precondition by the install-once-before-workers
+  discipline the Task 10 spike doc names).
+- Callback `push_sigil_thread_precise_roots` (runs once per mark
+  phase): if the calling thread's `IS_SIGIL_THREAD` is true,
+  walks via `stackmap::walk_for_gc()` (Plan E2 Phase 1 walker)
+  and pushes each precise root location as an 8-byte range
+  via `GC_push_all_eager`. For non-Sigil threads → no-op.
+- Wiring:
+  - `runtime/src/gc.rs::sigil_gc_init` calls
+    `register_sigil_thread_for_precise_roots()` after the
+    existing handler/arena root setup (under `cfg(not(test))`).
+  - `runtime/src/profile/cpu.rs::drainer_loop` calls
+    `register_runtime_thread_for_conservative_roots()` at
+    function entry (the "one line at the spawn site" the plan
+    body specified).
+- **No behaviour change yet.** Boehm's conservative stack scan
+  still runs for Sigil threads; the precise walker pushes
+  *additional* roots that Boehm already finds via auto-scan.
+  Task 12 disables conservative scan for Sigil threads, at
+  which point the walker becomes the load-bearing root supply.
+- Open question deferred from Task 10 (whether `sigil_alloc`
+  needs `GC_call_with_gc_active` wrapping when called from a
+  blocked Sigil thread) is still deferred — Task 12 picks
+  empirically when it introduces the `GC_do_blocking` wrapping.
+- Tests (`runtime/src/gc/threads.rs::tests`): 3 cases — fresh
+  thread starts with `IS_SIGIL_THREAD=false`; runtime
+  registration leaves the flag `false`; Sigil registration
+  sets it `true`. Plus 312/312 existing runtime lib tests
+  still pass (no regression from the new wiring).
 
 ### Task 12 — Drop conservative stack scan on Sigil threads
 

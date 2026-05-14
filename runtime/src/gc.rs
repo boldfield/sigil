@@ -138,6 +138,7 @@ extern "C" {
 }
 
 pub(crate) mod descriptor;
+pub mod threads;
 
 // `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
 // dump counters when the compiled program exits. We avoid depending on
@@ -209,6 +210,13 @@ pub extern "C" fn sigil_gc_init() {
         crate::handlers::register_handler_stack_root_for_calling_thread();
         crate::handlers::register_outer_post_arm_k_stack_root_for_calling_thread();
         crate::arena::register_arena_root_for_calling_thread();
+
+        // Plan E2 Phase 3 Task 11: register the calling thread
+        // (the Sigil program's main thread) for precise stack
+        // roots. Sets IS_SIGIL_THREAD; installs the
+        // push_other_roots callback (Once-gated); pre-warms the
+        // stackmap module's lazy initialisers.
+        crate::gc::threads::register_sigil_thread_for_precise_roots();
     }
 
     // v2 profile-data surface — gated by env vars. When neither
