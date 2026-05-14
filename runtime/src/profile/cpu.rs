@@ -247,6 +247,18 @@ extern "C" fn sigprof_handler(
 /// samples into the global `SAMPLES` vec. Exits cleanly when
 /// [`DRAINER_STOP`] is set.
 fn drainer_loop() {
+    // Plan E2 Phase 3 Task 11: explicit "runtime-internal,
+    // conservative roots" registration. The drainer doesn't
+    // touch GC-managed memory today (it shuffles `Vec<Sample>`
+    // between a Rust SPSC ring and a `Mutex<Vec<Sample>>`), so
+    // un-registered would also work; this future-proofs against
+    // a runtime worker that DOES touch heap memory and needs
+    // STW suspension + conservative stack scan. The call also
+    // ensures the Phase 3 `push_other_roots` walker is installed
+    // (idempotent / Once-gated) regardless of which thread
+    // registers first.
+    crate::gc::threads::register_runtime_thread_for_conservative_roots();
+
     let ring_ptr = CPU_RING_PTR.load(Ordering::Acquire);
     if ring_ptr.is_null() {
         return;
