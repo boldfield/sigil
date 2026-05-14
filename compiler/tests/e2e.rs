@@ -787,25 +787,21 @@ fn arena_escape_count_is_zero_below_one_percent_ceiling() {
 /// state / choose which carry their own `examples/` files.
 #[test]
 fn p18_safe_parser_example_prints_recovery_message() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: (String) -> Int }\n\
-               fn parse_token(token: Int) -> Int ![Raise, IO] {\n\
-                 match token {\n\
-                   0 => perform Raise.fail(\"token zero is not allowed\"),\n\
-                   _ => token * 10,\n\
+    let src = "effect Raise { fail: (String) -> Int }\n\
+               fn parse_token(token: Int) -> Int ![Raise, IO] {\n  \
+                 match token {\n    \
+                   0 => perform Raise.fail(\"token zero is not allowed\"),\n    \
+                   _ => token * 10,\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = handle parse_token(0) with {\n\
-                   Raise.fail(msg, k) => {\n\
-                     perform IO.println(msg);\n\
-                     -1\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle parse_token(0) with {\n    \
+                   Raise.fail(msg, k) => {\n      \
+                     perform IO.println(msg);\n      \
+                     -1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "p18_safe_parser");
@@ -1740,11 +1736,9 @@ fn effect_decl_with_no_handler_use_compiles_and_runs() {
     // additional symbols for it. The program below should compile
     // cleanly and behave identically to the IO-only program (`hello,
     // world\n` to stdout, exit 0).
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: (String) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(\"hello, world\");\n\
+    let src = "effect Raise { fail: (String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(\"hello, world\");\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "effect_decl_no_use");
@@ -1765,14 +1759,10 @@ fn handle_with_no_perform_in_body_compiles_and_runs() {
     // expression for the first time end-to-end. The handle's body is
     // the literal `42`; the `Raise.fail` arm is never invoked. Final
     // stdout: `42\n` (via int_to_string + IO.println), exit 0.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 42 with { Raise.fail(k) => 0 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with { Raise.fail(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_no_perform");
@@ -1793,14 +1783,10 @@ fn handle_with_non_io_perform_runs_arm_and_returns_value() {
     // from the returned `*mut NextStep` and treats it as the
     // perform's value, which is the handle's value. Final stdout:
     // `42\n`, exit 0.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 42 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with { Raise.fail(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_perform_arm_value");
@@ -1819,17 +1805,13 @@ fn handle_with_two_arms_dispatches_correct_arm_by_op_id() {
     // arm) to fire. Op IDs are assigned alphabetically per effect:
     // `left` → 0, `right` → 1, so this exercises the non-zero op_id
     // path through the runtime arm-slot table.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose { left: () -> Int, right: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Choose.right()) with {\n\
-                   Choose.left(k) => 10,\n\
-                   Choose.right(k) => 20,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Choose.right()) with {\n    \
+                   Choose.left(k) => 10,\n    \
+                   Choose.right(k) => 20,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_two_arms_dispatches");
@@ -1866,22 +1848,18 @@ fn handle_with_mixed_effect_arms_dispatches_correct_arm_per_effect() {
     // "TRAP_HANDLE_DISCIPLINE_VIOLATION (0x42)" attributes to the
     // reverse-pop discipline (stray pop in body, or n_frames
     // mismatch).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Foo { f: () -> Int }\n\
+    let src = "effect Foo { f: () -> Int }\n\
                effect Bar { b: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let a: Int = handle (perform Foo.f()) with {\n\
-                   Foo.f(k) => 7,\n\
-                   Bar.b(k) => 99,\n\
-                 };\n\
-                 let b: Int = handle (perform Bar.b()) with {\n\
-                   Foo.f(k) => 99,\n\
-                   Bar.b(k) => 11,\n\
-                 };\n\
-                 perform IO.println(int_to_string(a + b));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle (perform Foo.f()) with {\n    \
+                   Foo.f(k) => 7,\n    \
+                   Bar.b(k) => 99,\n  \
+                 };\n  \
+                 let b: Int = handle (perform Bar.b()) with {\n    \
+                   Foo.f(k) => 99,\n    \
+                   Bar.b(k) => 11,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a + b));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_mixed_effect_dispatches");
@@ -1915,41 +1893,37 @@ fn handle_with_two_effects_two_arms_each_dispatches_per_op() {
     // BTreeMap-grouping or per-frame `set_arm` dispatch. A
     // wrong-effect-arm landing produces e.g. "3\n2\n3\n4\n" (E1.a
     // routing to E2's op_id 0 = x, returning 3 instead of 1).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E1 { a: () -> Int, b: () -> Int }\n\
+    let src = "effect E1 { a: () -> Int, b: () -> Int }\n\
                effect E2 { x: () -> Int, y: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let r1: Int = handle (perform E1.a()) with {\n\
-                   E1.a(k) => 1,\n\
-                   E1.b(k) => 2,\n\
-                   E2.x(k) => 3,\n\
-                   E2.y(k) => 4,\n\
-                 };\n\
-                 let r2: Int = handle (perform E1.b()) with {\n\
-                   E1.a(k) => 1,\n\
-                   E1.b(k) => 2,\n\
-                   E2.x(k) => 3,\n\
-                   E2.y(k) => 4,\n\
-                 };\n\
-                 let r3: Int = handle (perform E2.x()) with {\n\
-                   E1.a(k) => 1,\n\
-                   E1.b(k) => 2,\n\
-                   E2.x(k) => 3,\n\
-                   E2.y(k) => 4,\n\
-                 };\n\
-                 let r4: Int = handle (perform E2.y()) with {\n\
-                   E1.a(k) => 1,\n\
-                   E1.b(k) => 2,\n\
-                   E2.x(k) => 3,\n\
-                   E2.y(k) => 4,\n\
-                 };\n\
-                 perform IO.println(int_to_string(r1));\n\
-                 perform IO.println(int_to_string(r2));\n\
-                 perform IO.println(int_to_string(r3));\n\
-                 perform IO.println(int_to_string(r4));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r1: Int = handle (perform E1.a()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r2: Int = handle (perform E1.b()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r3: Int = handle (perform E2.x()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 let r4: Int = handle (perform E2.y()) with {\n    \
+                   E1.a(k) => 1,\n    \
+                   E1.b(k) => 2,\n    \
+                   E2.x(k) => 3,\n    \
+                   E2.y(k) => 4,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(r1));\n  \
+                 perform IO.println(int_to_string(r2));\n  \
+                 perform IO.println(int_to_string(r3));\n  \
+                 perform IO.println(int_to_string(r4));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_2x2_dispatch");
@@ -1974,23 +1948,19 @@ fn handle_with_arms_in_reverse_source_order_produces_same_output() {
     // Bisecting hint: `stdout != "7\n7\n"` attributes to source-
     // order leaking through the BTreeMap-grouping abstraction (e.g.,
     // a refactor that replaced the BTreeMap with a Vec).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect AAA { go: () -> Int }\n\
+    let src = "effect AAA { go: () -> Int }\n\
                effect BBB { go: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let a: Int = handle (perform AAA.go()) with {\n\
-                   AAA.go(k) => 7,\n\
-                   BBB.go(k) => 99,\n\
-                 };\n\
-                 let b: Int = handle (perform AAA.go()) with {\n\
-                   BBB.go(k) => 99,\n\
-                   AAA.go(k) => 7,\n\
-                 };\n\
-                 perform IO.println(int_to_string(a));\n\
-                 perform IO.println(int_to_string(b));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle (perform AAA.go()) with {\n    \
+                   AAA.go(k) => 7,\n    \
+                   BBB.go(k) => 99,\n  \
+                 };\n  \
+                 let b: Int = handle (perform AAA.go()) with {\n    \
+                   BBB.go(k) => 99,\n    \
+                   AAA.go(k) => 7,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_source_order_independent");
@@ -2019,31 +1989,32 @@ fn handle_with_one_effect_at_max_handler_arms_compiles_and_dispatches() {
     // attributes to a per-frame cap regression introduced after this
     // commit; "stdout != 14" attributes to dispatch landing the
     // wrong arm.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Wide { op00: () -> Int, op01: () -> Int, op02: () -> Int, op03: () -> Int, op04: () -> Int, op05: () -> Int, op06: () -> Int, op07: () -> Int, op08: () -> Int, op09: () -> Int, op10: () -> Int, op11: () -> Int, op12: () -> Int, op13: () -> Int }\n\
+    let src = "effect Wide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int }\n\
                effect Other { only: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Wide.op13()) with {\n\
-                   Wide.op00(k) => 0,\n\
-                   Wide.op01(k) => 1,\n\
-                   Wide.op02(k) => 2,\n\
-                   Wide.op03(k) => 3,\n\
-                   Wide.op04(k) => 4,\n\
-                   Wide.op05(k) => 5,\n\
-                   Wide.op06(k) => 6,\n\
-                   Wide.op07(k) => 7,\n\
-                   Wide.op08(k) => 8,\n\
-                   Wide.op09(k) => 9,\n\
-                   Wide.op10(k) => 10,\n\
-                   Wide.op11(k) => 11,\n\
-                   Wide.op12(k) => 12,\n\
-                   Wide.op13(k) => 14,\n\
-                   Other.only(k) => 99,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Wide.op13()) with {\n    \
+                   Wide.op00(k) => 0,\n    \
+                   Wide.op01(k) => 1,\n    \
+                   Wide.op02(k) => 2,\n    \
+                   Wide.op03(k) => 3,\n    \
+                   Wide.op04(k) => 4,\n    \
+                   Wide.op05(k) => 5,\n    \
+                   Wide.op06(k) => 6,\n    \
+                   Wide.op07(k) => 7,\n    \
+                   Wide.op08(k) => 8,\n    \
+                   Wide.op09(k) => 9,\n    \
+                   Wide.op10(k) => 10,\n    \
+                   Wide.op11(k) => 11,\n    \
+                   Wide.op12(k) => 12,\n    \
+                   Wide.op13(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "handle_at_max_handler_arms");
@@ -2064,32 +2035,33 @@ fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
     //
     // Asserts a clean compile-time diagnostic mentioning
     // `MAX_HANDLER_ARMS` and the offending effect name.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect TooWide { op00: () -> Int, op01: () -> Int, op02: () -> Int, op03: () -> Int, op04: () -> Int, op05: () -> Int, op06: () -> Int, op07: () -> Int, op08: () -> Int, op09: () -> Int, op10: () -> Int, op11: () -> Int, op12: () -> Int, op13: () -> Int, op14: () -> Int }\n\
+    let src = "effect TooWide { \
+                 op00: () -> Int, op01: () -> Int, op02: () -> Int, \
+                 op03: () -> Int, op04: () -> Int, op05: () -> Int, \
+                 op06: () -> Int, op07: () -> Int, op08: () -> Int, \
+                 op09: () -> Int, op10: () -> Int, op11: () -> Int, \
+                 op12: () -> Int, op13: () -> Int, op14: () -> Int }\n\
                effect Other { only: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 0 with {\n\
-                   TooWide.op00(k) => 0,\n\
-                   TooWide.op01(k) => 1,\n\
-                   TooWide.op02(k) => 2,\n\
-                   TooWide.op03(k) => 3,\n\
-                   TooWide.op04(k) => 4,\n\
-                   TooWide.op05(k) => 5,\n\
-                   TooWide.op06(k) => 6,\n\
-                   TooWide.op07(k) => 7,\n\
-                   TooWide.op08(k) => 8,\n\
-                   TooWide.op09(k) => 9,\n\
-                   TooWide.op10(k) => 10,\n\
-                   TooWide.op11(k) => 11,\n\
-                   TooWide.op12(k) => 12,\n\
-                   TooWide.op13(k) => 13,\n\
-                   TooWide.op14(k) => 14,\n\
-                   Other.only(k) => 99,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 0 with {\n    \
+                   TooWide.op00(k) => 0,\n    \
+                   TooWide.op01(k) => 1,\n    \
+                   TooWide.op02(k) => 2,\n    \
+                   TooWide.op03(k) => 3,\n    \
+                   TooWide.op04(k) => 4,\n    \
+                   TooWide.op05(k) => 5,\n    \
+                   TooWide.op06(k) => 6,\n    \
+                   TooWide.op07(k) => 7,\n    \
+                   TooWide.op08(k) => 8,\n    \
+                   TooWide.op09(k) => 9,\n    \
+                   TooWide.op10(k) => 10,\n    \
+                   TooWide.op11(k) => 11,\n    \
+                   TooWide.op12(k) => 12,\n    \
+                   TooWide.op13(k) => 13,\n    \
+                   TooWide.op14(k) => 14,\n    \
+                   Other.only(k) => 99,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
@@ -2143,16 +2115,12 @@ fn handle_with_one_effect_exceeding_max_handler_arms_is_rejected_at_codegen() {
 /// exit and stderr containing `E0142` plus the unhandled op name.
 #[test]
 fn partial_handler_of_multi_op_effect_rejected_with_e0142() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose { left: () -> Int, right: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Choose.right()) with {\n\
-                   Choose.right(k) => 20,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Choose { left: () -> Int, right: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Choose.right()) with {\n    \
+                   Choose.right(k) => 20,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     assert_compile_fails_with_code(src, "E0142", &["Choose.left"], "partial_handler_e0142");
@@ -2294,18 +2262,14 @@ fn statement_form_non_io_perform_inside_handle_compiles_and_runs() {
     // which dispatched the arm; arm returned 99 to the perform
     // site (where the Stmt::Perform discarded it); helper then
     // continued to its tail `42`. Pre-Phase-4e behavior.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn helper() -> Int ![E] {\n\
-                 perform E.op();\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn helper() -> Int ![E] {\n  \
+                 perform E.op();\n  \
                  42\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with { E.op(k) => 99 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with { E.op(k) => 99 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "stmt_perform_non_io_in_handle");
@@ -2346,20 +2310,16 @@ fn nested_handle_in_outer_body_propagates_inner_unsupported_diagnostic() {
     // { Outer.op_out(k) => 0 }` — body produces 1, no perform fires
     // so no op arm runs; without a return arm, the handle's overall
     // value is the body's value = 1. main prints "1\n".
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Inner { op_in: () -> Int }\n\
+    let src = "effect Inner { op_in: () -> Int }\n\
                effect Outer { op_out: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle\n\
-                   (handle 0 with {\n\
-                     return(v) => v + 1,\n\
-                     Inner.op_in(k) => 1,\n\
-                   })\n\
-                 with { Outer.op_out(k) => 0 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (handle 0 with {\n      \
+                     return(v) => v + 1,\n      \
+                     Inner.op_in(k) => 1,\n    \
+                   })\n  \
+                 with { Outer.op_out(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_nested_inner_return_arm");
@@ -2622,16 +2582,12 @@ fn cps_wrapped_identity_matches_native_on_native_eligible_programs() {
                }}\n"
         );
         let wrapped_src = format!(
-            "import std.int\n\
-               import std.io\n\
-               use std.int.{{int_to_string}};\n\
-               use std.io.{{IO}};\n\
-               effect E_eff {{ op: () -> Int }}\n\
-               fn main() -> Int ![IO] {{\n\
-               let n: Int = handle {expr} with {{ E_eff.op(k) => 999 }};\n\
-               perform IO.println(int_to_string(n));\n\
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle {expr} with {{ E_eff.op(k) => 999 }};\n  \
+               perform IO.println(int_to_string(n));\n  \
                0\n\
-               }}\n"
+             }}\n"
         );
 
         let (native_stdout, native_stderr, native_exit) =
@@ -2694,16 +2650,12 @@ fn cps_dispatch_returns_arm_value_across_op_id_shape_space() {
         let arm_value: i64 = rng.range(-99, 99);
 
         let src = format!(
-            "import std.int\n\
-               import std.io\n\
-               use std.int.{{int_to_string}};\n\
-               use std.io.{{IO}};\n\
-               effect E_eff {{ op: () -> Int }}\n\
-               fn main() -> Int ![IO] {{\n\
-               let n: Int = handle (perform E_eff.op()) with {{ E_eff.op(k) => {arm_value} }};\n\
-               perform IO.println(int_to_string(n));\n\
+            "effect E_eff {{ op: () -> Int }}\n\
+             fn main() -> Int ![IO] {{\n  \
+               let n: Int = handle (perform E_eff.op()) with {{ E_eff.op(k) => {arm_value} }};\n  \
+               perform IO.println(int_to_string(n));\n  \
                0\n\
-               }}\n"
+             }}\n"
         );
         let (stdout, stderr, exit) = compile_and_run(&src, &format!("mf2_dispatch_{trial}"));
         assert_eq!(
@@ -2733,22 +2685,18 @@ fn handle_with_three_arms_dispatches_op_id_two() {
     // Without this test, off-by-one in op_id arithmetic would
     // surface only at MAX_HANDLER_ARMS=14 (covered by runtime unit
     // tests) — never at the small index where most user code lives.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Pick {\n\
-                 a: () -> Int,\n\
-                 b: () -> Int,\n\
+    let src = "effect Pick {\n  \
+                 a: () -> Int,\n  \
+                 b: () -> Int,\n  \
                  c: () -> Int,\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Pick.c()) with {\n\
-                   Pick.a(k) => 0,\n\
-                   Pick.b(k) => 1,\n\
-                   Pick.c(k) => 2,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Pick.c()) with {\n    \
+                   Pick.a(k) => 0,\n    \
+                   Pick.b(k) => 1,\n    \
+                   Pick.c(k) => 2,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "handle_three_arms_op_id_two");
@@ -2767,16 +2715,12 @@ fn handle_with_int_arg_op_packs_args_buffer() {
     // (no codegen-entry rejection of the user-arg-bearing perform,
     // no runtime crash from a malformed args buffer or `sigil_perform`
     // overflow check) and returns the arm's IntLit value.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: (Int) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Raise.fail(99)) with {\n\
-                   Raise.fail(msg, k) => 0,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: (Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail(99)) with {\n    \
+                   Raise.fail(msg, k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "handle_int_arg_packs");
@@ -2795,16 +2739,12 @@ fn handle_with_three_int_args_packs_buffer() {
     // (Phase 4c will read the bound names); this test pins the
     // buffer-packing path doesn't off-by-one or misalign across
     // arg count > 1.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Triple { do: (Int, Int, Int) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Triple.do(10, 20, 30)) with {\n\
-                   Triple.do(a, b, c, k) => 7,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Triple { do: (Int, Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Triple.do(10, 20, 30)) with {\n    \
+                   Triple.do(a, b, c, k) => 7,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "handle_three_int_args_packs");
@@ -2825,16 +2765,12 @@ fn handle_with_mixed_type_args_widens_correctly() {
     // or a runtime crash inside `sigil_perform`'s `args_ptr.add(i)`
     // u64-stride read. Without this test, the widen branch sits dead
     // until Phase 4c ships an arm body that reads the bound name.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Mix { it: (Int, Bool, String) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Mix.it(42, true, \"hi\")) with {\n\
-                   Mix.it(n, b, s, k) => 11,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Mix { it: (Int, Bool, String) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Mix.it(42, true, \"hi\")) with {\n    \
+                   Mix.it(n, b, s, k) => 11,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "handle_mixed_type_args_widen");
@@ -2868,16 +2804,12 @@ fn arm_reads_int_arg_returns_it() {
     // through perform, bind it in the arm body, return it. Pins
     // that the perform-side widen → slot-store → sigil_perform copy
     // → arm-fn ireduce-back chain preserves Int values bit-for-bit.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op(42)) with {\n\
-                   E.op(x, k) => x,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(42)) with {\n    \
+                   E.op(x, k) => x,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_int");
@@ -2894,16 +2826,12 @@ fn arm_reads_bool_arg_branches_on_it() {
     // Without correct widen-truncate roundtrip, the bool would
     // either always be true (any non-zero u64 → true under naive
     // reduction) or always be false.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Bool) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op(true)) with {\n\
-                   E.op(b, k) => if b { 7 } else { 99 },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Bool) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(true)) with {\n    \
+                   E.op(b, k) => if b { 7 } else { 99 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_bool");
@@ -2934,14 +2862,12 @@ fn arm_reads_string_arg_prints_via_io_println() {
     // expression — Block only appears in fn bodies / if branches —
     // so the arm body has to be a single Ident expression rather
     // than `{ perform IO.println(s); 0 }`.)
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect E { op: (String) -> String }\n\
-               fn main() -> Int ![IO] {\n\
-                 let s: String = handle (perform E.op(\"hello\")) with {\n\
-                   E.op(arg, k) => arg,\n\
-                 };\n\
-                 perform IO.println(s);\n\
+    let src = "effect E { op: (String) -> String }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle (perform E.op(\"hello\")) with {\n    \
+                   E.op(arg, k) => arg,\n  \
+                 };\n  \
+                 perform IO.println(s);\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_string");
@@ -2959,16 +2885,12 @@ fn arm_reads_multi_args_in_declared_order() {
     // surface as 10 or 30 instead of 20; a swapped order would
     // surface as the wrong end. None of the Phase 4b tests would
     // have caught any of these.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int, Int, Int) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op(10, 20, 30)) with {\n\
-                   E.op(a, b, c, k) => b,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Int, Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(10, 20, 30)) with {\n    \
+                   E.op(a, b, c, k) => b,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_multi_arg_order");
@@ -2985,18 +2907,12 @@ fn arm_reads_char_arg_branches_on_codepoint() {
     // same width as String args (test 3 below). The arm-body branch
     // dispatches through `char_eq` (Plan C addendum surface) which
     // derefs both Chars and compares codepoints via `sigil_char_eq`.
-    let src = "import std.char\n\
-               import std.int\n\
-               import std.io\n\
-               use std.char.{char_eq};\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Char) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op('Z')) with {\n\
-                   E.op(c, k) => if char_eq(c, 'Z') { 1 } else { 0 },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Char) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op('Z')) with {\n    \
+                   E.op(c, k) => if char_eq(c, 'Z') { 1 } else { 0 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_reads_char");
@@ -3025,17 +2941,13 @@ fn perform_side_narrow_to_bool_value_checked() {
     // expected — Cranelift's verifier would reject. With a
     // wrong-direction sign extend in the body widen, `if b`
     // would observe `false` and return `99` instead of `7`.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Bool }\n\
-               fn main() -> Int ![IO] {\n\
-                 let b: Bool = handle (perform E.op(1)) with {\n\
-                   E.op(n, k) => true,\n\
-                 };\n\
-                 let n: Int = if b { 7 } else { 99 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Int) -> Bool }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle (perform E.op(1)) with {\n    \
+                   E.op(n, k) => true,\n  \
+                 };\n  \
+                 let n: Int = if b { 7 } else { 99 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_perform_narrow_bool");
@@ -3054,19 +2966,13 @@ fn perform_side_narrow_to_char_value_checked() {
     // arm-body return path still exercises the boxed-Char widen /
     // narrow symmetry through `args_ptr` since the op's declared
     // return is `Char`.
-    let src = "import std.char\n\
-               import std.int\n\
-               import std.io\n\
-               use std.char.{char_eq};\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Char }\n\
-               fn main() -> Int ![IO] {\n\
-                 let c: Char = handle (perform E.op(1)) with {\n\
-                   E.op(n, k) => 'Y',\n\
-                 };\n\
-                 let n: Int = if char_eq(c, 'Y') { 11 } else { 22 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Int) -> Char }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let c: Char = handle (perform E.op(1)) with {\n    \
+                   E.op(n, k) => 'Y',\n  \
+                 };\n  \
+                 let n: Int = if char_eq(c, 'Y') { 11 } else { 22 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_perform_narrow_char");
@@ -3083,16 +2989,12 @@ fn arm_body_does_arithmetic_on_op_args() {
     // expression. Pins that the Lowerer-driven path correctly
     // resolves multiple bound names + lowers binary ops in the
     // synthetic-fn context.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int, Int) -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op(5, 7)) with {\n\
-                   E.op(a, b, k) => a * b + 1,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: (Int, Int) -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op(5, 7)) with {\n    \
+                   E.op(a, b, k) => a * b + 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, exit) = compile_and_run(src, "phase4c_arm_arithmetic");
@@ -3119,16 +3021,12 @@ fn arm_uses_k_in_tail_position_returns_continuation_value() {
     // synchronous shape diverges from algebraic semantics
     // (discard-k across function-call boundaries, non-tail k use);
     // tail-position k(arg) on a tail-position perform is correct.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op()) with {\n\
-                   E.op(k) => k(99),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => k(99),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4d_tail_k_returns_value");
@@ -3158,19 +3056,15 @@ fn arm_captures_outer_scope_returns_value() {
     // "Verification limits" section and pinned in
     // `discard_k_handler_does_not_abort_helper_phase_4e_pending`
     // below.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn helper(threshold: Int) -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op()) with {\n\
-                   E.op(k) => threshold,\n\
-                 };\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => threshold,\n  \
+                 };\n  \
                  n\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(helper(42)));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(helper(42)));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4d_arm_captures_outer_scope");
@@ -3224,17 +3118,13 @@ fn arm_inside_lambda_captures_outer_via_closure_env_load_returns_value() {
     // than let-bound and called by name. The closure_convert rewrite
     // of the captured `x` → `ClosureEnvLoad` happens the same way
     // for an IIFE'd lambda as for a let-bound one.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let x: Int = 7;\n\
-                 let n: Int = (fn (_d: Int) -> Int ![IO] => handle (perform E.op()) with {\n\
-                   E.op(k) => x,\n\
-                 })(0);\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let x: Int = 7;\n  \
+                 let n: Int = (fn (_d: Int) -> Int ![IO] => handle (perform E.op()) with {\n    \
+                   E.op(k) => x,\n  \
+                 })(0);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_d_arm_inside_lambda_captures_outer");
@@ -3262,16 +3152,12 @@ fn arm_uses_k_in_non_tail_position_is_rejected_pointing_at_phase_4e() {
     //
     // Test program: arm body is `k(0) + 1` — the `k(0)` is in
     // arithmetic-binop-LHS position, not tail. The walker rejects.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op()) with {\n\
-                   E.op(k) => k(0) + 1,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => k(0) + 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
@@ -3349,15 +3235,11 @@ fn cps_abi_helper_with_simple_tail_perform_called_from_native_main_returns_arm_v
     // a valid Cranelift function with the right shape; the call-
     // site wrapper packs args correctly and drives the trampoline;
     // the ret-type narrow returns the right value.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
+    let src = "effect E { op: () -> Int }\n\
                fn raise_e() -> Int ![E] { perform E.op() }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle raise_e() with { E.op(k) => 42 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle raise_e() with { E.op(k) => 42 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(
@@ -3385,17 +3267,13 @@ fn cps_abi_helper_called_twice_from_one_caller_uses_independent_stack_slots() {
     // Two handle expressions, each calling raise_e and discharging
     // E with different arm values. Expected stdout: each handle's
     // arm value, both correctly returned.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
+    let src = "effect E { op: () -> Int }\n\
                fn raise_e() -> Int ![E] { perform E.op() }\n\
-               fn main() -> Int ![IO] {\n\
-                 let a: Int = handle raise_e() with { E.op(k) => 10 };\n\
-                 let b: Int = handle raise_e() with { E.op(k) => 20 };\n\
-                 perform IO.println(int_to_string(a));\n\
-                 perform IO.println(int_to_string(b));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle raise_e() with { E.op(k) => 10 };\n  \
+                 let b: Int = handle raise_e() with { E.op(k) => 20 };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -3416,17 +3294,15 @@ fn cps_abi_helper_with_bool_return_exercises_ireduce_narrow() {
     //
     // helper returns Bool; arm returns `true`. main asserts the
     // value via an if-expression that prints accordingly.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect B { op: () -> Bool }\n\
+    let src = "effect B { op: () -> Bool }\n\
                fn raise_b() -> Bool ![B] { perform B.op() }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Bool = handle raise_b() with { B.op(k) => true };\n\
-                 if result {\n\
-                   perform IO.println(\"yes\")\n\
-                 } else {\n\
-                   perform IO.println(\"no\")\n\
-                 };\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Bool = handle raise_b() with { B.op(k) => true };\n  \
+                 if result {\n    \
+                   perform IO.println(\"yes\")\n  \
+                 } else {\n    \
+                   perform IO.println(\"no\")\n  \
+                 };\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_bool_return_ireduce");
@@ -3475,15 +3351,11 @@ fn cps_abi_helper_with_arity_n_user_args_and_perform_args_returns_arm_value() {
     // The two existing Phase 4e tests previously excluded this
     // path via the D1 arity gate; this commit removes the gate
     // and the new test exercises the now-supported shape.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
+    let src = "effect E { op: (Int) -> Int }\n\
                fn helper(x: Int) -> Int ![E] { perform E.op(x) }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + arg };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + arg };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -3503,13 +3375,11 @@ fn cps_abi_helper_with_string_return_exercises_pointer_ret_path() {
     // on x86_64-linux + aarch64-darwin). Pins this branch.
     //
     // helper returns String; arm returns a literal. main prints it.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect S { op: () -> String }\n\
+    let src = "effect S { op: () -> String }\n\
                fn raise_s() -> String ![S] { perform S.op() }\n\
-               fn main() -> Int ![IO] {\n\
-                 let s: String = handle raise_s() with { S.op(k) => \"phase4e\" };\n\
-                 perform IO.println(s);\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle raise_s() with { S.op(k) => \"phase4e\" };\n  \
+                 perform IO.println(s);\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "cps_abi_helper_string_return_pointer_ret");
@@ -3569,20 +3439,16 @@ fn discard_k_handler_does_abort_helper_across_call_boundary() {
     // perform_inside_handle_compiles_and_runs`, inverted at
     // `b818fc3`). With this test inverted, hard condition #2
     // closes.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x + 100\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => 42,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_discard_k_cross_call");
@@ -3626,20 +3492,16 @@ fn captures_bearing_synth_cont_arity_n_helper_discard_k() {
     // simpler shapes; this commit closes the remaining gap for
     // helpers that use their user params in the post-yield
     // expression.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper(threshold: Int) -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x + threshold\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(10) with {\n\
-                   Raise.fail(k) => 42,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_discard_k");
@@ -3673,18 +3535,14 @@ fn cps_abi_arity_n_helper_with_constant_done_synth_cont() {
     // Adjacent shape to the captures-bearing tests but exercises
     // the ConstantDone path, not LetBindThenTail. Pre-this-test,
     // this body shape's arity-N variant was untested.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper(x: Int) -> Int ![E] {\n\
-                 perform E.op(x);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
                  99\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => arg + 35 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done");
@@ -3718,18 +3576,14 @@ fn cps_abi_arity_n_helper_with_constant_done_synth_cont_use_k() {
     //
     // Closes the coverage symmetry with the LetBindThenTail
     // `discard_k` + `use_k` test pair.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper(x: Int) -> Int ![E] {\n\
-                 perform E.op(x);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(x: Int) -> Int ![E] {\n  \
+                 perform E.op(x);\n  \
                  99\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(7) with { E.op(arg, k) => k(arg) };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(7) with { E.op(arg, k) => k(arg) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_arity_n_constant_done_use_k");
@@ -3758,18 +3612,14 @@ fn cps_abi_let_yield_helper_with_bool_binding_exercises_ireduce_narrow() {
     // Use-k arm `=> k(true)` — synth-cont reads args_ptr[0] =
     // 1 (widened bool true), narrows to I8 = 1, binds `b: Bool
     // = true`, lowers `if b then 1 else 0` = 1. Result `1`.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect B { op: () -> Bool }\n\
-               fn helper() -> Int ![B, IO] {\n\
-                 let b: Bool = perform B.op();\n\
+    let src = "effect B { op: () -> Bool }\n\
+               fn helper() -> Int ![B, IO] {\n  \
+                 let b: Bool = perform B.op();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with { B.op(k) => k(true) };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with { B.op(k) => k(true) };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_bool_binding");
@@ -3794,16 +3644,14 @@ fn cps_abi_let_yield_helper_with_string_binding_exercises_pointer_path() {
     // returns the binding. Use-k arm `=> k("hello")` — synth-
     // cont reads args_ptr[0] (String pointer), passes through,
     // binds `s`, lowers tail `s`. Result is the string "hello".
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect S { op: () -> String }\n\
-               fn helper() -> String ![S, IO] {\n\
-                 let s: String = perform S.op();\n\
+    let src = "effect S { op: () -> String }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.op();\n  \
                  s\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let s: String = handle helper() with { S.op(k) => k(\"hello\") };\n\
-                 perform IO.println(s);\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with { S.op(k) => k(\"hello\") };\n  \
+                 perform IO.println(s);\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_let_yield_string_binding");
@@ -3835,20 +3683,16 @@ fn cps_abi_captures_bearing_with_bool_capture_exercises_widen_narrow_symmetry() 
     //
     // For flag=false: the test inverts (n = 0). Both paths
     // exercise the widen/narrow symmetry.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper(flag: Bool) -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(flag: Bool) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  if flag { x } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let a: Int = handle helper(true) with { Raise.fail(k) => k(99) };\n\
-                 let b: Int = handle helper(false) with { Raise.fail(k) => k(99) };\n\
-                 perform IO.println(int_to_string(a));\n\
-                 perform IO.println(int_to_string(b));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper(true) with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper(false) with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_bool");
@@ -3873,22 +3717,16 @@ fn cps_abi_captures_bearing_with_char_capture_exercises_widen_narrow_symmetry() 
     // capture is a pointer to a `TAG_CHAR` record — and the
     // post-resume comparison runs through `char_eq` (which derefs
     // both Chars and compares codepoints via `sigil_char_eq`).
-    let src = "import std.char\n\
-               import std.int\n\
-               import std.io\n\
-               use std.char.{char_eq};\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper(marker: Char) -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(marker: Char) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  if char_eq(marker, 'A') { x } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n\
-                 let b: Int = handle helper('B') with { Raise.fail(k) => k(99) };\n\
-                 perform IO.println(int_to_string(a));\n\
-                 perform IO.println(int_to_string(b));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let a: Int = handle helper('A') with { Raise.fail(k) => k(99) };\n  \
+                 let b: Int = handle helper('B') with { Raise.fail(k) => k(99) };\n  \
+                 perform IO.println(int_to_string(a));\n  \
+                 perform IO.println(int_to_string(b));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_bearing_char");
@@ -3917,20 +3755,16 @@ fn captures_bearing_synth_cont_with_two_user_params_captured() {
     //
     // Use-k arm `=> k(7)`: synth-cont fires, x=7, threshold=10,
     // multiplier=3, result = (7 + 10) * 3 = 51. main: n = 51.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper(threshold: Int, multiplier: Int) -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int, multiplier: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  (x + threshold) * multiplier\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(10, 3) with {\n\
-                   Raise.fail(k) => k(7),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10, 3) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_multi_capture_use_k");
@@ -3963,20 +3797,16 @@ fn captures_bearing_synth_cont_arity_n_helper_use_k() {
     // This is the load-bearing test for the captures-load path
     // — the synth-cont's `closure_ptr + 16 + 8*i` reads + the
     // env-bind chain.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper(threshold: Int) -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper(threshold: Int) -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x + threshold\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(10) with {\n\
-                   Raise.fail(k) => k(7),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_captures_arity_n_use_k");
@@ -4003,20 +3833,16 @@ fn discard_k_handler_use_k_arm_runs_synth_cont_with_bound_value() {
     // This pins the synth-cont's Lowerer-driven body emission
     // (binding lookup + Binary lowering) — the alternative to the
     // ConstantDone shape's hand-rolled iconst-only path.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x + 100\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => k(7),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => k(7),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4e_use_k_arm_synth_cont");
@@ -4072,19 +3898,15 @@ fn arm_body_with_inner_block_and_outer_capture_works() {
     // handle discharges `E` inside the body, so `E` is not in
     // outer's externally-observable effects. Same shape as existing
     // `arm_captures_outer_scope_returns_value`.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: () -> Int }\n\
-               fn outer(local: Int) -> Int ![IO] {\n\
-                 let n: Int = handle (perform E.op()) with {\n\
-                   E.op(k) => if true { let extra: Int = 7; local + extra } else { 0 },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect E { op: () -> Int }\n\
+               fn outer(local: Int) -> Int ![IO] {\n  \
+                 let n: Int = handle (perform E.op()) with {\n    \
+                   E.op(k) => if true { let extra: Int = 7; local + extra } else { 0 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
+               fn main() -> Int ![IO] {\n  \
                  outer(5)\n\
                }\n";
     let (stdout, stderr, code) =
@@ -4131,23 +3953,19 @@ fn slice_b_arm_body_let_then_pure_tail_post_arm_k_synth_fn_fires() {
     //     mismatch.
     //   - Crash on `args_len == 1 || args_len == 3` assert: codegen
     //     emitted an unexpected args shape.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => {\n\
-                     let r: Int = k(99);\n\
-                     r + 1\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Int = k(99);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_let_then_pure");
@@ -4166,20 +3984,16 @@ fn slice_b_arm_body_let_then_pure_tail_with_non_trivial_pure_arg() {
     // (`99 + 1`), not just a literal. Exercises the arg lowerer's
     // widen path under a Binary expression. Expected stdout: "101"
     // (= (99 + 1) + 1).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => { let r: Int = k(99 + 1); r + 1 },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99 + 1); r + 1 },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_non_trivial_arg");
@@ -4239,20 +4053,16 @@ fn slice_b_arm_body_post_arm_k_tail_with_op_arg_now_compiles_via_g1_captures_bea
     // → handle's overall body value = 99 → no return arm declared, so
     // `k(99)` returns 99 directly. Arm body computes `r + arg = 99 + 7
     // = 106`. Prints "106\n".
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: (Int) -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail(7);\n\
+    let src = "effect Raise { fail: (Int) -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail(7);\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(arg, k) => { let r: Int = k(99); r + arg },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(arg, k) => { let r: Int = k(99); r + arg },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_b_g1_captures_bearing_op_arg");
@@ -4272,20 +4082,16 @@ fn slice_b_arm_body_post_arm_k_tail_referencing_k_is_rejected_at_codegen() {
     //
     // arm body `Raise.fail(k) => { let r: Int = k(99); k }` would
     // try to use `k` as a value in tail position. Slice B rejects.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let x: Int = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let x: Int = perform Raise.fail();\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => { let r: Int = k(99); k },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => { let r: Int = k(99); k },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp =
@@ -4363,23 +4169,19 @@ fn slice_b_post_arm_k_synth_fn_lowered_tail_type_differs_from_op_return_type() {
     //   `if b { 1 } else { 0 }` → 1, dispatches Call(post_arm_k_addr, [1]).
     // - post_arm_k synth fn reads r=1 from args_ptr[0], lowers `r + 1`
     //   → 2, returns Done(2).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Bool }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let b: Bool = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => {\n\
-                     let r: Int = k(true);\n\
-                     r + 1\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r: Int = k(true);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_b_post_arm_k_body_ty_neq_tail_ty");
@@ -4427,24 +4229,20 @@ fn slice_c_choose_multi_shot_arm_invokes_k_twice_with_different_args() {
     //     computes r1 + r2 = 1, returns Done(1).
     //
     // Expected stdout: "1\n".
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { 10 } else { 3 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let r1: Int = k(true);\n\
-                     let r2: Int = k(false);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot");
@@ -4516,24 +4314,20 @@ fn slice_c_multi_let_arm_body_with_resumes_one_effect_is_rejected_at_codegen() {
     // invocation in `resumes: one` arms; the codegen-side gate
     // here mirrors it so the diagnostic surfaces with both the
     // typecheck framing AND the Slice C framing.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Bool }\n\
-               fn helper() -> Int ![Raise, IO] {\n\
-                 let b: Bool = perform Raise.fail();\n\
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn helper() -> Int ![Raise, IO] {\n  \
+                 let b: Bool = perform Raise.fail();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Raise.fail(k) => {\n\
-                     let r1: Int = k(true);\n\
-                     let r2: Int = k(false);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
@@ -4579,24 +4373,20 @@ fn slice_c_chain_arg_referencing_user_op_arg_runs() {
     // Step trace: helper(5) performs Choose.choose(5). Arm dispatched
     // with arg=5. r1 = k(arg+10) = k(15) → resumes helper with 15
     // → r1 = 15. r2 = k(arg+20) = k(25) → r2 = 25. tail = r1+r2 = 40.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, IO] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(arg + 10);\n\
-                     let r2: Int = k(arg + 20);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(arg + 10);\n      \
+                     let r2: Int = k(arg + 20);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_arg_op_arg");
@@ -4642,22 +4432,20 @@ fn slice_c_choose_multi_shot_with_string_chain_threads_pointer_through_closures(
     // pooled refs that don't get collected); a future test
     // exercising fresh heap String allocations across the chain
     // would harden this further.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> String ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> String ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { \"yes\" } else { \"no\" }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let s: String = handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let r1: String = k(true);\n\
-                     let r2: String = k(false);\n\
-                     r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(s);\n\
+               fn main() -> Int ![IO] {\n  \
+                 let s: String = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: String = k(true);\n      \
+                     let r2: String = k(false);\n      \
+                     r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(s);\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_choose_multi_shot_string");
@@ -4735,25 +4523,21 @@ fn slice_c_multi_let_arm_body_with_different_callee_in_second_let_is_rejected_at
     // is rejected at codegen, even though the detector silently
     // declines to match (so the rejection diagnostic comes from
     // the non-tail-`k` walker, not from a multi-let-specific path).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
                fn different_fn(b: Bool) -> Int ![] { if b { 1 } else { 0 } }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let r1: Int = k(true);\n\
-                     let r2: Int = different_fn(false);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = different_fn(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let tmp = std::env::temp_dir().join(format!(
@@ -4799,17 +4583,13 @@ fn handle_with_return_arm_transforms_body_value_no_op_arms_fired() {
     // `handle 5 with { return(v) => v * 2 + 1, Raise.fail(k) => -1 }`
     // — body produces 5; no Raise.fail performed; return arm fires
     // with v=5 and returns 5*2+1 = 11. main prints "11\n".
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 5 with {\n\
-                   return(v) => v * 2 + 1,\n\
-                   Raise.fail(k) => 0 - 1,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 5 with {\n    \
+                   return(v) => v * 2 + 1,\n    \
+                   Raise.fail(k) => 0 - 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_no_perform");
@@ -4845,17 +4625,13 @@ fn handle_with_op_arm_discharge_skips_return_arm() {
     // run_state-shaped test landed alongside this fix) shows the
     // bug clearly: the discharged R-typed value is passed as B-typed
     // `v` and pointer arithmetic ensues.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Raise.fail()) with {\n\
-                   Raise.fail(k) => 99,\n\
-                   return(v) => v * 100,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with {\n    \
+                   Raise.fail(k) => 99,\n    \
+                   return(v) => v * 100,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -4879,18 +4655,14 @@ fn handle_with_return_arm_captures_outer_fn_local() {
     // `let scale = 7; handle 4 with { return(v) => v * scale, ... }`
     // — body produces 4; return arm fires with v=4, captures scale=7
     // → returns 4*7 = 28.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let scale: Int = 7;\n\
-                 let n: Int = handle 4 with {\n\
-                   return(v) => v * scale,\n\
-                   Raise.fail(k) => 0,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let scale: Int = 7;\n  \
+                 let n: Int = handle 4 with {\n    \
+                   return(v) => v * scale,\n    \
+                   Raise.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_captures");
@@ -4913,19 +4685,15 @@ fn handle_with_return_arm_in_multi_effect_handle_first_frame_contract() {
     // `handle 3 with { Foo.f(k) => 100, Bar.b(k) => 200, return(v)
     // => v * 10 }` — body produces 3 (no perform); return arm fires
     // with v=3 → 30.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Foo { f: () -> Int }\n\
+    let src = "effect Foo { f: () -> Int }\n\
                effect Bar { b: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 3 with {\n\
-                   Foo.f(k) => 100,\n\
-                   Bar.b(k) => 200,\n\
-                   return(v) => v * 10,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 3 with {\n    \
+                   Foo.f(k) => 100,\n    \
+                   Bar.b(k) => 200,\n    \
+                   return(v) => v * 10,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_multi_effect");
@@ -4948,20 +4716,16 @@ fn handle_with_return_arm_body_performs_io() {
     // runs: prints "done", returns v=42. Output: "done\n42\n".
     // Raise.fail op arm never fires (body has no perform); it
     // exists only to satisfy parser's at-least-one-op-arm rule.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 42 with {\n\
-                   return(v) => {\n\
-                     perform IO.println(\"done\");\n\
-                     v\n\
-                   },\n\
-                   Raise.fail(k) => 0,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 42 with {\n    \
+                   return(v) => {\n      \
+                     perform IO.println(\"done\");\n      \
+                     v\n    \
+                   },\n    \
+                   Raise.fail(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_body_io");
@@ -4980,20 +4744,18 @@ fn handle_with_return_arm_body_type_differs_from_body_type() {
     // path: body type = Int (I64), return-arm body type = Bool (I8)
     // — handle's overall type is Bool, narrowed via `ireduce` from
     // the I64 trampoline result.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let big: Bool = handle 100 with {\n\
-                   return(v) => v > 50,\n\
-                   Raise.fail(k) => false,\n\
-                 };\n\
-                 if big {\n\
-                   perform IO.println(\"big\");\n\
-                   0\n\
-                 } else {\n\
-                   perform IO.println(\"small\");\n\
-                   1\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let big: Bool = handle 100 with {\n    \
+                   return(v) => v > 50,\n    \
+                   Raise.fail(k) => false,\n  \
+                 };\n  \
+                 if big {\n    \
+                   perform IO.println(\"big\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"small\");\n    \
+                   1\n  \
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_return_arm_narrow_to_bool");
@@ -5023,24 +4785,20 @@ fn handle_returning_fn_typed_value_with_op_arm_discharge_runs() {
     // chain integration gap` in `PLAN_B_PRIME_DEVIATIONS.md`).
     // Closing rs_a unblocks the canonical run_state rewrite that
     // PR #38 deferred.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger { fire: () -> Int }\n\
-               fn comp() -> Int ![Trigger] {\n\
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
                  perform Trigger.fire()\n\
                }\n\
-               fn caller() -> (Int) -> Int ![] ![] {\n\
-                 handle comp() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v + s,\n\
-                   Trigger.fire(k) => fn (s: Int) -> Int ![] => s + 100,\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => s + 100,\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = caller();\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5072,23 +4830,19 @@ fn handle_with_post_perform_body_code_uses_arm_discharge_value() {
     // probe — the "Layer 1" residual from `[DEVIATION Stage-6.8-
     // followup Layer 2 analysis]`'s "What's still blocking the
     // canonical run_state" enumeration.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger { fire: () -> Int }\n\
-               fn make_f() -> (Int) -> Int ![] ![] {\n\
-                 handle {\n\
-                   let _: Int = perform Trigger.fire();\n\
-                   fn (x: Int) -> Int ![] => x\n\
-                 } with {\n\
-                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n\
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn make_f() -> (Int) -> Int ![] ![] {\n  \
+                 handle {\n    \
+                   let _: Int = perform Trigger.fire();\n    \
+                   fn (x: Int) -> Int ![] => x\n  \
+                 } with {\n    \
+                   Trigger.fire(k) => fn (x: Int) -> Int ![] => x + 100,\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = make_f();\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = make_f();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5114,22 +4868,18 @@ fn cps_effected_fn_typed_parameter_indirect_call_returns_correct_value() {
     // shim packs args + trailing (null, identity) into a stack slot,
     // calls the Cps fn, drives sigil_run_loop, and narrows back. The
     // indirect call site sees uniform Sync convention.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger { fire: () -> Int }\n\
-               fn produces_42() -> Int ![Trigger] {\n\
+    let src = "effect Trigger { fire: () -> Int }\n\
+               fn produces_42() -> Int ![Trigger] {\n  \
                  perform Trigger.fire()\n\
                }\n\
-               fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] {\n\
+               fn invoke(c: () -> Int ![Trigger]) -> Int ![Trigger] {\n  \
                  c()\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle invoke(produces_42) with {\n\
-                   Trigger.fire(k) => 42,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle invoke(produces_42) with {\n    \
+                   Trigger.fire(k) => 42,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_cps_indirect");
@@ -5154,25 +4904,21 @@ fn handle_with_eager_resume_arms_chains_let_yield_correctly() {
     //   - State.get arm fires `k(initial=5)` (tail-k, captures `initial`).
     //   - step_1 binds 5 to v, computes v + 1 = 6, returns Done(6).
     //   - run_loop terminates with 6; handle's overall = 6.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
-               fn comp() -> Int ![State] {\n\
-                 let _: Int = perform State.set(10);\n\
-                 let v: Int = perform State.get();\n\
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
                  v + 1\n\
                }\n\
-               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n\
-                 handle c() with {\n\
-                   State.get(k) => k(initial),\n\
-                   State.set(arg, k) => k(arg),\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 handle c() with {\n    \
+                   State.get(k) => k(initial),\n    \
+                   State.set(arg, k) => k(arg),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(5, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "stage_6_8_followup_layer3b_eager_chain");
@@ -5207,24 +4953,20 @@ fn handle_return_arm_with_outer_captures_in_k_pair_dispatch_path() {
     //     `(s) => v * factor + s` with v=7, factor=3 captured.
     //   - Inner k(7) yields closure_for_v_eq_7_factor_eq_3.
     //   - Outer call closure(7) = 7*3 + 7 = 28.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger resumes: many { fire: () -> Int }\n\
-               fn comp() -> Int ![Trigger] {\n\
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
                  perform Trigger.fire()\n\
                }\n\
-               fn caller(factor: Int) -> (Int) -> Int ![] ![] {\n\
-                 handle comp() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v * factor + s,\n\
-                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
+               fn caller(factor: Int) -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v * factor + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = caller(3);\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller(3);\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5252,24 +4994,20 @@ fn integration_bug2_plus_layer2_only_tail_perform_canonical_arms() {
     // If this regresses but `bug2_alone` and `layer2_alone` probes
     // pass, the regression is in the composition (e.g., Layer 2's
     // self-apply path interaction with Bug 2's discharge tag check).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger resumes: many { fire: () -> Int }\n\
-               fn comp() -> Int ![Trigger] {\n\
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
                  perform Trigger.fire()\n\
                }\n\
-               fn caller() -> (Int) -> Int ![] ![] {\n\
-                 handle comp() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v + s,\n\
-                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = caller();\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5306,25 +5044,21 @@ fn integration_bug2_layer2_bug1_non_tail_perform_canonical_arms() {
     // If this regresses but `integration_bug2_plus_layer2_only` and
     // `dbg_a` probes pass, the regression is in the Bug 1 / Layer 3a
     // / Layer 3c composition.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger resumes: many { fire: () -> Int }\n\
-               fn comp() -> Int ![Trigger] {\n\
-                 let v: Int = perform Trigger.fire();\n\
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
+                 let v: Int = perform Trigger.fire();\n  \
                  v + 1\n\
                }\n\
-               fn caller() -> (Int) -> Int ![] ![] {\n\
-                 handle comp() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v + s,\n\
-                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = caller();\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5387,27 +5121,23 @@ fn run_state_canonical_higher_order_helper_returns_threaded_value() {
     //     * Inner k(10) returns closure_for_v_eq_11.
     //     * Outer call: closure_for_v_eq_11(10) = 11.
     //   - state_fn(5) returns 11.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
-               fn comp() -> Int ![State] {\n\
-                 let _: Int = perform State.set(10);\n\
-                 let v: Int = perform State.get();\n\
+    let src = "effect State resumes: many { get: () -> Int, set: (Int) -> Int }\n\
+               fn comp() -> Int ![State] {\n  \
+                 let _: Int = perform State.set(10);\n  \
+                 let v: Int = perform State.get();\n  \
                  v + 1\n\
                }\n\
-               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle c() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, c: () -> Int ![State]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle c() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   State.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   State.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(5, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(5, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5438,24 +5168,20 @@ fn handle_returning_k_capturing_lambda_invoked_outside_handle() {
     // Layers 1 (non-tail-perform body) and 3 (multi-arm composition)
     // remain documented under `[DEVIATION Stage-6.8-followup Layer 2
     // analysis]` for follow-up.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Trigger resumes: many { fire: () -> Int }\n\
-               fn comp() -> Int ![Trigger] {\n\
+    let src = "effect Trigger resumes: many { fire: () -> Int }\n\
+               fn comp() -> Int ![Trigger] {\n  \
                  perform Trigger.fire()\n\
                }\n\
-               fn caller() -> (Int) -> Int ![] ![] {\n\
-                 handle comp() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v + s,\n\
-                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
+               fn caller() -> (Int) -> Int ![] ![] {\n  \
+                 handle comp() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v + s,\n    \
+                   Trigger.fire(k) => fn (s: Int) -> Int ![] => k(s)(s),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let f: (Int) -> Int ![] = caller();\n\
-                 let n: Int = f(7);\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let f: (Int) -> Int ![] = caller();\n  \
+                 let n: Int = f(7);\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -5478,17 +5204,13 @@ fn handle_with_op_arm_discharge_skips_constant_return_arm() {
     // works), and (b) the return arm is skipped on op-arm
     // discharge per standard algebraic-effects semantics
     // (sibling `handle_with_op_arm_discharge_skips_return_arm`).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle (perform Raise.fail()) with {\n\
-                   Raise.fail(k) => 7,\n\
-                   return(v) => 999,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle (perform Raise.fail()) with {\n    \
+                   Raise.fail(k) => 7,\n    \
+                   return(v) => 999,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(
@@ -5509,19 +5231,15 @@ fn nested_handle_with_inner_lambda_in_arm_body_compiles() {
     // discard-k and doesn't capture `k`, so it now compiles cleanly;
     // both inner and outer `handle` bodies are `0` (no perform), so
     // arms never fire — overall returns 0.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Inner { op_in: () -> Int }\n\
+    let src = "effect Inner { op_in: () -> Int }\n\
                effect Outer { op_out: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle\n\
-                   (handle 0 with {\n\
-                     Inner.op_in(k) => (fn (x: Int) -> Int ![] => x + 1)(0),\n\
-                   })\n\
-                 with { Outer.op_out(k) => 0 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle\n    \
+                   (handle 0 with {\n      \
+                     Inner.op_in(k) => (fn (x: Int) -> Int ![] => x + 1)(0),\n    \
+                   })\n  \
+                 with { Outer.op_out(k) => 0 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase4g_walker_recursion_inverted");
@@ -5582,16 +5300,12 @@ fn compose_body_via_closure_env_callees_returns_42() {
 /// body assignment binds `n = 43`.
 #[test]
 fn arm_body_iife_returns_43() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle perform Raise.fail() with {\n\
-                   Raise.fail(k) => (fn (n: Int) -> Int ![] => n + 1)(42),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => (fn (n: Int) -> Int ![] => n + 1)(42),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "arm_body_iife");
@@ -5619,22 +5333,18 @@ fn arm_body_iife_returns_43() {
 /// (returns 99 directly).
 #[test]
 fn arm_body_lambda_capturing_k_compiles_returns_99() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Int }\n\
-               fn run() -> Int ![] {\n\
-                 let r: Int = handle 0 with {\n\
-                   Choose.flip(k) => {\n\
-                     let _: (Int) -> Int ![] = fn (x: Int) -> Int ![] => k(x);\n\
-                     99\n\
-                   },\n\
-                 };\n\
+    let src = "effect Choose resumes: many { flip: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 let r: Int = handle 0 with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Int) -> Int ![] = fn (x: Int) -> Int ![] => k(x);\n      \
+                     99\n    \
+                   },\n  \
+                 };\n  \
                  r\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run()));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "arm_lambda_captures_k");
@@ -5664,22 +5374,18 @@ fn task_108_arm_body_lambda_captures_k_runs() {
     // (no perform); the handle returns 0. The lambda's k-capture
     // is allocated via Phase B's trailing-pair convention but
     // never invoked.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn run() -> Int ![] {\n\
-                 let r: Int = handle 0 with {\n\
-                   Choose.flip(k) => {\n\
-                     let _: (Bool) -> Int ![] = fn (b: Bool) -> Int ![] => k(b);\n\
-                     42\n\
-                   },\n\
-                 };\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn run() -> Int ![] {\n  \
+                 let r: Int = handle 0 with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let _: (Bool) -> Int ![] = fn (b: Bool) -> Int ![] => k(b);\n      \
+                     42\n    \
+                   },\n  \
+                 };\n  \
                  r\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run()));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_108_choose");
@@ -5703,21 +5409,17 @@ fn task_117_let_bound_k_single_shot_resumes_with_arg() {
     //
     // body = perform Raise.fail(); arm = let f = k; f(42); handle
     // returns 42.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn run() -> Int ![] {\n\
-                 handle perform Raise.fail() with {\n\
-                   Raise.fail(k) => {\n\
-                     let f: Continuation[Int, Int] = k;\n\
-                     f(42)\n\
-                   },\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let f: Continuation[Int, Int] = k;\n      \
+                     f(42)\n    \
+                   },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run()));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_117_let_bound_k_single_shot");
@@ -5747,27 +5449,23 @@ fn task_117_let_bound_k_multi_shot_via_2_let_returns_3() {
     // f(true) → helper returns 1.
     // f(false) → helper returns 2.
     // r1 + r2 = 3.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { 1 } else { 2 }\n\
                }\n\
-               fn run() -> Int ![IO] {\n\
-                 handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let f: Continuation[Bool, Int] = k;\n\
-                     let r1: Int = f(true);\n\
-                     let r2: Int = f(false);\n\
-                     r1 + r2\n\
-                   },\n\
+               fn run() -> Int ![IO] {\n  \
+                 handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let f: Continuation[Bool, Int] = k;\n      \
+                     let r1: Int = f(true);\n      \
+                     let r2: Int = f(false);\n      \
+                     r1 + r2\n    \
+                   },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run()));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_117_let_bound_k_multishot");
@@ -5853,22 +5551,18 @@ fn task_117_let_bound_k_chained_aliases_runs_cleanly() {
     // Cont = k; g(42)`, codegen-walker rejected bare `k` in
     // let-RHS. Test asserts the program compiles + runs + returns
     // 42 — only possible with the substitute-then-recheck.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn run() -> Int ![] {\n\
-                 handle perform Raise.fail() with {\n\
-                   Raise.fail(k) => {\n\
-                     let f: Continuation[Int, Int] = k;\n\
-                     let g: Continuation[Int, Int] = f;\n\
-                     g(42)\n\
-                   },\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn run() -> Int ![] {\n  \
+                 handle perform Raise.fail() with {\n    \
+                   Raise.fail(k) => {\n      \
+                     let f: Continuation[Int, Int] = k;\n      \
+                     let g: Continuation[Int, Int] = f;\n      \
+                     g(42)\n    \
+                   },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run()));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run()));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_117_chained_aliases");
@@ -5983,22 +5677,18 @@ fn task_118_conditional_k_call_inside_if_drives_both_ways() {
     // op-arg (in scope at the arm body via the standard arm-fn
     // closure). Drive both branches by calling `run` twice with
     // different op-arg values.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Pick { pick: (Bool) -> Int }\n\
-               fn body(b: Bool) -> Int ![Pick] {\n\
+    let src = "effect Pick { pick: (Bool) -> Int }\n\
+               fn body(b: Bool) -> Int ![Pick] {\n  \
                  perform Pick.pick(b)\n\
                }\n\
-               fn run(b: Bool) -> Int ![] {\n\
-                 handle body(b) with {\n\
-                   Pick.pick(cond, k) => if cond { k(10) } else { k(20) },\n\
+               fn run(b: Bool) -> Int ![] {\n  \
+                 handle body(b) with {\n    \
+                   Pick.pick(cond, k) => if cond { k(10) } else { k(20) },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run(true)));\n\
-                 perform IO.println(int_to_string(run(false)));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(true)));\n  \
+                 perform IO.println(int_to_string(run(false)));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_118_cond_k_in_if");
@@ -6014,26 +5704,22 @@ fn task_118_conditional_k_call_inside_if_drives_both_ways() {
 fn task_118_conditional_k_call_inside_match_drives_both_ways() {
     // (b) Conditional k-call inside `match`. The arm body matches
     // an op-arg tag and calls `k` with different ints per variant.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               type Tag = | TagA | TagB\n\
+    let src = "type Tag = | TagA | TagB\n\
                effect Pick { pick: (Tag) -> Int }\n\
-               fn body(t: Tag) -> Int ![Pick] {\n\
+               fn body(t: Tag) -> Int ![Pick] {\n  \
                  perform Pick.pick(t)\n\
                }\n\
-               fn run(t: Tag) -> Int ![] {\n\
-                 handle body(t) with {\n\
-                   Pick.pick(tag, k) => match tag {\n\
-                     TagA => k(10),\n\
-                     TagB => k(20),\n\
-                   },\n\
+               fn run(t: Tag) -> Int ![] {\n  \
+                 handle body(t) with {\n    \
+                   Pick.pick(tag, k) => match tag {\n      \
+                     TagA => k(10),\n      \
+                     TagB => k(20),\n    \
+                   },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run(TagA)));\n\
-                 perform IO.println(int_to_string(run(TagB)));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(TagA)));\n  \
+                 perform IO.println(int_to_string(run(TagB)));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_118_cond_k_in_match");
@@ -6052,22 +5738,18 @@ fn task_118_k_call_in_one_branch_else_discharges() {
     // with 0). When cond=false → arm body evaluates to 42 without
     // invoking k → handle's overall is 42 (DISCHARGED path; no
     // return-arm wrapper since this handle has no return arm).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Pick { pick: (Bool) -> Int }\n\
-               fn body(b: Bool) -> Int ![Pick] {\n\
+    let src = "effect Pick { pick: (Bool) -> Int }\n\
+               fn body(b: Bool) -> Int ![Pick] {\n  \
                  perform Pick.pick(b)\n\
                }\n\
-               fn run(b: Bool) -> Int ![] {\n\
-                 handle body(b) with {\n\
-                   Pick.pick(cond, k) => if cond { k(0) } else { 42 },\n\
+               fn run(b: Bool) -> Int ![] {\n  \
+                 handle body(b) with {\n    \
+                   Pick.pick(cond, k) => if cond { k(0) } else { 42 },\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(int_to_string(run(true)));\n\
-                 perform IO.println(int_to_string(run(false)));\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(int_to_string(run(true)));\n  \
+                 perform IO.println(int_to_string(run(false)));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_118_one_branch_k_else_discharge");
@@ -6091,35 +5773,31 @@ fn task_118_recursive_choose_first_choice_three_candidates() {
     // the picked value is 1 (only candidate 1 succeeds). Discharger
     // tries k(0), then k(1), then k(2) in nested-match shape; the
     // first ISome wins. Expect ISome(1).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               type IntOpt = | INone | ISome(Int)\n\
+    let src = "type IntOpt = | INone | ISome(Int)\n\
                effect Choose resumes: many { choose: (Int) -> Int, fail: () -> Int }\n\
-               fn body() -> IntOpt ![Choose] {\n\
-                 let n: Int = perform Choose.choose(3);\n\
+               fn body() -> IntOpt ![Choose] {\n  \
+                 let n: Int = perform Choose.choose(3);\n  \
                  if n == 1 { ISome(n) } else { INone }\n\
                }\n\
-               fn run() -> IntOpt ![] {\n\
-                 handle body() with {\n\
-                   Choose.choose(arg, k) => match k(0) {\n\
-                     ISome(s) => ISome(s),\n\
-                     INone => match k(1) {\n\
-                       ISome(s) => ISome(s),\n\
-                       INone => k(2),\n\
-                     },\n\
-                   },\n\
-                   Choose.fail(k) => INone,\n\
+               fn run() -> IntOpt ![] {\n  \
+                 handle body() with {\n    \
+                   Choose.choose(arg, k) => match k(0) {\n      \
+                     ISome(s) => ISome(s),\n      \
+                     INone => match k(1) {\n        \
+                       ISome(s) => ISome(s),\n        \
+                       INone => k(2),\n      \
+                     },\n    \
+                   },\n    \
+                   Choose.fail(k) => INone,\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let r: IntOpt = run();\n\
-                 let v: Int = match r {\n\
-                   ISome(x) => x,\n\
-                   INone => 0 - 1,\n\
-                 };\n\
-                 perform IO.println(int_to_string(v));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: IntOpt = run();\n  \
+                 let v: Int = match r {\n    \
+                   ISome(x) => x,\n    \
+                   INone => 0 - 1,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(v));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_118_recursive_choose_first_choice");
@@ -6150,20 +5828,16 @@ fn handle_with_return_arm_inside_match_arm_compiles() {
     // time. With the fix, it compiles cleanly and prints "10\n"
     // (match scrutinee 5, arm body is `handle 5 with { return(v)
     // => v + 5, ... }`, return arm fires with v=5 → 5+5=10).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let scrut: Int = 5;\n\
-                 let n: Int = match scrut {\n\
-                   _ => handle 5 with {\n\
-                     return(v) => v + 5,\n\
-                     Raise.fail(k) => 0,\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+    let src = "effect Raise { fail: () -> Int }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let scrut: Int = 5;\n  \
+                 let n: Int = match scrut {\n    \
+                   _ => handle 5 with {\n      \
+                     return(v) => v + 5,\n      \
+                     Raise.fail(k) => 0,\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_handle_inside_match_arm");
@@ -6188,21 +5862,17 @@ fn handle_with_nested_handle_in_return_arm_body_compiles() {
     // fires with v=4; outer return arm body = inner handle, body
     // = v+1 = 5; inner return arm fires with w=5 → 5*2 = 10.
     // Final: 10.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Foo { f: () -> Int }\n\
+    let src = "effect Foo { f: () -> Int }\n\
                effect Bar { b: () -> Int }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle 4 with {\n\
-                   return(v) => handle (v + 1) with {\n\
-                     return(w) => w * 2,\n\
-                     Bar.b(k) => 0,\n\
-                   },\n\
-                   Foo.f(k) => 0,\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle 4 with {\n    \
+                   return(v) => handle (v + 1) with {\n      \
+                     return(w) => w * 2,\n      \
+                     Bar.b(k) => 0,\n    \
+                   },\n    \
+                   Foo.f(k) => 0,\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "phase_4g_nested_handle_in_return_arm");
@@ -6234,20 +5904,18 @@ fn handle_with_bool_body_and_return_arm_uses_v_at_narrow_type() {
     // `v = true (I8)`. Return-arm body `if v { false } else { true }`
     // → `false` (I8). The handle's overall = false; main's `if b`
     // takes the else branch, prints "false\n", returns 1.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Raise { fail: () -> Bool }\n\
-               fn main() -> Int ![IO] {\n\
-                 let b: Bool = handle true with {\n\
-                   return(v) => if v { false } else { true },\n\
-                   Raise.fail(k) => true,\n\
-                 };\n\
-                 if b {\n\
-                   perform IO.println(\"true\");\n\
-                   0\n\
-                 } else {\n\
-                   perform IO.println(\"false\");\n\
-                   1\n\
+    let src = "effect Raise { fail: () -> Bool }\n\
+               fn main() -> Int ![IO] {\n  \
+                 let b: Bool = handle true with {\n    \
+                   return(v) => if v { false } else { true },\n    \
+                   Raise.fail(k) => true,\n  \
+                 };\n  \
+                 if b {\n    \
+                   perform IO.println(\"true\");\n    \
+                   0\n  \
+                 } else {\n    \
+                   perform IO.println(\"false\");\n    \
+                   1\n  \
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "stage_6_cleanup_bool_body_binding_ty");
@@ -6281,21 +5949,17 @@ fn chained_synth_cont_two_perform_helper_returns_sum_of_bindings() {
     //
     // Verifies: step_0->step_1 transition, prior_bindings forward
     // copy, args_ptr[0] bind, post_arm_k dispatch from Final.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper() -> Int ![E, IO] {\n\
-                 let x: Int = perform E.op(1);\n\
-                 let y: Int = perform E.op(2);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
                  x + y\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   E.op(arg, k) => k(arg + 100),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_two_perform_helper");
@@ -6320,22 +5984,18 @@ fn chained_synth_cont_three_perform_helper_returns_sum_of_bindings() {
     // step_2 (Final): load x from prior_bindings[0], y from
     //   prior_bindings[1]; bind z=103; lower `x + y + z`; dispatch
     //   through post_arm_k.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper() -> Int ![E, IO] {\n\
-                 let x: Int = perform E.op(1);\n\
-                 let y: Int = perform E.op(2);\n\
-                 let z: Int = perform E.op(3);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
+                 let z: Int = perform E.op(3);\n  \
                  x + y + z\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   E.op(arg, k) => k(arg + 100),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_three_perform_helper");
@@ -6367,21 +6027,17 @@ fn chained_synth_cont_two_perform_with_forward_data_dependency() {
     // step_1's perform lowers correctly with x in scope.
     //
     // x = handler(1) = 101. y = handler(101) = 201. x + y = 302.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper() -> Int ![E, IO] {\n\
-                 let x: Int = perform E.op(1);\n\
-                 let y: Int = perform E.op(x);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper() -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(x);\n  \
                  x + y\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   E.op(arg, k) => k(arg + 100),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_forward_data_dependency");
@@ -6404,21 +6060,17 @@ fn chained_synth_cont_two_perform_helper_with_user_param_capture() {
     // step_1 record: [threshold, x] (captures + prior_bindings).
     // step_1 (Final): loads threshold from captures slot, x from
     //   prior_bindings slot, binds y; lowers `x + y + threshold`.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper(threshold: Int) -> Int ![E, IO] {\n\
-                 let x: Int = perform E.op(1);\n\
-                 let y: Int = perform E.op(2);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(1);\n  \
+                 let y: Int = perform E.op(2);\n  \
                  x + y + threshold\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(10) with {\n\
-                   E.op(arg, k) => k(arg + 100),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "chained_synth_cont_user_param_capture");
@@ -6441,21 +6093,17 @@ fn chained_synth_cont_user_param_referenced_in_perform_arg_and_tail() {
     //   So x = 110.
     // step_1's perform arg = 2; arm returns 102. So y = 102.
     // tail: x + y + threshold = 110 + 102 + 10 = 222.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect E { op: (Int) -> Int }\n\
-               fn helper(threshold: Int) -> Int ![E, IO] {\n\
-                 let x: Int = perform E.op(threshold);\n\
-                 let y: Int = perform E.op(2);\n\
+    let src = "effect E { op: (Int) -> Int }\n\
+               fn helper(threshold: Int) -> Int ![E, IO] {\n  \
+                 let x: Int = perform E.op(threshold);\n  \
+                 let y: Int = perform E.op(2);\n  \
                  x + y + threshold\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper(10) with {\n\
-                   E.op(arg, k) => k(arg + 100),\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper(10) with {\n    \
+                   E.op(arg, k) => k(arg + 100),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -6483,20 +6131,18 @@ fn chained_synth_cont_two_perform_with_string_binding_exercises_pointer_bitmap()
     //   args_ptr[0]; tail returns s.
     //
     // helper's tail returns the String binding `s`; main prints it.
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect S { gen_str: () -> String, gen_int: () -> Int }\n\
-               fn helper() -> String ![S, IO] {\n\
-                 let s: String = perform S.gen_str();\n\
-                 let n: Int = perform S.gen_int();\n\
+    let src = "effect S { gen_str: () -> String, gen_int: () -> Int }\n\
+               fn helper() -> String ![S, IO] {\n  \
+                 let s: String = perform S.gen_str();\n  \
+                 let n: Int = perform S.gen_int();\n  \
                  s\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let r: String = handle helper() with {\n\
-                   S.gen_str(k) => k(\"hello-chain\"),\n\
-                   S.gen_int(k) => k(42),\n\
-                 };\n\
-                 perform IO.println(r);\n\
+               fn main() -> Int ![IO] {\n  \
+                 let r: String = handle helper() with {\n    \
+                   S.gen_str(k) => k(\"hello-chain\"),\n    \
+                   S.gen_int(k) => k(42),\n  \
+                 };\n  \
+                 perform IO.println(r);\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -6543,25 +6189,21 @@ fn slice_c_chain_three_let_arm_body_invokes_k_three_times() {
     //     closure (Final layout: [r1, r2]), dispatches.
     //   - step_2 (Final): binds r3=1, loads [r1, r2], lowers
     //     `r1+r2+r3 = 1+0+1 = 2`, returns Done(2).
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let r1: Int = k(true);\n\
-                     let r2: Int = k(false);\n\
-                     let r3: Int = k(true);\n\
-                     r1 + r2 + r3\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_three_let");
@@ -6581,27 +6223,23 @@ fn slice_c_chain_five_let_arm_body_invokes_k_five_times() {
     // sums all 5 results.
     //
     // Expected: r1=1, r2=0, r3=1, r4=0, r5=1 → sum=3.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { flip: () -> Bool }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let b: Bool = perform Choose.flip();\n\
+    let src = "effect Choose resumes: many { flip: () -> Bool }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let b: Bool = perform Choose.flip();\n  \
                  if b { 1 } else { 0 }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle helper() with {\n\
-                   Choose.flip(k) => {\n\
-                     let r1: Int = k(true);\n\
-                     let r2: Int = k(false);\n\
-                     let r3: Int = k(true);\n\
-                     let r4: Int = k(false);\n\
-                     let r5: Int = k(true);\n\
-                     r1 + r2 + r3 + r4 + r5\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle helper() with {\n    \
+                   Choose.flip(k) => {\n      \
+                     let r1: Int = k(true);\n      \
+                     let r2: Int = k(false);\n      \
+                     let r3: Int = k(true);\n      \
+                     let r4: Int = k(false);\n      \
+                     let r5: Int = k(true);\n      \
+                     r1 + r2 + r3 + r4 + r5\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_five_let");
@@ -6631,25 +6269,21 @@ fn slice_c_chain_three_let_with_forward_data_dependency() {
     //   - r2 = k(r1) = k(1) → r2=1.
     //   - r3 = k(r1 + r2) = k(2) → r3=2.
     //   - tail = r1 + r2 + r3 = 1 + 1 + 2 = 4.
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Gen resumes: many { next: (Int) -> Int }\n\
-               fn helper() -> Int ![Gen, IO] {\n\
-                 let n: Int = perform Gen.next(0);\n\
+    let src = "effect Gen resumes: many { next: (Int) -> Int }\n\
+               fn helper() -> Int ![Gen, IO] {\n  \
+                 let n: Int = perform Gen.next(0);\n  \
                  n\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let m: Int = handle helper() with {\n\
-                   Gen.next(arg, k) => {\n\
-                     let r1: Int = k(arg + 1);\n\
-                     let r2: Int = k(r1);\n\
-                     let r3: Int = k(r1 + r2);\n\
-                     r1 + r2 + r3\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(m));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let m: Int = handle helper() with {\n    \
+                   Gen.next(arg, k) => {\n      \
+                     let r1: Int = k(arg + 1);\n      \
+                     let r2: Int = k(r1);\n      \
+                     let r3: Int = k(r1 + r2);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(m));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "slice_c_chain_forward_data_dep");
@@ -8578,22 +8212,18 @@ fn auto_prelude_with_explicit_import_for_helpers() {
 /// `enum Color { None, ... }` shadows `Option::None` in scope.
 #[test]
 fn auto_prelude_user_type_shadows_none_ctor() {
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               type Color = | Red | Green | None\n\
-               \n\
-               fn name_of(c: Color) -> String ![] {\n\
-                 match c {\n\
-                   Red   => \"red\",\n\
-                   Green => \"green\",\n\
-                   None  => \"none-color\",\n\
+    let src = "type Color = | Red | Green | None\n\n\
+               fn name_of(c: Color) -> String ![] {\n  \
+                 match c {\n    \
+                   Red   => \"red\",\n    \
+                   Green => \"green\",\n    \
+                   None  => \"none-color\",\n  \
                  }\n\
-               }\n\
-               \n\
-               fn main() -> Int ![IO] {\n\
-                 perform IO.println(name_of(Red));\n\
-                 perform IO.println(name_of(Green));\n\
-                 perform IO.println(name_of(None));\n\
+               }\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 perform IO.println(name_of(Red));\n  \
+                 perform IO.println(name_of(Green));\n  \
+                 perform IO.println(name_of(None));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_color_none");
@@ -8610,29 +8240,20 @@ fn auto_prelude_user_type_shadows_none_ctor() {
 /// `Option::Some`.
 #[test]
 fn auto_prelude_per_ctor_shadowing_leaves_other_prelude_names() {
-    let src = "import std.int\n\
-               import std.io\n\
-               import std.option\n\
-               import std.result\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               use std.option.{Option, Some};\n\
-               use std.result.{Err, Ok, Result};\n\
-               type Color = | Red | Green | None\n\
-               \n\
-               fn main() -> Int ![IO] {\n\
-                 // `Some` and `Ok` are NOT declared on Color, so the\n\
-                 // prelude versions remain in scope and these compile.\n\
-                 let opt: Option[Int] = Some(7);\n\
-                 let res: Result[Int, Int] = Ok(42);\n\
-                 match opt {\n\
-                   Some(n) => perform IO.println(int_to_string(n)),\n\
-                   None    => perform IO.println(\"none-shadowed-as-color\"),\n\
-                 };\n\
-                 match res {\n\
-                   Ok(n)  => perform IO.println(int_to_string(n)),\n\
-                   Err(_) => perform IO.println(\"err\"),\n\
-                 };\n\
+    let src = "type Color = | Red | Green | None\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 // `Some` and `Ok` are NOT declared on Color, so the\n  \
+                 // prelude versions remain in scope and these compile.\n  \
+                 let opt: Option[Int] = Some(7);\n  \
+                 let res: Result[Int, Int] = Ok(42);\n  \
+                 match opt {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none-shadowed-as-color\"),\n  \
+                 };\n  \
+                 match res {\n    \
+                   Ok(n)  => perform IO.println(int_to_string(n)),\n    \
+                   Err(_) => perform IO.println(\"err\"),\n  \
+                 };\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_per_ctor_shadow");
@@ -8647,18 +8268,13 @@ fn auto_prelude_per_ctor_shadowing_leaves_other_prelude_names() {
 /// a user type, not a prelude type).
 #[test]
 fn auto_prelude_user_redeclares_option_overrides() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               type Option = | None | Some(Int)\n\
-               \n\
-               fn main() -> Int ![IO] {\n\
-                 let o: Option = Some(7);\n\
-                 match o {\n\
-                   Some(n) => perform IO.println(int_to_string(n)),\n\
-                   None    => perform IO.println(\"none\"),\n\
-                 };\n\
+    let src = "type Option = | None | Some(Int)\n\n\
+               fn main() -> Int ![IO] {\n  \
+                 let o: Option = Some(7);\n  \
+                 match o {\n    \
+                   Some(n) => perform IO.println(int_to_string(n)),\n    \
+                   None    => perform IO.println(\"none\"),\n  \
+                 };\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "auto_prelude_user_option_override");
@@ -9093,32 +8709,28 @@ fn std_state_run_state_via_wrappers_pending_v2_wrapper_fn_frame_fix() {
 /// continuation; result = 11 (set 10, get 10, tail = 10+1).
 #[test]
 fn task_112_wrapper_fn_frame_composition_state_set_get_returns_11() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
                fn get_state() -> Int ![S] { perform S.get() }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _: Int = set_state(10);\n\
-                 let v: Int = get_state();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = set_state(10);\n  \
+                 let v: Int = get_state();\n  \
                  v + 1\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112_wrappers_set_get");
@@ -9166,35 +8778,31 @@ fn task_112_wrapper_fn_frame_composition_state_set_get_returns_11() {
 /// `v+1` = 21).
 #[test]
 fn task_112b_chained_let_yield_wrapper_state_threading_returns_21() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
-               fn double_set(a: Int, b: Int) -> Int ![S] {\n\
-                 let _a: Int = perform S.set(a);\n\
-                 let _b: Int = perform S.set(b);\n\
+               fn double_set(a: Int, b: Int) -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
                  0\n\
                }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _c: Int = double_set(10, 20);\n\
-                 let v: Int = perform S.get();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _c: Int = double_set(10, 20);\n  \
+                 let v: Int = perform S.get();\n  \
                  v + 1\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_state");
@@ -9221,35 +8829,31 @@ fn task_112b_chained_let_yield_wrapper_state_threading_returns_21() {
 /// yields `20` (last-set state). Tail `v + r = 20 + 30 = 50`.
 #[test]
 fn task_112b_chained_let_yield_wrapper_binding_uses_returned_value_returns_50() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
-               fn double_set_returning(a: Int, b: Int) -> Int ![S] {\n\
-                 let _a: Int = perform S.set(a);\n\
-                 let _b: Int = perform S.set(b);\n\
+               fn double_set_returning(a: Int, b: Int) -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
                  a + b\n\
                }\n\
-               fn comp() -> Int ![S] {\n\
-                 let r: Int = double_set_returning(10, 20);\n\
-                 let v: Int = perform S.get();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let r: Int = double_set_returning(10, 20);\n  \
+                 let v: Int = perform S.get();\n  \
                  v + r\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_binding_uses_r");
@@ -9275,36 +8879,32 @@ fn task_112b_chained_let_yield_wrapper_binding_uses_returned_value_returns_50() 
 /// last-set state (3). Tail = 3.
 #[test]
 fn task_112b_chained_let_yield_wrapper_chain_length_3_returns_3() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
-               fn triple_set(a: Int, b: Int, c: Int) -> Int ![S] {\n\
-                 let _a: Int = perform S.set(a);\n\
-                 let _b: Int = perform S.set(b);\n\
-                 let _c: Int = perform S.set(c);\n\
+               fn triple_set(a: Int, b: Int, c: Int) -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(a);\n  \
+                 let _b: Int = perform S.set(b);\n  \
+                 let _c: Int = perform S.set(c);\n  \
                  0\n\
                }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _x: Int = triple_set(1, 2, 3);\n\
-                 let v: Int = perform S.get();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _x: Int = triple_set(1, 2, 3);\n  \
+                 let v: Int = perform S.get();\n  \
                  v\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112b_chained_wrapper_chain_3");
@@ -9343,42 +8943,38 @@ fn task_112b_chained_let_yield_wrapper_chain_length_3_returns_3() {
 /// - L_set_1(0) = 1. state_fn(0) = 1.
 #[test]
 fn task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
-               fn level_1() -> Int ![S] {\n\
-                 let _a: Int = perform S.set(1);\n\
+               fn level_1() -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(1);\n  \
                  0\n\
                }\n\
-               fn level_2() -> Int ![S] {\n\
-                 let _b: Int = level_1();\n\
+               fn level_2() -> Int ![S] {\n  \
+                 let _b: Int = level_1();\n  \
                  0\n\
                }\n\
-               fn level_3() -> Int ![S] {\n\
-                 let _c: Int = level_2();\n\
+               fn level_3() -> Int ![S] {\n  \
+                 let _c: Int = level_2();\n  \
                  0\n\
                }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _d: Int = level_3();\n\
-                 let v: Int = perform S.get();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _d: Int = level_3();\n  \
+                 let v: Int = perform S.get();\n  \
                  v\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112b_3_deep_nested");
@@ -9440,27 +9036,23 @@ fn task_112b_chained_wrapper_3_deep_nested_via_visited_set_returns_1() {
 /// - Trampoline returns 1 to the handle's body run_loop. n=1.
 #[test]
 fn task_112c_case_d_wrapper_in_chain_with_slice_b_outer_arm_returns_1() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Eff { fail: () -> Int }\n\
-               fn helper() -> Int ![Eff] {\n\
-                 let _a: Int = perform Eff.fail();\n\
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn helper() -> Int ![Eff] {\n  \
+                 let _a: Int = perform Eff.fail();\n  \
                  99\n\
                }\n\
-               fn comp() -> Int ![Eff] {\n\
-                 let _x: Int = helper();\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _x: Int = helper();\n  \
                  0\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle comp() with {\n\
-                   Eff.fail(k) => {\n\
-                     let r: Int = k(7);\n\
-                     r + 1\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(7);\n      \
+                     r + 1\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d");
@@ -9495,31 +9087,27 @@ fn task_112c_case_d_wrapper_in_chain_with_slice_b_outer_arm_returns_1() {
 /// - Slice B fires with r=30. r*2 = 60.
 #[test]
 fn task_112c_case_d_two_layer_wrapper_chain_with_slice_b_outer_arm_returns_60() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Eff { fail: () -> Int }\n\
-               fn inner_helper() -> Int ![Eff] {\n\
-                 let _a: Int = perform Eff.fail();\n\
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn inner_helper() -> Int ![Eff] {\n  \
+                 let _a: Int = perform Eff.fail();\n  \
                  10\n\
                }\n\
-               fn outer_helper() -> Int ![Eff] {\n\
-                 let _i: Int = inner_helper();\n\
+               fn outer_helper() -> Int ![Eff] {\n  \
+                 let _i: Int = inner_helper();\n  \
                  20\n\
                }\n\
-               fn comp() -> Int ![Eff] {\n\
-                 let _o: Int = outer_helper();\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _o: Int = outer_helper();\n  \
                  30\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle comp() with {\n\
-                   Eff.fail(k) => {\n\
-                     let r: Int = k(0);\n\
-                     r * 2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r * 2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d_two_layer");
@@ -9553,35 +9141,31 @@ fn task_112c_case_d_two_layer_wrapper_chain_with_slice_b_outer_arm_returns_60() 
 /// - Slice B fires with r=4. r+7 = 11.
 #[test]
 fn task_112c_case_d_three_layer_wrapper_chain_with_slice_b_outer_arm_returns_11() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Eff { fail: () -> Int }\n\
-               fn level_1() -> Int ![Eff] {\n\
-                 let _x: Int = perform Eff.fail();\n\
+    let src = "effect Eff { fail: () -> Int }\n\
+               fn level_1() -> Int ![Eff] {\n  \
+                 let _x: Int = perform Eff.fail();\n  \
                  1\n\
                }\n\
-               fn level_2() -> Int ![Eff] {\n\
-                 let _a: Int = level_1();\n\
+               fn level_2() -> Int ![Eff] {\n  \
+                 let _a: Int = level_1();\n  \
                  2\n\
                }\n\
-               fn level_3() -> Int ![Eff] {\n\
-                 let _b: Int = level_2();\n\
+               fn level_3() -> Int ![Eff] {\n  \
+                 let _b: Int = level_2();\n  \
                  3\n\
                }\n\
-               fn comp() -> Int ![Eff] {\n\
-                 let _c: Int = level_3();\n\
+               fn comp() -> Int ![Eff] {\n  \
+                 let _c: Int = level_3();\n  \
                  4\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let n: Int = handle comp() with {\n\
-                   Eff.fail(k) => {\n\
-                     let r: Int = k(0);\n\
-                     r + 7\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(n));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let n: Int = handle comp() with {\n    \
+                   Eff.fail(k) => {\n      \
+                     let r: Int = k(0);\n      \
+                     r + 7\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(n));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112c_case_d_three_layer");
@@ -10097,34 +9681,30 @@ fn task_112_mutually_recursive_chained_wrappers_stack_overflow_not_silent_garbag
 /// wrapper-Call with its own k-pair).
 #[test]
 fn task_112_wrapper_chain_three_sets_then_get_returns_3() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
                fn get_state() -> Int ![S] { perform S.get() }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _a: Int = set_state(1);\n\
-                 let _b: Int = set_state(2);\n\
-                 let _c: Int = set_state(3);\n\
-                 let v: Int = get_state();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _a: Int = set_state(1);\n  \
+                 let _b: Int = set_state(2);\n  \
+                 let _c: Int = set_state(3);\n  \
+                 let v: Int = get_state();\n  \
                  v\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112_wrapper_chain_three");
@@ -10142,32 +9722,28 @@ fn task_112_wrapper_chain_three_sets_then_get_returns_3() {
 /// flows correctly into a non-trivial tail expression.
 #[test]
 fn task_112_wrapper_returns_binding_used_in_tail() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
                fn get_state() -> Int ![S] { perform S.get() }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _: Int = set_state(7);\n\
-                 let v: Int = get_state();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _: Int = set_state(7);\n  \
+                 let v: Int = get_state();\n  \
                  v + v\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112_wrapper_binding_in_tail");
@@ -10183,32 +9759,28 @@ fn task_112_wrapper_returns_binding_used_in_tail() {
 /// in the same body without falling back to Sync ABI.
 #[test]
 fn task_112_mixed_inline_perform_and_wrapper_in_chain() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect S resumes: many {\n\
-                 get: () -> Int,\n\
+    let src = "effect S resumes: many {\n  \
+                 get: () -> Int,\n  \
                  set: (Int) -> Int,\n\
                }\n\
                fn set_state(n: Int) -> Int ![S] { perform S.set(n) }\n\
-               fn comp() -> Int ![S] {\n\
-                 let _a: Int = perform S.set(0);\n\
-                 let _b: Int = set_state(20);\n\
-                 let v: Int = perform S.get();\n\
+               fn comp() -> Int ![S] {\n  \
+                 let _a: Int = perform S.set(0);\n  \
+                 let _b: Int = set_state(20);\n  \
+                 let v: Int = perform S.get();\n  \
                  v + 5\n\
                }\n\
-               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n\
-                 let state_fn: (Int) -> Int ![] = handle body() with {\n\
-                   return(v) => fn (s: Int) -> Int ![] => v,\n\
-                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n\
-                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n\
-                 };\n\
+               fn run_state(initial: Int, body: () -> Int ![S]) -> Int ![] {\n  \
+                 let state_fn: (Int) -> Int ![] = handle body() with {\n    \
+                   return(v) => fn (s: Int) -> Int ![] => v,\n    \
+                   S.get(k) => fn (s: Int) -> Int ![] => k(s)(s),\n    \
+                   S.set(arg, k) => fn (s: Int) -> Int ![] => k(arg)(arg),\n  \
+                 };\n  \
                  state_fn(initial)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = run_state(0, comp);\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = run_state(0, comp);\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "task_112_mixed_inline_wrapper");
@@ -14442,28 +14014,24 @@ fn state_raise_composition_catch_inside_run_state() {
 
 #[test]
 fn top_level_row_poly_with_logging_wrapper() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Ask { ask: () -> Int }\n\
-               fn with_io(body: () -> Int ![IO | e]) -> Int ![IO | e] {\n\
-                 perform IO.println(\"start\");\n\
-                 let result: Int = body();\n\
-                 perform IO.println(\"end\");\n\
+    let src = "effect Ask { ask: () -> Int }\n\
+               fn with_io(body: () -> Int ![IO | e]) -> Int ![IO | e] {\n  \
+                 perform IO.println(\"start\");\n  \
+                 let result: Int = body();\n  \
+                 perform IO.println(\"end\");\n  \
                  result\n\
                }\n\
-               fn computation() -> Int ![IO, Ask] {\n\
-                 perform IO.println(\"inner\");\n\
-                 let v: Int = perform Ask.ask();\n\
+               fn computation() -> Int ![IO, Ask] {\n  \
+                 perform IO.println(\"inner\");\n  \
+                 let v: Int = perform Ask.ask();\n  \
                  v\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = handle with_io(computation) with {\n\
-                   return(v) => v,\n\
-                   Ask.ask(k) => k(42),\n\
-                 };\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle with_io(computation) with {\n    \
+                   return(v) => v,\n    \
+                   Ask.ask(k) => k(42),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, _stderr, code) = compile_and_run(src, "top_level_row_poly_logging");
@@ -14473,29 +14041,25 @@ fn top_level_row_poly_with_logging_wrapper() {
 
 #[test]
 fn top_level_row_poly_handler_passes_residual() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect A resumes: many { op_a: () -> Int }\n\
+    let src = "effect A resumes: many { op_a: () -> Int }\n\
                effect B resumes: many { op_b: () -> Int }\n\
-               fn handle_a(body: () -> Int ![A | e]) -> Int ![| e] {\n\
-                 handle body() with {\n\
-                   return(v) => v,\n\
-                   A.op_a(k) => k(10),\n\
+               fn handle_a(body: () -> Int ![A | e]) -> Int ![| e] {\n  \
+                 handle body() with {\n    \
+                   return(v) => v,\n    \
+                   A.op_a(k) => k(10),\n  \
                  }\n\
                }\n\
-               fn computation() -> Int ![A, B] {\n\
-                 let a: Int = perform A.op_a();\n\
-                 let b: Int = perform B.op_b();\n\
+               fn computation() -> Int ![A, B] {\n  \
+                 let a: Int = perform A.op_a();\n  \
+                 let b: Int = perform B.op_b();\n  \
                  a + b\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = handle handle_a(computation) with {\n\
-                   return(v) => v,\n\
-                   B.op_b(k) => k(20),\n\
-                 };\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle handle_a(computation) with {\n    \
+                   return(v) => v,\n    \
+                   B.op_b(k) => k(20),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, _stderr, code) = compile_and_run(src, "top_level_row_poly_residual");
@@ -15850,24 +15414,20 @@ fn tail_recursive_mutual_ping_pong_ten_million() {
 
 #[test]
 fn tail_recursive_cps_colored_count_down_ten_million() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect State { get: () -> Int, set: (Int) -> Int }\n\
-               fn count_down_cps(n: Int) -> Int ![State, IO] {\n\
-                 let _: Int = perform State.get();\n\
-                 match n {\n\
-                   0 => 0,\n\
-                   _ => count_down_cps(n - 1),\n\
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
+               fn count_down_cps(n: Int) -> Int ![State, IO] {\n  \
+                 let _: Int = perform State.get();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_cps(n - 1),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = handle count_down_cps(10000000) with {\n\
-                   State.get(k) => k(0),\n\
-                   State.set(arg, k) => k(arg),\n\
-                 };\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle count_down_cps(10000000) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -16074,31 +15634,27 @@ fn tail_recursive_through_match_literal_arms() {
 
 #[test]
 fn tail_recursive_cps_colored_under_nested_handlers() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect State { get: () -> Int, set: (Int) -> Int }\n\
+    let src = "effect State { get: () -> Int, set: (Int) -> Int }\n\
                effect Choose { decide: () -> Int }\n\
-               fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n\
-                 let _s: Int = perform State.get();\n\
-                 let _c: Int = perform Choose.decide();\n\
-                 match n {\n\
-                   0 => 0,\n\
-                   _ => count_down_compose(n - 1),\n\
+               fn count_down_compose(n: Int) -> Int ![State, Choose, IO] {\n  \
+                 let _s: Int = perform State.get();\n  \
+                 let _c: Int = perform Choose.decide();\n  \
+                 match n {\n    \
+                   0 => 0,\n    \
+                   _ => count_down_compose(n - 1),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let result: Int = handle (\n\
-                   handle count_down_compose(10000000) with {\n\
-                     Choose.decide(k) => k(0),\n\
-                     return(v) => v + 7,\n\
-                   }\n\
-                 ) with {\n\
-                   State.get(k) => k(0),\n\
-                   State.set(arg, k) => k(arg),\n\
-                 };\n\
-                 perform IO.println(int_to_string(result));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let result: Int = handle (\n    \
+                   handle count_down_compose(10000000) with {\n      \
+                     Choose.decide(k) => k(0),\n      \
+                     return(v) => v + 7,\n    \
+                   }\n  \
+                 ) with {\n    \
+                   State.get(k) => k(0),\n    \
+                   State.set(arg, k) => k(arg),\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(result));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -18785,25 +18341,21 @@ fn assert_in_function_validation_fails() {
 /// per-resume IO ordering matches the spec §8.3 semantics.
 #[test]
 fn multi_shot_post_perform_tail_io_per_resume() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, IO] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
-                 perform IO.println(int_to_string(x));\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
                  x * 1000\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle helper(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(7);\n\
-                     let r2: Int = k(11);\n\
-                     r1 * 100 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "multi_shot_post_perform_tail_io_per_resume");
@@ -18822,26 +18374,22 @@ fn multi_shot_post_perform_tail_io_per_resume() {
 /// each resume independently runs the full post-perform tail.
 #[test]
 fn multi_shot_post_perform_tail_nested_perform_per_resume() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, IO] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
-                 perform IO.println(int_to_string(x));\n\
-                 perform IO.println(\"got\");\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
+                 perform IO.println(\"got\");\n  \
                  x * 100\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle helper(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(2);\n\
-                     let r2: Int = k(3);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(2);\n      \
+                     let r2: Int = k(3);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(
@@ -18863,26 +18411,22 @@ fn multi_shot_post_perform_tail_nested_perform_per_resume() {
 /// and that each resume sees its own arg.
 #[test]
 fn multi_shot_three_resumes_distinct_io() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, IO] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
-                 perform IO.println(int_to_string(x));\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform IO.println(int_to_string(x));\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle helper(0) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(7);\n\
-                     let r2: Int = k(11);\n\
-                     let r3: Int = k(13);\n\
-                     r1 + r2 + r3\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(0) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     let r3: Int = k(13);\n      \
+                     r1 + r2 + r3\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "multi_shot_three_resumes_distinct_io");
@@ -18913,33 +18457,29 @@ fn multi_shot_three_resumes_distinct_io() {
 /// body on the let-yield-prefix-branched-cps-tail emit path.
 #[test]
 fn multi_shot_choose_pair_enumeration() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
-               fn pairs() -> Int ![Choose, IO] {\n\
-                 let a: Int = perform Choose.pick(1, 6);\n\
-                 let b: Int = perform Choose.pick(1, 6);\n\
-                 if a + b == 7 {\n\
-                   perform IO.println(int_to_string(a * 10 + b));\n\
-                   0\n\
-                 } else {\n\
-                   0\n\
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 if a + b == 7 {\n    \
+                   perform IO.println(int_to_string(a * 10 + b));\n    \
+                   0\n  \
+                 } else {\n    \
+                   0\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let _r: Int = handle pairs() with {\n\
-                   Choose.pick(low, high, k) => {\n\
-                     let r1: Int = k(1);\n\
-                     let r2: Int = k(2);\n\
-                     let r3: Int = k(3);\n\
-                     let r4: Int = k(4);\n\
-                     let r5: Int = k(5);\n\
-                     let r6: Int = k(6);\n\
-                     0\n\
-                   },\n\
-                 };\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     let r3: Int = k(3);\n      \
+                     let r4: Int = k(4);\n      \
+                     let r5: Int = k(5);\n      \
+                     let r6: Int = k(6);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "multi_shot_choose_pair_enumeration");
@@ -18971,32 +18511,28 @@ fn multi_shot_choose_pair_enumeration() {
 /// statement+literal-tail framing.
 #[test]
 fn multi_shot_choose_pair_enumeration_match_as_stmt() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
-               fn pairs() -> Int ![Choose, IO] {\n\
-                 let a: Int = perform Choose.pick(1, 6);\n\
-                 let b: Int = perform Choose.pick(1, 6);\n\
-                 match a + b == 7 {\n\
-                   true => perform IO.println(int_to_string(a * 10 + b)),\n\
-                   false => (),\n\
-                 };\n\
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 match a + b == 7 {\n    \
+                   true => perform IO.println(int_to_string(a * 10 + b)),\n    \
+                   false => (),\n  \
+                 };\n  \
                  0\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let _r: Int = handle pairs() with {\n\
-                   Choose.pick(low, high, k) => {\n\
-                     let r1: Int = k(1);\n\
-                     let r2: Int = k(2);\n\
-                     let r3: Int = k(3);\n\
-                     let r4: Int = k(4);\n\
-                     let r5: Int = k(5);\n\
-                     let r6: Int = k(6);\n\
-                     0\n\
-                   },\n\
-                 };\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     let r3: Int = k(3);\n      \
+                     let r4: Int = k(4);\n      \
+                     let r5: Int = k(5);\n      \
+                     let r6: Int = k(6);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -19017,24 +18553,20 @@ fn multi_shot_choose_pair_enumeration_match_as_stmt() {
 /// Mirrors `examples/choose_demo.sigil` shape.
 #[test]
 fn multi_shot_pure_tail_unchanged() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int) -> Int ![Choose] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
                  x\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle helper(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(arg + 10);\n\
-                     let r2: Int = k(arg + 20);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(arg + 10);\n      \
+                     let r2: Int = k(arg + 20);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "multi_shot_pure_tail_unchanged");
@@ -19054,30 +18586,28 @@ fn multi_shot_pure_tail_unchanged() {
 /// any object code is emitted.
 #[test]
 fn p20_backstop_rejects_multiple_branched_stmts_in_series() {
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
-               fn pairs() -> Int ![Choose, IO] {\n\
-                 let a: Int = perform Choose.pick(1, 6);\n\
-                 let b: Int = perform Choose.pick(1, 6);\n\
-                 match a == 7 {\n\
-                   true => perform IO.println(\"seven\"),\n\
-                   false => (),\n\
-                 };\n\
-                 match b == 7 {\n\
-                   true => perform IO.println(\"seven\"),\n\
-                   false => (),\n\
-                 };\n\
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn pairs() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 let b: Int = perform Choose.pick(1, 6);\n  \
+                 match a == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
+                 match b == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
                  0\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let _r: Int = handle pairs() with {\n\
-                   Choose.pick(low, high, k) => {\n\
-                     let r1: Int = k(1);\n\
-                     let r2: Int = k(2);\n\
-                     0\n\
-                   },\n\
-                 };\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle pairs() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
                  0\n\
                }\n";
     assert_compile_fails_with_code(
@@ -19097,25 +18627,23 @@ fn p20_backstop_rejects_multiple_branched_stmts_in_series() {
 /// silently miscompile on multi-shot resumes. E0149 fires.
 #[test]
 fn p20_backstop_rejects_branched_stmt_with_perform_tail() {
-    let src = "import std.io\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
-               fn helper() -> Int ![Choose, IO] {\n\
-                 let a: Int = perform Choose.pick(1, 6);\n\
-                 match a == 7 {\n\
-                   true => perform IO.println(\"seven\"),\n\
-                   false => (),\n\
-                 };\n\
+    let src = "effect Choose resumes: many { pick: (Int, Int) -> Int }\n\
+               fn helper() -> Int ![Choose, IO] {\n  \
+                 let a: Int = perform Choose.pick(1, 6);\n  \
+                 match a == 7 {\n    \
+                   true => perform IO.println(\"seven\"),\n    \
+                   false => (),\n  \
+                 };\n  \
                  perform Choose.pick(1, 1)\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let _r: Int = handle helper() with {\n\
-                   Choose.pick(low, high, k) => {\n\
-                     let r1: Int = k(1);\n\
-                     let r2: Int = k(2);\n\
-                     0\n\
-                   },\n\
-                 };\n\
+               fn main() -> Int ![IO] {\n  \
+                 let _r: Int = handle helper() with {\n    \
+                   Choose.pick(low, high, k) => {\n      \
+                     let r1: Int = k(1);\n      \
+                     let r2: Int = k(2);\n      \
+                     0\n    \
+                   },\n  \
+                 };\n  \
                  0\n\
                }\n";
     assert_compile_fails_with_code(
@@ -19135,25 +18663,21 @@ fn p20_backstop_rejects_branched_stmt_with_perform_tail() {
 /// closes the gap; this test pins it.
 #[test]
 fn multi_shot_post_perform_tail_nontrivial_perform_args() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int, factor: Int) -> Int ![Choose, IO] {\n\
-                 let x: Int = perform Choose.choose(seed + factor * factor);\n\
-                 perform IO.println(int_to_string(x));\n\
+    let src = "effect Choose resumes: many { choose: (Int) -> Int }\n\
+               fn helper(seed: Int, factor: Int) -> Int ![Choose, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed + factor * factor);\n  \
+                 perform IO.println(int_to_string(x));\n  \
                  x * 1000\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle helper(5, 3) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(7);\n\
-                     let r2: Int = k(11);\n\
-                     r1 * 100 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle helper(5, 3) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -19177,35 +18701,31 @@ fn multi_shot_post_perform_tail_nontrivial_perform_args() {
 /// exercises that path.
 #[test]
 fn multi_shot_post_perform_tail_cps_call_in_args() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Tag { mark: () -> Int }\n\
-               fn marked_id(x: Int) -> Int ![Tag] {\n\
-                 let _t: Int = perform Tag.mark();\n\
+    let src = "effect Tag { mark: () -> Int }\n\
+               fn marked_id(x: Int) -> Int ![Tag] {\n  \
+                 let _t: Int = perform Tag.mark();\n  \
                  x\n\
                }\n\
                effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, Tag, IO] {\n\
-                 let x: Int = perform Choose.choose(marked_id(seed));\n\
-                 perform IO.println(int_to_string(x));\n\
+               fn helper(seed: Int) -> Int ![Choose, Tag, IO] {\n  \
+                 let x: Int = perform Choose.choose(marked_id(seed));\n  \
+                 perform IO.println(int_to_string(x));\n  \
                  x * 100\n\
                }\n\
-               fn run_tag(s: Int) -> Int ![Choose, IO] {\n\
-                 handle helper(s) with {\n\
-                   Tag.mark(k) => k(1),\n\
+               fn run_tag(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Tag.mark(k) => k(1),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle run_tag(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(7);\n\
-                     let r2: Int = k(11);\n\
-                     r1 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_tag(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =
@@ -19231,32 +18751,28 @@ fn multi_shot_post_perform_tail_cps_call_in_args() {
 /// semantics.
 #[test]
 fn multi_shot_post_perform_tail_nonunit_discard_perform() {
-    let src = "import std.int\n\
-               import std.io\n\
-               use std.int.{int_to_string};\n\
-               use std.io.{IO};\n\
-               effect Counter { tick: () -> Int }\n\
+    let src = "effect Counter { tick: () -> Int }\n\
                effect Choose resumes: many { choose: (Int) -> Int }\n\
-               fn helper(seed: Int) -> Int ![Choose, Counter, IO] {\n\
-                 let x: Int = perform Choose.choose(seed);\n\
-                 perform Counter.tick();\n\
-                 perform IO.println(int_to_string(x));\n\
+               fn helper(seed: Int) -> Int ![Choose, Counter, IO] {\n  \
+                 let x: Int = perform Choose.choose(seed);\n  \
+                 perform Counter.tick();\n  \
+                 perform IO.println(int_to_string(x));\n  \
                  x * 1000\n\
                }\n\
-               fn run_counter(s: Int) -> Int ![Choose, IO] {\n\
-                 handle helper(s) with {\n\
-                   Counter.tick(k) => k(99),\n\
+               fn run_counter(s: Int) -> Int ![Choose, IO] {\n  \
+                 handle helper(s) with {\n    \
+                   Counter.tick(k) => k(99),\n  \
                  }\n\
                }\n\
-               fn main() -> Int ![IO] {\n\
-                 let total: Int = handle run_counter(5) with {\n\
-                   Choose.choose(arg, k) => {\n\
-                     let r1: Int = k(7);\n\
-                     let r2: Int = k(11);\n\
-                     r1 * 100 + r2\n\
-                   },\n\
-                 };\n\
-                 perform IO.println(int_to_string(total));\n\
+               fn main() -> Int ![IO] {\n  \
+                 let total: Int = handle run_counter(5) with {\n    \
+                   Choose.choose(arg, k) => {\n      \
+                     let r1: Int = k(7);\n      \
+                     let r2: Int = k(11);\n      \
+                     r1 * 100 + r2\n    \
+                   },\n  \
+                 };\n  \
+                 perform IO.println(int_to_string(total));\n  \
                  0\n\
                }\n";
     let (stdout, stderr, code) =

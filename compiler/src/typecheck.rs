@@ -1671,7 +1671,10 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             // last-wins behavior is preserved as v1 status quo.
             // Tracking: `[DEVIATION Task 73]` namespace-qualified
             // imports follow-up.
-            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            // Plan F1 — canonical key form is `<module_label>.<name>`
+            // (`std.list.map`, `x.helper`), matching the user-facing
+            // qualified-path syntax. See `canonical_fn_key`.
+            let qualified_key = canonical_fn_key(&f.span.file, &f.name, &tc.stdlib_files);
             tc.fn_schemes.insert(qualified_key, scheme.clone());
             tc.fn_schemes.insert(f.name.clone(), scheme);
             // Plan C addendum (Tier 1) — bare-name ambiguity tracking.
@@ -1837,9 +1840,8 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         tc.push_error(
             "E0040",
             span,
-            "import std.io\n\
-               use std.io.{IO};\n\
-               program has no `fn main`; every Sigil program needs `fn main() -> Int ![IO]` or `fn main() -> Int ![]`",
+            "program has no `fn main`; every Sigil program needs \
+             `fn main() -> Int ![IO]` or `fn main() -> Int ![]`",
         );
     }
 
@@ -2137,6 +2139,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             &tc.resolved_idents,
             &tc.bare_name_origins,
             &mut tc.fn_schemes,
+            &tc.stdlib_files,
         );
     }
 
@@ -2328,6 +2331,7 @@ fn rewrite_resolved_idents(
     resolved_idents: &BTreeMap<Span, String>,
     bare_name_origins: &BTreeMap<String, Vec<String>>,
     fn_schemes: &mut BTreeMap<String, Scheme>,
+    stdlib_files: &BTreeSet<String>,
 ) {
     let mut collisions: BTreeSet<String> = BTreeSet::new();
     for (name, origins) in bare_name_origins {
@@ -2353,15 +2357,22 @@ fn rewrite_resolved_idents(
     for item in &program.items {
         if let Item::Fn(f) = item {
             if collisions.contains(&f.name) {
-                let mangled = format!("{}::{}", f.span.file, f.name);
-                // The bare-name scheme is what user-side references
-                // see at typecheck time; mirror it onto the mangled
-                // key so monomorphize / codegen lookups by the
-                // rewritten Ident name resolve. The file-qualified
-                // key was already populated at fn-registration time
-                // (typecheck pre-pass, dual-insert) — it happens to
-                // BE the mangled key in this codepath, so we'd just
-                // be overwriting with itself.
+                // Plan F1 — mangled form is `<module_label>.<name>`
+                // (`std.list.map`, `x.helper`), matching the
+                // user-facing qualified-path syntax. See
+                // `canonical_fn_key`. The pre-Plan-F1 review's
+                // "<file>::<name>" form (`list.sigil::map`) leaked
+                // filesystem path + Rust separator into error
+                // messages and into the symbol table; the new form
+                // is the same string the user would type to
+                // qualify the call.
+                let mangled = canonical_fn_key(&f.span.file, &f.name, stdlib_files);
+                // Mirror the bare-name scheme onto the mangled key
+                // so monomorphize / codegen lookups by the rewritten
+                // Ident name resolve. The dual-insert at fn
+                // registration already populated this key for the
+                // typical case; the insert here covers the post-
+                // rename path explicitly.
                 if let Some(scheme) = fn_schemes.get(&f.name).cloned() {
                     fn_schemes.insert(mangled.clone(), scheme);
                 }
@@ -2641,15 +2652,31 @@ const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
 ];
 
 /// Plan F1 — mirror every bare-key builtin fn_scheme onto its
-/// `<module_file>::<name>` form so `use std.X.{name}` works under
-/// the strict resolver.
+/// `<module_label>.<name>` form so `use std.X.{name}` works under
+/// the strict resolver. The canonical-key shape matches the
+/// user-facing qualified-path syntax (`std.int.int_to_string` —
+/// the same string a user writes to qualify the call).
 fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
+    // The BUILTIN_TO_MODULE_FILE table maps each builtin's bare
+    // name to its conceptual stdlib file (e.g., `int.sigil`); we
+    // construct the canonical key via `canonical_fn_key` so the
+    // mirror keys match the form produced by `resolve_qualified_or_-
+    // use_scheme` at the call site. Builtin stdlib files are
+    // always in `stdlib_files` once `imports::resolve` has run, BUT
+    // this mirror runs BEFORE `build_use_bindings_prepass` sees the
+    // imports; we use a synthetic stdlib_files set listing every
+    // module_file in our table, so the canonical key uses the
+    // `std.X` form.
+    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
+        .iter()
+        .map(|(_, mf)| (*mf).to_string())
+        .collect();
     for (name, module_file) in BUILTIN_TO_MODULE_FILE {
         let scheme = match tc.fn_schemes.get(*name).cloned() {
             Some(s) => s,
             None => continue,
         };
-        let qualified = format!("{module_file}::{name}");
+        let qualified = canonical_fn_key(module_file, name, &synthetic_stdlib_files);
         tc.fn_schemes.entry(qualified).or_insert(scheme);
     }
 }
@@ -2677,6 +2704,44 @@ fn module_file_for_path(path: &[String]) -> Option<String> {
 fn module_label_from_stdlib_file(file: &str) -> String {
     let stem = file.trim_end_matches(".sigil");
     format!("std.{}", stem.replace('/', "."))
+}
+
+/// Plan F1 — render the canonical key for a fn / type / ctor that
+/// lives in a given source `file`. The canonical key is the
+/// user-facing qualified-path form: `std.list.map` for a stdlib fn,
+/// `x.helper` for a user-file fn at `x.sigil`. This is the form the
+/// AST rewrite uses, the form `fn_schemes` keys are built around,
+/// and the form error messages / panic strings display — keeping
+/// internal representation = user-facing representation.
+///
+/// `stdlib_files` is the set of file paths that originated from the
+/// embedded stdlib (populated by `imports::resolve`). For files in
+/// that set, the label is `std.<dotted-path>`; for everything else
+/// (user files, synthesized spans), the label is the basename stem
+/// without a `std.` prefix.
+fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> String {
+    let module_label = canonical_module_label(file, stdlib_files);
+    format!("{module_label}.{name}")
+}
+
+/// Plan F1 — the module-label half of `canonical_fn_key`. Public
+/// (within-crate) so the dual-key registration paths can compute it
+/// once and reuse for both the bare name and the canonical form.
+fn canonical_module_label(file: &str, stdlib_files: &BTreeSet<String>) -> String {
+    if stdlib_files.contains(file) {
+        // Stdlib file. Treat the basename (after any `/` prefix) as
+        // the dotted module-label suffix: `list.sigil` → `std.list`,
+        // `iter/fold.sigil` → `std.iter.fold`.
+        let stem = file.trim_end_matches(".sigil");
+        format!("std.{}", stem.replace('/', "."))
+    } else {
+        // User file — use the basename without `.sigil` so the
+        // canonical key for a user-defined fn at `x.sigil` is
+        // `x.<fn_name>`. Matches `__module_label_from_file`'s
+        // basename treatment for the user-file branch.
+        let basename = file.rsplit('/').next().unwrap_or(file);
+        basename.trim_end_matches(".sigil").to_string()
+    }
 }
 
 /// Language builtins — functions that appear to user code as ordinary
@@ -3948,9 +4013,9 @@ impl Tc {
                 let module_label = segments[..split].join(".");
                 let sym = segments[split..].join(".");
                 if let Some(module_file) = modules.get(&module_label) {
-                    let file_key = format!("{module_file}::{sym}");
-                    if let Some(scheme) = self.fn_schemes.get(&file_key).cloned() {
-                        return Some((scheme, file_key));
+                    let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                    if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                        return Some((scheme, canonical));
                     }
                     // Builtins fall back to the bare source-name key.
                     if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
@@ -3964,9 +4029,13 @@ impl Tc {
             // Bare name. Consult the current file's `use` bindings.
             let bindings = self.file_use_bindings.get(file)?;
             let resolved = bindings.get(name)?;
-            let file_key = format!("{}::{}", resolved.module_file, resolved.source_name);
-            if let Some(scheme) = self.fn_schemes.get(&file_key).cloned() {
-                return Some((scheme, file_key));
+            let canonical = canonical_fn_key(
+                &resolved.module_file,
+                &resolved.source_name,
+                &self.stdlib_files,
+            );
+            if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                return Some((scheme, canonical));
             }
             // Builtin schemes use bare-name keys only — fall back so
             // a `use std.int.{int_to_string}` line resolves correctly.
@@ -5746,12 +5815,15 @@ impl Tc {
                 body: resolved,
             };
             // Plan D Task 117 (b) Phase 4 — write to BOTH the
-            // file-qualified key (unique per fn) AND the bare key
-            // (last-wins for user-facing lookup). The qualified key
-            // ensures cross-module same-name fns each have their
-            // own resolved scheme; the bare key keeps user code's
-            // default-resolution behavior unchanged.
-            let qualified_key = format!("{}::{}", f.span.file, f.name);
+            // canonical (`<module_label>.<name>`, e.g.,
+            // `x.foo`) key AND the bare key (last-wins). The
+            // canonical key ensures cross-module same-name fns
+            // each have their own resolved scheme; the bare key
+            // keeps user code's default-resolution behaviour
+            // unchanged. Plan F1 (2026-05-14): the canonical key
+            // shape switched from `<file>::<name>` to
+            // `<module_label>.<name>` — see `canonical_fn_key`.
+            let qualified_key = canonical_fn_key(&f.span.file, &f.name, &self.stdlib_files);
             self.fn_schemes.insert(qualified_key, scheme.clone());
             self.fn_schemes.insert(f.name.clone(), scheme);
         }
@@ -6111,16 +6183,21 @@ impl Tc {
                 let plan_f1_scheme = plan_f1_resolved.as_ref().map(|(s, _)| s.clone());
                 if let Some((_, ref canonical)) = plan_f1_resolved {
                     // Record the canonical key for the AST rewrite
-                    // pass — only when it differs from the surface
-                    // name (qualified path or aliased bare-name). The
-                    // post-typecheck rewrite consults this map and
-                    // updates Expr::Ident names so monomorphize's
-                    // fn_decls / codegen's user_fn_refs lookups hit
-                    // the right entry. Same-key resolutions (the
-                    // common case where the source_name in a
-                    // non-collision `use` matches the bare lookup
-                    // key) leave the AST unchanged.
-                    if canonical != name {
+                    // pass — but ONLY when the bare name actually
+                    // collides across files (≥2 origins). For
+                    // single-origin names like `int_to_string`, the
+                    // canonical key (`std.int.int_to_string`) is
+                    // computed for resolver use only — the AST
+                    // keeps the bare name so monomorphize / codegen
+                    // lookups by Expr::Ident continue to hit the
+                    // bare-key entry. Without this gate, ~498 e2e
+                    // tests trip the codegen `unreachable!` because
+                    // single-origin builtins get pointlessly mangled.
+                    let is_colliding = self
+                        .bare_name_origins
+                        .get(name)
+                        .is_some_and(|origins| origins.len() >= 2);
+                    if canonical != name && is_colliding {
                         self.resolved_idents.insert(span.clone(), canonical.clone());
                     }
                 }
@@ -6134,9 +6211,10 @@ impl Tc {
                 // E0046 (or E0151 below for the dotted-non-module
                 // case).
                 let scheme_opt = plan_f1_scheme.or_else(|| {
-                    self.current_fn_file
-                        .as_ref()
-                        .and_then(|file| self.fn_schemes.get(&format!("{file}::{name}")).cloned())
+                    self.current_fn_file.as_ref().and_then(|file| {
+                        let canonical = canonical_fn_key(file, name, &self.stdlib_files);
+                        self.fn_schemes.get(&canonical).cloned()
+                    })
                 });
                 if let Some(scheme) = scheme_opt {
                     // Plan State-Cell — gate the three runtime cell
@@ -6191,14 +6269,25 @@ impl Tc {
                 // writing `record.field` intending field access
                 // (Sigil v1 has no field-access operator).
                 if name.contains('.') {
-                    let head = name.split('.').next().unwrap_or("");
-                    let is_known_module = self
+                    // Check ANY dotted prefix of the name against the
+                    // file's import / alias table — qualified paths
+                    // can have nested module forms (`std.list.X` has
+                    // head "std" but module label "std.list"). Only
+                    // when NO prefix matches a known module do we
+                    // fire E0151.
+                    let segments: Vec<&str> = name.split('.').collect();
+                    let modules = self
                         .current_fn_file
                         .as_ref()
-                        .and_then(|file| self.file_module_paths.get(file))
-                        .map(|map| map.contains_key(head))
+                        .and_then(|file| self.file_module_paths.get(file));
+                    let any_prefix_known = modules
+                        .map(|map| {
+                            (1..segments.len())
+                                .any(|split| map.contains_key(&segments[..split].join(".")))
+                        })
                         .unwrap_or(false);
-                    if !is_known_module {
+                    if !any_prefix_known {
+                        let head = segments[0];
                         self.push_error(
                             "E0151",
                             span.clone(),
@@ -6207,8 +6296,8 @@ impl Tc {
                                  are read by pattern-match destructure. Replace `{name}` \
                                  with `match {head} {{ TypeName {{ field, .. }} => field }}`, \
                                  or define a small accessor fn over the same destructure. \
-                                 (If you intended a qualified-path reference, the prefix \
-                                 `{head}` is not a known imported module in this file.)"
+                                 (If you intended a qualified-path reference, no prefix of \
+                                 `{name}` matches a known imported module in this file.)"
                             ),
                         );
                         return None;

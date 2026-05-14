@@ -262,10 +262,16 @@ fn load_module(
         }
     }
 
+    // Plan F1 — keep `Item::Import` items from stdlib files in the
+    // out vec too. The pre-Plan-F1 code stripped them (transitive
+    // import resolution is already handled by this recursion), but
+    // the qualified-imports pre-pass (`build_use_bindings_prepass`)
+    // needs them to build per-file import / alias tables. Without
+    // them, references like `std.list.__array_to_list` inside
+    // `env.sigil` (which `import std.list`s) would have no module
+    // path table to resolve against.
     for sub_item in subprog.items {
-        if !matches!(sub_item, Item::Import(_)) {
-            out.push(sub_item);
-        }
+        out.push(sub_item);
     }
 
     in_progress.remove(module);

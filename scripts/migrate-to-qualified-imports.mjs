@@ -138,14 +138,18 @@ function scanStdlib(repo) {
       const mFn = FN_DECL_RE.exec(line);
       if (mFn) {
         inTypeBody = false;
-        // Plan F1 includes `__`-prefixed (private-by-convention)
-        // fns in the exports table — cross-file references to them
-        // are an abstraction-boundary violation, but the migration
-        // shouldn't break the few historical sites that rely on it.
-        // The PR description / `__` convention itself is the
-        // existing soft warning; this script doesn't add a separate
-        // signal.
-        addExport(byModule, byName, module, mFn[1]);
+        // Plan F1 excludes `__`-prefixed (private-by-convention)
+        // fns from the exports table. Cross-file references to
+        // them stay as qualified calls (`std.list.__list_to_array(...)`)
+        // — adding a `use mod.{__name};` line would treat a
+        // module-internal helper as a public surface. Migration
+        // hits one such site (process.sigil → list.sigil's
+        // `__list_to_array`), which is hand-edited to qualify the
+        // call.
+        const name = mFn[1];
+        if (!name.startsWith("__")) {
+          addExport(byModule, byName, module, name);
+        }
         continue;
       }
       const mType = TYPE_DECL_RE.exec(line);
@@ -550,8 +554,35 @@ function migrateSigilSource(text, exports, fileLabel) {
 // `r"..."` / `r#"..."#` first and plain `"..."` second. Heuristic
 // for "is this Sigil source": the literal contains `import std.` or
 // `fn main()`.
+// True iff `body` looks like a Sigil source program (not a Rust
+// diagnostic message that happens to contain "fn main()" or
+// "import std." inside backtick-quoted code suggestions).
+//
+// The heuristic requires both:
+//   - `import std.` or `fn ` near the start (after leading
+//     whitespace / line continuations) — Sigil programs lead with
+//     imports or fn decls.
+//   - A `\\n` escape (i.e., the Rust-source representation of a
+//     newline) somewhere in the body. Single-line strings — even
+//     ones containing `fn main()` as a documentation snippet —
+//     are skipped.
 function looksLikeSigil(body) {
-  return body.includes("import std.") || body.includes("fn main()");
+  const hasNewline = body.includes("\\n") || body.includes("\n");
+  if (!hasNewline) return false;
+  // Find the first non-whitespace content (skipping ` ` and
+  // line-continuation `\` + spaces).
+  let i = 0;
+  while (i < body.length) {
+    const c = body[i];
+    if (c === " " || c === "\t") { i++; continue; }
+    if (c === "\\" && (body[i + 1] === "n" || body[i + 1] === " ")) {
+      i += 2; continue;
+    }
+    if (c === "\\" && body[i + 1] === "\\") { break; }
+    break;
+  }
+  const head = body.slice(i, i + 40);
+  return head.startsWith("import std.") || head.startsWith("fn ");
 }
 
 // Walk Rust source character-by-character, applying `bodyTransform` to

@@ -4,8 +4,6 @@
 
 type Result[A, E] = | Ok(A) | Err(E)
 
-// Plan C Task 63 + Option/Result prelude (2026-05-10):
-//
 // `Result[A, E]` represents either a successful value (`Ok(value)`)
 // or an error (`Err(reason)`). Sigil's nominal sum types make the
 // distinction explicit; there is no exception machinery.
