@@ -1319,9 +1319,7 @@ mod tests {
         let output = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
-                eprintln!(
-                    "run_gc_stress_in_subprocess_with_env: spawn `{full_name}` failed: {e}"
-                );
+                eprintln!("run_gc_stress_in_subprocess_with_env: spawn `{full_name}` failed: {e}");
                 std::process::abort();
             }
         };
@@ -1429,9 +1427,7 @@ mod tests {
         // test but does not need the budget — `GC_gcollect()` is
         // explicit.
         if !in_gc_stress_subprocess() {
-            run_gc_stress_in_subprocess(
-                "precise_walker_counter_increments_when_gc_fires",
-            );
+            run_gc_stress_in_subprocess("precise_walker_counter_increments_when_gc_fires");
             return;
         }
         let _guard = crate::test_support::gc_test_lock();
