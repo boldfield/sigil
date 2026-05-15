@@ -40,11 +40,20 @@ linear reading.
 ### E1 — Hello, world
 
 ```sigil
+import std.io
+use std.io.{IO};
+
 fn main() -> Int ![IO] {
   perform IO.println("hello, world");
   0
 }
 ```
+
+Every Sigil program reaches stdlib symbols via two declarations:
+`import std.io` makes the module addressable; `use std.io.{IO};`
+opts the `IO` name into this file's bare namespace so the
+`![IO]` row entry can name the effect without a `std.io.` prefix.
+See §10 for the full module-and-imports model.
 
 Every function declares an **effect row** in `![ … ]`. `IO` is a
 builtin effect with multiple sub-operations (`print`, `println`,
@@ -59,6 +68,11 @@ exit code; this program returns 0 (success).
 ### E2 — Arithmetic and the pure effect row
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 fn square(n: Int) -> Int ![] {
   n * n
 }
@@ -80,6 +94,11 @@ literals use `"..."` with C-style backslash escapes (`\\`, `\"`,
 ### E3 — Recursion and exhaustive `match`
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 fn fib(n: Int) -> Int ![] {
   match n {
     0 => 0,
@@ -104,7 +123,14 @@ order; the first matching arm wins.
 ### E4 — Sum types and pattern matching
 
 ```sigil
+import std.int
+import std.io
 import std.option
+import std.raise
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.option.{None, Option, Some};
+use std.raise.{ArithError};
 
 fn safe_div(num: Int, den: Int) -> Option[Int] ![ArithError] {
   match den {
@@ -132,7 +158,12 @@ stdlib type follows it).
 ### E5 — Higher-order functions and lambdas
 
 ```sigil
+import std.int
+import std.io
 import std.list
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{List, length, map, range};
 
 fn add_one(n: Int) -> Int ![] { n + 1 }
 
@@ -153,6 +184,11 @@ like top-level `fn`.
 ### E6 — Generic functions
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 fn identity[A](x: A) -> A ![] { x }
 
 fn main() -> Int ![IO] {
@@ -181,6 +217,11 @@ fn unwrap[A](b: Box[A]) -> A ![] {
 ### E7 — Records
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 type Point = { x: Int, y: Int }
 
 fn manhattan(a: Point, b: Point) -> Int ![] {
@@ -216,8 +257,14 @@ same fields but different declared names do not unify.
 ### E8 — Effects: `Raise` for exceptions
 
 ```sigil
+import std.int
+import std.io
 import std.raise
 import std.result
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.raise.{Raise, catch, raise};
+use std.result.{Err, Ok, Result};
 
 fn parse_pos(n: Int) -> Int ![Raise[String]] {
   match n {
@@ -252,8 +299,14 @@ string errors, `Raise[Int]` raises integer error codes, etc.
 ### E9 — Effects: `State[S]` for threaded state
 
 ```sigil
-import std.state
+import std.int
+import std.io
 import std.pair
+import std.state
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.pair.{fst};
+use std.state.{State, run_state};
 
 fn comp() -> Int ![State[Int]] {
   let _: Int = perform State.set(10);
@@ -289,8 +342,20 @@ Sync-ABI gap that would otherwise mask the discharge tag.
 ### E10 — Multi-effect rows
 
 ```sigil
-import std.raise
+import std.byte_array
+import std.int
+import std.io
 import std.ordering
+import std.raise
+import std.result
+import std.string
+use std.byte_array.{string_length};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.ordering.{Equal, string_compare};
+use std.raise.{Raise, catch, raise};
+use std.result.{Err, Ok, Result};
+use std.string.{string_concat};
 
 fn pipeline(s: String) -> Int ![IO, Raise[String]] {
   perform IO.println(string_concat("processing: ", s));
@@ -322,6 +387,17 @@ in `catch`'s signature captures the residual row.
 ### E11 — Mutable state via the `Mem` effect
 
 ```sigil
+import std.byte_array
+import std.int
+import std.io
+import std.mem
+import std.mut_byte_array
+use std.byte_array.{byte_to_int, byte_truncate};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.mem.{Mem};
+use std.mut_byte_array.{MutByteArray, mut_byte_array_get, mut_byte_array_new, mut_byte_array_set};
+
 fn main() -> Int ![IO, Mem] {
   let zero: Byte = byte_truncate(0);
   let buf: MutByteArray = mut_byte_array_new(4, zero);
@@ -345,7 +421,14 @@ incremental-string surface under `Mem` — see E12.
 ### E12 — Building a JSON document with `StringBuilder`
 
 ```sigil
+import std.int
+import std.io
+import std.mem
 import std.string_builder
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.mem.{Mem};
+use std.string_builder.{sb_append, sb_finalize, sb_new};
 
 fn render() -> String ![Mem] {
   let sb: StringBuilder = sb_new();
@@ -372,7 +455,12 @@ For a fuller example see [`examples/json.sigil`](https://github.com/boldfield/si
 ### E13 — Tuples and pair destructuring
 
 ```sigil
+import std.int
+import std.io
 import std.pair
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.pair.{fst, snd};
 
 fn swap(p: (Int, String)) -> (String, Int) ![] {
   match p { (a, b) => (b, a) }
@@ -397,8 +485,13 @@ support destructuring in match patterns with `(p1, p2, ...)`.
 
 ```sigil
 import std.choose
-import std.list
+import std.int
 import std.io
+import std.list
+use std.choose.{Choose, all_choices};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{List, length};
 
 fn pick_pair() -> Int ![Choose] {
   let a: Int = perform Choose.choose(3);
@@ -426,6 +519,12 @@ import std.env
 import std.fs
 import std.io
 import std.list
+import std.result
+use std.env.{Env, env_args};
+use std.fs.{Fs, FsError, NotFound, read_dir};
+use std.io.{IO};
+use std.list.{Cons, List, Nil};
+use std.result.{Err, Ok};
 
 fn dump_dir(path: String) -> Int ![IO, Fs] {
   match read_dir(path) {
@@ -479,9 +578,20 @@ spawn a subprocess.
 ### E16 — Word-frequency counter with `Map[Char, Int]`
 
 ```sigil
+import std.char
+import std.int
 import std.io
 import std.list
 import std.map
+import std.option
+import std.string
+use std.char.{char_to_string, string_chars};
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{Cons, List, Nil};
+use std.map.{Map, map_char_keys, map_get, map_insert, map_to_list};
+use std.option.{None, Some};
+use std.string.{string_concat};
 
 fn count_chars(cs: List[Char], m: Map[Char, Int]) -> Map[Char, Int] ![] {
   match cs {
@@ -527,8 +637,10 @@ across runs.
 ### E17 — Format-string log-line builder
 
 ```sigil
-import std.io
 import std.format
+import std.io
+use std.format.{AInt, AString, format3};
+use std.io.{IO};
 
 fn log_line(level: String, request_id: Int, message: String) -> String ![] {
   format3("[{}] req={} msg={}", AString(level), AInt(request_id), AString(message))
@@ -552,6 +664,11 @@ constructor ceremony for the common single-arg case. See §13.
 ### E18 — Partial application via a returned closure
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 fn make_adder(x: Int) -> (Int) -> Int ![] ![] {
   fn (y: Int) -> Int ![] => x + y
 }
@@ -635,10 +752,20 @@ A program is a sequence of top-level items, in any order:
 
 ```sigil
 import std.io                                   // import
+use std.io.{IO};                                // use (per-symbol opt-in)
 type Color = | Red | Green | Blue              // type declaration
 effect Counter { tick: () -> Int }              // effect declaration
 fn main() -> Int ![IO] { 0 }                   // function
 ```
+
+**`import` and `use`.** `import std.<name>` makes a module
+addressable from this file (so you can write `std.io.IO` or
+`std.list.map(...)` qualified) but binds no symbols. `use
+mod.{n1, n2, ...};` opts each listed name into the file's bare
+namespace. The two declarations are independent: importing
+without `use` keeps every reference qualified; a `use` without
+the matching `import` is rejected. See §10 for the full module
+system, including aliases and conflict resolution.
 
 **`fn` syntax.** `fn name[generics](params) -> RetType ![Effects] body`.
 - Generic params (`[A, B, …]`) are optional; absent means no quantifier.
@@ -748,8 +875,10 @@ or codepoints.
 ##### Worked example — count digits
 
 ```sigil
-import std.list
 import std.char
+import std.list
+use std.char.{is_ascii_digit, string_chars};
+use std.list.{Cons, List, Nil};
 
 fn count_digits(s: String) -> Int ![] {
   __count_digits(string_chars(s))
@@ -1223,6 +1352,11 @@ effects fire per resume in their original source order.
 ##### Worked example — per-resume IO ordering
 
 ```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
 effect Choose resumes: many { choose: (Int) -> Int }
 
 fn helper(seed: Int) -> Int ![Choose, IO] {
@@ -1482,56 +1616,144 @@ is a single global capability.
 
 ### §10 — Modules and imports
 
-Sigil's stdlib lives in [`std/`](https://github.com/boldfield/sigil/blob/main/std/). User code imports a
-module by writing `import std.<name>` at the top of the file:
+Sigil's stdlib lives in [`std/`](https://github.com/boldfield/sigil/blob/main/std/). User code reaches a
+stdlib symbol via two declarations: an `import` line that names
+the module, and a `use` line that opts specific symbols into the
+file's bare namespace.
 
 ```sigil
-import std.option
-import std.list
+import std.option              // make `std.option` addressable
+import std.list                // make `std.list` addressable
+use std.option.{None, Option, Some};
+use std.list.{Cons, List, Nil, map, range};
 ```
 
-Imports are flat — every public item from each imported module
-becomes available in the importing file's scope. There is no
-re-export, alias, or namespace qualification in v1.
+`import std.<name>` makes the module addressable from this file
+but binds **no symbols** — by itself it lets you write
+`std.option.map(opt, f)` (qualified) but not `map(opt, f)` (bare).
+`use mod.{n1, n2, ...};` brings each listed name into the file's
+bare namespace, so `Some(7)` and `map(opt, f)` work without a
+prefix.
 
-The `std.io` / `std.mem` / `std.int64` / `std.string_builder` /
-`std.char` / `std.panic` modules are **documentation-only**; their
-types and operations are registered as compiler builtins.
-Importing them is allowed (a no-op at the resolver) for
-documentary clarity.
+This is **strict by design** — Plan F1 (2026-05-14) removed the
+old auto-prelude. The only globally-available names are:
 
-**Auto-prelude (`std.option` / `std.result`).** Six names are
-pre-registered in the typechecker's builtin set and are always
-available without an `import` line: `Option[A]`, `Some(A)`,
-`None`, `Result[A, E]`, `Ok(A)`, `Err(E)`. This carve-out matches
-Rust's `std::prelude` (which auto-includes `Option`, `Some`,
-`None`, `Result`, `Ok`, `Err`), Haskell's `Prelude`, and OCaml's
-auto-opened `Stdlib` — every typed-language ecosystem that
-inspires Sigil's idioms. The helper functions in
-`std.option` (`map`, `and_then`, `unwrap_or`) and `std.result`
-(`map`, `map_err`, `and_then`) still ship as pure-Sigil source
-and require their explicit imports.
+- **Primitive type names:** `Int`, `Bool`, `String`, `Char`,
+  `Byte`, `Float`, `Int64`, `Unit`.
+- **Opaque container type names:** `Array`, `MutArray`,
+  `ByteArray`, `MutByteArray`, `StringBuilder`.
+- **Reserved type names:** `Continuation[OpRet, Ret]` (reserved
+  for the type-position continuation surface — see §8.5; the
+  name itself is protected by E0146 against user redeclaration)
+  and `Ref[T]` (the runtime cell type underlying `std/state.sigil`;
+  the constructors are file-gated to that one source by E0148,
+  but the type name is in scope everywhere for type-annotation
+  purposes).
 
-User code may shadow the prelude:
+The authoritative list is registered in
+`typecheck::builtin_types()` and the matching `builtin_fn_env_*`
+helpers — the bullets above mirror that registration.
 
-- `type Color = | Red | Green | None` — the user's `None`
-  shadows `Option::None` in that file's scope (matching Rust's
-  `enum Color { None }` shadowing semantics).
-- `type Option = | None | Some(Int)` — non-generic redeclaration
-  replaces the prelude entry entirely; the user's Option becomes
-  the source of truth.
-- `let Some: Int = 7` — local binding shadows the prelude `Some`
-  constructor in its scope.
+Every other name — including `Option`, `Result`, `Some`, `None`,
+`Ok`, `Err`, `List`, `Cons`, `Nil`, and any stdlib fn like `map`,
+`int_to_string`, `string_concat`, `read_dir`, etc. — must come
+from an `import` + `use` line, or be qualified at the call site.
 
-All other `std.*` modules ship real source. **Their declarations
-require an explicit `import std.<module>`** to be in scope —
-including `List`, sum-type constructors like `Cons` / `Nil`, and
-any pure-Sigil canonical wrapper (`string_to_int`,
-`string_to_float`, `string_from_bytes`, `array_get_opt`, etc.).
-When an unknown name is rejected with `E0046` / `E0112` /
-`E0114`, the diagnostic attaches an `import std.X` hint pointing
-at the missing module. Prelude names are never "unknown" so the
-hint never fires for them.
+**Module aliases.** `import` accepts an `as` alias for shorter
+qualified-call paths:
+
+```sigil
+import std.option as O;
+// ...
+let m: O.Option[Int] = O.map(O.Some(7), fn (x: Int) -> Int ![] => x + 1);
+```
+
+The alias `O` only applies to **qualified-path call sites**
+(`O.map(opt, f)`, `O.Some(7)`); it is not itself a binding and
+cannot appear on a `use` line. `use` declarations must always
+name the module's full `std.<name>` form (E0031: the `use`
+source must start with `std.`). To use names bare in this file,
+add `use std.option.{Option, Some, map};` alongside the aliased
+import.
+
+**Aliasing in `use`.** Two modules may export the same bare name
+(e.g., `map` is in `std.list`, `std.option`, and `std.result`).
+Listing both in `use` lines is rejected with E0147 — fix by
+aliasing one:
+
+```sigil
+use std.list.{map};
+use std.option.{map as option_map};
+```
+
+**Wildcards rejected.** `use mod.*;` fires E0034 — wildcards
+would re-introduce the cross-module bare-name ambiguity (E0147)
+that the qualified-imports design closes. Listing names
+explicitly keeps each file self-describing: a reader sees in one
+place which symbols are in scope.
+
+**Empty binding lists rejected.** `use mod.{};` fires E0035 —
+an empty list is dead code with no effect (no symbols opted in,
+no diagnostic value, almost certainly a typo for the intended
+binding list). Either delete the `use` line or fill in the
+symbols it should bring bare.
+
+**Documentation-only modules.** Six stdlib modules ship as
+header-only files — every name they export is registered as a
+compiler builtin, with no source-level fn declarations:
+`std.io`, `std.mem`, `std.int64`, `std.string_builder`,
+`std.char`, `std.panic`. Their `import` line is a no-op at the
+resolver (kept for documentary clarity); the matching `use` line
+still opts the names in (`use std.io.{IO};`, etc.).
+
+Several other modules — `std.int`, `std.float`, `std.array`,
+`std.mut_array`, `std.byte_array`, `std.mut_byte_array` — are
+**mixed**: they ship some compiler-builtin entries (registered
+via `BUILTIN_TO_MODULE_FILE`) alongside source-level fn
+declarations. From the user's perspective the two categories are
+indistinguishable — both come into scope via the same `import` +
+`use` pair. The distinction matters only to the compiler's name
+registration machinery.
+
+**Resolver semantics.** Three resolution paths cover every Ident
+that names a top-level fn or type:
+
+1. **Qualified path.** `std.list.map(xs, f)` — the resolver walks
+   the dotted prefix against the file's `import` / alias table.
+2. **Bare via `use`-binding.** `map(xs, f)` after
+   `use std.list.{map};` — the bare ident resolves to the
+   `(module, source_name)` pair the binding records.
+3. **Intra-file fall-through.** A bare reference inside a fn's
+   body to another fn declared in the same file resolves to that
+   fn's canonical key without needing a `use` line for itself
+   (the recursive `map(t, f)` inside `std.list`'s `fn map` is the
+   archetype).
+
+A bare reference that matches none of the three is rejected with
+E0046 (`unknown identifier`). When the missing name is in the
+stdlib, the diagnostic attaches a hint pointing at the
+`import std.<module>` line that brings the declaring module into
+scope. v1's hint generator points at the import only; if the
+file already has the import, the user still needs to add a
+matching `use std.<module>.{name};` line — that step isn't
+suggested by the hint.
+
+**Migration.** The migration script
+[`scripts/migrate-to-qualified-imports.mjs`](https://github.com/boldfield/sigil/blob/main/scripts/migrate-to-qualified-imports.mjs)
+walks every `.sigil` file in a project and adds the `use` lines
+the strict resolver expects, derived from the file's bare-name
+references. It also processes inline-Sigil string literals
+inside Rust test sources.
+
+It is idempotent on standalone `.sigil` sources. Inline
+fragments interpolated into Rust `format!()` macros via
+`{placeholder}` (the helper-fragment pattern in
+`compiler/tests/e2e.rs`) are a known carve-out: such fragments
+get hand-added `use` lines on the host test source to cover the
+fragment's bare names, and re-running the script on those host
+sources will rewrite (re-strip + re-emit) those manual `use`
+lines. PR #173's N1 finding documents the specific case
+(`int_list_print_helper` and its 5 host tests).
 
 ### §11 — Diagnostics
 
@@ -1686,8 +1908,8 @@ files are the authoritative API reference.
 
 | Module | Surface |
 |--------|---------|
-| `std.option` | **Prelude:** `Option[A]`, `Some(A)`, `None` are always available without `import std.option`. **Helpers** require the explicit import: `map`, `and_then`, `unwrap_or`. |
-| `std.result` | **Prelude:** `Result[A, E]`, `Ok(A)`, `Err(E)` are always available without `import std.result`. **Helpers** require the explicit import: `map`, `map_err`, `and_then`. |
+| `std.option` | `Option[A]`, `Some(A)`, `None` + helpers `map`, `and_then`, `unwrap_or`. Add `import std.option` + `use std.option.{None, Option, Some}` (plus any helpers used). |
+| `std.result` | `Result[A, E]`, `Ok(A)`, `Err(E)` + helpers `map`, `map_err`, `and_then`. Add `import std.result` + `use std.result.{Err, Ok, Result}` (plus any helpers used). |
 | `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
 | `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` is the canonical string comparator (returns `Ordering`) — the legacy Int-returning builtin was retired in this addendum. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
 | `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |
@@ -1729,9 +1951,12 @@ well-defined but depend on which side performs which role.
 Concrete example: case-sensitive vs case-insensitive string sets.
 
 ```sigil
+import std.int
+import std.io
 import std.set
-import std.ordering
-import std.string
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.set.{Set, set_empty, set_insert, set_intersect, set_size, set_string, set_subset};
 
 // `string_compare_ci(x, y)` would be a case-insensitive variant
 // (not shipped in v1; user-defined). For the purposes of the
