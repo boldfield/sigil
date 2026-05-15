@@ -14,6 +14,7 @@ pub mod cli;
 pub mod closure_convert;
 pub mod codegen;
 pub mod color;
+pub mod discharge;
 pub mod elaborate;
 pub mod errors;
 pub mod imports;
