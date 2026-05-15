@@ -278,6 +278,44 @@ extern "C" {
         -> c_int;
 }
 
+// ===========================================================
+// dladdr — PC → symbol-name lookup for dyld-loaded libraries.
+// ===========================================================
+
+/// `Dl_info` as returned by `dladdr(3)`. Layout is identical on Linux
+/// and macOS — both define it as four pointer-width fields with no
+/// padding (see `<dlfcn.h>` on each platform).
+///
+/// Field order matches the POSIX-ish definition Linux and macOS share:
+/// `dli_fname` (image path), `dli_fbase` (image load address),
+/// `dli_sname` (nearest symbol name, may be NULL when no symbol is
+/// close enough — Apple stripped dylibs hit this case), `dli_saddr`
+/// (address of that symbol).
+#[repr(C)]
+pub struct DlInfo {
+    pub dli_fname: *const core::ffi::c_char,
+    pub dli_fbase: *mut c_void,
+    pub dli_sname: *const core::ffi::c_char,
+    pub dli_saddr: *mut c_void,
+}
+
+extern "C" {
+    /// Resolve `addr` (a runtime PC) to the nearest symbol in any
+    /// loaded image. Returns non-zero on success; on failure the `info`
+    /// pointer is left untouched. On macOS, `dli_sname` is the closest
+    /// **exported** symbol; on Linux (glibc), it's the closest
+    /// symbol-table entry whose address is ≤ `addr`. In both cases
+    /// stripped images yield `dli_sname == NULL`, which the caller
+    /// must check before reading the name.
+    ///
+    /// `dladdr` is documented as thread-safe on both platforms but is
+    /// **not** signal-safe (it allocates / locks internally on the
+    /// macOS implementation). We only call it from flush-time writer
+    /// code, which runs on the drainer thread or at atexit — outside
+    /// the SIGPROF handler.
+    pub fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -305,5 +343,38 @@ mod tests {
         // function returns 0 before any read.
         let fp = unsafe { ucontext_fp(core::ptr::null_mut()) };
         assert_eq!(fp, 0);
+    }
+
+    #[test]
+    fn dladdr_resolves_libc_function() {
+        // Pass a libc function pointer through dladdr and assert we
+        // get a non-NULL `dli_sname`. Uses `setitimer` (already FFI-
+        // declared in this module) as the probe symbol so the test
+        // doesn't depend on any further bindings.
+        let probe = setitimer as *const core::ffi::c_void;
+        let mut info = DlInfo {
+            dli_fname: core::ptr::null(),
+            dli_fbase: core::ptr::null_mut(),
+            dli_sname: core::ptr::null(),
+            dli_saddr: core::ptr::null_mut(),
+        };
+        // SAFETY: probe is a valid function pointer; info is a stack
+        // value we own.
+        let rc = unsafe { dladdr(probe, &mut info as *mut _) };
+        assert!(rc != 0, "dladdr should succeed for a libc function ptr");
+        assert!(
+            !info.dli_sname.is_null(),
+            "dli_sname should be non-NULL for a libc function ptr"
+        );
+        // SAFETY: dli_sname is non-NULL on success; libc owns the
+        // string; reading is safe as long as we don't outlive the
+        // process. The string is short and has a NUL terminator.
+        let name = unsafe { core::ffi::CStr::from_ptr(info.dli_sname) }
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.contains("setitimer"),
+            "expected `setitimer` in resolved name, got {name:?}"
+        );
     }
 }

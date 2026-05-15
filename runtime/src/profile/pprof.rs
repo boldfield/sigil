@@ -155,7 +155,7 @@ struct FunctionRecord {
 /// Write `samples` to `out` as a pprof v0.4-shape Profile message.
 /// `kind` selects the `sample_type` headers.
 pub fn write_pprof(samples: &[Sample], kind: SampleKind, out: &mut impl Write) -> io::Result<()> {
-    let resolver = resolve::Resolver::from_env_for_main_binary();
+    let resolver = resolve::Resolver::from_env_for_main_binary().with_dyld_images();
     let body = encode_profile(samples, kind, &resolver);
     out.write_all(&body)
 }

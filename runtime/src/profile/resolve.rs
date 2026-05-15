@@ -1,5 +1,6 @@
 //! PC → function name resolution — plan 2026-05-08-sigil-v2-runtime-
-//! profile-data Phase 5.
+//! profile-data Phase 5, extended by plan 2026-05-11-sigil-v2-profile-
+//! dyld-symbolization for dyld-loaded library coverage.
 //!
 //! Reads the `prog.symtab` sidecar (emitted by Phase 1's
 //! `--emit-symbol-table`) and maps captured runtime PCs to demangled
@@ -22,8 +23,56 @@
 //! `dl_iterate_phdr` on Linux and `_dyld_get_image_vmaddr_slide(0)`
 //! on macOS. Captured PCs subtract that offset to get image-relative
 //! VAs, which we binary-search in the sorted sidecar.
+//!
+//! ## Dyld-loaded library coverage
+//!
+//! The sidecar only covers the main executable. PCs that land inside
+//! dyld-loaded libraries (libgc, libSystem, libc, ...) miss the
+//! sidecar and fall through to a `0x<hex>` rendering — which is the
+//! analysis-visibility bug plan 2026-05-11 fixes. Enabling
+//! [`Resolver::with_dyld_images`] turns on a `dladdr(3)` fallback so
+//! that on a sidecar miss the resolver consults the dynamic linker's
+//! loaded-image symbol tables.
+//!
+//! **Deviation from plan body.** The plan asks us to walk each
+//! dyld-loaded image's symbol table with `object::read::File` and
+//! append entries to the resolver's `Vec<Sym>`. That requires adding
+//! the `object` crate to the runtime — which the plan's hard rule
+//! "No new dependencies" forbids. `dladdr` is the standard POSIX
+//! per-PC resolver, already linked in via `-ldl` on Linux and
+//! libSystem on macOS (see `compiler/src/link.rs`'s linker line), and
+//! its NULL-on-miss semantics give us the "stripped dylib silently
+//! skipped" behavior plan Task 3 calls for. We get the plan's outcome
+//! (libgc PCs resolve to `GC_*` names) without the dep.
+//!
+//! **dladdr's nearest-symbol semantics.** Unlike sidecar entries —
+//! which carry an explicit `[address, address + size)` containment
+//! check — `dladdr` returns whichever symbol sits closest at-or-below
+//! the queried PC, with no upper bound. PCs in interstitial padding,
+//! literal pools, or trampoline regions resolve to whichever neighbor
+//! symbol happens to precede them, which can be slightly misleading.
+//! Acceptable trade-off: the alternative would be `0x<hex>` (strictly
+//! less informative), and the rendered name is still useful for
+//! orienting which library the PC came from. Treat dladdr-resolved
+//! names as advisory rather than authoritative — sidecar entries
+//! (with their precise size bounds) are the source of truth for any
+//! address inside the main binary.
+//!
+//! **No-sidecar mode produces mangled main-binary names.** If a user
+//! runs a profiler without `--emit-symbol-table` (so the sidecar is
+//! absent), `entries` is empty and dladdr resolves main-binary PCs
+//! to their raw C names (`sigil_user_main`, `sigil_user_foo____Int`)
+//! instead of the demangled forms the sidecar would produce. This is
+//! a known regression from the sidecar-only path — `--emit-symbol-
+//! table` is the expected workflow, and the alternative (silent
+//! `0x<hex>` for every main-binary PC) is strictly worse. A future
+//! refinement could run the sidecar's demangler on dladdr names too;
+//! for now, document the workflow.
 
 use std::path::PathBuf;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::profile::sys;
 
 #[derive(Debug, Clone)]
 struct Sym {
@@ -41,6 +90,11 @@ pub struct Resolver {
     /// Zero when the resolver was constructed in test mode without
     /// a real binary to inspect.
     image_base: u64,
+    /// When `true`, [`Resolver::lookup`] falls through to `dladdr(3)`
+    /// on a sidecar miss. Enabled via [`Resolver::with_dyld_images`].
+    /// Off by default so test-mode resolvers behave deterministically
+    /// (no dependence on the test binary's loaded-image state).
+    dyld_fallback: bool,
 }
 
 impl Resolver {
@@ -52,6 +106,7 @@ impl Resolver {
         Self {
             entries: Vec::new(),
             image_base: 0,
+            dyld_fallback: false,
         }
     }
 
@@ -70,6 +125,7 @@ impl Resolver {
         Self {
             entries,
             image_base: 0,
+            dyld_fallback: false,
         }
     }
 
@@ -105,14 +161,43 @@ impl Resolver {
         Self {
             entries,
             image_base,
+            dyld_fallback: false,
         }
+    }
+
+    /// Enable a `dladdr(3)` fallback for PCs that miss the main-binary
+    /// sidecar. Plan 2026-05-11 surface: PCs landing in libgc /
+    /// libSystem / future dyld-loaded libs resolve to their POSIX
+    /// linker-table names instead of falling through to `0x<hex>`.
+    ///
+    /// **Zero overhead when profiling is off.** This method only flips
+    /// a bool; it does no enumeration, allocation, or syscall. The
+    /// `dladdr` call only happens at lookup time, which only happens
+    /// at flush time, which only happens when `SIGIL_CPU_PROFILE` or
+    /// `SIGIL_ALLOC_PROFILE` is set.
+    ///
+    /// **Stripped images.** `dladdr` returns `dli_sname == NULL` for
+    /// addresses inside dylibs with no nearby exported symbol (Apple
+    /// ships stripped libSystem to consumers). Those PCs fall through
+    /// to the existing `0x<hex>` rendering — same UX as today, per
+    /// plan Task 3.
+    pub fn with_dyld_images(mut self) -> Self {
+        // On unsupported platforms `dladdr_lookup` is a no-op that
+        // always returns `None`, so setting the bool unconditionally
+        // is safe: lookup hits the no-op and falls through to hex.
+        // Avoids a redundant cfg block here that would otherwise
+        // duplicate the platform gate already encoded in
+        // `dladdr_lookup`'s `cfg(not(...))` arm.
+        self.dyld_fallback = true;
+        self
     }
 
     /// Look up a runtime PC. Returns the matching function name if
     /// the PC falls within any symbol's `[address, address + size)`;
-    /// otherwise `0x<hex>`. Always returns an owned `String` — the
-    /// writers (folded, pprof) need to hold multiple resolved names
-    /// in flight at once.
+    /// otherwise consults `dladdr(3)` (when enabled via
+    /// [`Resolver::with_dyld_images`]); otherwise returns `0x<hex>`.
+    /// Always returns an owned `String` — the writers (folded, pprof)
+    /// need to hold multiple resolved names in flight at once.
     pub fn lookup(&self, pc: usize) -> String {
         // Strip aarch64 PAC bits one more time defensively — the
         // walker already does this, but a sample produced before
@@ -121,23 +206,65 @@ impl Resolver {
         #[cfg(target_arch = "aarch64")]
         let pc = pc & 0x0000_FFFF_FFFF_FFFFusize;
 
-        if self.entries.is_empty() {
-            return format!("0x{:x}", pc);
+        if !self.entries.is_empty() {
+            let pc64 = (pc as u64).saturating_sub(self.image_base);
+            // Binary-search for the symbol whose `[address, address + size)`
+            // covers `pc64`.
+            let idx = self.entries.partition_point(|s| s.address <= pc64);
+            if idx > 0 {
+                let candidate = &self.entries[idx - 1];
+                if pc64 >= candidate.address && pc64 < candidate.address + candidate.size {
+                    return candidate.name.clone();
+                }
+            }
         }
-        let pc64 = (pc as u64).saturating_sub(self.image_base);
-        // Binary-search for the symbol whose `[address, address + size)`
-        // covers `pc64`.
-        let idx = self.entries.partition_point(|s| s.address <= pc64);
-        if idx == 0 {
-            return format!("0x{:x}", pc);
+
+        // Sidecar miss: optionally fall through to dladdr for
+        // dyld-loaded library PCs (libgc, libSystem, ...).
+        if self.dyld_fallback {
+            if let Some(name) = dladdr_lookup(pc) {
+                return name;
+            }
         }
-        let candidate = &self.entries[idx - 1];
-        if pc64 >= candidate.address && pc64 < candidate.address + candidate.size {
-            candidate.name.clone()
-        } else {
-            format!("0x{:x}", pc)
-        }
+
+        format!("0x{:x}", pc)
     }
+}
+
+/// Resolve `pc` via `dladdr(3)`. Returns `Some(name)` on success
+/// (name is a heap-owned string copied out of the loader-owned
+/// `dli_sname` storage); `None` when the address isn't inside any
+/// loaded image or the resolved symbol is anonymous.
+///
+/// Non-Linux / non-macOS hosts compile this as a no-op returning
+/// `None` — the `sys::dladdr` binding is only compiled on those two
+/// targets.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn dladdr_lookup(pc: usize) -> Option<String> {
+    let mut info = sys::DlInfo {
+        dli_fname: core::ptr::null(),
+        dli_fbase: core::ptr::null_mut(),
+        dli_sname: core::ptr::null(),
+        dli_saddr: core::ptr::null_mut(),
+    };
+    // SAFETY: `&mut info` is a valid pointer to a stack-owned
+    // `DlInfo`; `pc as *const c_void` is a numerical address treated
+    // as an opaque pointer by `dladdr`, which doesn't dereference it.
+    let rc = unsafe { sys::dladdr(pc as *const core::ffi::c_void, &mut info as *mut _) };
+    if rc == 0 || info.dli_sname.is_null() {
+        return None;
+    }
+    // SAFETY: dladdr success + non-null dli_sname guarantees a
+    // NUL-terminated C string owned by the dynamic linker. We copy
+    // the bytes into an owned String so the result outlives any
+    // subsequent dladdr calls / dlclose.
+    let cstr = unsafe { core::ffi::CStr::from_ptr(info.dli_sname) };
+    Some(cstr.to_string_lossy().into_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn dladdr_lookup(_pc: usize) -> Option<String> {
+    None
 }
 
 fn parse_symtab(body: &str) -> Vec<Sym> {
@@ -278,5 +405,105 @@ xx\t00\tbar
         let entries = parse_symtab(body);
         assert_eq!(entries.len(), 1, "only the valid line should survive");
         assert_eq!(entries[0].name, "sigil_alloc");
+    }
+
+    /// Plan 2026-05-11 Task 2 — `with_dyld_images()` enables a
+    /// `dladdr`-backed fallback so PCs that miss the main-binary
+    /// sidecar resolve to dyld-loaded library symbols (the libgc-
+    /// resolution surface the plan exists to fix).
+    ///
+    /// We can't reach a real libgc PC from a runtime unit test
+    /// without compiling and running a sigil program, so the test
+    /// uses a libc function pointer (`getpid` — the test binary
+    /// always links libc dynamically) as a stand-in. Any address
+    /// inside any loaded shared object exercises the same code
+    /// path the libgc surface does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn with_dyld_images_resolves_libc_function_pointer() {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        // Function pointers in Rust are opaque; cast through usize
+        // to get the runtime address bytes dladdr will resolve.
+        let pc = getpid as *const () as usize;
+        let r = Resolver::empty().with_dyld_images();
+        let name = r.lookup(pc);
+        assert!(
+            name.contains("getpid"),
+            "with_dyld_images() should resolve a libc function pointer to its symbol name; got {name:?}"
+        );
+    }
+
+    /// Without `with_dyld_images()`, an empty resolver returns the
+    /// `0x<hex>` fallback even for PCs that dladdr could resolve.
+    /// Pins the opt-in contract — production code paths that want
+    /// dyld coverage must explicitly chain `.with_dyld_images()`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn empty_resolver_without_dyld_fallback_returns_hex() {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        let pc = getpid as *const () as usize;
+        let r = Resolver::empty();
+        let name = r.lookup(pc);
+        assert!(
+            name.starts_with("0x"),
+            "without with_dyld_images() the empty resolver must fall through to hex; got {name:?}"
+        );
+    }
+
+    /// Plan 2026-05-11 Task 3 — stripped dylibs (or any address that
+    /// doesn't land inside a known image) silently fall through to
+    /// the `0x<hex>` rendering. We probe a high non-canonical
+    /// userspace address that's guaranteed unmapped on both x86_64
+    /// and aarch64 (the upper-half of the 48-bit virtual range is
+    /// reserved for the kernel on Linux and never returned to user
+    /// mmap on macOS) to verify dladdr's NULL-on-miss surfaces as
+    /// the hex fallback rather than a spurious symbol.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn dyld_fallback_returns_hex_for_unmapped_address() {
+        let r = Resolver::empty().with_dyld_images();
+        let name = r.lookup(0xffff_ffff_ffff_ffe0);
+        assert!(
+            name.starts_with("0x"),
+            "unmapped PC must surface as `0x<hex>` not a spurious symbol; got {name:?}"
+        );
+    }
+
+    /// Sidecar entries take precedence over dladdr — the main-binary
+    /// sidecar's address ranges are authoritative because they cover
+    /// the demangled sigil-user names (`main`, `foo$$Int`) which
+    /// dladdr would otherwise return in their mangled form
+    /// (`sigil_user_main`, `sigil_user_foo____Int`).
+    ///
+    /// To actually exercise precedence we need a PC where *both*
+    /// paths would resolve: a real libc function pointer (`getpid`)
+    /// covered by a synthetic sidecar entry that names it differently.
+    /// If precedence were inverted (dladdr first), the dladdr-resolved
+    /// `getpid` would win; with the correct order the sidecar's
+    /// `"sidecar_wins"` does. Without this construction (i.e. a
+    /// non-runtime PC like `0x1010`), dladdr returns `None` regardless
+    /// of order and the test passes vacuously.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sidecar_takes_precedence_over_dladdr_fallback() {
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        let pc = getpid as *const () as usize;
+        // image_base = 0 (from_entries default) makes the lookup
+        // treat the captured PC as image-relative, so a sidecar
+        // entry whose `address` equals the runtime PC covers it.
+        let r = Resolver::from_entries(vec![(pc as u64, 0x100, "sidecar_wins".into())])
+            .with_dyld_images();
+        let name = r.lookup(pc);
+        assert_eq!(
+            name, "sidecar_wins",
+            "sidecar must win over dladdr; if this returns a libc symbol \
+             like `getpid`, precedence is inverted"
+        );
     }
 }

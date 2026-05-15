@@ -28,7 +28,7 @@ use crate::profile::sample::Sample;
 /// Write `samples` as a folded-stacks file. Returns the number of
 /// unique-stack rows emitted.
 pub fn write_folded(samples: &[Sample], out: &mut impl Write) -> io::Result<usize> {
-    let resolver = resolve::Resolver::from_env_for_main_binary();
+    let resolver = resolve::Resolver::from_env_for_main_binary().with_dyld_images();
     // BTreeMap keys are deterministic (lex-sorted) — output bytes
     // are reproducible across runs.
     let mut buckets: BTreeMap<String, u64> = BTreeMap::new();
