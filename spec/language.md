@@ -1628,6 +1628,17 @@ old auto-prelude. The only globally-available names are:
   `Byte`, `Float`, `Int64`, `Unit`.
 - **Opaque container type names:** `Array`, `MutArray`,
   `ByteArray`, `MutByteArray`, `StringBuilder`.
+- **Reserved type names:** `Continuation[OpRet, Ret]` (reserved
+  for the type-position continuation surface — see §8.5; the
+  name itself is protected by E0146 against user redeclaration)
+  and `Ref[T]` (the runtime cell type underlying `std/state.sigil`;
+  the constructors are file-gated to that one source by E0148,
+  but the type name is in scope everywhere for type-annotation
+  purposes).
+
+The authoritative list is registered in
+`typecheck::builtin_types()` and the matching `builtin_fn_env_*`
+helpers — the bullets above mirror that registration.
 
 Every other name — including `Option`, `Result`, `Some`, `None`,
 `Ok`, `Err`, `List`, `Cons`, `Nil`, and any stdlib fn like `map`,
@@ -1652,9 +1663,9 @@ add `use std.option.{Option, Some, map};` alongside the aliased
 import.
 
 **Aliasing in `use`.** Two modules may export the same bare name
-(e.g., `map` is in `std.list`, `std.option`, `std.result`, and
-`std.map`). Listing both in `use` lines is rejected with E0147 —
-fix by aliasing one:
+(e.g., `map` is in `std.list`, `std.option`, and `std.result`).
+Listing both in `use` lines is rejected with E0147 — fix by
+aliasing one:
 
 ```sigil
 use std.list.{map};
@@ -1666,6 +1677,12 @@ would re-introduce the cross-module bare-name ambiguity (E0147)
 that the qualified-imports design closes. Listing names
 explicitly keeps each file self-describing: a reader sees in one
 place which symbols are in scope.
+
+**Empty binding lists rejected.** `use mod.{};` fires E0035 —
+an empty list is dead code with no effect (no symbols opted in,
+no diagnostic value, almost certainly a typo for the intended
+binding list). Either delete the `use` line or fill in the
+symbols it should bring bare.
 
 **Documentation-only modules.** Six stdlib modules ship as
 header-only files — every name they export is registered as a
@@ -1711,9 +1728,18 @@ suggested by the hint.
 [`scripts/migrate-to-qualified-imports.mjs`](../scripts/migrate-to-qualified-imports.mjs)
 walks every `.sigil` file in a project and adds the `use` lines
 the strict resolver expects, derived from the file's bare-name
-references. It is idempotent — re-running on already-migrated
-sources is a no-op. The script also processes inline-Sigil string
-literals inside Rust test sources.
+references. It also processes inline-Sigil string literals
+inside Rust test sources.
+
+It is idempotent on standalone `.sigil` sources. Inline
+fragments interpolated into Rust `format!()` macros via
+`{placeholder}` (the helper-fragment pattern in
+`compiler/tests/e2e.rs`) are a known carve-out: such fragments
+get hand-added `use` lines on the host test source to cover the
+fragment's bare names, and re-running the script on those host
+sources will rewrite (re-strip + re-emit) those manual `use`
+lines. PR #173's N1 finding documents the specific case
+(`int_list_print_helper` and its 5 host tests).
 
 ### §11 — Diagnostics
 
@@ -1868,8 +1894,8 @@ files are the authoritative API reference.
 
 | Module | Surface |
 |--------|---------|
-| `std.option` | **Prelude:** `Option[A]`, `Some(A)`, `None` are always available without `import std.option`. **Helpers** require the explicit import: `map`, `and_then`, `unwrap_or`. |
-| `std.result` | **Prelude:** `Result[A, E]`, `Ok(A)`, `Err(E)` are always available without `import std.result`. **Helpers** require the explicit import: `map`, `map_err`, `and_then`. |
+| `std.option` | `Option[A]`, `Some(A)`, `None` + helpers `map`, `and_then`, `unwrap_or`. Add `import std.option` + `use std.option.{None, Option, Some}` (plus any helpers used). |
+| `std.result` | `Result[A, E]`, `Ok(A)`, `Err(E)` + helpers `map`, `map_err`, `and_then`. Add `import std.result` + `use std.result.{Err, Ok, Result}` (plus any helpers used). |
 | `std.list` | `List[A]`, `length`, `map`, `filter`, `fold`, `reverse`, `append`, `range`, `list_sort` (stable functional merge sort, comparator-driven, `(T, T) -> Ordering`), per-type wrappers `list_sort_int`, `list_sort_string`, `list_sort_char`, `list_sort_float`. |
 | `std.ordering` | `Ordering = \| Less \| Equal \| Greater` plus per-type comparators `int_compare`, `string_compare`, `char_compare`, `bool_compare`, `float_compare`, `int64_compare`. `string_compare` is the canonical string comparator (returns `Ordering`) — the legacy Int-returning builtin was retired in this addendum. `float_compare` uses total-order NaN semantics: `NaN == NaN`, `NaN < non-NaN`, `non-NaN > NaN`. |
 | `std.map` | Persistent ordered `Map[K, V]` (AA tree, O(log n) lookup / insert / remove). `map_empty(cmp)`, `map_size`, `map_is_empty`, `map_get`, `map_contains`, `map_insert`, `map_remove`, `map_keys`, `map_values`, `map_to_list`, `map_from_list`, `map_fold`, `map_map`, `map_filter`. Convenience constructors `map_int_keys`, `map_string_keys`, `map_char_keys` thread the matching `std.ordering` comparator. Iteration order is sorted ascending by key. |
