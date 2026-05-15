@@ -554,6 +554,18 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
+- Mark-phase hypothesis verdict (follow-up) — _measurement-run
+  pending_ — see
+  [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
+  Adds the `SIGIL_MAX_HEAP_SIZE_KB` env var + the always-on
+  `SIGIL_COUNTER_PRECISE_WALKER_NS` counter so the
+  conservative-scan-savings vs. precise-walker-cost
+  decomposition becomes computable. The original throughput
+  report stays as a frozen snapshot of the unfalsifiable
+  state; the follow-up doc lands the verdict (confirmed /
+  disproven / inconclusive even under forced pressure).
+  TL;DR will be filled by the Task-4 workflow run on this
+  branch.
 
 ## Deviations
 

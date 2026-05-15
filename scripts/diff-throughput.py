@@ -83,18 +83,30 @@ def render(workload: str, pre: dict, post: dict) -> str:
             f"| {pct_delta(pre[key]['median'], post[key]['median'])} |"
         )
 
-    # Counter-derived metrics are single values.
+    # Counter-derived metrics are single values. `precise_walker_ns`
+    # is the Plan E2 Phase 3 GC-time follow-up's walker-cost
+    # accumulator — pre-checkpoint binaries do not have it (counter
+    # added by the follow-up plan), so its pre value renders as
+    # "n/a" while post is non-zero. The decomposition tables in the
+    # report doc consume the post side directly.
     for key, unit in [
         ("alloc_count", ""),
         ("alloc_bytes", "bytes"),
         ("boehm_gc_time_ms", "ms"),
+        ("precise_walker_ns", "ns"),
     ]:
+        # Defensive: keys added by a later plan may be absent on a
+        # JSON file produced by an older measure-throughput.sh.
+        # `dict.get` returns None for missing keys; fmt_scalar /
+        # abs_delta / pct_delta already handle None.
+        pre_val = pre.get(key)
+        post_val = post.get(key)
         rows.append(
             f"| {key}{(' (' + unit + ')') if unit else ''} "
-            f"| {fmt_scalar(pre[key])} "
-            f"| {fmt_scalar(post[key])} "
-            f"| {abs_delta(pre[key], post[key])} "
-            f"| {pct_delta(pre[key], post[key])} |"
+            f"| {fmt_scalar(pre_val)} "
+            f"| {fmt_scalar(post_val)} "
+            f"| {abs_delta(pre_val, post_val)} "
+            f"| {pct_delta(pre_val, post_val)} |"
         )
 
     rows.append("")
