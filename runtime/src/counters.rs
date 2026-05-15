@@ -114,14 +114,30 @@ pub enum CounterId {
     /// (alloc_count ÷ N should match this counter ± 1). Zero
     /// when the env var is unset.
     ForcedGcCount = 29,
+    /// Plan E2 alloc-trampoline-elision — count of
+    /// `alloc_dispatch_active` calls that took the elided fast
+    /// path (skipped `GC_call_with_gc_active`). Diagnostic
+    /// counter; lets the throughput-report Task 6 verdict
+    /// sanity-check that the elision mechanism actually fired
+    /// during the measurement run — by construction this is
+    /// `BoehmAllocCount - <count of allocs while thread parked>`
+    /// when `SIGIL_ALLOC_ELIDE_WRAP=1`, and stays at 0 when the
+    /// env var is unset / 0 / invalid. Without this counter, a
+    /// "no wall-time change" Task 6 result would be ambiguous
+    /// between "elision fires but TLS-read cost eats the win" and
+    /// "elision never fired because the env var didn't reach the
+    /// runtime", and the plan body's Task 6 conclusion branch
+    /// depends on telling those apart.
+    AllocWrapElidedCount = 30,
 }
 
-const COUNTER_SLOTS: usize = 30;
+const COUNTER_SLOTS: usize = 31;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -187,6 +203,7 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_CHAR_ALLOC_BYTES",
     "SIGIL_COUNTER_PRECISE_WALKER_NS",
     "SIGIL_COUNTER_FORCED_GC_COUNT",
+    "SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT",
 ];
 
 #[inline]
@@ -275,6 +292,10 @@ mod tests {
         assert_eq!(
             NAMES[CounterId::ForcedGcCount as usize],
             "SIGIL_COUNTER_FORCED_GC_COUNT"
+        );
+        assert_eq!(
+            NAMES[CounterId::AllocWrapElidedCount as usize],
+            "SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT"
         );
     }
 
