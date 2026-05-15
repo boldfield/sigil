@@ -101,6 +101,7 @@ unsafe fn build_process_result_tuple(
     stdout: *mut u8,
     stderr: *mut u8,
 ) -> *mut u8 {
+    let idx = crate::gc::runtime_shape_indices().tuple_int_int_ptr_ptr;
     alloc_tuple(
         &[
             error_tag as u64,
@@ -109,6 +110,7 @@ unsafe fn build_process_result_tuple(
             stderr as u64,
         ],
         0b1100,
+        idx,
     )
 }
 

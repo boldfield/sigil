@@ -90,7 +90,8 @@ unsafe fn path_str_from_sigil_arg<'a>(p: *const u8) -> Option<&'a str> {
 /// `value` (used by the `Other` variant for the error display
 /// string; ignored by the others — empty string).
 unsafe fn build_int_string_tuple(tag: i64, value: *mut u8) -> *mut u8 {
-    alloc_tuple(&[tag as u64, value as u64], 0b10)
+    let idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+    alloc_tuple(&[tag as u64, value as u64], 0b10, idx)
 }
 
 /// Build an `(Int, T, String)` tuple where `T` is a pointer-typed
@@ -104,7 +105,8 @@ unsafe fn build_int_string_tuple(tag: i64, value: *mut u8) -> *mut u8 {
 /// stdlib `Err(Other(msg))` construction site. Earlier draft used a
 /// 2-tuple `(Int, T)` here which dropped the message on the floor.
 unsafe fn build_int_pointer_string_tuple(tag: i64, ptr: *mut u8, msg: *mut u8) -> *mut u8 {
-    alloc_tuple(&[tag as u64, ptr as u64, msg as u64], 0b110)
+    let idx = crate::gc::runtime_shape_indices().tuple_int_ptr_ptr;
+    alloc_tuple(&[tag as u64, ptr as u64, msg as u64], 0b110, idx)
 }
 
 // ── Predicates ─────────────────────────────────────────────────────

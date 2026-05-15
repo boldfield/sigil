@@ -62,7 +62,9 @@ use crate::header::{Header, TAG_MUT_ARRAY, TAG_MUT_BYTE_ARRAY};
 pub extern "C" fn sigil_mut_array_new(len: u64, fill: u64) -> *mut u8 {
     let payload_bytes = 8usize.saturating_add((len as usize).saturating_mul(8));
     let h = Header::new(TAG_MUT_ARRAY, 0, 1);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // count=0 + bitmap!=0 → conservative GC_malloc path;
+    // descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
 
     // Length word at offset 8.
     //
@@ -174,7 +176,8 @@ pub extern "C" fn sigil_mut_byte_array_new(len: u64, fill: u8) -> *mut u8 {
     }
     let payload_bytes = mut_byte_payload_bytes_for(len);
     let h = Header::new(TAG_MUT_BYTE_ARRAY, 0, 0);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // bitmap=0 → atomic path; descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
 
     // Length word at offset 8.
     //

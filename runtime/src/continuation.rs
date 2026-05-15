@@ -69,7 +69,10 @@ pub unsafe extern "C" fn sigil_continuation_alloc(
     // pointers, GC-managed); bits 1 and 3 (fn pointers) are code
     // addresses, not heap pointers.
     let h = Header::new(TAG_CONTINUATION, 4, 0b0101);
-    let obj = sigil_alloc(h.raw(), 32);
+    // Typed-malloc shape `(0b0101, 4)` — pre-registered as
+    // `RuntimeShapeIndices::continuation` by `sigil_init_shapes`.
+    let descriptor_index = crate::gc::runtime_shape_indices().continuation;
+    let obj = sigil_alloc(h.raw(), 32, descriptor_index);
     // SAFETY: gc-heap-ptr arithmetic (transient base for four aligned
     // pointer stores).
     let p_k_closure: *mut *mut u8 = obj.add(8).cast();

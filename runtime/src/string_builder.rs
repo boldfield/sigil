@@ -81,7 +81,8 @@ const SB_PAYLOAD_BYTES: usize = 32; // 4 payload words × 8 bytes each
 fn alloc_segment() -> *mut u8 {
     let payload_bytes = 8usize.saturating_add(SEG_SIZE); // length word + payload
     let h = Header::new(TAG_MUT_BYTE_ARRAY, 0, 0);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // bitmap=0 → atomic path; descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned u64 store).
     unsafe {
         let len_ptr: *mut u64 = obj.add(8).cast();
@@ -99,7 +100,8 @@ fn alloc_segment() -> *mut u8 {
 fn alloc_segments_array(cap: u64) -> *mut u8 {
     let payload_bytes = 8usize.saturating_add((cap as usize).saturating_mul(8));
     let h = Header::new(TAG_ARRAY, 0, 1);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // count=0 + bitmap!=0 → conservative path; descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned u64 store).
     unsafe {
         let len_ptr: *mut u64 = obj.add(8).cast();
@@ -197,7 +199,10 @@ mod fields {
 #[no_mangle]
 pub extern "C" fn sigil_string_builder_new() -> *mut u8 {
     let h = Header::new(TAG_STRING_BUILDER, 4, 0b1000);
-    let sb = sigil_alloc(h.raw(), SB_PAYLOAD_BYTES);
+    // Typed-malloc shape `(0b1000, 4)` — pre-registered as
+    // `RuntimeShapeIndices::string_builder` by `sigil_init_shapes`.
+    let descriptor_index = crate::gc::runtime_shape_indices().string_builder;
+    let sb = sigil_alloc(h.raw(), SB_PAYLOAD_BYTES, descriptor_index);
     // SAFETY: gc-heap-ptr arithmetic (transient stores into freshly-allocated SB).
     unsafe {
         fields::write_u64(sb, fields::TOTAL_LEN_OFF, 0);

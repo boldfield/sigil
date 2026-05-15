@@ -868,7 +868,22 @@ pub unsafe extern "C" fn sigil_handler_frame_new(
     effect_id: u32,
     arm_count: u32,
 ) -> *mut HandlerFrame {
-    sigil_handler_frame_new_with_resumes_many(effect_id, arm_count, 0)
+    // Looks up the descriptor index for this `arm_count` via the
+    // runtime's pre-registered handler-frame shape table. Codegen-
+    // emitted call sites bypass this wrapper and call
+    // `sigil_handler_frame_new_with_resumes_many` directly (passing
+    // the index they computed during the shape pre-pass), so this
+    // branch is only reached by direct runtime / test callers.
+    let descriptor_index = if (arm_count as usize) < crate::gc::MAX_HANDLER_ARMS_INCLUSIVE {
+        crate::gc::runtime_shape_indices().handler_frame[arm_count as usize]
+    } else {
+        // Out-of-range arm_count — pass `u32::MAX`; the
+        // `arm_count > MAX_HANDLER_ARMS` check in the inner
+        // entry will fire and abort before the descriptor
+        // lookup runs anyway.
+        u32::MAX
+    };
+    sigil_handler_frame_new_with_resumes_many(effect_id, arm_count, 0, descriptor_index)
 }
 
 /// Plotkin fix — variant of `sigil_handler_frame_new` that records
@@ -894,6 +909,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     effect_id: u32,
     arm_count: u32,
     resumes_many: u32,
+    descriptor_index: u32,
 ) -> *mut HandlerFrame {
     if arm_count > MAX_HANDLER_ARMS {
         eprintln!(
@@ -902,7 +918,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
         );
         std::process::abort();
     }
-    let payload_bytes: usize = handler_frame_payload_bytes(arm_count as usize);
+    let payload_bytes: usize = handler_frame_payload_bytes(arm_count);
     let payload_words: u8 = (payload_bytes / 8).try_into().unwrap_or_else(|_| {
         // Unreachable under MAX_HANDLER_ARMS = 14: payload_bytes peaks
         // at 32 + 16*14 = 256, payload_words at 32 → fits u8. Defensive
@@ -914,7 +930,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
         );
         std::process::abort();
     });
-    let bitmap = handler_frame_pointer_bitmap(arm_count as usize);
+    let bitmap = handler_frame_pointer_bitmap(arm_count);
 
     // INVARIANT: Boehm consumes the pointer bitmap two ways post-
     // Plan E2 Task 8: (a) bitmap=0 selects `GC_malloc_atomic` (no
@@ -926,7 +942,7 @@ pub unsafe extern "C" fn sigil_handler_frame_new_with_resumes_many(
     // introduced, add TAG_HANDLER_FRAME alongside in
     // `sigil-header-constants` and revise this site.
     let header = Header::new(TAG_CLOSURE, payload_words, bitmap);
-    let obj = crate::gc::sigil_alloc(header.raw(), payload_bytes);
+    let obj = crate::gc::sigil_alloc(header.raw(), payload_bytes, descriptor_index);
 
     // Frame fields begin at offset 8 (past the Sigil object header).
     //
@@ -1627,7 +1643,10 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
         // code_ptr (null), slot 2 is inner_fn (code addr), slot 4 is
         // saved_fn (code addr).
         let h = Header::new(TAG_CLOSURE, 5, 0b01010);
-        let wrapper = sigil_alloc(h.raw(), 40);
+        // Typed-malloc shape `(0b01010, 5)` — pre-registered as
+        // `RuntimeShapeIndices::wrapper_continuation`.
+        let descriptor_index = crate::gc::runtime_shape_indices().wrapper_continuation;
+        let wrapper = sigil_alloc(h.raw(), 40, descriptor_index);
         *(wrapper.add(8) as *mut *mut u8) = ptr::null_mut();
         *(wrapper.add(16) as *mut *mut u8) = current_closure;
         *(wrapper.add(24) as *mut *mut u8) = current_fn;
@@ -2597,44 +2616,20 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
 // HandlerFrame internal helpers
 // ---------------------------------------------------------------------
 
-#[inline]
-fn handler_frame_payload_bytes(arm_count: usize) -> usize {
-    // 32 bytes of fixed header + 16 bytes per arm.
-    32 + 16 * arm_count
-}
-
-fn handler_frame_pointer_bitmap(arm_count: usize) -> u32 {
-    // Word 0: (effect_id, arm_count) — not a pointer.
-    // Word 1: return_fn — function pointer, NOT GC-tracked.
-    // Word 2: return_closure — GC pointer.
-    // Word 3: prev — GC pointer (to another HandlerFrame, also GC-allocated).
-    // Words 4+: arms — even slots are fn_ptrs (skip), odd slots are closure_ptrs (track).
-    //
-    // Defensive check: `arm_count` must be the masked count (low 16
-    // bits of `HandlerFrame::arm_count`), NOT the raw field with the
-    // `RESUMES_MANY_BIT` flag set. A caller passing the raw u32 would
-    // iterate ~2^31 times here (silently producing garbage); catch
-    // that misuse early in dev builds.
-    debug_assert!(
-        arm_count <= MAX_HANDLER_ARMS as usize,
-        "handler_frame_pointer_bitmap: arm_count {arm_count} exceeds \
-         MAX_HANDLER_ARMS ({}); caller likely passed a raw \
-         arm_count field with RESUMES_MANY_BIT set instead of the \
-         masked value",
-        MAX_HANDLER_ARMS
-    );
-    let mut bitmap: u32 = 0;
-    bitmap |= 1 << 2;
-    bitmap |= 1 << 3;
-    for i in 0..arm_count {
-        let closure_word_idx = 5 + 2 * i;
-        // The MAX_HANDLER_ARMS cap (14) keeps `closure_word_idx` ≤ 31:
-        // i ranges over [0, arm_count) ⊆ [0, 14), so max idx = 5 + 2*13 = 31.
-        debug_assert!(closure_word_idx < 32);
-        bitmap |= 1u32 << closure_word_idx;
-    }
-    bitmap
-}
+// Re-export from sigil-abi so callers inside this crate keep the
+// short name. The static-descriptor-table refactor promoted these to
+// `pub const fn` in `sigil-abi::effect` so codegen can register the
+// 14 handler-frame shapes at compile time without duplicating the
+// bitmap derivation.
+//
+// The runtime entry point (`sigil_handler_frame_new_with_resumes_many`)
+// is the load-bearing arm_count-bounds checker — it rejects
+// `arm_count > MAX_HANDLER_ARMS` BEFORE these helpers are called,
+// so the cap-overflow UB that the prior `debug_assert!` guarded is
+// already unreachable in this caller. (Tests of the helpers
+// directly stay bounded to MAX_HANDLER_ARMS; see the
+// `handler_frame_pointer_bitmap_marks_correct_words` test.)
+use sigil_abi::effect::{handler_frame_payload_bytes, handler_frame_pointer_bitmap};
 
 /// Pointer to the start of the variable-length arms array on `frame`.
 /// Each arm slot is two pointers: `(fn_ptr, closure_ptr)`.
@@ -3307,8 +3302,8 @@ mod tests {
         assert_eq!(handler_frame_pointer_bitmap(1), 0b0010_1100);
         // 3 arms → adds bits 5, 7, 9.
         assert_eq!(handler_frame_pointer_bitmap(3), 0b10_1010_1100);
-        // Max (13) arms → bits 5, 7, 9, ..., 31.
-        let max = handler_frame_pointer_bitmap(MAX_HANDLER_ARMS as usize);
+        // Max (14) arms → bits 5, 7, 9, ..., 31.
+        let max = handler_frame_pointer_bitmap(MAX_HANDLER_ARMS);
         // bits 2, 3 plus odd bits from 5 through 31.
         assert!(max & (1 << 2) != 0);
         assert!(max & (1 << 3) != 0);
@@ -3324,7 +3319,7 @@ mod tests {
         assert_eq!(handler_frame_payload_bytes(0), 32);
         assert_eq!(handler_frame_payload_bytes(1), 48);
         assert_eq!(
-            handler_frame_payload_bytes(MAX_HANDLER_ARMS as usize),
+            handler_frame_payload_bytes(MAX_HANDLER_ARMS),
             32 + 16 * MAX_HANDLER_ARMS as usize
         );
     }
@@ -3542,7 +3537,7 @@ mod tests {
             // that may still hold the `frame` local.
             for _ in 0..32 {
                 let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
-                let _ = crate::gc::sigil_alloc(h.raw(), 8);
+                let _ = crate::gc::sigil_alloc(h.raw(), 8, u32::MAX);
             }
             // Force a full collection.
             crate::gc::GC_gcollect();
@@ -3598,7 +3593,7 @@ mod tests {
         unsafe {
             // Allocate the "closure" (1 payload word holding the sentinel).
             let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
-            let closure = crate::gc::sigil_alloc(h.raw(), 8);
+            let closure = crate::gc::sigil_alloc(h.raw(), 8, u32::MAX);
             let payload = closure.add(8) as *mut u64;
             payload.write(STRESS_CLOSURE_SENTINEL);
 
@@ -3612,7 +3607,7 @@ mod tests {
             // Allocate-spam to overwrite stack-side aliases of `closure`.
             for _ in 0..32 {
                 let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
-                let _ = crate::gc::sigil_alloc(h.raw(), 8);
+                let _ = crate::gc::sigil_alloc(h.raw(), 8, u32::MAX);
             }
             crate::gc::GC_gcollect();
 
@@ -3649,7 +3644,7 @@ mod tests {
         _args_len: u32,
     ) -> *mut NextStep {
         let h = crate::header::Header::new(crate::header::TAG_INT64, 1, 0);
-        let target_closure = crate::gc::sigil_alloc(h.raw(), 8);
+        let target_closure = crate::gc::sigil_alloc(h.raw(), 8, u32::MAX);
         let payload = target_closure.add(8) as *mut u64;
         payload.write(STRESS_CLOSURE_SENTINEL);
         let ns = sigil_next_step_call(target_closure, arm_read_closure_sentinel as *mut u8, 0);
@@ -3728,7 +3723,7 @@ mod tests {
         _args_ptr: *const u64,
         _args_len: u32,
     ) -> *mut NextStep {
-        let heap_closure = crate::gc::sigil_alloc(0, 64);
+        let heap_closure = crate::gc::sigil_alloc(0, 64, u32::MAX);
         sigil_outer_post_arm_k_push(heap_closure, cps_done_with_arg as *mut u8);
         sigil_next_step_done(42)
     }
@@ -3755,7 +3750,7 @@ mod tests {
         // stack range gets scanned conservatively, so we want pointers
         // that resolve to valid heap blocks. The buffer's contents are
         // never read; only pointer-identity round-trip is checked.
-        let closure_ptr = crate::gc::sigil_alloc(0, 64);
+        let closure_ptr = crate::gc::sigil_alloc(0, 64, u32::MAX);
         let fn_ptr = cps_done_with_arg as *mut u8; // text-segment pointer.
         unsafe {
             sigil_outer_post_arm_k_push(closure_ptr, fn_ptr);
@@ -3806,7 +3801,9 @@ mod tests {
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
         reset_outer_post_arm_k_stack();
 
-        let closures: Vec<*mut u8> = (0..3).map(|_| crate::gc::sigil_alloc(0, 64)).collect();
+        let closures: Vec<*mut u8> = (0..3)
+            .map(|_| crate::gc::sigil_alloc(0, 64, u32::MAX))
+            .collect();
         let fns: [*mut u8; 3] = [
             cps_done_with_arg as *mut u8,
             cps_done_plus_one as *mut u8,
@@ -3848,7 +3845,9 @@ mod tests {
         reset_outer_post_arm_k_stack();
 
         let n = OUTER_POST_ARM_K_STACK_SIZE - 1;
-        let closures: Vec<*mut u8> = (0..n).map(|_| crate::gc::sigil_alloc(0, 64)).collect();
+        let closures: Vec<*mut u8> = (0..n)
+            .map(|_| crate::gc::sigil_alloc(0, 64, u32::MAX))
+            .collect();
         let fn_ptr = cps_done_with_arg as *mut u8;
         unsafe {
             for c in closures.iter() {

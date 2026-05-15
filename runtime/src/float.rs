@@ -27,7 +27,8 @@ use crate::header::{Header, TAG_FLOAT};
 
 fn alloc_float(payload: f64) -> *mut u8 {
     let h = Header::new(TAG_FLOAT, 1, 0);
-    let obj = sigil_alloc(h.raw(), 8);
+    // bitmap=0 (atomic path); descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), 8, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned f64 store).
     unsafe {
         let p: *mut f64 = obj.add(8).cast();

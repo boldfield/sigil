@@ -99,7 +99,8 @@ pub unsafe extern "C" fn sigil_env_var_arm(
         // as querying a missing variable.
         Err(_) => (1, alloc_string_from_str("")),
     };
-    let tup = alloc_tuple(&[tag as u64, value as u64], 0b10);
+    let idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+    let tup = alloc_tuple(&[tag as u64, value as u64], 0b10, idx);
 
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
@@ -133,7 +134,8 @@ pub unsafe extern "C" fn sigil_env_vars_arm(
         // tuple is written into the array slot it's rooted via `arr`.
         let k_ptr = alloc_string_from_str(k);
         let v_ptr = alloc_string_from_str(v);
-        let tup = alloc_tuple(&[k_ptr as u64, v_ptr as u64], 0b11);
+        let tup_idx = crate::gc::runtime_shape_indices().tuple_ptr_ptr;
+        let tup = alloc_tuple(&[k_ptr as u64, v_ptr as u64], 0b11, tup_idx);
         array_set_slot_raw(arr, i, tup as u64);
     }
 
@@ -186,7 +188,8 @@ mod tests {
             let s = std::str::from_utf8(name_slice).expect("ascii");
             let v = std::env::var(s).expect("present");
             let value = alloc_string_from_str(&v);
-            let tup = alloc_tuple(&[0_u64, value as u64], 0b10);
+            let tup_idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+            let tup = alloc_tuple(&[0_u64, value as u64], 0b10, tup_idx);
             // tag at offset 8, value ptr at offset 16.
             assert_eq!((tup.add(8) as *const i64).read(), 0);
             let val_ptr = (tup.add(16) as *const *const u8).read();
@@ -205,7 +208,8 @@ mod tests {
                 Ok(v) => (0_i64, alloc_string_from_str(&v)),
                 Err(_) => (1_i64, alloc_string_from_str("")),
             };
-            let tup = alloc_tuple(&[tag as u64, value as u64], 0b10);
+            let tup_idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+            let tup = alloc_tuple(&[tag as u64, value as u64], 0b10, tup_idx);
             assert_eq!((tup.add(8) as *const i64).read(), 1);
             let val_ptr = (tup.add(16) as *const *const u8).read();
             assert_eq!(sigil_string_len(val_ptr), 0);

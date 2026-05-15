@@ -320,6 +320,27 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml)
   (manual `workflow_dispatch`).
+- **Static-descriptor-table follow-up (2026-05-15) — ✅ Confirmed
+  (ubuntu) / directionally confirmed within noise (macos).**
+  Replaces the runtime `RwLock<BTreeMap<(u32, u8), GC_descr>>`
+  descriptor cache with a compile-time-emitted shape table the
+  runtime materialises once at startup via `sigil_init_shapes`.
+  Every `sigil_alloc` / `sigil_handler_frame_new` call site passes
+  a u32 `descriptor_index`; the runtime indexes into a static
+  `Vec<GC_descr>`. ~150 lines of cache code removed
+  (`runtime/src/gc/descriptor.rs` deleted).
+  **Measurement (apples-to-apples baseline `pre_sha=b1ff665` =
+  pre-PR-#178 HEAD):** `descriptor_cache_stress` ubuntu −80 ms /
+  −30.8%; macos −20 ms / −11.1% (within IQR);
+  `tree_stress_repeat_large` ubuntu −20% / macos −25%; other
+  workloads flat. Phase 2's +21% / +86% regression is more than
+  fully recovered on ubuntu. Doc:
+  [`compiler/docs/plan-e2-phase-2-static-descriptor-table.md`](compiler/docs/plan-e2-phase-2-static-descriptor-table.md).
+  Lesson recorded in the doc: `pre_sha` must include every
+  per-alloc / per-GC overhead change between the named regression
+  and the post commit, not just the phase boundary that motivated
+  the work — Run A against `4f7ec86` was confounded by Phase 3's
+  per-alloc `SigilCallerFpGuard::capture()`.
 
 ## Phase 3 — Precise stack roots
 

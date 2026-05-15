@@ -436,6 +436,189 @@ fn stackmap_section_parses_v1_with_real_safepoints() {
     let _ = std::fs::remove_file(&obj_path);
 }
 
+/// Static-descriptor-table follow-up (2026-05-15) — compile a small
+/// program and assert the emitted object file carries a non-empty
+/// `__sigil_shape_table` data symbol whose byte layout matches the
+/// codegen contract `(bitmap: u32 LE, count_padded: u32 LE)` per
+/// 8-byte entry. The plan body's Task 2 acceptance test ("verify the
+/// resulting binary has the `__SIGIL_SHAPE_TABLE` symbol via `nm` or
+/// similar; check the byte layout").
+#[test]
+fn sigil_shape_table_is_emitted_with_valid_entries() {
+    use sigil_compiler::{
+        closure_convert, codegen, color, elaborate, lexer, monomorphize, parser, resolve, typecheck,
+    };
+
+    let _ = sigil_binary();
+
+    let root = workspace_root();
+    let src = std::fs::read_to_string(root.join("examples/choose_demo.sigil"))
+        .expect("read choose_demo.sigil");
+
+    let (toks, lex_errs) = lexer::lex("choose_demo.sigil", &src);
+    assert!(lex_errs.is_empty(), "lex errors: {lex_errs:?}");
+    let (prog, parse_errs) = parser::parse("choose_demo.sigil", &toks);
+    assert!(parse_errs.is_empty(), "parse errors: {parse_errs:?}");
+    let (rp, resolve_errs) = resolve::resolve(prog);
+    assert!(resolve_errs.is_empty(), "resolve errors: {resolve_errs:?}");
+    let (checked, tc_errs) = typecheck::typecheck(rp.program);
+    assert!(tc_errs.is_empty(), "tc errors: {tc_errs:?}");
+    let anf = elaborate::elaborate(checked);
+    let mono = monomorphize::monomorphize(anf);
+    let colored = color::infer_colors(mono);
+    let cc = closure_convert::convert(colored);
+
+    let obj_path =
+        std::env::temp_dir().join(format!("sigil_e2e_shape_table_{}.o", std::process::id()));
+    codegen::emit_object(&cc, &obj_path).expect("emit_object");
+
+    let bytes = std::fs::read(&obj_path).expect("read object file");
+    use cranelift_object::object::{Object, ObjectSection, ObjectSymbol};
+    let obj = cranelift_object::object::File::parse(&bytes[..]).expect("parse object file");
+
+    // Locate the `__sigil_shape_table` symbol. Linkers may add a
+    // leading underscore on Mach-O; check both forms.
+    let sym = obj
+        .symbols()
+        .find(|s| {
+            s.name()
+                .map(|n| n == "__sigil_shape_table" || n == "___sigil_shape_table")
+                .unwrap_or(false)
+        })
+        .expect(
+            "expected __sigil_shape_table data symbol in emitted object; \
+             ShapeTable / data-section emission regressed",
+        );
+
+    // Read the bytes the symbol points at, via its parent section.
+    let section = obj
+        .section_by_index(sym.section_index().expect("symbol must have a section"))
+        .expect("symbol's section resolves");
+    let section_data = section.data().expect("read section data");
+    let sym_off = sym.address() - section.address();
+
+    // ELF carries explicit symbol sizes; Mach-O `nlist` entries do not,
+    // so `sym.size()` returns 0 on macOS. Synthesize size as the gap
+    // to the next symbol in the same section, falling back to the
+    // section's end (`address + size`). Same pattern
+    // `compiler/src/symtab.rs::write_for_binary` uses; the
+    // `feedback_sigil_macho_symbol_table` memory entry documents the
+    // origin of this quirk.
+    let sym_size = if sym.size() > 0 {
+        sym.size()
+    } else {
+        let section_end = section.address() + section.size();
+        let next_addr = obj
+            .symbols()
+            .filter(|s| s.section_index() == sym.section_index() && s.address() > sym.address())
+            .map(|s| s.address())
+            .min()
+            .unwrap_or(section_end);
+        next_addr - sym.address()
+    };
+
+    // The data section layout is:
+    //   bytes 0..4: N (u32 LE) — entry count
+    //   bytes 4..8: padding (u32 LE, zero)
+    //   bytes 8.. : N × (bitmap: u32 LE, count_padded: u32 LE)
+    //
+    // choose_demo allocates closure records of various shapes + uses
+    // multi-shot handler arms; the shim's 4 distinct default handler-
+    // frame shapes are always present (ArithError arm_count=2, IO+Env
+    // dedup'd at arm_count=3, Fs arm_count=10, Process arm_count=1).
+    // So the realistic minimum table is `8 (header) + 4 * 8 = 40` bytes.
+    assert!(
+        sym_size >= 8,
+        "expected `__sigil_shape_table` to hold at least the 8-byte \
+         header; got size {sym_size}"
+    );
+    assert_eq!(
+        sym_size % 8,
+        0,
+        "shape table size {sym_size} not a multiple of 8 — entry layout broken"
+    );
+
+    let start = sym_off as usize;
+    let end = start + sym_size as usize;
+    let table_bytes = &section_data[start..end];
+
+    // Decode N from the header.
+    let n = u32::from_le_bytes([
+        table_bytes[0],
+        table_bytes[1],
+        table_bytes[2],
+        table_bytes[3],
+    ]) as usize;
+    let padding = u32::from_le_bytes([
+        table_bytes[4],
+        table_bytes[5],
+        table_bytes[6],
+        table_bytes[7],
+    ]);
+    assert_eq!(
+        padding, 0,
+        "shape table header padding must be zero — got {padding:#x}"
+    );
+    assert_eq!(
+        sym_size as usize,
+        8 + n * 8,
+        "shape table size {sym_size} does not match header N={n} (expected {} bytes)",
+        8 + n * 8
+    );
+    assert!(
+        n >= 4,
+        "shape table must contain at least the 4 distinct shim handler-frame \
+         shapes (ArithError, IO+Env dedup, Fs, Process); got N={n}"
+    );
+
+    // Parse each (bitmap, count) entry, validate per-entry invariants,
+    // and collect them for the spot-check below.
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(n);
+    for (i, chunk) in table_bytes[8..].chunks_exact(8).enumerate() {
+        let bitmap = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let count_padded = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        // The shape table only contains typed-malloc shapes, so
+        // bitmap must be non-zero and count <= COUNT_MASK.
+        assert_ne!(
+            bitmap, 0,
+            "shape entry {i}: bitmap=0 reached the table — atomic \
+             paths should pass u32::MAX sentinel and not register"
+        );
+        assert!(
+            count_padded > 0,
+            "shape entry {i}: count_padded=0 reached the table — \
+             conservative paths should pass u32::MAX sentinel and not register"
+        );
+        assert!(
+            count_padded <= sigil_header_constants::COUNT_MASK as u32,
+            "shape entry {i}: count_padded={count_padded} exceeds \
+             COUNT_MASK = {} — header bit-layout regression",
+            sigil_header_constants::COUNT_MASK,
+        );
+        entries.push((bitmap, count_padded));
+    }
+
+    // Spot-check: every shim handler-frame shape MUST appear in the
+    // table. arm_count ∈ {1, 2, 3, 10}. For each, compute the
+    // canonical (bitmap, count) via the const fns the runtime +
+    // codegen share, and assert the pair is in `entries`. Closes the
+    // re-review's "no static index↔entry correspondence check" gap.
+    use sigil_abi::effect::{handler_frame_payload_bytes, handler_frame_pointer_bitmap};
+    for arm_count in &[1u32, 2, 3, 10] {
+        let bitmap = handler_frame_pointer_bitmap(*arm_count);
+        let payload_bytes = handler_frame_payload_bytes(*arm_count);
+        let count = (payload_bytes / 8) as u32;
+        assert!(
+            entries.contains(&(bitmap, count)),
+            "expected handler-frame shape (bitmap={bitmap:#x}, count={count}) \
+             for arm_count={arm_count} in the codegen-emitted shape table; \
+             table entries = {entries:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&obj_path);
+}
+
 // ===== Plan A2 Task 26 — canonical Stage-2 examples =========================
 
 /// Plan A2 task 26 — compiles and runs `examples/arith.sigil`. The

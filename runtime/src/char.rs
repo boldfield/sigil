@@ -49,7 +49,8 @@ const CONS_PAYLOAD_BYTES: usize = 24;
 
 fn alloc_char(codepoint: u32) -> *mut u8 {
     let h = Header::new(TAG_CHAR, 1, 0);
-    let obj = sigil_alloc(h.raw(), 8);
+    // bitmap=0 (atomic path); descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), 8, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned u32 store).
     unsafe {
         let p: *mut u32 = obj.add(8).cast();
@@ -377,7 +378,11 @@ fn decode_codepoints_lossy(bytes: &[u8]) -> Vec<u32> {
 /// layout is fixed by std/list.sigil: discriminant at offset 8, head
 /// at offset 16, tail at offset 24.
 unsafe fn alloc_cons(head: *mut u8, tail: *mut u8, cons_header: u64, cons_disc: i64) -> *mut u8 {
-    let obj = sigil_alloc(cons_header, CONS_PAYLOAD_BYTES);
+    // `List[A]` Cons layout is always `(disc: non-ptr, head: ptr,
+    // tail: ptr)` → `(bitmap=0b110, count=3)`. Matches the runtime's
+    // `tuple_int_ptr_ptr` shape, pre-registered by `sigil_init_shapes`.
+    let descriptor_index = crate::gc::runtime_shape_indices().tuple_int_ptr_ptr;
+    let obj = sigil_alloc(cons_header, CONS_PAYLOAD_BYTES, descriptor_index);
     // SAFETY: gc-heap-ptr arithmetic (transient base for three aligned 8-byte stores).
     let disc_p: *mut i64 = obj.add(8).cast();
     disc_p.write(cons_disc);
@@ -392,7 +397,9 @@ unsafe fn alloc_cons(head: *mut u8, tail: *mut u8, cons_header: u64, cons_disc: 
 /// header word and discriminant. Payload layout: just the
 /// discriminant word at offset 8.
 unsafe fn alloc_nil(nil_header: u64, nil_disc: i64) -> *mut u8 {
-    let obj = sigil_alloc(nil_header, NIL_PAYLOAD_BYTES);
+    // `List[A]` Nil layout is `(disc: non-ptr)` only →
+    // `(bitmap=0, count=1)` → atomic path; descriptor_index unused.
+    let obj = sigil_alloc(nil_header, NIL_PAYLOAD_BYTES, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned 8-byte store).
     let disc_p: *mut i64 = obj.add(8).cast();
     disc_p.write(nil_disc);
