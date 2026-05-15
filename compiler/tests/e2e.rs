@@ -20861,6 +20861,106 @@ fn validate_folded_against_workload(folded: &str, workload_label: &str) {
     );
 }
 
+/// Plan 2026-05-11 Task 2 — dyld-image symbolization e2e gate.
+///
+/// Compiles `examples/fib_cps_perf.sigil` with `--emit-symbol-table`,
+/// runs it under `SIGIL_CPU_PROFILE=<txt>` so the folded-stacks writer
+/// fires, and asserts at least one frame in the rendered output is a
+/// `GC_*` symbol (libgc / Boehm-GC). That symbol can ONLY appear if
+/// the resolver's `with_dyld_images()` fallback resolved a PC inside
+/// the loaded libgc image — without dyld coverage those PCs render as
+/// `0x<hex>`, which is the bug this plan fixes.
+///
+/// `fib_cps_perf.sigil` is the same long-running workload Plan E1's
+/// evidence runs use (~250-500 ms; reliably catches 250+ ticks at
+/// 999 Hz). It allocates enough through CPS conts to drive
+/// allocator-leaf samples into libgc territory — the same shape as
+/// the 2026-05-11 activation-gate measurement.
+///
+/// If libgc was statically linked into the host binary the GC_*
+/// symbols would already resolve via the main-binary symtab sidecar,
+/// not via dladdr. Sigil's standard linker line uses `-lgc` against
+/// dynamic libgc on both Linux (`libgc.so.1` from `libgc-dev`) and
+/// macOS (`libgc.1.dylib` from Homebrew), so this test exercises the
+/// dynamic path. A static-libgc CI lane (none today) would need a
+/// different gate.
+#[test]
+fn cpu_profile_resolves_libgc_symbols_via_dyld_fallback() {
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let source = root.join("examples/fib_cps_perf.sigil");
+
+    let test_id = std::process::id();
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_libgc_dyld_{test_id}"));
+    let symtab_path = std::path::PathBuf::from(format!("{}.symtab", bin_path.display()));
+    let profile_path = std::env::temp_dir().join(format!("sigil_e2e_libgc_dyld_{test_id}.txt"));
+
+    let _ = std::fs::remove_file(&profile_path);
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--emit-symbol-table")
+        .current_dir(&root)
+        .output()
+        .expect("invoke sigil compiler");
+    assert!(
+        compile.status.success(),
+        "compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .env("SIGIL_CPU_PROFILE", profile_path.to_str().unwrap())
+        .env("SIGIL_CPU_PROFILE_HZ", "999")
+        .output()
+        .expect("execute compiled binary");
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_file(&symtab_path);
+
+    assert!(
+        run.status.success(),
+        "run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+
+    let folded = std::fs::read_to_string(&profile_path)
+        .expect("folded sidecar must exist after fib_cps_perf run");
+    let _ = std::fs::remove_file(&profile_path);
+
+    assert!(
+        !folded.is_empty(),
+        "folded output must contain at least one row (fib_cps_perf runs >100ms)"
+    );
+
+    // Hunt for a `GC_` symbol anywhere in the folded text. We accept
+    // any of `GC_malloc`, `GC_mark_some`, `GC_push_all_stack`,
+    // `GC_collect`, ... — libgc's exported surface is broad and any
+    // hit proves the dladdr fallback resolved a libgc PC.
+    let has_libgc_symbol = folded.lines().any(|line| {
+        // Strip the trailing ` <count>` column; the frame names are
+        // separated by `;`. Look for any frame whose name starts
+        // with `GC_` (libgc's documented exported-symbol prefix).
+        let last_space = match line.rfind(' ') {
+            Some(i) => i,
+            None => return false,
+        };
+        let (stack, _count) = line.split_at(last_space);
+        stack.split(';').any(|frame| frame.starts_with("GC_"))
+    });
+
+    assert!(
+        has_libgc_symbol,
+        "expected at least one `GC_*` libgc symbol in folded output (proves dyld-image \
+         resolution path works). If the workload ran but no GC_* names appear, the \
+         resolver's `with_dyld_images()` fallback isn't firing. First 10 rows:\n{}",
+        folded.lines().take(10).collect::<Vec<_>>().join("\n")
+    );
+}
+
 /// Regression — Mach-O caps section names at 16 bytes, so the prior
 /// per-literal `sigil_str_lit_{idx}` section name overflowed at
 /// idx >= 100 (`sigil_str_lit_100` is 17 chars), failing codegen with
