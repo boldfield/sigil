@@ -105,14 +105,24 @@ pub enum CounterId {
     /// counter; the decomposition treats the missing pre value as 0
     /// and documents the asymmetry in the report doc.
     PreciseWalkerNs = 28,
+    /// Plan E2 Phase 3 GC-time follow-up #2 — count of forced
+    /// `GC_gcollect()` calls fired by the
+    /// `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env-var-gated injection in
+    /// `sigil_alloc`. Diagnostic counter — lets the throughput-
+    /// report verdict doc sanity-check that the injection
+    /// mechanism actually fired during the measurement run
+    /// (alloc_count ÷ N should match this counter ± 1). Zero
+    /// when the env var is unset.
+    ForcedGcCount = 29,
 }
 
-const COUNTER_SLOTS: usize = 29;
+const COUNTER_SLOTS: usize = 30;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -176,6 +186,7 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_CHAR_ALLOC_COUNT",
     "SIGIL_COUNTER_CHAR_ALLOC_BYTES",
     "SIGIL_COUNTER_PRECISE_WALKER_NS",
+    "SIGIL_COUNTER_FORCED_GC_COUNT",
 ];
 
 #[inline]
@@ -260,6 +271,10 @@ mod tests {
         assert_eq!(
             NAMES[CounterId::NativeCallCount as usize],
             "SIGIL_COUNTER_NATIVE_CALL_COUNT"
+        );
+        assert_eq!(
+            NAMES[CounterId::ForcedGcCount as usize],
+            "SIGIL_COUNTER_FORCED_GC_COUNT"
         );
     }
 

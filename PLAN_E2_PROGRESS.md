@@ -554,8 +554,21 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
-- Mark-phase hypothesis verdict (follow-up) — ✅ **Inconclusive**
-  even under forced budget. See
+- Mark-phase hypothesis verdict (follow-up #2: force-injection) —
+  ⏳ **Scaffolded, awaiting measurement.** Runtime-internal
+  `SIGIL_FORCE_GC_EVERY_N_ALLOCS=N` env-var-gated `GC_gcollect()`
+  injection in `sigil_alloc` (post side) + a tracked
+  `scripts/pre-checkpoint-cadence-patch.diff` cherry-picked onto
+  the pre-checkpoint worktree by `throughput-report.yml`'s
+  `pre — patch in cadence injection` step. Adds the
+  `SIGIL_COUNTER_FORCED_GC_COUNT` diagnostic counter. The
+  verdict (Confirmed / Disproven / Pathological) is operator-
+  filled after triggering the workflow with
+  `force_gc_every_n_allocs=1000`; see the "Force-injection
+  follow-up" section of
+  [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
+- Mark-phase hypothesis verdict (follow-up #1: forced budget) —
+  ✅ **Inconclusive** even under forced budget. See
   [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
   Adds the `SIGIL_MAX_HEAP_SIZE_KB` env var + the always-on
   `SIGIL_COUNTER_PRECISE_WALKER_NS` counter. Workflow run

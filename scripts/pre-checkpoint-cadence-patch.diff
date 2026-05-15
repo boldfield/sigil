@@ -1,0 +1,110 @@
+--- a/runtime/src/gc.rs
++++ b/runtime/src/gc.rs
+@@ -18,7 +18,9 @@
+ //! Generalised String construction arrives with the stdlib in later plans.
+ 
+ use std::ffi::c_void;
+-use std::sync::Once;
++use std::num::NonZeroU64;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Once, OnceLock};
+ 
+ use crate::counters::{self, sigil_counter_print_all, CounterId};
+ use crate::header::{self, Header};
+@@ -62,13 +64,10 @@
+     // in Boehm's root list and segfault on the next collection).
+     #[cfg(test)]
+     pub(crate) fn GC_remove_roots(start: *mut c_void, end: *mut c_void);
+-    // Force a full GC cycle. Used by GC stress tests to deterministically
+-    // exercise reachability — without it, a passing test under low
+-    // allocation pressure does not prove rootedness; with it, an unrooted
+-    // pointer is reliably collected and the test trips. Not called by
+-    // production code paths; gated to test builds so the extern linkage
+-    // is not pulled into release binaries.
+-    #[cfg(test)]
++    // Force a full GC cycle. Production code uses this under the
++    // `SIGIL_FORCE_GC_EVERY_N_ALLOCS` cherry-picked injection patch
++    // (Plan E2 Phase 3 GC-time follow-up #2). The Boehm symbol is
++    // always present in libgc.
+     pub(crate) fn GC_gcollect();
+     // Boehm thread enrolment used by GC stress tests in this crate. A
+     // Rust test thread is not auto-registered with Boehm (see
+@@ -153,6 +152,16 @@
+ 
+ static GC_INIT: Once = Once::new();
+ 
++// Plan E2 Phase 3 GC-time follow-up #2 — cherry-picked cadence
++// counter for the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env-var
++// injection. Process-wide AtomicU64 (Relaxed); incremented once
++// per `sigil_alloc` call when the env var is set; `GC_gcollect()`
++// fires when `(count % N == 0)`. Patched onto the pre-checkpoint
++// SHA so pre/post throughput-report measurements share the same
++// injection mechanism.
++static FORCE_GC_ALLOC_COUNTER: AtomicU64 = AtomicU64::new(0);
++static FORCE_GC_CADENCE: OnceLock<Option<NonZeroU64>> = OnceLock::new();
++
+ /// Initialise Boehm GC. Safe to call multiple times from any number of
+ /// threads; only the first caller runs `GC_init()` and all others wait on
+ /// `Once` until init completes. The generated `main` shim calls this
+@@ -166,6 +175,34 @@
+ #[no_mangle]
+ pub extern "C" fn sigil_gc_init() {
+     GC_INIT.call_once(|| {
++        // Plan E2 Phase 3 GC-time follow-up #2 (cherry-picked) —
++        // cadence-injection env var. Read once at init time so
++        // per-alloc dispatch is a single Relaxed load. Unset /
++        // empty / 0 / invalid → no injection.
++        let cadence: Option<NonZeroU64> =
++            match std::env::var("SIGIL_FORCE_GC_EVERY_N_ALLOCS") {
++                Ok(s) if !s.is_empty() => match s.parse::<u64>() {
++                    Ok(n) => NonZeroU64::new(n).or_else(|| {
++                        eprintln!(
++                            "sigil_gc_init: ignoring \
++                             SIGIL_FORCE_GC_EVERY_N_ALLOCS={s:?} \
++                             (expected positive integer)"
++                        );
++                        None
++                    }),
++                    Err(_) => {
++                        eprintln!(
++                            "sigil_gc_init: ignoring \
++                             SIGIL_FORCE_GC_EVERY_N_ALLOCS={s:?} \
++                             (expected positive integer)"
++                        );
++                        None
++                    }
++                },
++                _ => None,
++            };
++        let _ = FORCE_GC_CADENCE.set(cadence);
++
+         // SAFETY: `Once::call_once` guarantees exactly one invocation even
+         // under concurrent entry, so Boehm's non-reentrant init runs on a
+         // single thread.
+@@ -356,6 +393,26 @@
+         let hdr_ptr: *mut u64 = raw.cast();
+         hdr_ptr.write(header);
+     }
++
++    // Plan E2 Phase 3 GC-time follow-up #2 (cherry-picked) — env-
++    // var-gated `GC_gcollect()` injection at a fixed allocation
++    // cadence. AFTER the alloc completes (header written) so
++    // we're not reentrant into Boehm during typed-malloc dispatch.
++    // No ForcedGcCount counter on this side: the counter slot
++    // (CounterId::ForcedGcCount = 29) lands in counters.rs in the
++    // post-side PR and would require a sibling patch to backport.
++    // The injection itself is sufficient for `boehm_gc_time_ms`
++    // comparability, which is the measurement we care about.
++    if let Some(Some(n)) = FORCE_GC_CADENCE.get() {
++        let count = FORCE_GC_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
++        if count % n.get() == 0 {
++            // SAFETY: `GC_gcollect` is documented as safe to call
++            // at any time from a registered thread; the main
++            // thread is implicitly registered.
++            unsafe { GC_gcollect() };
++        }
++    }
++
+     raw
+ }
+ 

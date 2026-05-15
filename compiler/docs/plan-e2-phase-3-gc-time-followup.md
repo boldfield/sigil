@@ -231,6 +231,12 @@ Boehm-integration shape**, even under forced pressure. Specifically:
   wants to measure mark-phase savings would follow this
   path.
 
+> **Update (force-injection follow-up landed):** the runtime-
+> internal `GC_gcollect()` injection alluded to above shipped
+> as the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env var (PR introducing
+> this section). See the "Force-injection follow-up" section
+> below for the conclusive verdict.
+
 What this follow-up DOES provide:
 
 - **Mechanism plumbing.** `SIGIL_MAX_HEAP_SIZE_KB` + the
@@ -341,6 +347,104 @@ decomposition-and-verdict, not a steady-state guard.
   walker-cost numbers as absolute-per-workload, not as
   relative-per-callback — the ratio could shift under a
   different workload mix or libgc version.
+
+## Force-injection follow-up (Status: scaffolded, awaiting measurement)
+
+This section is scaffolded with the infrastructure landing in this
+PR; the **verdict body is operator-filled** after triggering the
+`throughput-report.yml` workflow under the new
+`force_gc_every_n_allocs` input. Until that run lands, every
+`TODO(operator)` marker below is unresolved.
+
+### Mechanism
+
+`SIGIL_FORCE_GC_EVERY_N_ALLOCS=N` (positive integer) makes
+`sigil_alloc` invoke `GC_gcollect()` after every Nth allocation
+completes. Read once at `sigil_gc_init` time and cached in a
+`OnceLock<Option<NonZeroU64>>`; the per-alloc cost is a single
+Relaxed `OnceLock::get` + branch when the env var is unset.
+Diagnostic counter `SIGIL_COUNTER_FORCED_GC_COUNT` records how
+many forced collections fired so the operator can sanity-check
+the injection actually ran (`alloc_count ÷ N` should match
+± 1).
+
+The mechanism is symmetric across pre/post via
+[`scripts/pre-checkpoint-cadence-patch.diff`](../../scripts/pre-checkpoint-cadence-patch.diff),
+applied to `/tmp/pre-checkpoint/runtime/src/gc.rs` by the workflow's
+`pre — patch in cadence injection` step. Without that patch the
+pre side would run unconstrained and the comparison would not be
+apples-to-apples. The patch verified clean against the pre-Phase-3
+SHA `ca29d2061f2897cb824d8328c92a8d945da313cc` at authoring time.
+
+### How the operator runs the measurement
+
+1. **Trigger** `throughput-report.yml` from the Actions UI on this
+   branch with:
+   - `pre_sha=ca29d2061f2897cb824d8328c92a8d945da313cc`
+   - `runs=5`
+   - `heap_budget_kb=""` (leave empty — injection alone is enough;
+     combining with budget muddies the signal).
+   - `force_gc_every_n_allocs=1000` (starting cadence; iterate if
+     wall-clock explodes >60 s/workload or if injection fails to
+     register `boehm_gc_time_ms`).
+2. **Sanity-check artifacts:**
+   `SIGIL_COUNTER_FORCED_GC_COUNT` per workload ≈ `alloc_count / N`.
+   If the counter is 0 on a workload that allocated ≥ N times,
+   the injection didn't run — investigate before iterating N.
+3. **Iterate N if needed:**
+   - Wall-clock > 60 s/workload → N=10_000 or N=100_000.
+   - `boehm_gc_time_ms` still zero with counter advancing → root
+     cause something other than cadence; see "Failure modes" in
+     the implementation plan body.
+4. **Capture** the final workflow run ID + chosen N for the
+   verdict subsection below.
+
+### Verdict — TODO(operator)
+
+TODO(operator): **Replace this paragraph with one of the three
+verdict shapes (Confirmed / Disproven / Pathological) per the
+plan body's "Verdict outcomes" section.** Lead with the verdict in
+the first sentence, then the headline number. Then update this
+doc's top-of-file TL;DR to reflect the resolved state — the
+"Inconclusive" framing from PR #176 is no longer the latest word.
+
+### Run metadata — TODO(operator)
+
+- **Workflow run ID:** TODO(operator)
+- **Pre SHA:** `ca29d2061f2897cb824d8328c92a8d945da313cc`
+- **Post SHA:** TODO(operator) — commit on this branch the run measured
+- **N (final):** TODO(operator)
+- **Iteration history:** TODO(operator) — if N was adjusted, list prior values + why
+
+### Per-OS measurement tables — TODO(operator)
+
+Fill in from `throughput-data-{ubuntu-24.04,macos-14}` artifacts.
+Recommend one table per OS with columns:
+`workload | wall_clock_ms (pre/post) | boehm_gc_time_ms (pre/post) | SIGIL_COUNTER_FORCED_GC_COUNT (pre/post) | SIGIL_COUNTER_PRECISE_WALKER_NS (post) | alloc_count`.
+
+### Decomposition — TODO(operator)
+
+For each alloc-heavy workload:
+- `savings = pre boehm_gc_time_ms - post boehm_gc_time_ms`
+- `cost = post SIGIL_COUNTER_PRECISE_WALKER_NS / 1_000_000` (ns → ms)
+- `net = savings - cost`
+
+### Methodology caveats
+
+- **Pre-side patch is cherry-picked** by the workflow at run time —
+  the pre-checkpoint binary does not natively honor
+  `SIGIL_FORCE_GC_EVERY_N_ALLOCS`. The patch's stability rests on
+  `ca29d20`'s `sigil_alloc` shape; future re-pinning to a
+  different pre SHA may need a regenerated patch.
+- **No `ForcedGcCount` counter on the pre side.** The pre-side
+  patch does NOT backport the `CounterId::ForcedGcCount = 29`
+  slot — that would require a sibling patch to `counters.rs`.
+  The sanity-check column is post-side only. Pre-side firing is
+  inferred from `boehm_gc_time_ms` advancement.
+- **N selection trades wall-clock for signal.** Smaller N → more
+  GC cycles → more mark-phase wall-clock signal but slower runs.
+  Larger N → faster but mark-phase aggregate shrinks. Operator
+  should iterate empirically.
 
 ## Related work
 

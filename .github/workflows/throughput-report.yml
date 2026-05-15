@@ -37,6 +37,10 @@ on:
         description: "Optional: pin Boehm max heap to N KB (forces GC at low threshold for mark-phase measurement). Empty = no budget."
         required: false
         default: ""
+      force_gc_every_n_allocs:
+        description: "Optional: force GC_gcollect() every N allocations (mark-phase savings measurement). Empty = no injection."
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -120,6 +124,14 @@ jobs:
           # at the value's byte count (KB × 1024) to force collections
           # at low threshold for mark-phase measurement.
           SIGIL_MAX_HEAP_SIZE_KB: ${{ inputs.heap_budget_kb }}
+          # Plan E2 Phase 3 GC-time follow-up #2 — optional forced
+          # `GC_gcollect()` injection at fixed N-allocation cadence.
+          # Empty → no injection. Non-empty positive integer → fire
+          # a collection every Nth `sigil_alloc` call. Used to
+          # decompose Phase 3's mark-phase savings vs precise-walker
+          # cost at workload scale; see
+          # `compiler/docs/plan-e2-phase-3-gc-time-followup.md`.
+          SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}
         run: |
           mkdir -p throughput-data/post
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
@@ -180,6 +192,26 @@ jobs:
             fi
           done
 
+      # Plan E2 Phase 3 GC-time follow-up #2 — cherry-pick the
+      # `SIGIL_FORCE_GC_EVERY_N_ALLOCS` injection mechanism onto
+      # the pre-checkpoint worktree's `runtime/src/gc.rs`. Without
+      # this, the pre side runs unconstrained and post runs under
+      # forced injection — apples to oranges. The patch lives at
+      # `scripts/pre-checkpoint-cadence-patch.diff` (tracked +
+      # reviewable) and applies cleanly against the pre-Phase-3
+      # SHA `ca29d20…` (verified at patch authoring time). Gated
+      # on the input being non-empty so the workflow stays a no-op
+      # for runs that aren't measuring force-injection.
+      - name: pre — patch in cadence injection
+        if: ${{ inputs.force_gc_every_n_allocs != '' }}
+        run: |
+          cd /tmp/pre-checkpoint
+          git apply --check "${{ github.workspace }}/scripts/pre-checkpoint-cadence-patch.diff"
+          git apply "${{ github.workspace }}/scripts/pre-checkpoint-cadence-patch.diff"
+          # Echo the modified region for the audit trail.
+          echo "--- patched pre-side gc.rs head ---"
+          sed -n '/FORCE_GC_ALLOC_COUNTER/,/^static FORCE_GC_CADENCE/p' runtime/src/gc.rs | head -20
+
       - name: pre — cargo build --release
         run: |
           cd /tmp/pre-checkpoint
@@ -204,6 +236,14 @@ jobs:
           # symmetrically when re-running the workflow against a SHA
           # that has the env var read in place.
           SIGIL_MAX_HEAP_SIZE_KB: ${{ inputs.heap_budget_kb }}
+          # Plan E2 Phase 3 GC-time follow-up #2 — mirror the
+          # post-step's force-injection env wiring. The pre-side
+          # gc.rs has been patched in by the "pre — patch in cadence
+          # injection" step above (when this input is non-empty),
+          # so the env var is honored symmetrically with the post
+          # side. Required for an apples-to-apples mark-phase
+          # comparison under forced injection.
+          SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}
         run: |
           mkdir -p throughput-data/pre
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
@@ -222,6 +262,8 @@ jobs:
           mkdir -p throughput-data
           BUDGET="${{ inputs.heap_budget_kb }}"
           if [[ -z "$BUDGET" ]]; then BUDGET="(none)"; fi
+          INJECT="${{ inputs.force_gc_every_n_allocs }}"
+          if [[ -z "$INJECT" ]]; then INJECT="(none)"; fi
           {
             echo "## Deltas — ${{ matrix.os }}"
             echo ""
@@ -230,6 +272,7 @@ jobs:
             echo "Runs per workload: ${{ inputs.runs }}"
             echo "libgc version: \`${LIBGC_VERSION}\`"
             echo "Heap budget: \`${BUDGET}\` KB"
+            echo "Force-GC cadence: \`${INJECT}\` allocations"
             echo ""
             for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
               scripts/diff-throughput.py "${w}" \

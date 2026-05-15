@@ -18,7 +18,9 @@
 //! Generalised String construction arrives with the stdlib in later plans.
 
 use std::ffi::c_void;
-use std::sync::Once;
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 
 use crate::counters::{self, sigil_counter_print_all, CounterId};
 use crate::header::{self, Header};
@@ -89,10 +91,15 @@ extern "C" {
     // Force a full GC cycle. Used by GC stress tests to deterministically
     // exercise reachability — without it, a passing test under low
     // allocation pressure does not prove rootedness; with it, an unrooted
-    // pointer is reliably collected and the test trips. Not called by
-    // production code paths; gated to test builds so the extern linkage
-    // is not pulled into release binaries.
-    #[cfg(test)]
+    // pointer is reliably collected and the test trips.
+    //
+    // Plan E2 Phase 3 GC-time follow-up #2 also calls this from
+    // production paths under the `SIGIL_FORCE_GC_EVERY_N_ALLOCS`
+    // env-var gate, so the extern is no longer test-only. The
+    // Boehm symbol is always present in libgc; the gate is purely
+    // about whether non-test code references it. Zero per-alloc
+    // cost when the env var is unset (the cadence OnceLock returns
+    // `Some(None)` and the inner match falls through).
     pub(crate) fn GC_gcollect();
     // Boehm thread enrolment used by GC stress tests in this crate. A
     // Rust test thread is not auto-registered with Boehm (see
@@ -223,6 +230,29 @@ extern "C" fn counter_atexit_cb() {
 
 static GC_INIT: Once = Once::new();
 
+/// Plan E2 Phase 3 GC-time follow-up #2 — cadence counter for
+/// the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env-var injection.
+/// Incremented once per `sigil_alloc` call when the env var is
+/// set; `GC_gcollect()` fires when `(count % N == 0)`.
+///
+/// Process-wide AtomicU64 (Relaxed) — every alloc on every
+/// thread increments. Thread-local counters would each fire at
+/// their own N cadence, missing the "every N allocations across
+/// the process" semantics. AtomicU64 at 5M allocs/workload would
+/// take ~3.7M years to overflow; non-concern.
+static FORCE_GC_ALLOC_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Parsed `SIGIL_FORCE_GC_EVERY_N_ALLOCS` cadence. `Some(N)` when
+/// the env var is a positive integer at `sigil_gc_init` time;
+/// `None` otherwise. Cached so per-alloc dispatch is a single
+/// Relaxed load + branch.
+///
+/// The outer `OnceLock::get()` returns `Some(&Option<NonZeroU64>)`
+/// once `sigil_gc_init` has run; the inner `Option` distinguishes
+/// "env var unset / invalid → no injection" (`Some(None)`) from
+/// "env var set to N" (`Some(Some(N))`).
+static FORCE_GC_CADENCE: OnceLock<Option<NonZeroU64>> = OnceLock::new();
+
 /// Initialise Boehm GC. Safe to call multiple times from any number of
 /// threads; only the first caller runs `GC_init()` and all others wait on
 /// `Once` until init completes. The generated `main` shim calls this
@@ -287,6 +317,44 @@ pub extern "C" fn sigil_gc_init() {
                 }
             }
         }
+
+        // Plan E2 Phase 3 GC-time follow-up #2 — cadence-injection
+        // env var. Read once at init time so per-alloc dispatch is
+        // a single Relaxed load. Unset / empty / 0 / invalid → no
+        // injection (Boehm's default pacing applies).
+        //
+        // The empty-string guard matches `SIGIL_MAX_HEAP_SIZE_KB`'s
+        // PR #176 review-item-1 fix: the GitHub Actions workflow
+        // sets `SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}`
+        // with an empty input → env var set to empty-string (not
+        // unset). Without the empty-string guard, every default-
+        // injection workflow run would emit a spurious warning per
+        // workload invocation.
+        //
+        // See `compiler/docs/plan-e2-phase-3-gc-time-followup.md`'s
+        // "Force-injection follow-up" section.
+        let cadence: Option<NonZeroU64> = match std::env::var("SIGIL_FORCE_GC_EVERY_N_ALLOCS") {
+            Ok(s) if !s.is_empty() => match s.parse::<u64>() {
+                Ok(n) => NonZeroU64::new(n).or_else(|| {
+                    eprintln!(
+                        "sigil_gc_init: ignoring \
+                             SIGIL_FORCE_GC_EVERY_N_ALLOCS={s:?} \
+                             (expected positive integer)"
+                    );
+                    None
+                }),
+                Err(_) => {
+                    eprintln!(
+                        "sigil_gc_init: ignoring \
+                             SIGIL_FORCE_GC_EVERY_N_ALLOCS={s:?} \
+                             (expected positive integer)"
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        let _ = FORCE_GC_CADENCE.set(cadence);
 
         // SAFETY: `Once::call_once` guarantees exactly one invocation even
         // under concurrent entry, so Boehm's non-reentrant init runs on a
@@ -476,6 +544,36 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
         let hdr_ptr: *mut u64 = raw.cast();
         hdr_ptr.write(header);
     }
+
+    // Plan E2 Phase 3 GC-time follow-up #2 — env-var-gated
+    // `GC_gcollect()` injection at a fixed allocation cadence.
+    // Positioned at the END of `sigil_alloc`, after the typed-
+    // malloc dispatch returned and the header was written, so
+    // we're not reentrant into Boehm during allocation. The
+    // production-build FP-capture guard (`_fp_guard`) is still
+    // alive at this point; this is intentional — when the
+    // injected `GC_gcollect()` triggers a mark phase, the precise
+    // walker reads CAPTURED_SIGIL_CALLER_FP exactly as it would
+    // for any Boehm-initiated collection.
+    //
+    // Zero per-alloc cost when env var unset: the OnceLock returns
+    // `Some(&None)` and the inner match falls through without the
+    // AtomicU64 fetch_add.
+    if let Some(Some(n)) = FORCE_GC_CADENCE.get() {
+        let count = FORCE_GC_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+        if count.is_multiple_of(n.get()) {
+            counters::incr(CounterId::ForcedGcCount);
+            // SAFETY: `GC_gcollect` is documented as safe to call
+            // at any time from a registered thread. `sigil_alloc`
+            // runs on a Sigil thread which is implicitly registered
+            // (main thread) or explicitly registered via
+            // `register_sigil_thread_for_precise_roots` (Plan E2
+            // Phase 3 Task 11). Tests opt their thread in via
+            // `GcThreadEnrolment::acquire`.
+            unsafe { GC_gcollect() };
+        }
+    }
+
     raw
 }
 
@@ -1528,6 +1626,142 @@ mod tests {
         assert!(
             after > before,
             "precise-walker counter did not advance across GC_gcollect: before={before} after={after}"
+        );
+    }
+
+    // ============ Plan E2 Phase 3 GC-time follow-up #2 tests ==============
+    //
+    // Validate the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env-var injection
+    // mechanism: read-at-init plumbing, per-alloc cadence dispatch, and
+    // the diagnostic `SIGIL_COUNTER_FORCED_GC_COUNT` counter. All three
+    // tests are subprocess-gated for the same reason as the existing
+    // GC-stress tests — the env var is read inside `sigil_gc_init`'s
+    // `Once::call_once`, so each test needs a fresh process.
+
+    #[test]
+    fn sigil_force_gc_every_n_allocs_fires_collections() {
+        // Validates Task 1: setting `SIGIL_FORCE_GC_EVERY_N_ALLOCS=10`
+        // and allocating 30 objects fires exactly 3 forced GCs
+        // (counted via `SIGIL_COUNTER_FORCED_GC_COUNT`) and advances
+        // Boehm's `GC_get_gc_no()` by at least 3. The ForcedGcCount
+        // signal is exact: the injection runs `(count % N == 0) → fire`
+        // and bumps the counter immediately before the `GC_gcollect()`
+        // call. The `GC_get_gc_no` signal is a `>=` bound because
+        // Boehm may opportunistically fire additional collections under
+        // allocation pressure; the only invariant the test pins is
+        // that the injection actually drove collections.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_force_gc_every_n_allocs_fires_collections",
+                &[("SIGIL_FORCE_GC_EVERY_N_ALLOCS", "10")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        // SAFETY: pure accessor over Boehm's process-wide cycle count.
+        let before_gc_no = unsafe { GC_get_gc_no() };
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+        let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+        for _ in 0..30 {
+            let h = Header::new(header::TAG_INT64, 0, 0).raw();
+            let _ = sigil_alloc(h, 8);
+        }
+        let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+        // SAFETY: pure accessor.
+        let after_gc_no = unsafe { GC_get_gc_no() };
+
+        assert_eq!(
+            after_forced - before_forced,
+            3,
+            "Expected exactly 3 forced GCs (30 allocs @ N=10), got \
+             {} (before={before_forced} after={after_forced})",
+            after_forced - before_forced,
+        );
+        assert!(
+            after_gc_no >= before_gc_no + 3,
+            "Expected at least 3 GC cycles (30 allocs @ N=10), got \
+             GC_get_gc_no before={before_gc_no} after={after_gc_no}",
+        );
+    }
+
+    #[test]
+    fn sigil_force_gc_every_n_allocs_unset_skips_injection() {
+        // Validates Task 1's zero-overhead path: when the env var is
+        // unset, `FORCE_GC_CADENCE` resolves to `Some(None)` and the
+        // injection branch falls through without ticking the cadence
+        // counter. `SIGIL_COUNTER_FORCED_GC_COUNT` stays at 0 after a
+        // 100-alloc loop. Uses `run_gc_stress_in_subprocess` (not the
+        // `_with_env` variant) so no env-var customisation reaches
+        // the child — the parent's environment is inherited, and the
+        // existing GC-stress tests run under cargo test without
+        // `SIGIL_FORCE_GC_EVERY_N_ALLOCS` set.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess("sigil_force_gc_every_n_allocs_unset_skips_injection");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+        let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+        for _ in 0..100 {
+            let h = Header::new(header::TAG_INT64, 0, 0).raw();
+            let _ = sigil_alloc(h, 8);
+        }
+        let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+
+        assert_eq!(
+            after_forced, before_forced,
+            "ForcedGcCount advanced ({before_forced} -> {after_forced}) \
+             despite SIGIL_FORCE_GC_EVERY_N_ALLOCS being unset — the \
+             zero-overhead gate regressed.",
+        );
+    }
+
+    #[test]
+    fn sigil_force_gc_every_n_allocs_invalid_logs_warning() {
+        // Validates Task 1's invalid-input handling. A non-numeric
+        // value (or zero) must NOT crash; `sigil_gc_init` writes a
+        // warning to stderr and continues with no injection. The
+        // subprocess thus completes normally; its stderr (mirrored
+        // by `run_gc_stress_in_subprocess_with_env`) carries the
+        // warning. The test asserts the counter stays at 0 to pin
+        // that "no injection" half — the stderr-text assertion is
+        // covered by the parallel `_empty_string_is_silent` shape
+        // used for `SIGIL_MAX_HEAP_SIZE_KB`, kept off this test to
+        // avoid duplicating the custom-spawn boilerplate.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_force_gc_every_n_allocs_invalid_logs_warning",
+                &[("SIGIL_FORCE_GC_EVERY_N_ALLOCS", "not-a-number")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        // Echo a sentinel so the parent test's mirrored output makes
+        // the post-init reach point obvious — matches the
+        // SIGIL_MAX_HEAP_SIZE_KB invalid-input test's style.
+        eprintln!(
+            "subprocess reached post-init point — invalid \
+             SIGIL_FORCE_GC_EVERY_N_ALLOCS did not crash"
+        );
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+        let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+        for _ in 0..50 {
+            let h = Header::new(header::TAG_INT64, 0, 0).raw();
+            let _ = sigil_alloc(h, 8);
+        }
+        let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
+
+        assert_eq!(
+            after_forced, before_forced,
+            "ForcedGcCount advanced ({before_forced} -> {after_forced}) \
+             despite SIGIL_FORCE_GC_EVERY_N_ALLOCS being invalid — \
+             the invalid-input branch should fall through to no injection.",
         );
     }
 }
