@@ -244,10 +244,16 @@ mod tests {
         // helpers to non-const (e.g., adding a `debug_assert!` with a
         // non-const formatter argument) from silently breaking the
         // shape table population.
-        const ZERO_ARMS_BYTES: usize = handler_frame_payload_bytes(0);
-        const MAX_ARMS_BITMAP: u32 = handler_frame_pointer_bitmap(MAX_HANDLER_ARMS);
-        assert_eq!(ZERO_ARMS_BYTES, 32);
-        assert!(MAX_ARMS_BITMAP & (1u32 << 31) != 0);
+        //
+        // The `const { assert!(..) }` block lifts the assertion to
+        // const-eval time; the build fails at compile time if the
+        // const is wrong (instead of at test-run time). Clippy
+        // requires this shape over `assert!(CONST_EXPR)` per
+        // `clippy::assertions_on_constants`.
+        const _: () = {
+            assert!(handler_frame_payload_bytes(0) == 32);
+            assert!(handler_frame_pointer_bitmap(MAX_HANDLER_ARMS) & (1u32 << 31) != 0);
+        };
     }
 
     #[test]

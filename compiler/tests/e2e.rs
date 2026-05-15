@@ -496,7 +496,26 @@ fn sigil_shape_table_is_emitted_with_valid_entries() {
         .expect("symbol's section resolves");
     let section_data = section.data().expect("read section data");
     let sym_off = sym.address() - section.address();
-    let sym_size = sym.size();
+
+    // ELF carries explicit symbol sizes; Mach-O `nlist` entries do not,
+    // so `sym.size()` returns 0 on macOS. Synthesize size as the gap
+    // to the next symbol in the same section, falling back to the
+    // section's end (`address + size`). Same pattern
+    // `compiler/src/symtab.rs::write_for_binary` uses; the
+    // `feedback_sigil_macho_symbol_table` memory entry documents the
+    // origin of this quirk.
+    let sym_size = if sym.size() > 0 {
+        sym.size()
+    } else {
+        let section_end = section.address() + section.size();
+        let next_addr = obj
+            .symbols()
+            .filter(|s| s.section_index() == sym.section_index() && s.address() > sym.address())
+            .map(|s| s.address())
+            .min()
+            .unwrap_or(section_end);
+        next_addr - sym.address()
+    };
 
     // choose_demo allocates closure records of various shapes + uses
     // multi-shot handler arms; the shim's 5 default handler-frame
