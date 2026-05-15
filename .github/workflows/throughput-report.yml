@@ -153,6 +153,18 @@ jobs:
             if [[ ! -f "${src}" ]]; then
               cp "${{ github.workspace }}/${src}" "${src}"
               echo "cherry-picked ${src} (absent at PRE SHA)"
+              # PR #173 (qualified-only imports) added `use std.*;`
+              # lines to every workload. The pre-PR-#173 parser
+              # rejects them with E0010. Strip the `use` lines on
+              # cherry-pick so the pre-checkpoint compiler accepts
+              # the source — pre-PR-#173 `import std.foo` already
+              # brought every name in `std.foo` into the bare
+              # namespace, so the stripped form is semantically
+              # equivalent on the pre side. The sed `-i.bak` + rm
+              # idiom works on both GNU sed (linux) and BSD sed
+              # (macos) without per-OS branching.
+              sed -i.bak '/^use .*;$/d' "${src}"
+              rm -f "${src}.bak"
             else
               echo "PRE SHA already has ${src}; keeping its version"
             fi
