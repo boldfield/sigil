@@ -517,14 +517,20 @@ fn sigil_shape_table_is_emitted_with_valid_entries() {
         next_addr - sym.address()
     };
 
+    // The data section layout is:
+    //   bytes 0..4: N (u32 LE) — entry count
+    //   bytes 4..8: padding (u32 LE, zero)
+    //   bytes 8.. : N × (bitmap: u32 LE, count_padded: u32 LE)
+    //
     // choose_demo allocates closure records of various shapes + uses
-    // multi-shot handler arms; the shim's 5 default handler-frame
-    // shapes are always present. So the table must be non-empty
-    // (>= 1 entry = 8 bytes).
+    // multi-shot handler arms; the shim's 4 distinct default handler-
+    // frame shapes are always present (ArithError arm_count=2, IO+Env
+    // dedup'd at arm_count=3, Fs arm_count=10, Process arm_count=1).
+    // So the realistic minimum table is `8 (header) + 4 * 8 = 40` bytes.
     assert!(
         sym_size >= 8,
-        "expected `__sigil_shape_table` to hold at least one 8-byte \
-         entry; got size {sym_size}"
+        "expected `__sigil_shape_table` to hold at least the 8-byte \
+         header; got size {sym_size}"
     );
     assert_eq!(
         sym_size % 8,
@@ -536,10 +542,39 @@ fn sigil_shape_table_is_emitted_with_valid_entries() {
     let end = start + sym_size as usize;
     let table_bytes = &section_data[start..end];
 
-    // Parse each (u32 bitmap, u32 count_padded) entry. The runtime
-    // does the same `chunks_exact(8)` walk in `sigil_init_shapes`;
-    // pinning the format here keeps the wire format in sync.
-    for (i, chunk) in table_bytes.chunks_exact(8).enumerate() {
+    // Decode N from the header.
+    let n = u32::from_le_bytes([
+        table_bytes[0],
+        table_bytes[1],
+        table_bytes[2],
+        table_bytes[3],
+    ]) as usize;
+    let padding = u32::from_le_bytes([
+        table_bytes[4],
+        table_bytes[5],
+        table_bytes[6],
+        table_bytes[7],
+    ]);
+    assert_eq!(
+        padding, 0,
+        "shape table header padding must be zero — got {padding:#x}"
+    );
+    assert_eq!(
+        sym_size as usize,
+        8 + n * 8,
+        "shape table size {sym_size} does not match header N={n} (expected {} bytes)",
+        8 + n * 8
+    );
+    assert!(
+        n >= 4,
+        "shape table must contain at least the 4 distinct shim handler-frame \
+         shapes (ArithError, IO+Env dedup, Fs, Process); got N={n}"
+    );
+
+    // Parse each (bitmap, count) entry, validate per-entry invariants,
+    // and collect them for the spot-check below.
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(n);
+    for (i, chunk) in table_bytes[8..].chunks_exact(8).enumerate() {
         let bitmap = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         let count_padded = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
         // The shape table only contains typed-malloc shapes, so
@@ -559,6 +594,25 @@ fn sigil_shape_table_is_emitted_with_valid_entries() {
             "shape entry {i}: count_padded={count_padded} exceeds \
              COUNT_MASK = {} — header bit-layout regression",
             sigil_header_constants::COUNT_MASK,
+        );
+        entries.push((bitmap, count_padded));
+    }
+
+    // Spot-check: every shim handler-frame shape MUST appear in the
+    // table. arm_count ∈ {1, 2, 3, 10}. For each, compute the
+    // canonical (bitmap, count) via the const fns the runtime +
+    // codegen share, and assert the pair is in `entries`. Closes the
+    // re-review's "no static index↔entry correspondence check" gap.
+    use sigil_abi::effect::{handler_frame_payload_bytes, handler_frame_pointer_bitmap};
+    for arm_count in &[1u32, 2, 3, 10] {
+        let bitmap = handler_frame_pointer_bitmap(*arm_count);
+        let payload_bytes = handler_frame_payload_bytes(*arm_count);
+        let count = (payload_bytes / 8) as u32;
+        assert!(
+            entries.contains(&(bitmap, count)),
+            "expected handler-frame shape (bitmap={bitmap:#x}, count={count}) \
+             for arm_count={arm_count} in the codegen-emitted shape table; \
+             table entries = {entries:?}"
         );
     }
 

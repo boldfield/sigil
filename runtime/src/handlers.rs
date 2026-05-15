@@ -2617,10 +2617,10 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
 // ---------------------------------------------------------------------
 
 // Re-export from sigil-abi so callers inside this crate keep the
-// short name. The static-descriptor-table plan (2026-05-15) promoted
-// these to `pub const fn` in `sigil-abi::effect` so codegen can
-// register the 14 handler-frame shapes at compile time without
-// duplicating the bitmap derivation.
+// short name. The static-descriptor-table refactor promoted these to
+// `pub const fn` in `sigil-abi::effect` so codegen can register the
+// 14 handler-frame shapes at compile time without duplicating the
+// bitmap derivation.
 //
 // The runtime entry point (`sigil_handler_frame_new_with_resumes_many`)
 // is the load-bearing arm_count-bounds checker — it rejects

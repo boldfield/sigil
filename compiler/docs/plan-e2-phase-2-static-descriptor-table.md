@@ -52,9 +52,23 @@ The two entry points emit-time call sites use:
 
 A `__sigil_shape_table` data symbol is declared at codegen start and
 defined at the end of `emit_object` once every call site has
-registered. Layout: each entry is 8 bytes — `bitmap: u32 LE,
-count_padded: u32 LE`. The 3-byte padding per entry keeps `(u32, u32)`
-reads aligned; the wasted bytes are negligible at typical N < 100.
+registered. Layout:
+
+```text
+  bytes 0..4: N (u32 LE) — entry count
+  bytes 4..8: padding (u32 LE, zero) — keeps entries 8-byte aligned
+  bytes 8.. : N × `(bitmap: u32 LE, count_padded: u32 LE)`
+```
+
+**Why N lives in the data section header.** An earlier draft passed
+`n` as a second argument to `sigil_init_shapes`, captured by the main
+shim's `iconst` at shim-emit time. Synth arm fns and sync shims emit
+AFTER the main shim and can register novel shapes; the shim-time `n`
+undercounted the real entry count, leading to post-shim call sites
+silently indexing past N into the runtime suffix. Embedding N in the
+data section header closes that gap structurally — `encode_le` runs
+at table-finalize time, AFTER every Lowerer has run, so the embedded
+N reflects every registered shape.
 
 Section placement: `.rodata` segment, section name `sigil_shapes` —
 ELF gets a `sigil_shapes` section; Mach-O maps `.rodata` to
@@ -67,26 +81,29 @@ The compiler-emitted main shim emits, immediately after `sigil_gc_init`
 and BEFORE any user-code allocation:
 
 ```text
-sigil_init_shapes(&__sigil_shape_table, N)
+sigil_init_shapes(&__sigil_shape_table)
 ```
 
-`N` is the final shape count after the shim itself has registered its 5
-default handler-frame shapes (ArithError arm_count=2, IO arm_count=3,
-Env arm_count=3, Fs arm_count=10, Process arm_count=1).
+The runtime reads N from the first 4 bytes of the data section and
+walks the N `(bitmap, count_padded)` entries that follow. The shim
+itself contributes the 4 distinct default handler-frame shapes
+(ArithError arm_count=2; IO+Env both arm_count=3, dedup'd via
+`ShapeTable::register`; Fs arm_count=10; Process arm_count=1).
 
 `sigil_init_shapes` in `runtime/src/gc.rs`:
 
-1. Builds `Vec<usize>` descriptors from the codegen prefix via
+1. Decodes N from the data section header.
+2. Builds `Vec<usize>` descriptors from the codegen prefix via
    `GC_make_descriptor` once per shape — the same call the old cache
    made lazily.
-2. Appends the runtime-known shapes (Ref, Continuation, StringBuilder,
+3. Appends the runtime-known shapes (Ref, Continuation, StringBuilder,
    four tuple shapes from `alloc_tuple` call sites, the wrapper-
    continuation closure, and 15 handler-frame shapes for `arm_count ∈
    [0, MAX_HANDLER_ARMS]`).
-3. Stores the assigned indices in `RUNTIME_SHAPE_INDICES` so
-   runtime-internal allocators (`sigil_ref_alloc`, `alloc_tuple`, etc.)
-   can look up their shape without bitmap/count search.
-4. Publishes the descriptor vector in `SHAPE_DESCRIPTORS` (OnceLock).
+4. Publishes `SHAPE_DESCRIPTORS` (OnceLock) FIRST, then
+   `RUNTIME_SHAPE_INDICES` (OnceLock) — publish-after-construct
+   ordering so any reader that sees indices populated is guaranteed
+   to see the descriptors those indices point into.
 
 `sigil_alloc`'s typed-malloc branch becomes:
 

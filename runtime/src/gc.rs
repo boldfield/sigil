@@ -324,35 +324,59 @@ static RUNTIME_SHAPE_INDICES: OnceLock<RuntimeShapeIndices> = OnceLock::new();
 /// allocation (so `sigil_alloc`'s typed-malloc branch never reads
 /// `SHAPE_DESCRIPTORS` before it is populated).
 ///
-/// `table` points to `n` 8-byte entries in the codegen-emitted
-/// `__sigil_shape_table` data section. Each entry is laid out as
-/// `(bitmap: u32 little-endian, count: u32 little-endian)` — the
-/// `count` field is zero-extended from u8 to u32 to keep the entry
-/// 8-byte aligned (the wasted 3 bytes per entry are negligible
-/// since `N < 100` for realistic programs).
+/// `table` points to the codegen-emitted `__sigil_shape_table` data
+/// section. Layout:
+///
+/// ```text
+///   bytes 0..4: N (u32 LE) — entry count
+///   bytes 4..8: padding (u32 LE, zero)
+///   bytes 8.. : N × `(bitmap: u32 LE, count_padded: u32 LE)`
+/// ```
+///
+/// **Why N is embedded rather than passed as a separate argument.**
+/// An earlier draft passed `n` as a second arg, captured by the main
+/// shim's `iconst` at shim-emit time. Synth arm fns / sync shims
+/// emit AFTER the main shim and can register novel shapes; the
+/// shim-time `n` undercounted the real entry count, leading to
+/// post-shim call sites silently indexing into the runtime suffix.
+/// Embedding N in the data section closes that gap structurally —
+/// codegen finalizes the data section after every Lowerer has run,
+/// so the embedded N matches the entry count exactly.
 ///
 /// # Safety
 ///
-/// `table` must point to at least `n * 8` readable bytes; codegen
-/// guarantees this by emitting the table contents from the same
-/// pre-pass that determines `n`. Idempotent: a second call (e.g.,
-/// from a re-entry path in tests) is a silent no-op via
-/// `OnceLock::set`'s Err return.
+/// `table` must point to at least 8 readable bytes (the header) and
+/// `8 + N * 8` total readable bytes where N is the value stored in
+/// the first 4 bytes. Codegen guarantees this by emitting the table
+/// contents in one pass at the end of `emit_object`. Idempotent: a
+/// second call (e.g., from a re-entry path in tests) is a silent
+/// no-op via `OnceLock::set`'s Err return.
 #[no_mangle]
-pub unsafe extern "C" fn sigil_init_shapes(table: *const u8, n: usize) {
+pub unsafe extern "C" fn sigil_init_shapes(table: *const u8) {
+    // SAFETY: caller guarantees the first 4 bytes are readable per
+    // the doc above.
+    let header_bytes = std::slice::from_raw_parts(table, 8);
+    let n = u32::from_le_bytes([
+        header_bytes[0],
+        header_bytes[1],
+        header_bytes[2],
+        header_bytes[3],
+    ]) as usize;
+
     // Tolerate `n == 0` (a program with no precise-marking
     // allocations still emits the call so the runtime's invariant
     // — `SHAPE_DESCRIPTORS` is populated before any alloc — holds).
     let mut descriptors: Vec<usize> = if n == 0 {
         Vec::new()
     } else {
-        // SAFETY: caller guarantees `table` points to `n * 8`
-        // readable bytes per the doc comment above. The slice is
-        // valid for the duration of this function only; we copy
-        // out the (bitmap, count) pairs immediately.
-        let bytes = std::slice::from_raw_parts(table, n.saturating_mul(8));
+        // SAFETY: caller guarantees `8 + n * 8` readable bytes per
+        // the doc above. The slice is valid for the duration of
+        // this function only; we copy out the (bitmap, count) pairs
+        // immediately.
+        let total_bytes = 8usize.saturating_add(n.saturating_mul(8));
+        let bytes = std::slice::from_raw_parts(table, total_bytes);
         let mut out: Vec<usize> = Vec::with_capacity(n);
-        for chunk in bytes.chunks_exact(8) {
+        for chunk in bytes[8..].chunks_exact(8) {
             let bitmap = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             let count = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u8;
             out.push(build_descriptor_for_shape(bitmap, count));
@@ -367,9 +391,16 @@ pub unsafe extern "C" fn sigil_init_shapes(table: *const u8, n: usize) {
     // `SHAPE_DESCRIPTORS`'s doc for the layout rationale.
     let runtime_indices = append_runtime_shapes(&mut descriptors);
 
-    // Idempotent: re-entry returns Err which we discard.
-    let _ = RUNTIME_SHAPE_INDICES.set(runtime_indices);
+    // Publish-after-construct discipline: set `SHAPE_DESCRIPTORS`
+    // first (the load-bearing data), then `RUNTIME_SHAPE_INDICES`
+    // (which only carries indices INTO the descriptors). If any
+    // future refactor lifts the sequential-init invariant (main
+    // shim → user code), this ordering guarantees that a reader
+    // who sees `RUNTIME_SHAPE_INDICES` populated also sees the
+    // descriptors it indexes into. Idempotent: re-entry returns
+    // Err which we discard.
     let _ = SHAPE_DESCRIPTORS.set(descriptors);
+    let _ = RUNTIME_SHAPE_INDICES.set(runtime_indices);
 }
 
 /// Append the runtime-known typed-malloc shapes to `descriptors` and

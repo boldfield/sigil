@@ -7573,19 +7573,32 @@ impl ShapeTable {
         self.register(bitmap, count)
     }
 
-    /// Number of registered entries.
-    fn len(&self) -> u32 {
-        self.entries.len() as u32
-    }
-
     /// Encode the table for emission into the
-    /// `__sigil_shape_table` data section. Each entry occupies 8
-    /// bytes: `(bitmap: u32 little-endian, count_padded: u32 little-
-    /// endian)`. The 3-byte padding per entry keeps `(u32, u32)`
-    /// reads aligned and lets the runtime decode via straight
-    /// `chunks_exact(8)` — see `runtime/src/gc.rs::sigil_init_shapes`.
+    /// `__sigil_shape_table` data section. Layout:
+    ///
+    /// ```text
+    ///   bytes 0..4: N (u32 LE) — number of entries
+    ///   bytes 4..8: padding (u32 LE, zero) — keeps entries 8-byte aligned
+    ///   bytes 8.. : N × `(bitmap: u32 LE, count_padded: u32 LE)`
+    /// ```
+    ///
+    /// **Why N lives in the header.** Older drafts had the main shim
+    /// `iconst` an N value at shim-emit time and pass it as a
+    /// `sigil_init_shapes(table, n)` second argument. That captured N
+    /// too early: synth arm fns, sync shims, and post-arm-k
+    /// continuations all emit AFTER the main shim and can register
+    /// novel shapes. The runtime then saw an N smaller than the
+    /// true entry count, indexing into the (codegen-emitted)
+    /// post-shim shapes would silently land in the runtime suffix
+    /// inside `SHAPE_DESCRIPTORS`. Embedding N in the data section
+    /// closes that gap structurally — `encode_le` runs at
+    /// data-section-define time, AFTER every Lowerer has run, so
+    /// the embedded N matches the entry count exactly.
     fn encode_le(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.entries.len() * 8);
+        let n = self.entries.len() as u32;
+        let mut out = Vec::with_capacity(8 + self.entries.len() * 8);
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         for &(bitmap, count) in &self.entries {
             out.extend_from_slice(&bitmap.to_le_bytes());
             out.extend_from_slice(&(count as u32).to_le_bytes());
@@ -7678,12 +7691,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         crate::layout::build_layouts(&checked.types).map_err(|e| format!("E0130: {e}"))?;
     let ctor_index = crate::layout::build_ctor_index(&type_layouts);
 
-    // Static-descriptor-table follow-up (2026-05-15) — codegen-time
-    // shape registry shared across every `sigil_alloc` and
-    // `sigil_handler_frame_new` call site emitted during this
+    // Codegen-time shape registry shared across every `sigil_alloc`
+    // and `sigil_handler_frame_new` call site emitted during this
     // `emit_object` invocation. `Lowerer` instances borrow this via
     // a `&'b RefCell` field; the main shim's emit and any free-fn
-    // `lower_alloc_call` site in this fn body borrow directly.
+    // `lower_alloc_call` site in this fn body borrow directly. See
+    // `ShapeTable`'s doc for the design rationale.
     // Finalised into the `__sigil_shape_table` data section at the
     // end of this function once every call site has registered.
     let shape_table: std::cell::RefCell<ShapeTable> = std::cell::RefCell::new(ShapeTable::new());
@@ -7749,14 +7762,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // crate still exports `sigil_println` for the arm fn's internal
     // use, but codegen no longer declares it as an import.
 
-    // Plan A2 task 32 + static-descriptor-table follow-up (2026-05-15):
     // `sigil_alloc(header: u64, payload_bytes: usize,
     // descriptor_index: u32) -> *mut u8`. The third arg is a codegen-
     // emitted index into `__sigil_shape_table` for typed-malloc
     // shapes, or `SHAPE_DESCRIPTOR_SENTINEL` (`u32::MAX`) for atomic
     // / conservative call sites. The runtime resolves the index to a
     // Boehm `GC_descr` via the static `SHAPE_DESCRIPTORS` vector
-    // (populated by `sigil_init_shapes` at program start).
+    // (populated by `sigil_init_shapes` at program start). The third-
+    // arg extension is part of the static-descriptor-table refactor;
+    // see [`ShapeTable`]'s doc.
     let mut alloc_sig = Signature::new(isa_call_conv(&module));
     alloc_sig.params.push(AbiParam::new(types::I64)); // header
     alloc_sig.params.push(AbiParam::new(pointer_ty)); // payload_bytes (usize)
@@ -7766,20 +7780,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_alloc", Linkage::Import, &alloc_sig)
         .map_err(|e| format!("declare sigil_alloc: {e}"))?;
 
-    // Static-descriptor-table follow-up (2026-05-15): runtime init
-    // hook that builds the `SHAPE_DESCRIPTORS` vector from the
-    // codegen-emitted `__sigil_shape_table` data section. The main
-    // shim calls this immediately after `sigil_gc_init`, before any
-    // user-code allocation.
+    // `sigil_init_shapes` builds the runtime `SHAPE_DESCRIPTORS`
+    // vector from the codegen-emitted `__sigil_shape_table` data
+    // section. The main shim calls this immediately after
+    // `sigil_gc_init`, before any user-code allocation. The entry
+    // count N is the first u32 of the data section — see
+    // `ShapeTable::encode_le` for the rationale.
     let mut init_shapes_sig = Signature::new(isa_call_conv(&module));
     init_shapes_sig.params.push(AbiParam::new(pointer_ty)); // table: *const u8
-    init_shapes_sig.params.push(AbiParam::new(pointer_ty)); // n: usize
     let init_shapes = module
         .declare_function("sigil_init_shapes", Linkage::Import, &init_shapes_sig)
         .map_err(|e| format!("declare sigil_init_shapes: {e}"))?;
 
-    // Static-descriptor-table follow-up (2026-05-15): the
-    // `__sigil_shape_table` data section. The symbol is declared
+    // The `__sigil_shape_table` data section. The symbol is declared
     // here so the main shim can reference it via
     // `module.declare_data_in_func(...)`; the section's contents are
     // defined at the very end of `emit_object` once every call site
@@ -12734,32 +12747,25 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         builder.ins().call(gc_init_ref, &[]);
 
-        // Static-descriptor-table follow-up (2026-05-15) — register
-        // the main shim's own handler-frame shapes BEFORE emitting
-        // the `sigil_init_shapes` call so the published shape table
-        // size N includes them. By the time control reaches here,
-        // every user-fn body has already emitted (line 12608+ user-
-        // fn body emit) so the prefix is fully populated with their
-        // shapes; the shim's contribution is exactly the 5 default
-        // handler-frame shapes (arm_count ∈ {1, 2, 3, 10}).
+        // Register the main shim's own handler-frame shapes. These
+        // contribute the 4 distinct shapes IO+Env share (`arm_count=3`,
+        // deduplicated by `ShapeTable::register`) plus ArithError
+        // (`arm_count=2`), Fs (`arm_count=10`), and Process
+        // (`arm_count=1`).
         let arith_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(2);
         let io_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
         let env_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
         let fs_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(10);
         let process_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(1);
 
-        // Emit `sigil_init_shapes(&__sigil_shape_table, N)` so the
-        // runtime materialises the `SHAPE_DESCRIPTORS` vector before
-        // any user-code allocation runs. The actual byte contents of
-        // `__sigil_shape_table` are finalised at the end of
-        // `emit_object` (after the main shim has emitted; the data
-        // section size at that point matches the `N` we pass here).
-        let shape_count = shape_table.borrow().len();
-        let shape_count_v = builder.ins().iconst(pointer_ty, shape_count as i64);
+        // Materialise `SHAPE_DESCRIPTORS` before any user-code
+        // allocation runs. The entry count N is the first u32 of
+        // `__sigil_shape_table` (the data section is defined at the
+        // end of `emit_object`, AFTER every Lowerer — including
+        // synth arm fns and sync shims emitted post-shim — has run,
+        // so the embedded N reflects every registered shape).
         let shape_table_addr_v = builder.ins().symbol_value(pointer_ty, shape_table_gv);
-        builder
-            .ins()
-            .call(init_shapes_ref, &[shape_table_addr_v, shape_count_v]);
+        builder.ins().call(init_shapes_ref, &[shape_table_addr_v]);
 
         // ────── ArithError handler frame (first-pushed, last-popped) ──────
         // effect_id=0 (reserved low id), arm_count=2 (div_by_zero,
@@ -19390,44 +19396,34 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
     // --- finalise the static descriptor table ----------------------------
     //
-    // Static-descriptor-table follow-up (2026-05-15) — define the
-    // `__sigil_shape_table` data symbol with the bytes collected
-    // during fn / shim emit. Every call site that registered a
-    // shape via `ShapeTable::register` (directly or through
-    // `alloc_descriptor_index` / `handler_frame_descriptor_index`)
-    // has its index pointing into this table; the runtime decodes
-    // it in `sigil_init_shapes`.
+    // Define the `__sigil_shape_table` data symbol with the bytes
+    // collected during fn / shim emit. Every call site that
+    // registered a shape via `ShapeTable::register` (directly or
+    // through `alloc_descriptor_index` /
+    // `handler_frame_descriptor_index`) has its index pointing into
+    // this table; the runtime decodes it in `sigil_init_shapes`.
     //
-    // The `n` value the main shim emits as the second argument to
-    // `sigil_init_shapes(table, n)` was iconst'd against the
-    // shape_table size at shim-emit time. All user-fn emits run
-    // BEFORE the shim emit, and the shim's emit registered its 5
-    // own handler-frame shapes UPFRONT (before the
-    // `sigil_init_shapes` call site) so the iconst captures the
-    // final size correctly.
+    // `encode_le()` prepends an 8-byte header carrying the entry
+    // count N (see its doc for the rationale — N captured here, at
+    // table-finalize time, includes shapes registered by every
+    // Lowerer including synth arm fns and sync shims that emit
+    // after the main shim). The minimum data section size is
+    // therefore 8 bytes (header only); the main shim always
+    // registers ≥ 4 distinct handler-frame shapes (ArithError,
+    // IO+Env dedup'd, Fs, Process) so the realistic minimum is
+    // `8 + 4*8 = 40` bytes.
     {
         let table_bytes = shape_table.borrow().encode_le();
         let mut data = DataDescription::new();
-        // `define` requires non-empty bytes for the data to occupy
-        // any space; empty programs (no precise-marking allocs)
-        // still need a placeholder so the symbol resolves. Pad with
-        // one 8-byte zero entry whose count = 0 → unused by the
-        // runtime (the shim passes n = 0 in that case, so the
-        // runtime never reads it).
-        let final_bytes: Vec<u8> = if table_bytes.is_empty() {
-            vec![0u8; 8]
-        } else {
-            table_bytes
-        };
-        data.define(final_bytes.into_boxed_slice());
+        data.define(table_bytes.into_boxed_slice());
         // ELF: `.rodata` segment; section name `sigil_shapes`
         // groups the symbol in the read-only data section.
         // Mach-O: Cranelift's ObjectModule maps `.rodata` to
         // `(__DATA, __const)` regardless — see PR #161's
-        // 16-byte-limit fix for the section-name discipline.
-        // The leading `__` Mach-O requires is added by the
-        // platform mapping, so we pass `sigil_shapes` here
-        // matching the existing `sigil_str_lit` shape.
+        // 16-byte-limit fix for the section-name discipline. The
+        // leading `__` Mach-O requires is added by the platform
+        // mapping; we pass `sigil_shapes` here matching the existing
+        // `sigil_str_lit` shape.
         data.set_segment_section(".rodata", "sigil_shapes");
         module
             .define_data(shape_table_data_id, &data)
@@ -19922,13 +19918,13 @@ struct Lowerer<'a, 'b> {
     /// for non-arm Lowerers.
     arm_handle_span: Option<Span>,
 
-    /// Static-descriptor-table follow-up (2026-05-15) — shared
-    /// codegen-time shape registry. Each `sigil_alloc` and
+    /// Shared codegen-time shape registry. Each `sigil_alloc` and
     /// `sigil_handler_frame_new_with_resumes_many` call site asks
     /// this for the matching index, which it then emits as the
     /// trailing `descriptor_index: u32` argument. The runtime
     /// resolves the index into a Boehm `GC_descr` via the static
     /// `SHAPE_DESCRIPTORS` vector built by `sigil_init_shapes`.
+    /// See [`ShapeTable`]'s doc for the design rationale.
     ///
     /// Shared `RefCell` (not `&mut`) so multiple Lowerer methods
     /// can register shapes during a single emission without
@@ -19997,14 +19993,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         lower_alloc_call(&mut self.builder, callee, args)
     }
 
-    /// Static-descriptor-table follow-up (2026-05-15) — emit an
-    /// `iconst.i32` carrying the descriptor_index that `sigil_alloc`
-    /// (or one of its wrappers) should consume for a typed-malloc
-    /// allocation of the given `(bitmap, count)` shape. Returns the
-    /// `u32::MAX` sentinel for atomic / conservative paths. Use this
-    /// for every `sigil_alloc` call site so the shape gets
-    /// registered uniformly and the runtime sees a matching entry
-    /// in `SHAPE_DESCRIPTORS`.
+    /// Emit an `iconst.i32` carrying the descriptor_index that
+    /// `sigil_alloc` (or one of its wrappers) should consume for a
+    /// typed-malloc allocation of the given `(bitmap, count)` shape.
+    /// Returns the `u32::MAX` sentinel for atomic / conservative
+    /// paths. Use this for every `sigil_alloc` call site so the
+    /// shape gets registered uniformly and the runtime sees a
+    /// matching entry in `SHAPE_DESCRIPTORS`.
     fn lower_alloc_descriptor_index(&mut self, bitmap: u32, count: u8) -> Value {
         let idx = self
             .shape_table
@@ -20013,9 +20008,8 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         self.builder.ins().iconst(types::I32, idx as i64)
     }
 
-    /// Static-descriptor-table follow-up (2026-05-15) — emit the
-    /// `iconst.i32` carrying the descriptor_index for a handler-
-    /// frame allocation of the given `arm_count`. The shape
+    /// Emit the `iconst.i32` carrying the descriptor_index for a
+    /// handler-frame allocation of the given `arm_count`. The shape
     /// `(bitmap, count)` is derived from `arm_count` via the const
     /// fns in `sigil_abi::effect`. Always returns a real index;
     /// handler frames always hit the typed-malloc path (their
