@@ -5,9 +5,14 @@ noise (macos)**. Code shipped 2026-05-15 at commit `4afc5ce`;
 throughput-report runs `25935200346` (Phase 2 baseline `pre_sha=4f7ec86`)
 and `25935615684` (apples-to-apples baseline `pre_sha=b1ff665`).
 
-Cross-link: closes the +21% (ubuntu) / +86% (macos)
+Cross-link: targets the +21% (ubuntu) / +86% (macos)
 `descriptor_cache_stress` regression surfaced in
 [`plan-e2-phase-2-throughput.md`](plan-e2-phase-2-throughput.md).
+The descriptor-cache cost is removed cleanly (Run B's `−30.8%` on
+ubuntu / `−11.1%` on macos against an apples-to-apples baseline);
+whether the original `+21% / +86%` deltas reproduce on the
+current runners is a separate question — see "On the Phase 2
++21%/+86% regression specifically" in the TL;DR.
 
 ## TL;DR
 
@@ -31,12 +36,29 @@ load.
 - Other workloads: flat (within OS ms-resolution IQR; absolute values
   ≤ 20 ms).
 
-The ubuntu `descriptor_cache_stress` result is a clean win — the +21%
-Phase 2 regression is more than fully recovered (~−30% past the
-pre-Phase-2 baseline, since Phase 3 added some net-zero alloc-path
-overhead). The macos result is positive but inside the noise floor;
-the runner's higher IQR (`180 ± 20`) doesn't let us distinguish the
-delta from cross-run variance with 5 samples.
+The ubuntu `descriptor_cache_stress` result is a clean win — the post
+wall_ms is 30.8% below the Run B pre side, eliminating the descriptor-
+cache cost. The remaining ~40 ms gap above the pre-Phase-2 baseline
+(~140 ms ubuntu, per Run A's pre-side measurement of `4f7ec86`) is
+Phase 3's per-alloc overhead (`SigilCallerFpGuard::capture()` +
+`GC_call_with_gc_active` wrap) — that overhead lives on both sides of
+Run B and is therefore not part of this PR's delta to recover. The
+macos result is positive but inside the noise floor; the runner's
+higher IQR (`180 ± 20`) doesn't let us distinguish the delta from
+cross-run variance with 5 samples.
+
+**On the Phase 2 +21%/+86% regression specifically.** Run A's pre side
+at `4f7ec86` measured `descriptor_cache_stress` at 140 ms ubuntu /
+70 ms macos — at the pre-Phase-2 baseline level, not the +170 ms /
++130 ms regression level the original Phase 2 throughput report
+captured at PR #167. Whether the original Phase 2 regression
+reproduces on the current GitHub Actions runners is a separate
+question Run A alone can't answer; what Run B does establish is that
+removing the descriptor cache lowers wall_ms on the post side by 80 ms
+(ubuntu) / 20 ms (macos) versus an apples-to-apples baseline. That's
+this PR's measured delta; relating it back to the Phase 2 report's
+specific deltas would require a third run pinning the Phase 2
+post-side SHA, which isn't load-bearing for the verdict.
 
 **Initial-baseline-run caveat.** The first throughput run used
 `pre_sha=4f7ec86` (Plan E2 Phase 2 baseline, descriptor cache present).
@@ -261,23 +283,24 @@ future. Numbers below are the deltas the workflow emitted.
 
 ## Verdict
 
-**Throughput claim (closes the +21%/+86% Phase 2 regression):**
+**Throughput claim (descriptor-cache cost removed):**
 
 - **Confirmed on ubuntu-24.04.** Run B's `descriptor_cache_stress`
   delta is −80 ms / −30.8% with ±0 IQR on the post side (5 of 5 runs
-  identical at 180 ms). That's more than the Phase 2 regression
-  (~+30 ms / +21%) and exceeds the plan's expected closure ("drops
-  from ~170 ms toward ~140 ms"). Other workloads are flat-to-slightly-
-  improved as predicted.
+  identical at 180 ms). The descriptor-cache cost is removed
+  cleanly. Note that this is a Run-B-vs-Run-B comparison —
+  relating it to the Phase 2 report's +21% delta would require a
+  third run pinning Phase 2's post-side SHA, which isn't load-
+  bearing for the verdict. Other workloads are
+  flat-to-slightly-improved as predicted.
 - **Directionally confirmed within noise on macos-14.** Run B's
   `descriptor_cache_stress` delta is −20 ms / −11.1% with ±20 ms IQR
-  on the pre side and ±10 ms on the post side. The improvement is
-  smaller than the +60 ms / +86% Phase 2 regression would predict,
-  and the IQRs overlap — at 5 samples with 10 ms wall-clock
-  resolution we cannot rule out cross-run variance as the source.
-  `tree_stress_repeat_large` shows a consistent −25% on the same
-  runner, so the alloc-path improvement is not a phantom; just the
-  size of the descriptor_cache_stress delta is in the noise floor.
+  on the pre side and ±10 ms on the post side. The IQRs overlap —
+  at 5 samples with 10 ms wall-clock resolution we cannot rule out
+  cross-run variance as the source. `tree_stress_repeat_large`
+  shows a consistent −25% on the same runner, so the alloc-path
+  improvement is not a phantom; just the size of the
+  `descriptor_cache_stress` delta is in the noise floor.
 
 **Design / correctness claim (no lock on alloc hot path):**
 
@@ -342,7 +365,9 @@ noise (macos)** + **structurally confirmed (lock removal)**.
   `__sigil_shape_table` data symbol, `sigil_init_shapes` FFI, main-
   shim init call, per-call-site `descriptor_index` plumbing through
   every `sigil_alloc` / `sigil_handler_frame_new_with_resumes_many`
-  site (~13 sites).
+  site (16 codegen call sites: 5 main-shim default handler-frame
+  registrations + 11 user-fn / synth-arm-fn / sync-shim emit sites
+  that thread `descriptor_index` through `lower_alloc_call`).
 - `runtime/src/gc.rs` — `SHAPE_DESCRIPTORS` OnceLock,
   `sigil_init_shapes` extern, `RuntimeShapeIndices` struct,
   `shape_descriptor_at` accessor, test-override slot for direct

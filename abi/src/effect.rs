@@ -160,10 +160,14 @@ pub const fn handler_frame_payload_bytes(arm_count: u32) -> usize {
 ///
 /// The `MAX_HANDLER_ARMS = 14` cap keeps the highest set bit
 /// at `5 + 2*13 = 31`, fitting in the 32-bit bitmap. Callers
-/// that pass `arm_count > MAX_HANDLER_ARMS` get UB at the shift
-/// (shifting by 32+ on a `u32`); the runtime entry point checks
-/// this before calling, and the compiler's pre-pass iterates
-/// `arm_count ∈ [1, MAX_HANDLER_ARMS]` explicitly.
+/// that pass `arm_count > MAX_HANDLER_ARMS` would shift a `u32`
+/// by `>= 32` — that's a debug-build / const-eval panic
+/// ("attempt to shift left with overflow"), and a wrap to
+/// `shift mod 32` in release. Either way the result is wrong;
+/// the runtime entry point bounds-checks `arm_count` before
+/// calling, and the compiler's pre-pass iterates
+/// `arm_count ∈ [1, MAX_HANDLER_ARMS]` explicitly, so the
+/// overflow path is unreachable in practice.
 ///
 /// Shared between the runtime and compiler for the same reason
 /// as `handler_frame_payload_bytes` above.
