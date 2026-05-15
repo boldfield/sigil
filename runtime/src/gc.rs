@@ -502,6 +502,26 @@ pub(crate) fn runtime_shape_indices() -> RuntimeShapeIndices {
     if let Some(idx) = *runtime_guard {
         return idx;
     }
+
+    // Override-slot consistency invariant: `SHAPE_DESCRIPTORS_TEST_OVERRIDE`
+    // and `RUNTIME_SHAPE_INDICES_TEST_OVERRIDE` are always set as a
+    // pair (both `Some` after `install_shape_descriptors_for_test` /
+    // both `None` after `clear_shape_descriptors_for_test`). Reaching
+    // here with `runtime_guard = None` AND `shape_guard = Some(_)`
+    // means a future test helper drifted from that invariant — abort
+    // with a clear diagnostic rather than silently overwriting the
+    // shape override (which would invalidate any descriptor_index the
+    // test still holds against the prior `shape_guard` contents,
+    // exactly the footgun re-review #2 residual #2 flagged).
+    if shape_guard.is_some() {
+        eprintln!(
+            "runtime_shape_indices: SHAPE_DESCRIPTORS_TEST_OVERRIDE is Some but \
+             RUNTIME_SHAPE_INDICES_TEST_OVERRIDE is None — test-helper invariant \
+             violation; refusing to overwrite the existing shape override"
+        );
+        std::process::abort();
+    }
+
     let mut descriptors: Vec<usize> = Vec::new();
     let runtime_indices = append_runtime_shapes(&mut descriptors);
     *shape_guard = Some(descriptors);
@@ -611,6 +631,26 @@ static SHAPE_DESCRIPTORS_TEST_OVERRIDE: std::sync::Mutex<Option<Vec<usize>>> =
 ///
 /// Tests serialise via `gc_test_lock`, so concurrent modification of
 /// the override slots is not a concern.
+///
+/// **Override-slot consistency invariant.**
+/// `SHAPE_DESCRIPTORS_TEST_OVERRIDE` and
+/// `RUNTIME_SHAPE_INDICES_TEST_OVERRIDE` MUST be set / cleared as a
+/// pair. Both `Some` after this call; both `None` after
+/// `clear_shape_descriptors_for_test`. The lazy-install fast path in
+/// `runtime_shape_indices()` aborts if it observes them out of sync,
+/// rather than overwriting the existing shape override (which would
+/// invalidate any descriptor_index the test still holds against the
+/// prior contents — re-review #2 residual #2 footgun).
+///
+/// **Don't clear the override and then re-use indices from a prior
+/// install.** After `clear_shape_descriptors_for_test`, any
+/// previously-returned index is stale: a subsequent runtime call
+/// that triggers lazy-install rebuilds the override with an empty
+/// codegen prefix, shifting the runtime suffix down to indices
+/// `0..23`. If a test installs custom codegen shapes, runs
+/// allocations against the returned indices, and only then clears,
+/// that's fine — the clear happens after the indices are no longer
+/// in use.
 #[cfg(test)]
 pub(crate) fn install_shape_descriptors_for_test(shapes: &[(u32, u8)]) -> Vec<u32> {
     let mut descriptors: Vec<usize> = shapes
@@ -619,23 +659,35 @@ pub(crate) fn install_shape_descriptors_for_test(shapes: &[(u32, u8)]) -> Vec<u3
         .collect();
     let indices: Vec<u32> = (0..shapes.len() as u32).collect();
     let runtime_indices = append_runtime_shapes(&mut descriptors);
-    *SHAPE_DESCRIPTORS_TEST_OVERRIDE
+    // Lock order matches `runtime_shape_indices()`'s lazy-install
+    // path (SHAPE_DESCRIPTORS first, then RUNTIME_SHAPE_INDICES) so
+    // the two callers can never deadlock against each other.
+    let mut shape_guard = SHAPE_DESCRIPTORS_TEST_OVERRIDE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(descriptors);
-    *RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+        .unwrap_or_else(|e| e.into_inner());
+    let mut runtime_guard = RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(runtime_indices);
+        .unwrap_or_else(|e| e.into_inner());
+    *shape_guard = Some(descriptors);
+    *runtime_guard = Some(runtime_indices);
     indices
 }
 
+/// Clear both test-mode override slots in sync. See the override-
+/// slot consistency invariant in `install_shape_descriptors_for_test`'s
+/// doc: callers MUST clear (or replace) both slots together.
 #[cfg(test)]
 pub(crate) fn clear_shape_descriptors_for_test() {
-    *SHAPE_DESCRIPTORS_TEST_OVERRIDE
+    // Same lock order as `install_shape_descriptors_for_test` /
+    // `runtime_shape_indices()`'s lazy-install path.
+    let mut shape_guard = SHAPE_DESCRIPTORS_TEST_OVERRIDE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
-    *RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+        .unwrap_or_else(|e| e.into_inner());
+    let mut runtime_guard = RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
         .lock()
-        .unwrap_or_else(|e| e.into_inner()) = None;
+        .unwrap_or_else(|e| e.into_inner());
+    *shape_guard = None;
+    *runtime_guard = None;
 }
 
 // `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
@@ -1118,17 +1170,26 @@ fn alloc_dispatch(header: u64, total: usize, descriptor_index: u32) -> *mut u8 {
     } else {
         let count = h.payload_count();
         assert_precise_alloc_size(total, count, h.pointer_bitmap());
-        // Static-descriptor-table follow-up: the descriptor cache
-        // (`gc::descriptor` module) is gone; codegen threads the
-        // shape's pre-registered index through `sigil_alloc`'s
-        // third arg, and we read the materialised `GC_descr` out of
-        // the static `SHAPE_DESCRIPTORS` vector. `u32::MAX` is the
-        // sentinel value codegen emits for the atomic /
-        // conservative branches (which don't reach this typed-
-        // malloc arm); reaching this point with the sentinel
-        // signals a codegen / runtime branch-condition drift, not
-        // a recoverable runtime condition.
-        debug_assert!(
+        // The descriptor cache (the deleted `gc::descriptor` module)
+        // is gone; codegen threads the shape's pre-registered index
+        // through `sigil_alloc`'s third arg, and we read the
+        // materialised `GC_descr` out of the static
+        // `SHAPE_DESCRIPTORS` vector. `u32::MAX` is the sentinel
+        // value codegen emits for the atomic / conservative branches
+        // (which don't reach this typed-malloc arm); reaching this
+        // point with the sentinel signals a codegen / runtime
+        // branch-condition drift.
+        //
+        // `assert!` (not `debug_assert!`) because this is a
+        // soundness contract, not a performance-sensitive check:
+        // a sentinel index would otherwise propagate to
+        // `shape_descriptor_at(u32::MAX)` and trip `Vec` OOB in
+        // release — a safe crash, but a worse diagnostic than this
+        // assertion's branch / bitmap printout. The cost of one
+        // compare + always-taken branch per typed-malloc allocation
+        // is negligible compared to the `GC_malloc_explicitly_typed`
+        // call that follows.
+        assert!(
             descriptor_index != u32::MAX,
             "sigil_alloc: typed-malloc branch hit with sentinel \
              descriptor_index = u32::MAX (bitmap=0b{:b}, count={count})",
