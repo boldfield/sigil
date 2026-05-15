@@ -562,16 +562,22 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25899135194`](https://github.com/boldfield/sigil/actions/runs/25899135194)
   at `SIGIL_MAX_HEAP_SIZE_KB=16384` (the smallest budget every
   workload completes under): every workload × every
-  checkpoint × every OS shows `boehm_gc_time_ms = 0` — Boehm
-  refused to fire any STW full GC even under the budget pin.
-  The hypothesis remains structurally unfalsifiable; the
-  savings column is zero by measurement, not by inference.
-  The walker-cost column IS measurable — 0–625 µs cumulative
-  per workload run (~3.1% relative on the largest Cps
-  workload) — so half the decomposition was landed. Future
-  measurement would need a debug-injected `GC_gcollect()`
-  call from the runtime; per the plan body's design decision
-  #2 that path was rejected at this plan's scope.
+  checkpoint × every OS shows `boehm_gc_time_ms = 0` — either
+  no STW full GC fired, or each one completed in under 1 ms
+  (Boehm's ms-resolved counter rounds sub-ms to 0). The unit
+  test confirms the mechanism does fire collections at a
+  tighter 1 MiB budget; the 16 MiB workload budget sits in a
+  regime where the ms-resolved counter can't separate the two
+  readings. The hypothesis remains structurally unfalsifiable
+  at this resolution; the savings column is zero by
+  measurement. The walker-cost column IS measurable —
+  0–625 µs cumulative per workload run (~3.1% relative on the
+  largest Cps workload) — so half the decomposition was
+  landed. Future measurement would need a debug-build-only
+  runtime-internal `GC_gcollect()` injection — a separate
+  mechanism from the design's option-(b) rejection (that
+  was a language-surface intrinsic, not a runtime debug
+  knob).
 
 ## Deviations
 

@@ -255,25 +255,35 @@ pub extern "C" fn sigil_gc_init() {
         // (Boehm's default applies). Positive integer kilobytes →
         // budget enforced from the first allocation onward.
         //
+        // The empty-string guard is load-bearing for the GitHub
+        // Actions workflow: `SIGIL_MAX_HEAP_SIZE_KB: ${{ inputs.heap_budget_kb }}`
+        // with an empty `heap_budget_kb` input sets the env var to
+        // empty-string (not unset). Without `is_empty()`, every
+        // default-budget workflow run would emit a spurious
+        // "expected positive integer kilobytes" warning per workload
+        // invocation — see PR #176 review item 1.
+        //
         // See `compiler/docs/plan-e2-phase-3-gc-time-followup.md`.
         if let Ok(s) = std::env::var("SIGIL_MAX_HEAP_SIZE_KB") {
-            match s.parse::<usize>() {
-                Ok(n) if n > 0 => {
-                    // SAFETY: `GC_set_max_heap_size` is documented as
-                    // safe to call before `GC_init` (Boehm reads the
-                    // pinned value once at init time). Multiplying
-                    // by 1024 saturates to `usize::MAX` rather than
-                    // overflowing, which Boehm again treats as "no
-                    // practical limit" — both correct fall-backs for
-                    // a pathologically large input.
-                    let bytes = n.saturating_mul(1024);
-                    unsafe { GC_set_max_heap_size(bytes) };
-                }
-                _ => {
-                    eprintln!(
-                        "sigil_gc_init: ignoring SIGIL_MAX_HEAP_SIZE_KB={s:?} \
-                         (expected positive integer kilobytes)"
-                    );
+            if !s.is_empty() {
+                match s.parse::<usize>() {
+                    Ok(n) if n > 0 => {
+                        // SAFETY: `GC_set_max_heap_size` is documented as
+                        // safe to call before `GC_init` (Boehm reads the
+                        // pinned value once at init time). Multiplying
+                        // by 1024 saturates to `usize::MAX` rather than
+                        // overflowing, which Boehm again treats as "no
+                        // practical limit" — both correct fall-backs for
+                        // a pathologically large input.
+                        let bytes = n.saturating_mul(1024);
+                        unsafe { GC_set_max_heap_size(bytes) };
+                    }
+                    _ => {
+                        eprintln!(
+                            "sigil_gc_init: ignoring SIGIL_MAX_HEAP_SIZE_KB={s:?} \
+                             (expected positive integer kilobytes)"
+                        );
+                    }
                 }
             }
         }
@@ -1374,15 +1384,25 @@ mod tests {
             let h = Header::new(header::TAG_INT64, 0, 0).raw();
             let _ = sigil_alloc(h, 1024);
         }
-        unsafe { GC_gcollect() };
 
+        // Read the cycle counter HERE — after the allocation loop
+        // but BEFORE any explicit `GC_gcollect` — so the assertion
+        // measures specifically that the budget mechanism (env-var
+        // read + `GC_set_max_heap_size` call) caused collections to
+        // fire under allocation pressure. An explicit `GC_gcollect`
+        // before this read would advance the counter regardless of
+        // whether the budget mechanism worked, masking a regression
+        // in either the env-var read or the budget plumbing. PR #176
+        // review item 2 surfaced this isolation gap.
+        //
         // SAFETY: pure accessor over Boehm's process-wide stats.
-        let after = unsafe { GC_get_gc_no() };
+        let after_allocs = unsafe { GC_get_gc_no() };
         assert!(
-            after > before,
+            after_allocs > before,
             "SIGIL_MAX_HEAP_SIZE_KB=1024 did not force any collection \
-             (GC_get_gc_no before={before} after={after}). The budget \
-             read or the `GC_set_max_heap_size` call may have regressed."
+             during the 16 MiB allocation loop (GC_get_gc_no before={before} \
+             after_allocs={after_allocs}). The budget read or the \
+             `GC_set_max_heap_size` call may have regressed."
         );
     }
 
@@ -1412,6 +1432,67 @@ mod tests {
         eprintln!("subprocess reached post-init point — invalid env var did not crash");
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
         // Trivial alloc to confirm the runtime is functional.
+        let h = Header::new(header::TAG_INT64, 1, 0).raw();
+        let obj = sigil_alloc(h, 8);
+        assert!(!obj.is_null());
+    }
+
+    #[test]
+    fn sigil_max_heap_size_kb_empty_string_is_silent() {
+        // PR #176 review item 1: when the GitHub Actions workflow's
+        // `heap_budget_kb` input is empty (the default), it sets
+        // `SIGIL_MAX_HEAP_SIZE_KB=""` (not unset). Without the
+        // `is_empty()` guard in `sigil_gc_init`, this triggers the
+        // "expected positive integer kilobytes" warning on every
+        // default-budget workflow run — noisy and misleading. The
+        // guard makes empty-string indistinguishable from unset:
+        // both → no budget, no warning.
+        //
+        // Parent spawns the inner subprocess directly here (rather
+        // than going through `run_gc_stress_in_subprocess_with_env`)
+        // because the assertion is on the child's STDERR contents —
+        // specifically that the parse-warning text is ABSENT — and
+        // the parent needs unfiltered access to the raw output.
+        if !in_gc_stress_subprocess() {
+            // Mirrors `run_gc_stress_in_subprocess_with_env`'s error
+            // handling style (abort on spawn failure rather than
+            // `.expect()`) — clippy's disallowed-methods rule in
+            // this crate forbids `Result::expect` even in tests.
+            let exe = match std::env::current_exe() {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("empty_string_is_silent: current_exe failed: {e}");
+                    std::process::abort();
+                }
+            };
+            let full_name = "gc::tests::sigil_max_heap_size_kb_empty_string_is_silent";
+            let output = match std::process::Command::new(&exe)
+                .args(["--exact", full_name, "--nocapture"])
+                .env(GC_STRESS_INNER_VAR, "1")
+                .env("SIGIL_MAX_HEAP_SIZE_KB", "")
+                .output()
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("empty_string_is_silent: spawn `{full_name}` failed: {e}");
+                    std::process::abort();
+                }
+            };
+            let stderr_str = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "subprocess failed: status={} stderr={stderr_str}",
+                output.status
+            );
+            assert!(
+                !stderr_str.contains("expected positive integer kilobytes"),
+                "empty SIGIL_MAX_HEAP_SIZE_KB triggered the warning anyway: stderr={stderr_str}"
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
         let h = Header::new(header::TAG_INT64, 1, 0).raw();
         let obj = sigil_alloc(h, 8);
         assert!(!obj.is_null());

@@ -21,12 +21,22 @@ deltas summary live in the run's artifact upload.
 **Inconclusive — the hypothesis remains structurally unfalsifiable
 even under forced budget.** `boehm_gc_time_ms = 0` on every workload
 × every checkpoint × every OS in this run, including under a
-`SIGIL_MAX_HEAP_SIZE_KB=16384` pin. Boehm refused to fire any
-stop-the-world full GC at the smallest budget that lets every
+`SIGIL_MAX_HEAP_SIZE_KB=16384` pin. Two readings are consistent
+with that observation: either no stop-the-world full GC fired, or
+each collection completed in under 1 ms (Boehm's
+`GC_get_full_gc_total_time` reports integer milliseconds, so any
+sub-ms aggregate rounds to 0). The unit test
+`sigil_max_heap_size_kb_pin_forces_full_gc` confirms that at a
+much tighter 1 MiB budget the mechanism DOES fire collections
+(`GC_get_gc_no` advances), so the budget plumbing is verified
+end-to-end; what we don't have at the 16 MiB workload budget is a
+millisecond-resolved signal. The smallest budget that lets every
 workload complete (`descriptor_cache_stress` allocates 192 MB
 of total churn at 5M alloc sites; smaller budgets OOM-abort with
 "Heap size: N MiB. Returning NULL!" before that workload can
-finish).
+finish) sits in the regime where Boehm collects fast enough to
+read 0 ms but apparently not often enough to register the
+hypothesised savings.
 
 The walker-cost side IS measurable, and per-Phase-3 design that's
 half the decomposition that was wanted:
@@ -84,11 +94,11 @@ Reused as-is from Phase 3's throughput suite (7 workloads):
 **(a) `SIGIL_MAX_HEAP_SIZE_KB` env var.** Read once at
 `sigil_gc_init` time, BEFORE `GC_init()`. Calls
 `GC_set_max_heap_size(N * 1024)` when the value parses to a
-positive integer; otherwise logs a warning to stderr and proceeds
-with Boehm's default heap-growth heuristic. Unset / empty /
-invalid → no budget.
+positive integer; otherwise (empty / unset / invalid) silently
+proceeds with Boehm's default heap-growth heuristic. Non-empty
+non-numeric values log a warning to stderr.
 
-**(c) `SIGIL_COUNTER_PRECISE_WALKER_NS` counter.** Always-on
+**(b) `SIGIL_COUNTER_PRECISE_WALKER_NS` counter.** Always-on
 `AtomicU64` accumulator. Snapshots `Instant` at the start of
 `push_sigil_thread_precise_roots`'s body (AFTER the chained
 prior-proc call), reads `Instant::elapsed()` at every exit
@@ -271,15 +281,15 @@ decomposition-and-verdict, not a steady-state guard.
   env var is honored only by the post-checkpoint binary —
   the read site landed in this PR. The pre-checkpoint
   binary (`ca29d20`) runs unconstrained regardless of the
-  workflow input. The verdict ("Boehm refused to fire any
-  STW full GC even under the budget pin") is therefore
-  verified on the post side only; the pre side's behaviour
-  under budget is not measured. Future re-runs against a
-  post-merge `pre_sha` honor the budget symmetrically on
-  both sides. The verdict doesn't change either way — if
-  the post side under budget can't trigger GCs, the pre
-  side under budget wouldn't either (Boehm's heap-pin
-  semantics are version-stable across `8.2.6` ↔ `8.2.12`).
+  workflow input. The verdict ("`boehm_gc_time_ms = 0` even
+  under the budget pin") is therefore verified on the post
+  side only; the pre side's behaviour under budget is not
+  measured. Future re-runs against a post-merge `pre_sha`
+  honor the budget symmetrically on both sides. The verdict
+  doesn't change either way — if the post side under budget
+  produces no ms-resolved GC time, the pre side under budget
+  wouldn't either (Boehm's heap-pin semantics are version-
+  stable across `8.2.6` ↔ `8.2.12`).
 - **Counter excludes chained-prior-proc.** Boehm's internal
   push_other_roots proc handles TLS roots + dynamic-library
   roots; its cost is not Phase 3's overhead. The counter
