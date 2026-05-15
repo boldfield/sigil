@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use crate::closure_convert;
 use crate::codegen;
 use crate::color;
+use crate::discharge;
 use crate::elaborate;
 use crate::errors::{CompilerError, DiagnosticEmitter, ErrorFormat};
 use crate::imports;
@@ -198,4 +199,62 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
     let colored = color::infer_colors(mono);
     emit_errors(&all_errs, format);
     Ok(color::dump_color(&colored))
+}
+
+/// Plan E3 Phase 1 — `--dump-discharge`. Runs the front end through
+/// color inference and Plan E3's per-call-site discharge analysis;
+/// returns the rendered dump as a `String`. Same failure modes as
+/// [`dump_color`].
+pub fn dump_discharge(input: &str, format: ErrorFormat) -> Result<String, DumpColorError> {
+    let src = match std::fs::read_to_string(input) {
+        Ok(s) => s,
+        Err(e) => {
+            let stderr = std::io::stderr();
+            let mut out = stderr.lock();
+            let _ = writeln!(out, "sigil: cannot read `{input}`: {e}");
+            return Err(DumpColorError::ReadFailed);
+        }
+    };
+
+    let mut all_errs: Vec<CompilerError> = Vec::new();
+
+    let (tokens, lex_errs) = lexer::lex(input, &src);
+    all_errs.extend(lex_errs);
+
+    let (prog, parse_errs) = parser::parse(input, &tokens);
+    all_errs.extend(parse_errs);
+
+    let (prog, import_errs) = imports::resolve(prog);
+    all_errs.extend(import_errs);
+
+    let (resolved, resolve_errs) = resolve::resolve(prog);
+    all_errs.extend(resolve_errs);
+
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
+        let n = all_errs.len();
+        emit_errors(&all_errs, format);
+        return Err(DumpColorError::FrontEndErrors(n));
+    }
+
+    let (checked, tc_errs) = typecheck::typecheck(resolved.program);
+    all_errs.extend(tc_errs);
+
+    if all_errs
+        .iter()
+        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
+    {
+        let n = all_errs.len();
+        emit_errors(&all_errs, format);
+        return Err(DumpColorError::FrontEndErrors(n));
+    }
+
+    let anf = elaborate::elaborate(checked);
+    let mono = monomorphize::monomorphize(anf);
+    let colored = color::infer_colors(mono);
+    let analysis = discharge::analyze(&colored);
+    emit_errors(&all_errs, format);
+    Ok(discharge::dump_discharge(&analysis))
 }

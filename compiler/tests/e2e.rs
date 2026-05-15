@@ -1539,6 +1539,47 @@ fn dump_color_multi_fn_pure_program() {
     );
 }
 
+// ===== Plan E3 Phase 1 — `--dump-discharge` ================================
+
+/// `sigil <input> --dump-discharge` runs the front end + Plan E3's
+/// per-call-site discharge analysis and prints one line per
+/// top-level-fn call site to stdout, followed by a `# summary:` line.
+/// No codegen, no executable produced. CI-runs the binary against
+/// `examples/catch.sigil` — the smallest example known to produce a
+/// `FullyDischarged` call site (per the Phase 1 activation
+/// inventory recorded in `compiler/src/discharge.rs::phase_1_-
+/// activation_inventory_across_examples`).
+#[test]
+fn dump_discharge_catch_example_has_full_summary() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&source)
+        .arg("--dump-discharge")
+        .output()
+        .expect("invoke sigil --dump-discharge");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--dump-discharge exit; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    // `examples/catch.sigil` has one user-program FullyDischarged
+    // call site: `main -> risky` inside the `Raise.fail` handle.
+    assert!(
+        stdout.contains("FullyDischarged"),
+        "expected at least one FullyDischarged site in dump-discharge output: {stdout}"
+    );
+    // The trailing summary line must be present (Phase 1 review
+    // contract — the user reads this line for the activation
+    // inventory).
+    assert!(
+        stdout.contains("# summary:"),
+        "expected `# summary:` trailer in dump-discharge output: {stdout}"
+    );
+}
+
 // ===== Plan B Task 51 — `examples/generic_map.sigil` =======================
 
 /// `examples/generic_map.sigil` — first user-authored generic syntax to

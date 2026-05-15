@@ -18,6 +18,15 @@ pub enum Command {
     /// executable). Required for diagnosing performance-floor misses
     /// and for the Stage 5 color-decision review checkpoint.
     DumpColor(DumpColorArgs),
+    /// Plan E3 Phase 1 — `sigil <input> --dump-discharge`. Runs the
+    /// front end through color inference + Plan E3's per-call-site
+    /// discharge analysis and prints one line per top-level-fn call
+    /// site to stdout, then exits without codegen. Used to inventory
+    /// `FullyDischarged` Cps-color call sites for the Phase-2
+    /// activation review checkpoint. Same `-o` semantics as
+    /// `--dump-color`: accepted for shell-history ergonomics, warned
+    /// about because no executable is produced.
+    DumpDischarge(DumpDischargeArgs),
     Usage,
     UsageError(String),
 }
@@ -30,6 +39,17 @@ pub struct DumpColorArgs {
     /// Color analysis emits no executable; the driver in `main.rs`
     /// uses this flag to print a stderr warning so the misuse is
     /// visible rather than silent.
+    pub output_supplied: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DumpDischargeArgs {
+    pub input: String,
+    pub error_format: ErrorFormat,
+    /// Mirrors [`DumpColorArgs::output_supplied`]: `-o` is accepted
+    /// under `--dump-discharge` so users can re-use shell history with
+    /// a `-o` already typed, but the path is recorded so `main.rs` can
+    /// print a stderr warning. Discharge analysis emits no executable.
     pub output_supplied: Option<String>,
 }
 
@@ -64,6 +84,7 @@ pub fn parse(args: &[String]) -> Command {
     //   sigil <input> --dump-color [--human-errors]
     let mut print_stats = false;
     let mut dump_color = false;
+    let mut dump_discharge = false;
     let mut emit_symbol_table = false;
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
@@ -87,6 +108,9 @@ pub fn parse(args: &[String]) -> Command {
             }
             "--dump-color" => {
                 dump_color = true;
+            }
+            "--dump-discharge" => {
+                dump_discharge = true;
             }
             "--emit-symbol-table" => {
                 emit_symbol_table = true;
@@ -112,6 +136,9 @@ pub fn parse(args: &[String]) -> Command {
         None => return Command::UsageError("compile: missing <input.sigil>".into()),
     };
 
+    if dump_color && dump_discharge {
+        return Command::UsageError("--dump-color cannot be combined with --dump-discharge".into());
+    }
     if dump_color {
         if print_stats {
             return Command::UsageError(
@@ -128,6 +155,24 @@ pub fn parse(args: &[String]) -> Command {
         // driver in `main.rs` prints a stderr warning when this is
         // set so the misuse is visible.
         return Command::DumpColor(DumpColorArgs {
+            input,
+            error_format,
+            output_supplied: output,
+        });
+    }
+
+    if dump_discharge {
+        if print_stats {
+            return Command::UsageError(
+                "--dump-discharge cannot be combined with --print-runtime-stats".into(),
+            );
+        }
+        if emit_symbol_table {
+            return Command::UsageError(
+                "--dump-discharge cannot be combined with --emit-symbol-table".into(),
+            );
+        }
+        return Command::DumpDischarge(DumpDischargeArgs {
             input,
             error_format,
             output_supplied: output,
@@ -156,6 +201,7 @@ usage:
     sigil <input.sigil> -o <output> [--human-errors] [--emit-symbol-table]
     sigil --print-runtime-stats <input.sigil> -o <output>
     sigil <input.sigil> --dump-color [--human-errors]
+    sigil <input.sigil> --dump-discharge [--human-errors]
     sigil explain <code>
 
 flags:
@@ -164,6 +210,10 @@ flags:
     --print-runtime-stats    Compile, run, and print runtime counters at exit.
     --dump-color             Run color inference and print one line per monomorph
                              (`<name> native|cps <reason>`) to stdout. No codegen.
+    --dump-discharge         Run color inference + per-call-site discharge analysis
+                             (Plan E3 Phase 1) and print one line per top-level-fn
+                             call site to stdout, with a trailing `# summary:` line.
+                             No codegen.
     --emit-symbol-table      Write `<output>.symtab` next to the executable: one
                              tab-separated line per function symbol
                              (`<text_offset_hex>\\t<size_hex>\\t<demangled_name>`),
@@ -313,6 +363,61 @@ mod tests {
     #[test]
     fn emit_symbol_table_conflicts_with_dump_color() {
         let c = parse_argv(&["hello.sigil", "--dump-color", "--emit-symbol-table"]);
+        assert!(matches!(c, Command::UsageError(_)));
+    }
+
+    #[test]
+    fn dump_discharge_default_format() {
+        let c = parse_argv(&["hello.sigil", "--dump-discharge"]);
+        assert_eq!(
+            c,
+            Command::DumpDischarge(DumpDischargeArgs {
+                input: "hello.sigil".into(),
+                error_format: ErrorFormat::JsonLines,
+                output_supplied: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dump_discharge_with_human_errors() {
+        let c = parse_argv(&["hello.sigil", "--dump-discharge", "--human-errors"]);
+        assert_eq!(
+            c,
+            Command::DumpDischarge(DumpDischargeArgs {
+                input: "hello.sigil".into(),
+                error_format: ErrorFormat::Human,
+                output_supplied: None,
+            })
+        );
+    }
+
+    #[test]
+    fn dump_discharge_records_dash_o_for_warning() {
+        let c = parse_argv(&["hello.sigil", "-o", "/tmp/x", "--dump-discharge"]);
+        match c {
+            Command::DumpDischarge(args) => {
+                assert_eq!(args.output_supplied.as_deref(), Some("/tmp/x"));
+            }
+            other => panic!("expected DumpDischarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dump_discharge_conflicts_with_dump_color() {
+        let c = parse_argv(&["hello.sigil", "--dump-color", "--dump-discharge"]);
+        assert!(matches!(c, Command::UsageError(_)));
+    }
+
+    #[test]
+    fn dump_discharge_conflicts_with_print_runtime_stats() {
+        let c = parse_argv(&["hello.sigil", "--dump-discharge", "--print-runtime-stats"]);
+        assert!(matches!(c, Command::UsageError(_)));
+    }
+
+    #[test]
+    fn dump_discharge_conflicts_with_emit_symbol_table() {
+        let c = parse_argv(&["hello.sigil", "--dump-discharge", "--emit-symbol-table"]);
         assert!(matches!(c, Command::UsageError(_)));
     }
 }
