@@ -31,6 +31,7 @@
 #     "alloc_count":   <int, from SIGIL_COUNTER_BOEHM_ALLOC_COUNT>,
 #     "alloc_bytes":   <int, from SIGIL_COUNTER_BOEHM_ALLOC_BYTES>,
 #     "boehm_gc_time_ms": <int or null, from boehm_gc_time_ms>
+#     "precise_walker_ns": <int or null, from SIGIL_COUNTER_PRECISE_WALKER_NS>
 #   }
 #
 # Wall-clock / RSS are aggregated across runs; alloc counters are
@@ -136,6 +137,7 @@ peak_rss_kb_values=()
 last_alloc_count=""
 last_alloc_bytes=""
 last_gc_time_ms=""
+last_precise_walker_ns=""
 
 for ((i = 1; i <= RUNS; i++)); do
     time_log="$(mktemp)"
@@ -202,6 +204,12 @@ for ((i = 1; i <= RUNS; i++)); do
             | tail -1 | cut -d= -f2 || true)
         last_gc_time_ms=$(grep '^boehm_gc_time_ms=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
+        # Plan E2 Phase 3 GC-time follow-up — precise-walker
+        # cumulative ns. Counter is introduced post-Phase-3-followup
+        # only, so pre-checkpoint builds will not emit this line.
+        # Treat its absence as `null` (the diff tool renders "n/a").
+        last_precise_walker_ns=$(grep '^SIGIL_COUNTER_PRECISE_WALKER_NS=' "$stderr_log" \
+            | tail -1 | cut -d= -f2 || true)
         if [[ -z "$last_alloc_count" || -z "$last_alloc_bytes" ]]; then
             echo "measure-throughput: run $i — missing alloc counter line in stderr:" >&2
             cat "$stderr_log" >&2
@@ -211,6 +219,9 @@ for ((i = 1; i <= RUNS; i++)); do
         # Probe-absence on pre-Phase-2 builds maps to JSON null.
         if [[ -z "$last_gc_time_ms" ]]; then
             last_gc_time_ms="null"
+        fi
+        if [[ -z "$last_precise_walker_ns" ]]; then
+            last_precise_walker_ns="null"
         fi
     fi
 
@@ -250,6 +261,7 @@ cat <<JSON
   $rss_json,
   "alloc_count": $last_alloc_count,
   "alloc_bytes": $last_alloc_bytes,
-  "boehm_gc_time_ms": $last_gc_time_ms
+  "boehm_gc_time_ms": $last_gc_time_ms,
+  "precise_walker_ns": $last_precise_walker_ns
 }
 JSON

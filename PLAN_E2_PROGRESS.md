@@ -554,6 +554,30 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
+- Mark-phase hypothesis verdict (follow-up) — ✅ **Inconclusive**
+  even under forced budget. See
+  [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
+  Adds the `SIGIL_MAX_HEAP_SIZE_KB` env var + the always-on
+  `SIGIL_COUNTER_PRECISE_WALKER_NS` counter. Workflow run
+  [`25899135194`](https://github.com/boldfield/sigil/actions/runs/25899135194)
+  at `SIGIL_MAX_HEAP_SIZE_KB=16384` (the smallest budget every
+  workload completes under): every workload × every
+  checkpoint × every OS shows `boehm_gc_time_ms = 0` — either
+  no STW full GC fired, or each one completed in under 1 ms
+  (Boehm's ms-resolved counter rounds sub-ms to 0). The unit
+  test confirms the mechanism does fire collections at a
+  tighter 1 MiB budget; the 16 MiB workload budget sits in a
+  regime where the ms-resolved counter can't separate the two
+  readings. The hypothesis remains structurally unfalsifiable
+  at this resolution; the savings column is zero by
+  measurement. The walker-cost column IS measurable —
+  0–625 µs cumulative per workload run (~3.1% relative on the
+  largest Cps workload) — so half the decomposition was
+  landed. Future measurement would need a debug-build-only
+  runtime-internal `GC_gcollect()` injection — a separate
+  mechanism from the design's option-(b) rejection (that
+  was a language-surface intrinsic, not a runtime debug
+  knob).
 
 ## Deviations
 

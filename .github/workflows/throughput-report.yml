@@ -33,6 +33,10 @@ on:
         description: "Measurement runs per workload"
         required: true
         default: "5"
+      heap_budget_kb:
+        description: "Optional: pin Boehm max heap to N KB (forces GC at low threshold for mark-phase measurement). Empty = no budget."
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -108,6 +112,14 @@ jobs:
           done
 
       - name: post — measure workloads
+        env:
+          # Plan E2 Phase 3 GC-time follow-up — optional Boehm max
+          # heap pin. Empty input → unset → runtime treats as
+          # "no budget" (matches Phase 2 / Phase 3 report behaviour).
+          # Non-empty → `sigil_gc_init` calls `GC_set_max_heap_size`
+          # at the value's byte count (KB × 1024) to force collections
+          # at low threshold for mark-phase measurement.
+          SIGIL_MAX_HEAP_SIZE_KB: ${{ inputs.heap_budget_kb }}
         run: |
           mkdir -p throughput-data/post
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
@@ -141,6 +153,18 @@ jobs:
             if [[ ! -f "${src}" ]]; then
               cp "${{ github.workspace }}/${src}" "${src}"
               echo "cherry-picked ${src} (absent at PRE SHA)"
+              # PR #173 (qualified-only imports) added `use std.*;`
+              # lines to every workload. The pre-PR-#173 parser
+              # rejects them with E0010. Strip the `use` lines on
+              # cherry-pick so the pre-checkpoint compiler accepts
+              # the source — pre-PR-#173 `import std.foo` already
+              # brought every name in `std.foo` into the bare
+              # namespace, so the stripped form is semantically
+              # equivalent on the pre side. The sed `-i.bak` + rm
+              # idiom works on both GNU sed (linux) and BSD sed
+              # (macos) without per-OS branching.
+              sed -i.bak '/^use .*;$/d' "${src}"
+              rm -f "${src}.bak"
             else
               echo "PRE SHA already has ${src}; keeping its version"
             fi
@@ -171,6 +195,15 @@ jobs:
           done
 
       - name: pre — measure workloads
+        env:
+          # Plan E2 Phase 3 GC-time follow-up — mirror the post-step's
+          # env wiring so pre/post are measured under the same budget
+          # pressure. Pre-checkpoint runtime does not yet honor this
+          # env var (the read site landed in this PR); the value is
+          # set anyway so the runtime, post-merge, can apply it
+          # symmetrically when re-running the workflow against a SHA
+          # that has the env var read in place.
+          SIGIL_MAX_HEAP_SIZE_KB: ${{ inputs.heap_budget_kb }}
         run: |
           mkdir -p throughput-data/pre
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
@@ -187,6 +220,8 @@ jobs:
       - name: render deltas summary
         run: |
           mkdir -p throughput-data
+          BUDGET="${{ inputs.heap_budget_kb }}"
+          if [[ -z "$BUDGET" ]]; then BUDGET="(none)"; fi
           {
             echo "## Deltas — ${{ matrix.os }}"
             echo ""
@@ -194,6 +229,7 @@ jobs:
             echo "Post SHA: \`${{ github.sha }}\`"
             echo "Runs per workload: ${{ inputs.runs }}"
             echo "libgc version: \`${LIBGC_VERSION}\`"
+            echo "Heap budget: \`${BUDGET}\` KB"
             echo ""
             for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
               scripts/diff-throughput.py "${w}" \

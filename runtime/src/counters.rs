@@ -88,14 +88,32 @@ pub enum CounterId {
     /// `Char` records (header + 4-byte codepoint + 4-byte padding;
     /// 16 bytes per record, matching the `Float` / `Int64` cost).
     CharAllocBytes = 27,
+    /// Plan E2 Phase 3 GC-time follow-up — cumulative wall-clock
+    /// nanoseconds spent inside `push_sigil_thread_precise_roots`'s
+    /// walker body (excludes the chained prior-proc call, which is
+    /// Boehm's internal hook cost not Phase 3's overhead). Reported
+    /// by `sigil_counter_print_all` at process exit so the
+    /// throughput script can extract it alongside `boehm_gc_time_ms`
+    /// and decompose Phase 3's net effect into:
+    ///
+    ///   savings = pre-`boehm_gc_time_ms` - post-`boehm_gc_time_ms`
+    ///   cost    = post-`SIGIL_COUNTER_PRECISE_WALKER_NS` (ns -> ms)
+    ///   net     = savings - cost
+    ///
+    /// Always-on (~50ns per callback fire — two `Instant::now()` +
+    /// a relaxed atomic add). Pre-Phase-3 binaries do not have this
+    /// counter; the decomposition treats the missing pre value as 0
+    /// and documents the asymmetry in the report doc.
+    PreciseWalkerNs = 28,
 }
 
-const COUNTER_SLOTS: usize = 28;
+const COUNTER_SLOTS: usize = 29;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -157,6 +175,7 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_FLOAT_ALLOC_BYTES",
     "SIGIL_COUNTER_CHAR_ALLOC_COUNT",
     "SIGIL_COUNTER_CHAR_ALLOC_BYTES",
+    "SIGIL_COUNTER_PRECISE_WALKER_NS",
 ];
 
 #[inline]

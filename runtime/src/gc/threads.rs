@@ -429,15 +429,42 @@ extern "C" fn push_sigil_thread_precise_roots() {
         prior();
     }
 
+    // Plan E2 Phase 3 GC-time follow-up — time the walker body so
+    // the throughput follow-up doc can decompose Phase 3's net
+    // effect into (conservative-scan-savings) - (walker-cost).
+    // The snapshot is taken AFTER the chained prior-proc call —
+    // that proc is Boehm's internal hook (TLS roots + dynamic-
+    // library roots) and its cost is not Phase 3's overhead.
+    //
+    // Per-call cost: two `Instant::now()` reads + a relaxed atomic
+    // add (~50 ns). Always-on (not env-gated) — the cost is below
+    // the noise floor on alloc-heavy workloads and gating would add
+    // config complexity for marginal savings. See the design doc's
+    // §"Key decisions" item 3.
+    //
+    // Increment on every exit path (gate-short-circuit and walked-
+    // body alike) so the counter reflects the actual wall-clock
+    // cost of the callback — including the gate checks themselves,
+    // which are small but non-zero.
+    let walker_start = std::time::Instant::now();
+
     // Discriminator gates per the doc above: a `false`
     // IS_SIGIL_THREAD or a null captured FP both mean "no
     // precise roots to supply from this thread's call chain".
     let is_sigil = IS_SIGIL_THREAD.with(Cell::get);
     if !is_sigil {
+        crate::counters::add(
+            crate::counters::CounterId::PreciseWalkerNs,
+            walker_start.elapsed().as_nanos() as u64,
+        );
         return;
     }
     let captured_fp = CAPTURED_SIGIL_CALLER_FP.with(Cell::get);
     if captured_fp.is_null() {
+        crate::counters::add(
+            crate::counters::CounterId::PreciseWalkerNs,
+            walker_start.elapsed().as_nanos() as u64,
+        );
         return;
     }
     crate::stackmap::walk_for_gc_with_callback_from(captured_fp, |r| {
@@ -452,6 +479,10 @@ extern "C" fn push_sigil_thread_precise_roots() {
         let top = (r.addr.wrapping_add(8)) as *mut c_void;
         unsafe { GC_push_all_eager(bottom, top) };
     });
+    crate::counters::add(
+        crate::counters::CounterId::PreciseWalkerNs,
+        walker_start.elapsed().as_nanos() as u64,
+    );
 }
 
 #[cfg(test)]
