@@ -88,12 +88,18 @@ def render(workload: str, pre: dict, post: dict) -> str:
     # accumulator — pre-checkpoint binaries do not have it (counter
     # added by the follow-up plan), so its pre value renders as
     # "n/a" while post is non-zero. The decomposition tables in the
-    # report doc consume the post side directly.
+    # report doc consume the post side directly. `forced_gc_count`
+    # (Phase 3 GC-time follow-up #2) is the same shape: the pre-side
+    # cherry-picked patch deliberately omits the counter slot, so
+    # pre renders as "n/a" while post is the operator's sanity check
+    # (forced_gc_count ≈ alloc_count / N — confirms the
+    # SIGIL_FORCE_GC_EVERY_N_ALLOCS injection actually fired).
     for key, unit in [
         ("alloc_count", ""),
         ("alloc_bytes", "bytes"),
         ("boehm_gc_time_ms", "ms"),
         ("precise_walker_ns", "ns"),
+        ("forced_gc_count", ""),
     ]:
         # Defensive: keys added by a later plan may be absent on a
         # JSON file produced by an older measure-throughput.sh.

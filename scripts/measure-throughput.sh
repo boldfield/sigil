@@ -32,6 +32,7 @@
 #     "alloc_bytes":   <int, from SIGIL_COUNTER_BOEHM_ALLOC_BYTES>,
 #     "boehm_gc_time_ms": <int or null, from boehm_gc_time_ms>
 #     "precise_walker_ns": <int or null, from SIGIL_COUNTER_PRECISE_WALKER_NS>
+#     "forced_gc_count":  <int or null, from SIGIL_COUNTER_FORCED_GC_COUNT>
 #   }
 #
 # Wall-clock / RSS are aggregated across runs; alloc counters are
@@ -138,6 +139,7 @@ last_alloc_count=""
 last_alloc_bytes=""
 last_gc_time_ms=""
 last_precise_walker_ns=""
+last_forced_gc_count=""
 
 for ((i = 1; i <= RUNS; i++)); do
     time_log="$(mktemp)"
@@ -210,6 +212,17 @@ for ((i = 1; i <= RUNS; i++)); do
         # Treat its absence as `null` (the diff tool renders "n/a").
         last_precise_walker_ns=$(grep '^SIGIL_COUNTER_PRECISE_WALKER_NS=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
+        # Plan E2 Phase 3 GC-time follow-up #2 — count of forced
+        # `GC_gcollect()` injections fired by the
+        # `SIGIL_FORCE_GC_EVERY_N_ALLOCS` cadence. Diagnostic-only:
+        # the operator's sanity check is `forced_gc_count ≈
+        # alloc_count / N`, distinguishing "injection fired,
+        # `boehm_gc_time_ms` is genuinely 0" from "injection silently
+        # didn't fire". The pre-checkpoint binary's cherry-picked
+        # patch deliberately omits this counter slot (counters.rs
+        # would need a sibling patch), so pre-side reads as `null`.
+        last_forced_gc_count=$(grep '^SIGIL_COUNTER_FORCED_GC_COUNT=' "$stderr_log" \
+            | tail -1 | cut -d= -f2 || true)
         if [[ -z "$last_alloc_count" || -z "$last_alloc_bytes" ]]; then
             echo "measure-throughput: run $i — missing alloc counter line in stderr:" >&2
             cat "$stderr_log" >&2
@@ -222,6 +235,9 @@ for ((i = 1; i <= RUNS; i++)); do
         fi
         if [[ -z "$last_precise_walker_ns" ]]; then
             last_precise_walker_ns="null"
+        fi
+        if [[ -z "$last_forced_gc_count" ]]; then
+            last_forced_gc_count="null"
         fi
     fi
 
@@ -262,6 +278,7 @@ cat <<JSON
   "alloc_count": $last_alloc_count,
   "alloc_bytes": $last_alloc_bytes,
   "boehm_gc_time_ms": $last_gc_time_ms,
-  "precise_walker_ns": $last_precise_walker_ns
+  "precise_walker_ns": $last_precise_walker_ns,
+  "forced_gc_count": $last_forced_gc_count
 }
 JSON
