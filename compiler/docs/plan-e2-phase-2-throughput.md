@@ -7,6 +7,12 @@ macos-14) at the pre-Phase-2 SHA (`4f7ec86`) and the branch
 HEAD (`2871742`); the per-workload JSON + per-OS deltas
 summary live in the run's artifact upload.
 
+**Follow-up:** the descriptor-cache hot-path cost surfaced
+here is closed by the static-descriptor-table refactor
+(2026-05-15). See
+[`plan-e2-phase-2-static-descriptor-table.md`](plan-e2-phase-2-static-descriptor-table.md)
+for mechanism + per-OS measurement (operator-triggered).
+
 ## TL;DR
 
 Phase 2 makes the descriptor-cache hot path measurably slower

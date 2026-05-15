@@ -63,7 +63,10 @@ const REF_PAYLOAD_BYTES: usize = 8;
 #[no_mangle]
 pub extern "C" fn sigil_ref_alloc(initial: u64) -> *mut u8 {
     let h = Header::new(TAG_REF, 1, 0b1);
-    let obj = sigil_alloc(h.raw(), REF_PAYLOAD_BYTES);
+    // Typed-malloc shape `(0b1, 1)` — pre-registered as
+    // `RuntimeShapeIndices::ref_cell` by `sigil_init_shapes`.
+    let descriptor_index = crate::gc::runtime_shape_indices().ref_cell;
+    let obj = sigil_alloc(h.raw(), REF_PAYLOAD_BYTES, descriptor_index);
     // SAFETY: gc-heap-ptr arithmetic — `obj` is a freshly-allocated
     // 16-byte block (8-byte header + 8-byte value slot). Writing the
     // value slot at offset 8 is an aligned u64 store within the

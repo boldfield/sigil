@@ -323,10 +323,11 @@ pub unsafe extern "C" fn sigil_arena_promote(
     src: *const u8,
     header: u64,
     payload_bytes: usize,
+    descriptor_index: u32,
 ) -> *mut u8 {
     counters::incr(CounterId::ArenaEscapeCount);
 
-    let obj = crate::gc::sigil_alloc(header, payload_bytes);
+    let obj = crate::gc::sigil_alloc(header, payload_bytes, descriptor_index);
     if payload_bytes > 0 && !src.is_null() {
         // SAFETY: gc-heap-ptr arithmetic (the destination pointer is
         // computed from the just-allocated `obj` purely to drive a
@@ -448,7 +449,9 @@ mod tests {
         }
         let header = crate::header::Header::new(crate::header::TAG_INT64, 2, 0);
         let escape_before = counters::read(CounterId::ArenaEscapeCount);
-        let promoted = unsafe { sigil_arena_promote(arena_buf, header.raw(), 16) };
+        // bitmap=0 → atomic path inside sigil_alloc; descriptor_index
+        // ignored.
+        let promoted = unsafe { sigil_arena_promote(arena_buf, header.raw(), 16, u32::MAX) };
         assert!(!promoted.is_null());
         unsafe {
             let payload: *const u64 = promoted.add(8).cast();

@@ -213,8 +213,399 @@ extern "C" {
     pub(crate) fn GC_get_gc_no() -> usize;
 }
 
-pub(crate) mod descriptor;
 pub mod threads;
+
+/// Static descriptor table — Plan E2 Phase 2 static-descriptor-table
+/// follow-up (2026-05-15). Populated once at program start by
+/// `sigil_init_shapes`, which the compiler-emitted main shim calls
+/// immediately after `sigil_gc_init`. Indexed by a u32 codegen threads
+/// through `sigil_alloc`'s third argument; each entry is the Boehm
+/// `GC_descr` handle for one (bitmap, payload_word_count) shape the
+/// program statically uses.
+///
+/// Replaces the previous `RwLock<BTreeMap<(u32, u8), GC_descr>>`
+/// descriptor cache (the now-deleted `gc::descriptor` module). The
+/// cache's purpose was to amortize `GC_make_descriptor` across many
+/// allocations of the same shape; the static table does the same job
+/// at the cost of one extra `iconst` per `sigil_alloc` call site and
+/// none of the lock / map-lookup overhead on the alloc hot path.
+///
+/// **Layout:** `[codegen-emitted shapes (indices 0..n), runtime-known
+/// shapes (indices n..n + RUNTIME_SHAPE_COUNT)]`. The codegen prefix
+/// comes from the `__sigil_shape_table` data section the compiler
+/// emits; the runtime suffix covers shapes the runtime itself
+/// allocates (Ref, Continuation, StringBuilder, the various
+/// arm-fn tuple shapes, the wrapper-continuation closure shape).
+/// Runtime callers fetch their assigned indices from
+/// [`RUNTIME_SHAPE_INDICES`] (populated alongside SHAPE_DESCRIPTORS by
+/// `sigil_init_shapes`).
+///
+/// The plan body undercounted this: it identified only
+/// `sigil_handler_frame_new` as runtime-determined, missing the other
+/// runtime-internal typed-malloc callers. The runtime suffix closes
+/// that gap without re-introducing the lock + map lookup on the
+/// codegen hot path — runtime callers pay an extra `OnceLock::get()`
+/// (atomic relaxed load + branch on the fast path) rather than the
+/// RwLock + BTreeMap read of the prior descriptor cache.
+///
+/// The `OnceLock` is set exactly once during init; readers in
+/// `sigil_alloc`'s typed-malloc branch get a `&'static [usize]` and
+/// index into it. Tests register their shapes via
+/// `install_shape_descriptors_for_test` which rebuilds an override
+/// vector — slow but only runs in test builds and only when the
+/// typed-malloc path is exercised directly.
+static SHAPE_DESCRIPTORS: OnceLock<Vec<usize>> = OnceLock::new();
+
+/// Assigned indices for the runtime-known typed-malloc shapes. The
+/// runtime appends these shapes to `SHAPE_DESCRIPTORS` immediately
+/// after the codegen-emitted entries during `sigil_init_shapes`, then
+/// records the resulting indices here so each runtime allocator can
+/// look up its own index without performing a (bitmap, count) search.
+///
+/// Test builds populate this via `install_shape_descriptors_for_test`,
+/// which also fills `RUNTIME_SHAPE_INDICES_TEST_OVERRIDE` so tests can
+/// exercise typed-malloc paths without running through the compiler-
+/// emitted main shim.
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeShapeIndices {
+    /// `Ref[T]`: 1 payload word, payload word 0 is a GC pointer.
+    /// `(bitmap=0b1, count=1)`.
+    pub ref_cell: u32,
+    /// Continuation closure: 4 payload words; words 0 and 2 are
+    /// GC pointers (closure / k_closure_ptr), words 1 and 3 are
+    /// function pointers. `(bitmap=0b0101, count=4)`.
+    pub continuation: u32,
+    /// String builder: 4 payload words; word 3 holds the segments
+    /// table pointer. `(bitmap=0b1000, count=4)`.
+    pub string_builder: u32,
+    /// `(Tag/Int, Ptr)` tuple — fs/env Ok/Err shape.
+    /// `(bitmap=0b10, count=2)`.
+    pub tuple_int_ptr: u32,
+    /// `(Ptr, Ptr)` tuple — env-vars key/value pair shape.
+    /// `(bitmap=0b11, count=2)`.
+    pub tuple_ptr_ptr: u32,
+    /// `(Tag/Int, Ptr, Ptr)` tuple — fs-err 3-element shape.
+    /// `(bitmap=0b110, count=3)`.
+    pub tuple_int_ptr_ptr: u32,
+    /// `(Int, Int, Ptr, Ptr)` tuple — process-run result shape.
+    /// `(bitmap=0b1100, count=4)`.
+    pub tuple_int_int_ptr_ptr: u32,
+    /// Wrapper-continuation closure built by
+    /// `wrap_continuation_with_outer_post_arm_k`: 5 payload words,
+    /// pointers at slots 1 (inner_closure) and 3 (saved_closure).
+    /// `(bitmap=0b01010, count=5)`.
+    pub wrapper_continuation: u32,
+    /// Handler-frame shapes per `arm_count ∈ [0, MAX_HANDLER_ARMS]`.
+    /// Indexed by `arm_count` directly. Slot 0 (arm_count=0) is
+    /// populated even though codegen-emitted handler frames have
+    /// `arm_count >= 1`, so the runtime can serve direct
+    /// `sigil_handler_frame_new(_, 0)` test calls from the same
+    /// table.
+    pub handler_frame: [u32; MAX_HANDLER_ARMS_INCLUSIVE],
+}
+
+/// `MAX_HANDLER_ARMS + 1` (so the array slot for `arm_count = max`
+/// is in bounds). Declared at module scope so the const array
+/// initializer in `RuntimeShapeIndices` can reference it.
+pub(crate) const MAX_HANDLER_ARMS_INCLUSIVE: usize =
+    sigil_abi::effect::MAX_HANDLER_ARMS as usize + 1;
+
+/// Assigned runtime-shape indices; populated alongside
+/// `SHAPE_DESCRIPTORS` by `sigil_init_shapes` (production builds) or
+/// `install_shape_descriptors_for_test` (test builds). Production
+/// readers panic if unset — `sigil_init_shapes` must have run.
+static RUNTIME_SHAPE_INDICES: OnceLock<RuntimeShapeIndices> = OnceLock::new();
+
+/// Materialize Boehm descriptors for every shape in the codegen-
+/// emitted shape table and store them in `SHAPE_DESCRIPTORS`. Called
+/// exactly once from the compiler-emitted main shim, immediately
+/// after `sigil_gc_init` (which must run first so `GC_init` has
+/// fired before `GC_make_descriptor`) and before any user-code
+/// allocation (so `sigil_alloc`'s typed-malloc branch never reads
+/// `SHAPE_DESCRIPTORS` before it is populated).
+///
+/// `table` points to `n` 8-byte entries in the codegen-emitted
+/// `__sigil_shape_table` data section. Each entry is laid out as
+/// `(bitmap: u32 little-endian, count: u32 little-endian)` — the
+/// `count` field is zero-extended from u8 to u32 to keep the entry
+/// 8-byte aligned (the wasted 3 bytes per entry are negligible
+/// since `N < 100` for realistic programs).
+///
+/// # Safety
+///
+/// `table` must point to at least `n * 8` readable bytes; codegen
+/// guarantees this by emitting the table contents from the same
+/// pre-pass that determines `n`. Idempotent: a second call (e.g.,
+/// from a re-entry path in tests) is a silent no-op via
+/// `OnceLock::set`'s Err return.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_init_shapes(table: *const u8, n: usize) {
+    // Tolerate `n == 0` (a program with no precise-marking
+    // allocations still emits the call so the runtime's invariant
+    // — `SHAPE_DESCRIPTORS` is populated before any alloc — holds).
+    let mut descriptors: Vec<usize> = if n == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: caller guarantees `table` points to `n * 8`
+        // readable bytes per the doc comment above. The slice is
+        // valid for the duration of this function only; we copy
+        // out the (bitmap, count) pairs immediately.
+        let bytes = std::slice::from_raw_parts(table, n.saturating_mul(8));
+        let mut out: Vec<usize> = Vec::with_capacity(n);
+        for chunk in bytes.chunks_exact(8) {
+            let bitmap = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let count = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u8;
+            out.push(build_descriptor_for_shape(bitmap, count));
+        }
+        out
+    };
+
+    // Append the runtime-known shapes after the codegen-emitted
+    // prefix. Each push advances the next-index counter, so the
+    // resulting `RuntimeShapeIndices` carries indices that point
+    // back into the same `descriptors` vector. See
+    // `SHAPE_DESCRIPTORS`'s doc for the layout rationale.
+    let runtime_indices = append_runtime_shapes(&mut descriptors);
+
+    // Idempotent: re-entry returns Err which we discard.
+    let _ = RUNTIME_SHAPE_INDICES.set(runtime_indices);
+    let _ = SHAPE_DESCRIPTORS.set(descriptors);
+}
+
+/// Append the runtime-known typed-malloc shapes to `descriptors` and
+/// return the resulting indices. Centralises the runtime's shape
+/// inventory so production init and the test override path agree
+/// on shape→index assignments. See `RuntimeShapeIndices`'s doc for
+/// what each field carries.
+fn append_runtime_shapes(descriptors: &mut Vec<usize>) -> RuntimeShapeIndices {
+    let mut push = |bitmap: u32, count: u8| -> u32 {
+        let idx = descriptors.len() as u32;
+        descriptors.push(build_descriptor_for_shape(bitmap, count));
+        idx
+    };
+    let ref_cell = push(0b1, 1);
+    let continuation = push(0b0101, 4);
+    let string_builder = push(0b1000, 4);
+    let tuple_int_ptr = push(0b10, 2);
+    let tuple_ptr_ptr = push(0b11, 2);
+    let tuple_int_ptr_ptr = push(0b110, 3);
+    let tuple_int_int_ptr_ptr = push(0b1100, 4);
+    let wrapper_continuation = push(0b01010, 5);
+
+    // Handler-frame shapes for every `arm_count ∈ [0, MAX_HANDLER_ARMS]`.
+    // Codegen-emitted handler frames have `arm_count >= 1`; the
+    // arm_count=0 slot is unused by codegen-emitted code but is
+    // populated so direct runtime tests (which call
+    // `sigil_handler_frame_new(_, 0)`) hit the typed-malloc path
+    // through the same `descriptor_index` plumbing as production.
+    let mut handler_frame = [0u32; MAX_HANDLER_ARMS_INCLUSIVE];
+    for (arm_count, slot) in handler_frame.iter_mut().enumerate() {
+        let bitmap = sigil_abi::effect::handler_frame_pointer_bitmap(arm_count as u32);
+        let payload_bytes = sigil_abi::effect::handler_frame_payload_bytes(arm_count as u32);
+        let count = (payload_bytes / 8) as u8;
+        *slot = push(bitmap, count);
+    }
+
+    RuntimeShapeIndices {
+        ref_cell,
+        continuation,
+        string_builder,
+        tuple_int_ptr,
+        tuple_ptr_ptr,
+        tuple_int_ptr_ptr,
+        tuple_int_int_ptr_ptr,
+        wrapper_continuation,
+        handler_frame,
+    }
+}
+
+/// Accessor for the runtime-known shape indices. Returns by value
+/// (the struct is small and `Copy`) so the caller doesn't need to
+/// hold a guard. Panics if neither `sigil_init_shapes` has run
+/// (production) nor a test override is installed (test builds).
+/// On the production hot path this is a single OnceLock atomic load.
+#[cfg(not(test))]
+#[inline]
+pub(crate) fn runtime_shape_indices() -> RuntimeShapeIndices {
+    match RUNTIME_SHAPE_INDICES.get() {
+        Some(idx) => *idx,
+        None => {
+            eprintln!(
+                "sigil_init_shapes not called (RUNTIME_SHAPE_INDICES unset) \
+                 — runtime allocator reached typed-malloc path before \
+                 the codegen-emitted main shim ran `sigil_init_shapes`"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_shape_indices() -> RuntimeShapeIndices {
+    // Fast path: override already installed (by `sigil_gc_init` or a
+    // test-helper call). Return without taking the shape-descriptors
+    // lock.
+    {
+        let guard = RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(idx) = *guard {
+            return idx;
+        }
+    }
+    // Slow path: lazy install. Many runtime tests call
+    // `sigil_handler_frame_new` (which routes through
+    // `runtime_shape_indices()`) without explicitly calling
+    // `install_shape_descriptors_for_test` — they only need the
+    // runtime suffix populated, with no codegen prefix. Install it
+    // here on first hit. Lock order matches
+    // `install_shape_descriptors_for_test` (SHAPE_DESCRIPTORS first,
+    // then RUNTIME_SHAPE_INDICES) so the two callers never deadlock
+    // against each other.
+    let mut shape_guard = SHAPE_DESCRIPTORS_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut runtime_guard = RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(idx) = *runtime_guard {
+        return idx;
+    }
+    let mut descriptors: Vec<usize> = Vec::new();
+    let runtime_indices = append_runtime_shapes(&mut descriptors);
+    *shape_guard = Some(descriptors);
+    *runtime_guard = Some(runtime_indices);
+    runtime_indices
+}
+
+/// Test-only override for `RUNTIME_SHAPE_INDICES`. Set by
+/// `install_shape_descriptors_for_test` so tests can adjust the
+/// codegen-prefix size (which shifts the runtime suffix indices)
+/// across runs without needing to reset the production `OnceLock`.
+#[cfg(test)]
+static RUNTIME_SHAPE_INDICES_TEST_OVERRIDE: std::sync::Mutex<Option<RuntimeShapeIndices>> =
+    std::sync::Mutex::new(None);
+
+/// Build a Boehm typed-malloc descriptor for the given Sigil
+/// (bitmap, payload_word_count) shape. Same arithmetic the
+/// now-deleted `gc::descriptor::build_descriptor` performed; lifted
+/// here so the now-single caller (`sigil_init_shapes`) reads
+/// straightforwardly without an intermediate module.
+///
+/// Per `gc_typed.h`, `GC_make_descriptor` returns a non-zero
+/// `GC_descr` handle on success and a conservative-fallback handle
+/// (also non-zero) on internal memory exhaustion. The runtime
+/// stores either path transparently; precision loss would surface
+/// in the false-retention reproducer test, not at this site.
+fn build_descriptor_for_shape(sigil_bitmap: u32, payload_word_count: u8) -> usize {
+    debug_assert!(
+        (payload_word_count as u64) <= sigil_header_constants::COUNT_MASK,
+        "build_descriptor_for_shape: payload_word_count {} exceeds Header's 6-bit count field max = {}",
+        payload_word_count,
+        sigil_header_constants::COUNT_MASK,
+    );
+    let boehm_bitmap: usize = (sigil_bitmap as usize) << 1;
+    let len_bits: usize = 1 + payload_word_count as usize;
+    // SAFETY: `GC_make_descriptor` reads `len_bits` bits from
+    // `&boehm_bitmap`. The `payload_word_count <= 63` invariant
+    // keeps `len_bits <= 64`, exactly within the single-usize
+    // backing buffer on 64-bit targets. `&boehm_bitmap` is valid
+    // for the call's duration; Boehm doesn't retain it.
+    unsafe { GC_make_descriptor(&boehm_bitmap, len_bits) }
+}
+
+/// Read the descriptor for `index` at `sigil_alloc`'s typed-malloc
+/// branch. Production builds compile to a direct read from
+/// `SHAPE_DESCRIPTORS` (populated once by `sigil_init_shapes`); test
+/// builds layer a Mutex-protected override slot that tests can
+/// install / replace freely across runs without paying the
+/// `OnceLock::take`-on-nightly cost.
+#[cfg(not(test))]
+#[inline]
+fn shape_descriptor_at(index: u32) -> usize {
+    match SHAPE_DESCRIPTORS.get() {
+        Some(t) => t[index as usize],
+        None => {
+            eprintln!(
+                "sigil_init_shapes not called — sigil_alloc's typed-malloc \
+                 branch reached before the codegen-emitted main shim ran \
+                 `sigil_init_shapes` (descriptor_index = {index})"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(test)]
+fn shape_descriptor_at(index: u32) -> usize {
+    let guard = SHAPE_DESCRIPTORS_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match &*guard {
+        Some(ds) => ds[index as usize],
+        None => match SHAPE_DESCRIPTORS.get() {
+            Some(t) => t[index as usize],
+            None => {
+                eprintln!(
+                    "sigil_init_shapes not called and no test override \
+                     installed (descriptor_index = {index})"
+                );
+                std::process::abort();
+            }
+        },
+    }
+}
+
+/// Test-only override for `SHAPE_DESCRIPTORS`. Tests that exercise
+/// `sigil_alloc`'s typed-malloc branch register their shapes via
+/// `install_shape_descriptors_for_test`, which writes here. The
+/// production read path (`shape_descriptor_at`) reads from
+/// `SHAPE_DESCRIPTORS` directly; the test path consults this slot
+/// first. Replacing rather than appending matches the test-isolation
+/// pattern: each test starts from a known state, sets the shapes it
+/// needs, runs, then either drops out (next test's helper call
+/// overwrites) or explicitly clears.
+#[cfg(test)]
+static SHAPE_DESCRIPTORS_TEST_OVERRIDE: std::sync::Mutex<Option<Vec<usize>>> =
+    std::sync::Mutex::new(None);
+
+/// Test-only helper: install a fresh set of shape descriptors that
+/// `sigil_alloc`'s typed-malloc branch will see. Builds descriptors
+/// for the supplied codegen-emitted shapes, appends the runtime-known
+/// shapes after them (so runtime allocators inside the runtime crate
+/// keep working under tests), and records the resulting runtime-
+/// shape indices in `RUNTIME_SHAPE_INDICES_TEST_OVERRIDE`. Returns
+/// the indices the test should use for ITS shapes (i.e., the
+/// codegen-prefix indices `0..shapes.len()`).
+///
+/// Tests serialise via `gc_test_lock`, so concurrent modification of
+/// the override slots is not a concern.
+#[cfg(test)]
+pub(crate) fn install_shape_descriptors_for_test(shapes: &[(u32, u8)]) -> Vec<u32> {
+    let mut descriptors: Vec<usize> = shapes
+        .iter()
+        .map(|&(bitmap, count)| build_descriptor_for_shape(bitmap, count))
+        .collect();
+    let indices: Vec<u32> = (0..shapes.len() as u32).collect();
+    let runtime_indices = append_runtime_shapes(&mut descriptors);
+    *SHAPE_DESCRIPTORS_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(descriptors);
+    *RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(runtime_indices);
+    indices
+}
+
+#[cfg(test)]
+pub(crate) fn clear_shape_descriptors_for_test() {
+    *SHAPE_DESCRIPTORS_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *RUNTIME_SHAPE_INDICES_TEST_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
 
 // `atexit` from the C runtime. Used by `sigil --print-runtime-stats` to
 // dump counters when the compiled program exits. We avoid depending on
@@ -497,7 +888,7 @@ fn assert_precise_alloc_size(total: usize, count: u8, bitmap: u32) {
 /// aborts the process via its default oom-handler on OOM, which v1 does
 /// not override.
 #[no_mangle]
-pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
+pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize, descriptor_index: u32) -> *mut u8 {
     let total = 8usize.saturating_add(payload_bytes);
 
     // Bump Boehm counters before the alloc call so a panic inside Boehm
@@ -539,7 +930,7 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
     #[cfg(not(test))]
     let _fp_guard = SigilCallerFpGuard::capture();
 
-    let raw = alloc_dispatch_active(header, total);
+    let raw = alloc_dispatch_active(header, total, descriptor_index);
 
     if raw.is_null() {
         // Boehm's default oom-handler aborts before returning null, so
@@ -606,12 +997,13 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize) -> *mut u8 {
 /// `*mut c_void` `cd` pointer, but the dispatch itself is identical
 /// regardless of which path entered it.
 #[inline]
-fn alloc_dispatch_active(header: u64, total: usize) -> *mut u8 {
+fn alloc_dispatch_active(header: u64, total: usize, descriptor_index: u32) -> *mut u8 {
     #[cfg(not(test))]
     {
         let mut ctx = AllocActiveCtx {
             header,
             total,
+            descriptor_index,
             raw: std::ptr::null_mut(),
         };
         // SAFETY: GC_call_with_gc_active is documented as stack-
@@ -630,7 +1022,7 @@ fn alloc_dispatch_active(header: u64, total: usize) -> *mut u8 {
     }
     #[cfg(test)]
     {
-        alloc_dispatch(header, total)
+        alloc_dispatch(header, total, descriptor_index)
     }
 }
 
@@ -639,6 +1031,7 @@ fn alloc_dispatch_active(header: u64, total: usize) -> *mut u8 {
 struct AllocActiveCtx {
     header: u64,
     total: usize,
+    descriptor_index: u32,
     raw: *mut u8,
 }
 
@@ -649,7 +1042,7 @@ extern "C" fn alloc_active_trampoline(cd: *mut c_void) -> *mut c_void {
     // of the `GC_call_with_gc_active` call which contains us. No
     // other thread has access to this stack-local context.
     let ctx = unsafe { &mut *(cd as *mut AllocActiveCtx) };
-    ctx.raw = alloc_dispatch(ctx.header, ctx.total);
+    ctx.raw = alloc_dispatch(ctx.header, ctx.total, ctx.descriptor_index);
     std::ptr::null_mut()
 }
 
@@ -685,7 +1078,7 @@ extern "C" fn alloc_active_trampoline(cd: *mut c_void) -> *mut c_void {
 /// non-pointer, silently collecting any heap-bearing array
 /// elements that lacked an independent stack root.
 #[inline]
-fn alloc_dispatch(header: u64, total: usize) -> *mut u8 {
+fn alloc_dispatch(header: u64, total: usize, descriptor_index: u32) -> *mut u8 {
     let h = Header(header);
     if h.pointer_bitmap() == 0 {
         unsafe { GC_malloc_atomic(total) as *mut u8 }
@@ -694,11 +1087,29 @@ fn alloc_dispatch(header: u64, total: usize) -> *mut u8 {
     } else {
         let count = h.payload_count();
         assert_precise_alloc_size(total, count, h.pointer_bitmap());
-        let descr = descriptor::get_or_create(h.pointer_bitmap(), count);
-        // SAFETY: `descr` was built by `GC_make_descriptor` and is
-        // alive for the process lifetime (the cache never evicts).
-        // `total` meets the descriptor's `len_bits * sizeof(GC_word)`
-        // floor (debug_asserted above for non-release builds).
+        // Static-descriptor-table follow-up: the descriptor cache
+        // (`gc::descriptor` module) is gone; codegen threads the
+        // shape's pre-registered index through `sigil_alloc`'s
+        // third arg, and we read the materialised `GC_descr` out of
+        // the static `SHAPE_DESCRIPTORS` vector. `u32::MAX` is the
+        // sentinel value codegen emits for the atomic /
+        // conservative branches (which don't reach this typed-
+        // malloc arm); reaching this point with the sentinel
+        // signals a codegen / runtime branch-condition drift, not
+        // a recoverable runtime condition.
+        debug_assert!(
+            descriptor_index != u32::MAX,
+            "sigil_alloc: typed-malloc branch hit with sentinel \
+             descriptor_index = u32::MAX (bitmap=0b{:b}, count={count})",
+            h.pointer_bitmap(),
+        );
+        let descr = shape_descriptor_at(descriptor_index);
+        // SAFETY: `descr` was built by `GC_make_descriptor` (via
+        // `sigil_init_shapes` at program start) and is alive for the
+        // process lifetime (the static `SHAPE_DESCRIPTORS` table never
+        // evicts). `total` meets the descriptor's
+        // `len_bits * sizeof(GC_word)` floor (debug_asserted above
+        // for non-release builds).
         unsafe { GC_malloc_explicitly_typed(total, descr) as *mut u8 }
     }
 }
@@ -832,7 +1243,9 @@ pub unsafe extern "C" fn sigil_string_new(src: *const u8, len: usize) -> *mut u8
     };
 
     let h = Header::new(header::TAG_STRING, count_field, 0);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // String payload is byte data (bitmap=0) → atomic path;
+    // descriptor_index unused, pass the sentinel.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
 
     // Write the length word at offset 8.
     //
@@ -938,68 +1351,59 @@ mod tests {
     }
 
     #[test]
-    fn sigil_alloc_routes_nonzero_bitmap_through_descriptor_cache() {
-        // Plan E2 Phase 2 Task 8 three-branch wiring proof.
-        //   - bitmap=0           → GC_malloc_atomic (cache untouched)
-        //   - bitmap!=0, count=0 → GC_malloc        (cache untouched)
-        //   - bitmap!=0, count>0 → GC_malloc_explicitly_typed (cache+1)
+    fn sigil_alloc_routes_typed_bitmap_through_static_descriptor_table() {
+        // Static-descriptor-table follow-up rewrite of the prior
+        // Plan E2 Phase 2 Task 8 cache-population test. The
+        // RwLock + BTreeMap descriptor cache is gone; the new
+        // mechanism is a codegen-emitted shape table materialized
+        // at startup by `sigil_init_shapes`. Tests install the
+        // table via `install_shape_descriptors_for_test`.
+        //
+        // Branch coverage matches the prior test:
+        //   - bitmap=0           → GC_malloc_atomic (descriptor unused)
+        //   - bitmap!=0, count=0 → GC_malloc        (descriptor unused)
+        //   - bitmap!=0, count>0 → GC_malloc_explicitly_typed via
+        //                           SHAPE_DESCRIPTORS[index]
         let _guard = crate::test_support::gc_test_lock();
         sigil_gc_init();
-        descriptor::clear_cache();
-        assert_eq!(descriptor::cache_size(), 0, "cache must start empty");
 
-        // Bitmap=0 path: should NOT touch the cache.
+        // Register two distinct typed-malloc shapes. Indices are
+        // [0, 1] in the codegen-prefix portion of the table.
+        let indices = install_shape_descriptors_for_test(&[(0b1, 1), (0b10, 2)]);
+        assert_eq!(indices.len(), 2, "test helper must return two indices");
+
+        // Bitmap=0 path: descriptor_index unused; pass u32::MAX
+        // sentinel. Atomic path does not touch the descriptor table.
         let zero_bitmap_header = Header::new(header::TAG_INT64, 1, 0).raw();
-        let obj_atomic = sigil_alloc(zero_bitmap_header, 8);
+        let obj_atomic = sigil_alloc(zero_bitmap_header, 8, u32::MAX);
         assert!(!obj_atomic.is_null());
-        assert_eq!(
-            descriptor::cache_size(),
-            0,
-            "bitmap=0 alloc must not populate the descriptor cache"
-        );
 
         // count=0, bitmap!=0 path (arrays / mut-arrays / segments
-        // table): should route to plain GC_malloc, NOT the typed
-        // path. Cache untouched.
+        // table): plain GC_malloc, descriptor_index unused.
         let array_header = Header::new(header::TAG_ARRAY, 0, 1).raw();
-        let obj_array = sigil_alloc(array_header, 32); // length word + 3 elements
+        let obj_array = sigil_alloc(array_header, 32, u32::MAX);
         assert!(!obj_array.is_null());
-        assert_eq!(
-            descriptor::cache_size(),
-            0,
-            "count=0 + bitmap!=0 alloc must route to conservative GC_malloc, not typed path"
-        );
 
-        // Bitmap=0b1 path: should populate the cache with one entry.
+        // Bitmap=0b1, count=1 → typed-malloc, descriptor at index 0.
         let one_ptr_header = Header::new(header::TAG_REF, 1, 0b1).raw();
-        let obj_precise = sigil_alloc(one_ptr_header, 8);
+        let obj_precise = sigil_alloc(one_ptr_header, 8, indices[0]);
         assert!(!obj_precise.is_null());
-        assert_eq!(
-            descriptor::cache_size(),
-            1,
-            "non-zero bitmap + count>0 alloc must populate the descriptor cache"
-        );
 
-        // Second alloc of the same shape: cache size unchanged.
-        let obj_precise_2 = sigil_alloc(one_ptr_header, 8);
+        // Repeat-shape alloc reuses the same descriptor entry — the
+        // table is read-only after init, so this is a single load
+        // from SHAPE_DESCRIPTORS[0] both times. (The prior cache's
+        // monotonic-growth invariant is now trivially preserved by
+        // construction: the table has fixed size.)
+        let obj_precise_2 = sigil_alloc(one_ptr_header, 8, indices[0]);
         assert!(!obj_precise_2.is_null());
-        assert_eq!(
-            descriptor::cache_size(),
-            1,
-            "repeat-shape alloc must reuse the cached descriptor"
-        );
 
-        // Distinct shape: cache size grows to 2. A closure with one
-        // env slot — `count=2` (code_ptr at word 0 + env_slot_0 at
-        // word 1), `bitmap=0b10` (only env_slot_0 is a pointer).
+        // Distinct shape: closure with one env slot (count=2,
+        // bitmap=0b10) → typed-malloc at index 1.
         let closure_header = Header::new(header::TAG_CLOSURE, 2, 0b10).raw();
-        let obj_closure = sigil_alloc(closure_header, 16);
+        let obj_closure = sigil_alloc(closure_header, 16, indices[1]);
         assert!(!obj_closure.is_null());
-        assert_eq!(
-            descriptor::cache_size(),
-            2,
-            "distinct-shape alloc must add a fresh cache entry"
-        );
+
+        clear_shape_descriptors_for_test();
     }
 
     /// Subprocess-mode env var for the GC-forcing tests in this
@@ -1070,7 +1474,8 @@ mod tests {
         // string survives by reading its bytes back.
         let array_header = Header::new(header::TAG_ARRAY, 0, 1);
         let payload_bytes = 8 + 8 * 8; // length word + 8 element slots
-        let array_obj = sigil_alloc(array_header.raw(), payload_bytes);
+                                       // count=0 + bitmap!=0 → conservative path; descriptor_index unused.
+        let array_obj = sigil_alloc(array_header.raw(), payload_bytes, u32::MAX);
         assert!(!array_obj.is_null());
 
         // SAFETY: array_obj is a fresh allocation; we own the full
@@ -1185,8 +1590,15 @@ mod tests {
         // bitmap=0b10. Word 0 (code_ptr slot) is bitmap-bit-CLEAR;
         // word 1 (env slot 0) is bitmap-bit-SET. Routes through
         // `GC_malloc_explicitly_typed` per Task 8's dispatch.
+        //
+        // Register the shape so the typed-malloc branch can resolve
+        // its descriptor_index. `install_shape_descriptors_for_test`
+        // returns the indices for the supplied shapes; we want the
+        // `(0b10, 2)` shape at index 0.
+        let indices = install_shape_descriptors_for_test(&[(0b10, 2)]);
+        let alias_descriptor_index = indices[0];
         let typed_header = Header::new(header::TAG_CLOSURE, 2, 0b10).raw();
-        let alias_obj = sigil_alloc(typed_header, 16);
+        let alias_obj = sigil_alloc(typed_header, 16, alias_descriptor_index);
         assert!(!alias_obj.is_null());
         // Initialise both payload slots to zero so we don't smuggle
         // any stale pointer-shaped values in (Boehm zeroes by
@@ -1238,7 +1650,7 @@ mod tests {
         // in the handler GC stress tests.
         for _ in 0..128 {
             let h = Header::new(header::TAG_INT64, 1, 0).raw();
-            let _ = sigil_alloc(h, 8);
+            let _ = sigil_alloc(h, 8, u32::MAX);
         }
 
         // Force a full collection. Two GC cycles + invoke_finalizers
@@ -1315,7 +1727,7 @@ mod tests {
 
         // Atomic alias object (bitmap=0 → GC_malloc_atomic).
         let atomic_header = Header::new(header::TAG_INT64, 1, 0).raw();
-        let alias_obj = sigil_alloc(atomic_header, 8);
+        let alias_obj = sigil_alloc(atomic_header, 8, u32::MAX);
         assert!(!alias_obj.is_null());
 
         #[inline(never)]
@@ -1339,7 +1751,7 @@ mod tests {
 
         for _ in 0..128 {
             let h = Header::new(header::TAG_INT64, 1, 0).raw();
-            let _ = sigil_alloc(h, 8);
+            let _ = sigil_alloc(h, 8, u32::MAX);
         }
 
         unsafe {
@@ -1496,7 +1908,7 @@ mod tests {
         // by what the test thread's stack happens to retain.
         for _ in 0..16_384 {
             let h = Header::new(header::TAG_INT64, 0, 0).raw();
-            let _ = sigil_alloc(h, 1024);
+            let _ = sigil_alloc(h, 1024, u32::MAX);
         }
 
         // Read the cycle counter HERE — after the allocation loop
@@ -1547,7 +1959,7 @@ mod tests {
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
         // Trivial alloc to confirm the runtime is functional.
         let h = Header::new(header::TAG_INT64, 1, 0).raw();
-        let obj = sigil_alloc(h, 8);
+        let obj = sigil_alloc(h, 8, u32::MAX);
         assert!(!obj.is_null());
     }
 
@@ -1608,7 +2020,7 @@ mod tests {
         sigil_gc_init();
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
         let h = Header::new(header::TAG_INT64, 1, 0).raw();
-        let obj = sigil_alloc(h, 8);
+        let obj = sigil_alloc(h, 8, u32::MAX);
         assert!(!obj.is_null());
     }
 
@@ -1682,7 +2094,7 @@ mod tests {
         let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
         for _ in 0..30 {
             let h = Header::new(header::TAG_INT64, 0, 0).raw();
-            let _ = sigil_alloc(h, 8);
+            let _ = sigil_alloc(h, 8, u32::MAX);
         }
         let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
         // SAFETY: pure accessor.
@@ -1724,7 +2136,7 @@ mod tests {
         let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
         for _ in 0..100 {
             let h = Header::new(header::TAG_INT64, 0, 0).raw();
-            let _ = sigil_alloc(h, 8);
+            let _ = sigil_alloc(h, 8, u32::MAX);
         }
         let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
 
@@ -1769,7 +2181,7 @@ mod tests {
         let before_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
         for _ in 0..50 {
             let h = Header::new(header::TAG_INT64, 0, 0).raw();
-            let _ = sigil_alloc(h, 8);
+            let _ = sigil_alloc(h, 8, u32::MAX);
         }
         let after_forced = crate::counters::read(crate::counters::CounterId::ForcedGcCount);
 

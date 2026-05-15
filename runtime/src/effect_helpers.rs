@@ -25,16 +25,21 @@ use sigil_header_constants::{header_word, MAX_TUPLE_ARITY, TAG_ARRAY, TAG_TUPLE}
 /// Allocate a Sigil Tuple holding the given pre-widened 64-bit slot
 /// values. `pointer_bitmap` follows the `Expr::Tuple` codegen
 /// convention (bit `i` set iff element `i` is a heap pointer that
-/// the GC should trace). Caller must keep each element root-alive
-/// until this call returns — the slots are uninitialized memory
-/// between `sigil_alloc` and the per-slot writes, so an interleaved
-/// GC pass would only see roots on the Rust stack.
+/// the GC should trace). `descriptor_index` is the pre-registered
+/// Boehm typed-malloc descriptor for the `(bitmap, n)` shape — the
+/// caller looks it up via `crate::gc::runtime_shape_indices()`.
+/// Caller must keep each element root-alive until this call
+/// returns — the slots are uninitialized memory between
+/// `sigil_alloc` and the per-slot writes, so an interleaved GC pass
+/// would only see roots on the Rust stack.
 ///
 /// # Safety
 ///
 /// Same as `sigil_alloc`. `elems.len()` must satisfy
-/// `MAX_TUPLE_ARITY`.
-pub unsafe fn alloc_tuple(elems: &[u64], pointer_bitmap: u32) -> *mut u8 {
+/// `MAX_TUPLE_ARITY`. `descriptor_index` must point to a descriptor
+/// matching `(pointer_bitmap, n)` (or be `u32::MAX` if the shape is
+/// known to route through the atomic / conservative paths).
+pub unsafe fn alloc_tuple(elems: &[u64], pointer_bitmap: u32, descriptor_index: u32) -> *mut u8 {
     let n = elems.len();
     debug_assert!(
         n <= MAX_TUPLE_ARITY,
@@ -42,7 +47,7 @@ pub unsafe fn alloc_tuple(elems: &[u64], pointer_bitmap: u32) -> *mut u8 {
     );
     let header = header_word(TAG_TUPLE, n as u8, pointer_bitmap);
     let payload_bytes = n * 8;
-    let obj = sigil_alloc(header, payload_bytes);
+    let obj = sigil_alloc(header, payload_bytes, descriptor_index);
     // SAFETY: gc-heap-ptr arithmetic (transient base pointer for
     // sequential aligned 8-byte stores into a freshly-allocated
     // payload of size `payload_bytes`).
@@ -76,7 +81,8 @@ pub unsafe fn alloc_array_with_capacity(len: usize) -> *mut u8 {
     // length word at offset 8, elements at offset 16+.
     let header = header_word(TAG_ARRAY, 0, 1);
     let payload_bytes = 8usize.saturating_add(len.saturating_mul(8));
-    let obj = sigil_alloc(header, payload_bytes);
+    // count=0 + bitmap!=0 → conservative path; descriptor_index unused.
+    let obj = sigil_alloc(header, payload_bytes, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one
     // aligned u64 store; the length word lives at offset 8 by
     // contract).
@@ -121,7 +127,8 @@ pub unsafe fn alloc_int64(n: i64) -> *mut u8 {
     use crate::counters::{self, CounterId};
     use sigil_header_constants::TAG_INT64;
     let header = header_word(TAG_INT64, 1, 0);
-    let obj = sigil_alloc(header, 8);
+    // bitmap=0 → atomic path; descriptor_index unused.
+    let obj = sigil_alloc(header, 8, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one
     // aligned i64 store at offset 8).
     let payload: *mut i64 = obj.add(8).cast();
@@ -155,7 +162,8 @@ mod tests {
         let _g = gc_test_lock();
         unsafe {
             let s = alloc_string_from_str("hello");
-            let tup = alloc_tuple(&[42_u64, s as u64], 0b10);
+            let idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+            let tup = alloc_tuple(&[42_u64, s as u64], 0b10, idx);
             // Read back: tag at offset 8, value pointer at offset 16.
             let tag = (tup.add(8) as *const i64).read();
             let val_ptr = (tup.add(16) as *const *const u8).read();

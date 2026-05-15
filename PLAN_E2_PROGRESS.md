@@ -320,6 +320,18 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml)
   (manual `workflow_dispatch`).
+- **Static-descriptor-table follow-up (2026-05-15) — ⏳ shipped,
+  measurement TODO.** Replaces the runtime
+  `RwLock<BTreeMap<(u32, u8), GC_descr>>` descriptor cache with a
+  compile-time-emitted shape table the runtime materialises once
+  at startup via `sigil_init_shapes`. Every `sigil_alloc` /
+  `sigil_handler_frame_new` call site passes a u32
+  `descriptor_index`; the runtime indexes into a static
+  `Vec<GC_descr>`. ~150 lines of cache code removed
+  (`runtime/src/gc/descriptor.rs` deleted). Doc:
+  [`compiler/docs/plan-e2-phase-2-static-descriptor-table.md`](compiler/docs/plan-e2-phase-2-static-descriptor-table.md).
+  Throughput run pending against `pre_sha=4f7ec86` (Phase 2
+  baseline); expected to close the +21% / +86% cost.
 
 ## Phase 3 — Precise stack roots
 

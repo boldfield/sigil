@@ -128,6 +128,57 @@ pub const HANDLER_FRAME_RETURN_FN_OFF: i32 = 8;
 /// `HANDLER_FRAME_RETURN_FN_OFF`; see that constant's docs.
 pub const HANDLER_FRAME_RETURN_CLOSURE_OFF: i32 = 16;
 
+/// `HandlerFrame` payload size in bytes for a frame carrying
+/// `arm_count` op arms. 32 bytes of fixed header
+/// (`effect_id` + `arm_count` + `return_fn` + `return_closure` +
+/// `prev`) plus 16 bytes per arm (`fn_ptr` + `closure_ptr`).
+///
+/// Shared between the runtime (which calls this from
+/// `sigil_handler_frame_new` to compute its Boehm allocation
+/// size) and the compiler (which calls this from the static-
+/// descriptor-table pre-pass to register the 14 possible
+/// handler-frame shapes at codegen time). Promoting the runtime's
+/// helper to a `pub const fn` here closes the duplication risk
+/// the static-descriptor-table plan's "Notes for the implementer"
+/// section flagged.
+#[inline]
+pub const fn handler_frame_payload_bytes(arm_count: u32) -> usize {
+    32 + 16 * (arm_count as usize)
+}
+
+/// Sigil pointer bitmap for a `HandlerFrame` carrying `arm_count`
+/// op arms. Bit `k` is `1` iff payload word `k` holds a Sigil
+/// (Boehm-managed) heap pointer.
+///
+/// Layout (payload words, indexed from 0):
+/// - 0: `(effect_id, arm_count)` — non-pointer.
+/// - 1: `return_fn` — function pointer (not GC-tracked).
+/// - 2: `return_closure` — GC pointer (bit 2).
+/// - 3: `prev` — GC pointer (bit 3).
+/// - 4 + 2*i: arm `i` `fn_ptr` — function pointer (skip).
+/// - 5 + 2*i: arm `i` `closure_ptr` — GC pointer (bit 5 + 2*i).
+///
+/// The `MAX_HANDLER_ARMS = 14` cap keeps the highest set bit
+/// at `5 + 2*13 = 31`, fitting in the 32-bit bitmap. Callers
+/// that pass `arm_count > MAX_HANDLER_ARMS` get UB at the shift
+/// (shifting by 32+ on a `u32`); the runtime entry point checks
+/// this before calling, and the compiler's pre-pass iterates
+/// `arm_count ∈ [1, MAX_HANDLER_ARMS]` explicitly.
+///
+/// Shared between the runtime and compiler for the same reason
+/// as `handler_frame_payload_bytes` above.
+#[inline]
+pub const fn handler_frame_pointer_bitmap(arm_count: u32) -> u32 {
+    let mut bitmap: u32 = (1u32 << 2) | (1u32 << 3);
+    let mut i: u32 = 0;
+    while i < arm_count {
+        let closure_word_idx = 5 + 2 * i;
+        bitmap |= 1u32 << closure_word_idx;
+        i += 1;
+    }
+    bitmap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +212,42 @@ mod tests {
         // reachable bit = 5 + 2*13 = 31). Bumping requires growing
         // the bitmap word size in `runtime/src/handlers.rs`.
         assert_eq!(MAX_HANDLER_ARMS, 14);
+    }
+
+    #[test]
+    fn handler_frame_helpers_match_known_layout() {
+        // Pinning the helpers against hand-derived values for the
+        // edge cases the runtime and codegen both rely on. A drift
+        // here would silently miscompute the descriptor index lookup
+        // in the static-descriptor-table pre-pass (compiler) and
+        // the Boehm typed-malloc routing (runtime).
+        assert_eq!(handler_frame_payload_bytes(0), 32);
+        assert_eq!(handler_frame_payload_bytes(1), 48);
+        assert_eq!(
+            handler_frame_payload_bytes(MAX_HANDLER_ARMS),
+            32 + 16 * MAX_HANDLER_ARMS as usize
+        );
+        assert_eq!(handler_frame_pointer_bitmap(0), 0b0000_1100);
+        assert_eq!(handler_frame_pointer_bitmap(1), 0b0010_1100);
+        // arm_count = MAX exercises the highest bit (closure slot at
+        // payload word 31).
+        let max_bitmap = handler_frame_pointer_bitmap(MAX_HANDLER_ARMS);
+        assert!(max_bitmap & (1u32 << 31) != 0);
+    }
+
+    #[test]
+    fn handler_frame_helpers_are_const_eval_callable() {
+        // The compiler's static-descriptor-table pre-pass calls these
+        // helpers in const context (or close enough — at codegen
+        // initialization, before any per-fn lowering). Pinning the
+        // const-fn property prevents an accidental promotion of the
+        // helpers to non-const (e.g., adding a `debug_assert!` with a
+        // non-const formatter argument) from silently breaking the
+        // shape table population.
+        const ZERO_ARMS_BYTES: usize = handler_frame_payload_bytes(0);
+        const MAX_ARMS_BITMAP: u32 = handler_frame_pointer_bitmap(MAX_HANDLER_ARMS);
+        assert_eq!(ZERO_ARMS_BYTES, 32);
+        assert!(MAX_ARMS_BITMAP & (1u32 << 31) != 0);
     }
 
     #[test]

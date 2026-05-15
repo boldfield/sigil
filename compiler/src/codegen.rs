@@ -7493,6 +7493,107 @@ fn define_fn_and_capture_stackmap(
     Ok(())
 }
 
+/// Static-descriptor-table follow-up (2026-05-15) — codegen-time
+/// shape registry. Replaces Plan E2 Phase 2's runtime
+/// `RwLock<BTreeMap<(u32, u8), GC_descr>>` descriptor cache with a
+/// compile-time-emitted table the runtime materialises once at
+/// startup. Each `sigil_alloc` / `sigil_handler_frame_new` call site
+/// passes a `u32` index into this table; the runtime indexes into
+/// `SHAPE_DESCRIPTORS` to find the precomputed Boehm `GC_descr`.
+///
+/// Indices are stable within a single program build but not across
+/// builds (the entries are sorted by insertion order, which depends
+/// on the order codegen walks the AST). Stable-within-build is
+/// sufficient: the runtime sees the matching `__sigil_shape_table`
+/// data section the same build produces.
+///
+/// The atomic / conservative paths through `sigil_alloc` don't
+/// consume a descriptor; codegen emits `u32::MAX` as the
+/// `descriptor_index` value at those call sites and the runtime
+/// dispatch skips the descriptor read.
+struct ShapeTable {
+    entries: Vec<(u32, u8)>,
+    by_shape: BTreeMap<(u32, u8), u32>,
+}
+
+/// Sentinel value the codegen passes as `descriptor_index` when a
+/// call site routes through `sigil_alloc`'s atomic (`bitmap = 0`) or
+/// conservative (`count = 0 && bitmap != 0`) branches. Matches the
+/// runtime's `debug_assert!` guard in `gc.rs`.
+const SHAPE_DESCRIPTOR_SENTINEL: u32 = u32::MAX;
+
+impl ShapeTable {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            by_shape: BTreeMap::new(),
+        }
+    }
+
+    /// Register the `(bitmap, count)` shape; returns its index.
+    /// Idempotent: subsequent calls with the same shape return the
+    /// same index without growing the table.
+    fn register(&mut self, bitmap: u32, count: u8) -> u32 {
+        if let Some(&idx) = self.by_shape.get(&(bitmap, count)) {
+            return idx;
+        }
+        let idx = self.entries.len() as u32;
+        self.entries.push((bitmap, count));
+        self.by_shape.insert((bitmap, count), idx);
+        idx
+    }
+
+    /// Compute the `descriptor_index` value to pass to
+    /// `sigil_alloc(header, payload, descriptor_index)`. Returns
+    /// `SHAPE_DESCRIPTOR_SENTINEL` (`u32::MAX`) for the atomic /
+    /// conservative branches (the runtime ignores the index there);
+    /// otherwise registers + returns the typed-malloc index.
+    fn alloc_descriptor_index(&mut self, bitmap: u32, count: u8) -> u32 {
+        if bitmap == 0 || count == 0 {
+            SHAPE_DESCRIPTOR_SENTINEL
+        } else {
+            self.register(bitmap, count)
+        }
+    }
+
+    /// Compute the `descriptor_index` for a handler-frame allocation
+    /// with the given `arm_count`. The shape `(bitmap, count)` is
+    /// derived from `arm_count` via the const fns shared with the
+    /// runtime in `sigil_abi::effect`. Always returns a real index
+    /// (handler frames always hit the typed-malloc path because their
+    /// pointer bitmap is non-zero for any `arm_count >= 0`).
+    fn handler_frame_descriptor_index(&mut self, arm_count: u32) -> u32 {
+        let bitmap = sigil_abi::effect::handler_frame_pointer_bitmap(arm_count);
+        let payload_bytes = sigil_abi::effect::handler_frame_payload_bytes(arm_count);
+        // Conversion `payload_words u8`: `arm_count <= MAX_HANDLER_ARMS = 14`
+        // gives `payload_bytes <= 32 + 16*14 = 256` and `payload_words
+        // <= 32`, well within u8 range. Asserted in
+        // `sigil_abi::effect::handler_frame_helpers_match_known_layout`.
+        let count: u8 = (payload_bytes / 8) as u8;
+        self.register(bitmap, count)
+    }
+
+    /// Number of registered entries.
+    fn len(&self) -> u32 {
+        self.entries.len() as u32
+    }
+
+    /// Encode the table for emission into the
+    /// `__sigil_shape_table` data section. Each entry occupies 8
+    /// bytes: `(bitmap: u32 little-endian, count_padded: u32 little-
+    /// endian)`. The 3-byte padding per entry keeps `(u32, u32)`
+    /// reads aligned and lets the runtime decode via straight
+    /// `chunks_exact(8)` — see `runtime/src/gc.rs::sigil_init_shapes`.
+    fn encode_le(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.entries.len() * 8);
+        for &(bitmap, count) in &self.entries {
+            out.extend_from_slice(&bitmap.to_le_bytes());
+            out.extend_from_slice(&(count as u32).to_le_bytes());
+        }
+        out
+    }
+}
+
 /// Compile `cc` to an object file at `out_path`. Returns `Ok(())` on
 /// success. Stage 1 compilation is deterministic given identical input on
 /// the same host.
@@ -7577,6 +7678,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         crate::layout::build_layouts(&checked.types).map_err(|e| format!("E0130: {e}"))?;
     let ctor_index = crate::layout::build_ctor_index(&type_layouts);
 
+    // Static-descriptor-table follow-up (2026-05-15) — codegen-time
+    // shape registry shared across every `sigil_alloc` and
+    // `sigil_handler_frame_new` call site emitted during this
+    // `emit_object` invocation. `Lowerer` instances borrow this via
+    // a `&'b RefCell` field; the main shim's emit and any free-fn
+    // `lower_alloc_call` site in this fn body borrow directly.
+    // Finalised into the `__sigil_shape_table` data section at the
+    // end of this function once every call site has registered.
+    let shape_table: std::cell::RefCell<ShapeTable> = std::cell::RefCell::new(ShapeTable::new());
+
     // Build the Cranelift ISA for the current host.
     let triple = Triple::host();
     let mut flag_builder = settings::builder();
@@ -7638,17 +7749,49 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // crate still exports `sigil_println` for the arm fn's internal
     // use, but codegen no longer declares it as an import.
 
-    // Plan A2 task 32: `sigil_alloc(header: u64, payload_bytes: usize)
-    // -> *mut u8`. Heap allocation for closure records (and any future
-    // codegen-level alloc). `payload_bytes` is declared as
-    // `pointer_ty` since the Rust signature uses `usize`.
+    // Plan A2 task 32 + static-descriptor-table follow-up (2026-05-15):
+    // `sigil_alloc(header: u64, payload_bytes: usize,
+    // descriptor_index: u32) -> *mut u8`. The third arg is a codegen-
+    // emitted index into `__sigil_shape_table` for typed-malloc
+    // shapes, or `SHAPE_DESCRIPTOR_SENTINEL` (`u32::MAX`) for atomic
+    // / conservative call sites. The runtime resolves the index to a
+    // Boehm `GC_descr` via the static `SHAPE_DESCRIPTORS` vector
+    // (populated by `sigil_init_shapes` at program start).
     let mut alloc_sig = Signature::new(isa_call_conv(&module));
     alloc_sig.params.push(AbiParam::new(types::I64)); // header
     alloc_sig.params.push(AbiParam::new(pointer_ty)); // payload_bytes (usize)
+    alloc_sig.params.push(AbiParam::new(types::I32)); // descriptor_index
     alloc_sig.returns.push(AbiParam::new(pointer_ty));
     let alloc = module
         .declare_function("sigil_alloc", Linkage::Import, &alloc_sig)
         .map_err(|e| format!("declare sigil_alloc: {e}"))?;
+
+    // Static-descriptor-table follow-up (2026-05-15): runtime init
+    // hook that builds the `SHAPE_DESCRIPTORS` vector from the
+    // codegen-emitted `__sigil_shape_table` data section. The main
+    // shim calls this immediately after `sigil_gc_init`, before any
+    // user-code allocation.
+    let mut init_shapes_sig = Signature::new(isa_call_conv(&module));
+    init_shapes_sig.params.push(AbiParam::new(pointer_ty)); // table: *const u8
+    init_shapes_sig.params.push(AbiParam::new(pointer_ty)); // n: usize
+    let init_shapes = module
+        .declare_function("sigil_init_shapes", Linkage::Import, &init_shapes_sig)
+        .map_err(|e| format!("declare sigil_init_shapes: {e}"))?;
+
+    // Static-descriptor-table follow-up (2026-05-15): the
+    // `__sigil_shape_table` data section. The symbol is declared
+    // here so the main shim can reference it via
+    // `module.declare_data_in_func(...)`; the section's contents are
+    // defined at the very end of `emit_object` once every call site
+    // has registered its shape and the final byte layout is known.
+    //
+    // **Mach-O section-name constraint.** The platform caps section
+    // names at 16 bytes (including any null terminator); see the
+    // `sigil_str_lit` comment further down for the historical bug.
+    // `sigil_shapes` is 12 bytes — comfortably under the cap.
+    let shape_table_data_id = module
+        .declare_data("__sigil_shape_table", Linkage::Local, false, false)
+        .map_err(|e| format!("declare __sigil_shape_table: {e}"))?;
 
     // Plan A2 task 34: `sigil_int_to_string(n: i64) -> *mut u8`. The
     // runtime formats `n` as decimal, allocates a fresh String on the
@@ -8857,16 +9000,24 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // Phase 4+ adds continuation-using arms + multi-shot.
 
     // Plotkin fix — wire to the resumes_many-aware runtime entry.
-    // sigil_handler_frame_new_with_resumes_many(effect_id: u32, arm_count: u32, resumes_many: u32)
+    // sigil_handler_frame_new_with_resumes_many(effect_id: u32,
+    //     arm_count: u32, resumes_many: u32, descriptor_index: u32)
     //   -> *mut HandlerFrame
     // Codegen passes 1 for `resumes: many` effects, 0 for default
     // single-shot effects. The runtime sets a bit on the frame's
     // arm_count so wrap_continuation_with_outer_post_arm_k can
-    // discriminate at perform time.
+    // discriminate at perform time. The fourth arg
+    // (`descriptor_index`) is the codegen-emitted index into
+    // `__sigil_shape_table` for the handler frame's
+    // `(bitmap, count)` shape — derived from `arm_count` via the
+    // const fns in `sigil_abi::effect`. Runtime callers (tests,
+    // the convenience `sigil_handler_frame_new` wrapper) look up
+    // their index via `runtime_shape_indices().handler_frame[arm_count]`.
     let mut handler_frame_new_sig = Signature::new(isa_call_conv(&module));
     handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // effect_id
     handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // arm_count
     handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // resumes_many
+    handler_frame_new_sig.params.push(AbiParam::new(types::I32)); // descriptor_index
     handler_frame_new_sig
         .returns
         .push(AbiParam::new(pointer_ty));
@@ -10586,6 +10737,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         cont_param_callees: &cont_param_callees,
                         arm_handle_span: None,
                         arm_k_name: None,
+                        shape_table: &shape_table,
                     };
 
                     // Phase 3 — extract scrutinee + arms from the
@@ -10895,10 +11047,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                            let descriptor_index_v =
+                                lowerer.lower_alloc_descriptor_index(bitmap, count);
                             let closure_record = lower_alloc_call(
                                 &mut lowerer.builder,
                                 lowerer.builtins.alloc_ref,
-                                &[header_v, payload_v],
+                                &[header_v, payload_v, descriptor_index_v],
                             );
 
                             // Null code_ptr at +8.
@@ -11575,8 +11729,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
+                        let descriptor_index = shape_table
+                            .borrow_mut()
+                            .alloc_descriptor_index(bitmap, count);
+                        let descriptor_index_v =
+                            builder.ins().iconst(types::I32, descriptor_index as i64);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let cp = lower_alloc_call(&mut builder, alloc_ref, &[header_v, payload_v]);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            alloc_ref,
+                            &[header_v, payload_v, descriptor_index_v],
+                        );
 
                         // Null code_ptr at offset 8.
                         let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -11735,8 +11898,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                         let header_v = builder.ins().iconst(types::I64, header as i64);
                         let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
+                        let descriptor_index = shape_table
+                            .borrow_mut()
+                            .alloc_descriptor_index(bitmap, count);
+                        let descriptor_index_v =
+                            builder.ins().iconst(types::I32, descriptor_index as i64);
                         let alloc_ref = module.declare_func_in_func(alloc, builder.func);
-                        let cp = lower_alloc_call(&mut builder, alloc_ref, &[header_v, payload_v]);
+                        let cp = lower_alloc_call(
+                            &mut builder,
+                            alloc_ref,
+                            &[header_v, payload_v, descriptor_index_v],
+                        );
 
                         let null_v = builder.ins().iconst(pointer_ty, 0);
                         builder.ins().store(MemFlags::trusted(), null_v, cp, 8);
@@ -11903,6 +12075,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: None,
                     arm_k_name: None,
+                    shape_table: &shape_table,
                 };
 
                 // Phase 5 + Phase 6 — branch on body's first step
@@ -12401,6 +12574,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 cont_param_callees: &cont_param_callees,
                 arm_handle_span: None,
                 arm_k_name: None,
+                shape_table: &shape_table,
             };
 
             // TCO-4 — route fn-body lowering through
@@ -12527,6 +12701,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         builder.seal_block(block);
 
         let gc_init_ref = module.declare_func_in_func(gc_init, builder.func);
+        let init_shapes_ref = module.declare_func_in_func(init_shapes, builder.func);
+        let shape_table_gv = module.declare_data_in_func(shape_table_data_id, builder.func);
         let user_main_ref = module.declare_func_in_func(user_main, builder.func);
         let frame_new_ref = module.declare_func_in_func(handler_frame_new, builder.func);
         let frame_set_arm_ref = module.declare_func_in_func(handler_frame_set_arm, builder.func);
@@ -12558,16 +12734,51 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
         builder.ins().call(gc_init_ref, &[]);
 
+        // Static-descriptor-table follow-up (2026-05-15) — register
+        // the main shim's own handler-frame shapes BEFORE emitting
+        // the `sigil_init_shapes` call so the published shape table
+        // size N includes them. By the time control reaches here,
+        // every user-fn body has already emitted (line 12608+ user-
+        // fn body emit) so the prefix is fully populated with their
+        // shapes; the shim's contribution is exactly the 5 default
+        // handler-frame shapes (arm_count ∈ {1, 2, 3, 10}).
+        let arith_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(2);
+        let io_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
+        let env_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
+        let fs_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(10);
+        let process_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(1);
+
+        // Emit `sigil_init_shapes(&__sigil_shape_table, N)` so the
+        // runtime materialises the `SHAPE_DESCRIPTORS` vector before
+        // any user-code allocation runs. The actual byte contents of
+        // `__sigil_shape_table` are finalised at the end of
+        // `emit_object` (after the main shim has emitted; the data
+        // section size at that point matches the `N` we pass here).
+        let shape_count = shape_table.borrow().len();
+        let shape_count_v = builder.ins().iconst(pointer_ty, shape_count as i64);
+        let shape_table_addr_v = builder.ins().symbol_value(pointer_ty, shape_table_gv);
+        builder
+            .ins()
+            .call(init_shapes_ref, &[shape_table_addr_v, shape_count_v]);
+
         // ────── ArithError handler frame (first-pushed, last-popped) ──────
         // effect_id=0 (reserved low id), arm_count=2 (div_by_zero,
         // mod_by_zero alphabetically).
         let arith_effect_id_v = builder.ins().iconst(types::I32, 0);
         let arith_arm_count_v = builder.ins().iconst(types::I32, 2);
         let arith_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let arith_descriptor_idx_v = builder
+            .ins()
+            .iconst(types::I32, arith_descriptor_idx as i64);
         let arith_frame_ptr = lower_alloc_call(
             &mut builder,
             frame_new_ref,
-            &[arith_effect_id_v, arith_arm_count_v, arith_resumes_many_v],
+            &[
+                arith_effect_id_v,
+                arith_arm_count_v,
+                arith_resumes_many_v,
+                arith_descriptor_idx_v,
+            ],
         );
 
         let arith_null_closure = builder.ins().iconst(pointer_ty, 0);
@@ -12613,10 +12824,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let io_effect_id_v = builder.ins().iconst(types::I32, 1);
         let io_arm_count_v = builder.ins().iconst(types::I32, 3);
         let io_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let io_descriptor_idx_v = builder.ins().iconst(types::I32, io_descriptor_idx as i64);
         let io_frame_ptr = lower_alloc_call(
             &mut builder,
             frame_new_ref,
-            &[io_effect_id_v, io_arm_count_v, io_resumes_many_v],
+            &[
+                io_effect_id_v,
+                io_arm_count_v,
+                io_resumes_many_v,
+                io_descriptor_idx_v,
+            ],
         );
 
         let io_null_closure = builder.ins().iconst(pointer_ty, 0);
@@ -12643,10 +12860,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let env_effect_id_v = builder.ins().iconst(types::I32, 3);
         let env_arm_count_v = builder.ins().iconst(types::I32, 3);
         let env_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let env_descriptor_idx_v = builder.ins().iconst(types::I32, env_descriptor_idx as i64);
         let env_frame_ptr = lower_alloc_call(
             &mut builder,
             frame_new_ref,
-            &[env_effect_id_v, env_arm_count_v, env_resumes_many_v],
+            &[
+                env_effect_id_v,
+                env_arm_count_v,
+                env_resumes_many_v,
+                env_descriptor_idx_v,
+            ],
         );
         let env_null_closure = builder.ins().iconst(pointer_ty, 0);
         let install_env_arm =
@@ -12670,10 +12893,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let fs_effect_id_v = builder.ins().iconst(types::I32, 4);
         let fs_arm_count_v = builder.ins().iconst(types::I32, 10);
         let fs_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let fs_descriptor_idx_v = builder.ins().iconst(types::I32, fs_descriptor_idx as i64);
         let fs_frame_ptr = lower_alloc_call(
             &mut builder,
             frame_new_ref,
-            &[fs_effect_id_v, fs_arm_count_v, fs_resumes_many_v],
+            &[
+                fs_effect_id_v,
+                fs_arm_count_v,
+                fs_resumes_many_v,
+                fs_descriptor_idx_v,
+            ],
         );
         let fs_null_closure = builder.ins().iconst(pointer_ty, 0);
         let install_fs_arm =
@@ -12702,6 +12931,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let process_effect_id_v = builder.ins().iconst(types::I32, 5);
         let process_arm_count_v = builder.ins().iconst(types::I32, 1);
         let process_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let process_descriptor_idx_v = builder
+            .ins()
+            .iconst(types::I32, process_descriptor_idx as i64);
         let process_frame_ptr = lower_alloc_call(
             &mut builder,
             frame_new_ref,
@@ -12709,6 +12941,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 process_effect_id_v,
                 process_arm_count_v,
                 process_resumes_many_v,
+                process_descriptor_idx_v,
             ],
         );
         let process_null_closure = builder.ins().iconst(pointer_ty, 0);
@@ -13101,6 +13334,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: Some(synth.handle_span.clone()),
                     arm_k_name: Some(synth.k_name.clone()),
+                    shape_table: &shape_table,
                 };
 
                 // Plan B Task 55 (Phase 4d): route between the two
@@ -13218,10 +13452,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     let payload_bytes: i64 = 8 + 8 * total_capture_slots as i64;
                     let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                     let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                    let descriptor_index_v = lowerer.lower_alloc_descriptor_index(bitmap, count);
                     let step_0_closure_ptr = lower_alloc_call(
                         &mut lowerer.builder,
                         builtins.alloc_ref,
-                        &[header_v, payload_v],
+                        &[header_v, payload_v, descriptor_index_v],
                     );
                     let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
                     lowerer
@@ -14125,6 +14360,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     cont_param_callees: &cont_param_callees,
                     arm_handle_span: None,
                     arm_k_name: None,
+                    shape_table: &shape_table,
                 };
 
                 let body_value = lowerer.lower_expr(&synth.body);
@@ -14416,6 +14652,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 cont_param_callees: &cont_param_callees,
                 arm_handle_span: None,
                 arm_k_name: None,
+                shape_table: &shape_table,
             };
 
             let tail_value = lowerer.lower_expr(&post_arm_k.tail_expr);
@@ -14835,6 +15072,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         cont_param_callees: &cont_param_callees,
                         arm_handle_span: None,
                         arm_k_name: None,
+                        shape_table: &shape_table,
                     };
 
                     match &step.role {
@@ -15109,10 +15347,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             let payload_bytes: i64 = 8 + 8 * next_capture_count as i64;
                             let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                             let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                            let descriptor_index_v =
+                                lowerer.lower_alloc_descriptor_index(bitmap, count);
                             let next_closure_ptr = lower_alloc_call(
                                 &mut lowerer.builder,
                                 lowerer.builtins.alloc_ref,
-                                &[header_v, payload_v],
+                                &[header_v, payload_v, descriptor_index_v],
                             );
                             // code_ptr at offset 8 = null.
                             let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
@@ -15782,6 +16022,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             cont_param_callees: &cont_param_callees,
                             arm_handle_span: None,
                             arm_k_name: None,
+                            shape_table: &shape_table,
                         };
 
                         match role {
@@ -16681,10 +16922,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     .builder
                                                     .ins()
                                                     .iconst(pointer_ty, branch_payload);
+                                                let branch_descriptor_index_v = lowerer
+                                                    .lower_alloc_descriptor_index(
+                                                        branch_bitmap,
+                                                        branch_count,
+                                                    );
                                                 let branch_closure = lower_alloc_call(
                                                     &mut lowerer.builder,
                                                     lowerer.builtins.alloc_ref,
-                                                    &[bh_v, bp_v],
+                                                    &[bh_v, bp_v, branch_descriptor_index_v],
                                                 );
 
                                                 // Null code_ptr at +8.
@@ -17587,10 +17833,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     lowerer.builder.ins().iconst(types::I64, header as i64);
                                 let payload_v =
                                     lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                                let descriptor_index_v =
+                                    lowerer.lower_alloc_descriptor_index(bitmap, count);
                                 let next_closure_ptr = lower_alloc_call(
                                     &mut lowerer.builder,
                                     lowerer.builtins.alloc_ref,
-                                    &[header_v, payload_v],
+                                    &[header_v, payload_v, descriptor_index_v],
                                 );
 
                                 // Null code_ptr at +8.
@@ -18604,6 +18852,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             cont_param_callees: &cont_param_callees,
                             arm_handle_span: None,
                             arm_k_name: None,
+                            shape_table: &shape_table,
                         };
 
                         // Plan B Task 78.5 G4 Phase B.3 — CPS→CPS direct
@@ -19137,6 +19386,52 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         define_fn_and_capture_stackmap(&mut module, &mut ctx, shim_id, &shim_label, &mut stackmap)?;
     }
 
+    // --- finalise the static descriptor table ----------------------------
+    //
+    // Static-descriptor-table follow-up (2026-05-15) — define the
+    // `__sigil_shape_table` data symbol with the bytes collected
+    // during fn / shim emit. Every call site that registered a
+    // shape via `ShapeTable::register` (directly or through
+    // `alloc_descriptor_index` / `handler_frame_descriptor_index`)
+    // has its index pointing into this table; the runtime decodes
+    // it in `sigil_init_shapes`.
+    //
+    // The `n` value the main shim emits as the second argument to
+    // `sigil_init_shapes(table, n)` was iconst'd against the
+    // shape_table size at shim-emit time. All user-fn emits run
+    // BEFORE the shim emit, and the shim's emit registered its 5
+    // own handler-frame shapes UPFRONT (before the
+    // `sigil_init_shapes` call site) so the iconst captures the
+    // final size correctly.
+    {
+        let table_bytes = shape_table.borrow().encode_le();
+        let mut data = DataDescription::new();
+        // `define` requires non-empty bytes for the data to occupy
+        // any space; empty programs (no precise-marking allocs)
+        // still need a placeholder so the symbol resolves. Pad with
+        // one 8-byte zero entry whose count = 0 → unused by the
+        // runtime (the shim passes n = 0 in that case, so the
+        // runtime never reads it).
+        let final_bytes: Vec<u8> = if table_bytes.is_empty() {
+            vec![0u8; 8]
+        } else {
+            table_bytes
+        };
+        data.define(final_bytes.into_boxed_slice());
+        // ELF: `.rodata` segment; section name `sigil_shapes`
+        // groups the symbol in the read-only data section.
+        // Mach-O: Cranelift's ObjectModule maps `.rodata` to
+        // `(__DATA, __const)` regardless — see PR #161's
+        // 16-byte-limit fix for the section-name discipline.
+        // The leading `__` Mach-O requires is added by the
+        // platform mapping, so we pass `sigil_shapes` here
+        // matching the existing `sigil_str_lit` shape.
+        data.set_segment_section(".rodata", "sigil_shapes");
+        module
+            .define_data(shape_table_data_id, &data)
+            .map_err(|e| format!("define __sigil_shape_table: {e:#?}"))?;
+    }
+
     // --- finish and add the stackmap section ----------------------------
     let mut product = module.finish();
 
@@ -19624,6 +19919,22 @@ struct Lowerer<'a, 'b> {
     /// return_closure (via `arm_frame_ptr_v` + frame offset). None
     /// for non-arm Lowerers.
     arm_handle_span: Option<Span>,
+
+    /// Static-descriptor-table follow-up (2026-05-15) — shared
+    /// codegen-time shape registry. Each `sigil_alloc` and
+    /// `sigil_handler_frame_new_with_resumes_many` call site asks
+    /// this for the matching index, which it then emits as the
+    /// trailing `descriptor_index: u32` argument. The runtime
+    /// resolves the index into a Boehm `GC_descr` via the static
+    /// `SHAPE_DESCRIPTORS` vector built by `sigil_init_shapes`.
+    ///
+    /// Shared `RefCell` (not `&mut`) so multiple Lowerer methods
+    /// can register shapes during a single emission without
+    /// fighting the borrow checker over `&mut self.shape_table`.
+    /// `emit_object` holds the backing `ShapeTable` for the entire
+    /// codegen run and finalises it into the `__sigil_shape_table`
+    /// data section at the end.
+    shape_table: &'b std::cell::RefCell<ShapeTable>,
 }
 
 /// Task 78.5 G4 Approach 6 deep-redo (PR #80 review §7) — free-fn
@@ -19682,6 +19993,38 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// explicitly. See the free `lower_alloc_call` for the allocator contract.
     fn lower_alloc_call(&mut self, callee: FuncRef, args: &[Value]) -> Value {
         lower_alloc_call(&mut self.builder, callee, args)
+    }
+
+    /// Static-descriptor-table follow-up (2026-05-15) — emit an
+    /// `iconst.i32` carrying the descriptor_index that `sigil_alloc`
+    /// (or one of its wrappers) should consume for a typed-malloc
+    /// allocation of the given `(bitmap, count)` shape. Returns the
+    /// `u32::MAX` sentinel for atomic / conservative paths. Use this
+    /// for every `sigil_alloc` call site so the shape gets
+    /// registered uniformly and the runtime sees a matching entry
+    /// in `SHAPE_DESCRIPTORS`.
+    fn lower_alloc_descriptor_index(&mut self, bitmap: u32, count: u8) -> Value {
+        let idx = self
+            .shape_table
+            .borrow_mut()
+            .alloc_descriptor_index(bitmap, count);
+        self.builder.ins().iconst(types::I32, idx as i64)
+    }
+
+    /// Static-descriptor-table follow-up (2026-05-15) — emit the
+    /// `iconst.i32` carrying the descriptor_index for a handler-
+    /// frame allocation of the given `arm_count`. The shape
+    /// `(bitmap, count)` is derived from `arm_count` via the const
+    /// fns in `sigil_abi::effect`. Always returns a real index;
+    /// handler frames always hit the typed-malloc path (their
+    /// pointer bitmap is non-zero, including for `arm_count == 0`
+    /// which keeps the `return_closure` + `prev` slots marked).
+    fn lower_handler_frame_descriptor_index(&mut self, arm_count: u32) -> Value {
+        let idx = self
+            .shape_table
+            .borrow_mut()
+            .handler_frame_descriptor_index(arm_count);
+        self.builder.ins().iconst(types::I32, idx as i64)
     }
 
     /// 2026-05-04 return-arm-via-args lift Stage 3b/5 — load the active
@@ -21952,10 +22295,11 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                         .builder
                         .ins()
                         .iconst(types::I32, if resumes_many { 1 } else { 0 });
+                    let descriptor_index_v = self.lower_handler_frame_descriptor_index(arm_count);
                     let frame_ptr = lower_alloc_call(
                         &mut self.builder,
                         self.handler_frame_new_ref,
-                        &[effect_id_v, arm_count_v, resumes_many_v],
+                        &[effect_id_v, arm_count_v, resumes_many_v, descriptor_index_v],
                     );
                     if frame_1_ptr_snapshot.is_none() {
                         frame_1_ptr_snapshot = Some(frame_ptr);
@@ -23110,8 +23454,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 let header_v = self.builder.ins().iconst(types::I64, header as i64);
                 let payload_bytes: i64 = (n as i64) * 8;
                 let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+                let descriptor_index_v = self.lower_alloc_descriptor_index(bitmap, n as u8);
                 let callee = self.builtins.alloc_ref;
-                let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
+                let ptr = self.lower_alloc_call(callee, &[header_v, size_v, descriptor_index_v]);
                 for (i, (val, val_ty)) in elem_vals.into_iter().enumerate() {
                     let store_val = if val_ty == types::I64 || val_ty == self.pointer_ty {
                         val
@@ -25513,8 +25858,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+        let descriptor_index_v = self.lower_alloc_descriptor_index(bitmap, count);
         let callee = self.builtins.alloc_ref;
-        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v, descriptor_index_v]);
 
         // Store null at offset 8 (code_ptr slot — unused by arm fns;
         // the runtime dispatches via `HandlerFrame.arms[i].fn_ptr`).
@@ -25625,11 +25971,12 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // Value will be extended to i64 before store.
         let env_vals: Vec<Value> = env_exprs.iter().map(|e| self.lower_expr(e)).collect();
 
-        // Call sigil_alloc(header, payload_bytes) -> *u8.
+        // Call sigil_alloc(header, payload_bytes, descriptor_index) -> *u8.
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let payload_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+        let descriptor_index_v = self.lower_alloc_descriptor_index(bitmap, count);
         let callee = self.builtins.alloc_ref;
-        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v]);
+        let closure_ptr = self.lower_alloc_call(callee, &[header_v, payload_v, descriptor_index_v]);
 
         // Store code_ptr at offset 8 (past header).
         //
@@ -25785,8 +26132,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
         let header_v = self.builder.ins().iconst(types::I64, header as i64);
         let size_v = self.builder.ins().iconst(self.pointer_ty, payload_bytes);
+        let descriptor_index_v =
+            self.lower_alloc_descriptor_index(variant.pointer_bitmap, variant.payload_words);
         let callee = self.builtins.alloc_ref;
-        let ptr = self.lower_alloc_call(callee, &[header_v, size_v]);
+        let ptr = self.lower_alloc_call(callee, &[header_v, size_v, descriptor_index_v]);
 
         // Discriminant in payload word 0 (bytes 8..16 past header).
         // We store the full 8-byte word even though only the low

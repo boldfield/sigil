@@ -71,7 +71,9 @@ pub extern "C" fn sigil_array_alloc(len: u64, fill: u64) -> *mut u8 {
     // count = 0 (unused for arrays — see module docs); bitmap = 1
     // forces Boehm conservative scan over the payload.
     let h = Header::new(TAG_ARRAY, 0, 1);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // count=0 + bitmap!=0 → conservative GC_malloc path;
+    // descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
 
     // Length word at offset 8.
     //

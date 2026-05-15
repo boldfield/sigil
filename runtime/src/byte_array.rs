@@ -82,7 +82,8 @@ pub extern "C" fn sigil_byte_array_alloc(len: u64, fill: u8) -> *mut u8 {
     }
     let payload_bytes = payload_bytes_for(len);
     let h = Header::new(TAG_BYTE_ARRAY, 0, 0);
-    let obj = sigil_alloc(h.raw(), payload_bytes);
+    // bitmap=0 → atomic path; descriptor_index unused.
+    let obj = sigil_alloc(h.raw(), payload_bytes, u32::MAX);
 
     // Length word at offset 8.
     //

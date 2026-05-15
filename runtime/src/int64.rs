@@ -62,7 +62,9 @@ use sigil_abi::tag::{INT_MAX, INT_MIN};
 /// pointer.
 fn alloc_int64(payload: i64) -> *mut u8 {
     let h = Header::new(TAG_INT64, 1, 0);
-    let obj = sigil_alloc(h.raw(), 8);
+    // bitmap=0 routes through the atomic path; descriptor_index
+    // unused, pass the `u32::MAX` sentinel.
+    let obj = sigil_alloc(h.raw(), 8, u32::MAX);
     // SAFETY: gc-heap-ptr arithmetic (transient base for one aligned i64 store).
     unsafe {
         let p: *mut i64 = obj.add(8).cast();
