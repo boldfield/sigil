@@ -1059,11 +1059,31 @@ mod tests {
         };
         let src = std::fs::read_to_string(&path).expect("read examples/json.sigil");
         let file_label = path.display().to_string();
-        let (tokens, _) = lexer::lex(&file_label, &src);
-        let (prog, _) = parser::parse(&file_label, &tokens);
-        let (prog, _) = crate::imports::resolve(prog);
-        let (resolved, _) = resolve::resolve(prog);
-        let (checked, _) = typecheck::typecheck(resolved.program);
+        // Assert no hard errors at every pipeline stage (re-review
+        // 4294874724 #2). Earlier shape silently discarded all
+        // diagnostics; if json.sigil ever introduces a hard error,
+        // the test would feed a broken program into mono and the
+        // stdlib-fn-presence heuristic could pass spuriously.
+        let (tokens, lex_errs) = lexer::lex(&file_label, &src);
+        assert!(lex_errs.is_empty(), "lex json.sigil: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse(&file_label, &tokens);
+        assert!(parse_errs.is_empty(), "parse json.sigil: {parse_errs:?}");
+        let (prog, import_errs) = crate::imports::resolve(prog);
+        assert!(
+            import_errs.is_empty(),
+            "imports json.sigil: {import_errs:?}"
+        );
+        let (resolved, resolve_errs) = resolve::resolve(prog);
+        assert!(
+            resolve_errs.is_empty(),
+            "resolve json.sigil: {resolve_errs:?}"
+        );
+        let (checked, tc_errs) = typecheck::typecheck(resolved.program);
+        let hard: Vec<_> = tc_errs
+            .iter()
+            .filter(|e| matches!(e.severity, crate::errors::Severity::Error))
+            .collect();
+        assert!(hard.is_empty(), "typecheck json.sigil: {hard:?}");
         let anf = elaborate::elaborate(checked);
         let mono = monomorphize(anf);
         let stdlib_fns: Vec<&str> = mono
@@ -1132,13 +1152,10 @@ mod tests {
         let mut per_file: Vec<(String, usize, usize, usize, usize, usize)> = Vec::new();
 
         for rel in examples {
-            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join(rel);
-            if !path.exists() {
-                // Example may not exist on this branch — skip rather
-                // than fail. The inventory is a best-effort sweep.
+            // Use the same `example_path()` helper the per-example
+            // tests use — one workspace-relative-path resolver,
+            // single skip-if-missing pattern across the file.
+            if example_path(rel).is_none() {
                 eprintln!("inventory: skipping {} (not present)", rel);
                 continue;
             }
