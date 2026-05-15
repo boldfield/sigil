@@ -44,6 +44,30 @@
 //! its NULL-on-miss semantics give us the "stripped dylib silently
 //! skipped" behavior plan Task 3 calls for. We get the plan's outcome
 //! (libgc PCs resolve to `GC_*` names) without the dep.
+//!
+//! **dladdr's nearest-symbol semantics.** Unlike sidecar entries —
+//! which carry an explicit `[address, address + size)` containment
+//! check — `dladdr` returns whichever symbol sits closest at-or-below
+//! the queried PC, with no upper bound. PCs in interstitial padding,
+//! literal pools, or trampoline regions resolve to whichever neighbor
+//! symbol happens to precede them, which can be slightly misleading.
+//! Acceptable trade-off: the alternative would be `0x<hex>` (strictly
+//! less informative), and the rendered name is still useful for
+//! orienting which library the PC came from. Treat dladdr-resolved
+//! names as advisory rather than authoritative — sidecar entries
+//! (with their precise size bounds) are the source of truth for any
+//! address inside the main binary.
+//!
+//! **No-sidecar mode produces mangled main-binary names.** If a user
+//! runs a profiler without `--emit-symbol-table` (so the sidecar is
+//! absent), `entries` is empty and dladdr resolves main-binary PCs
+//! to their raw C names (`sigil_user_main`, `sigil_user_foo____Int`)
+//! instead of the demangled forms the sidecar would produce. This is
+//! a known regression from the sidecar-only path — `--emit-symbol-
+//! table` is the expected workflow, and the alternative (silent
+//! `0x<hex>` for every main-binary PC) is strictly worse. A future
+//! refinement could run the sidecar's demangler on dladdr names too;
+//! for now, document the workflow.
 
 use std::path::PathBuf;
 
@@ -158,10 +182,13 @@ impl Resolver {
     /// to the existing `0x<hex>` rendering — same UX as today, per
     /// plan Task 3.
     pub fn with_dyld_images(mut self) -> Self {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            self.dyld_fallback = true;
-        }
+        // On unsupported platforms `dladdr_lookup` is a no-op that
+        // always returns `None`, so setting the bool unconditionally
+        // is safe: lookup hits the no-op and falls through to hex.
+        // Avoids a redundant cfg block here that would otherwise
+        // duplicate the platform gate already encoded in
+        // `dladdr_lookup`'s `cfg(not(...))` arm.
+        self.dyld_fallback = true;
         self
     }
 
@@ -387,10 +414,10 @@ xx\t00\tbar
     ///
     /// We can't reach a real libgc PC from a runtime unit test
     /// without compiling and running a sigil program, so the test
-    /// uses a libc function pointer (`malloc` family — the test
-    /// binary always links libc dynamically) as a stand-in. Any
-    /// address inside any loaded shared object exercises the same
-    /// code path the libgc surface does.
+    /// uses a libc function pointer (`getpid` — the test binary
+    /// always links libc dynamically) as a stand-in. Any address
+    /// inside any loaded shared object exercises the same code
+    /// path the libgc surface does.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn with_dyld_images_resolves_libc_function_pointer() {
@@ -429,14 +456,17 @@ xx\t00\tbar
 
     /// Plan 2026-05-11 Task 3 — stripped dylibs (or any address that
     /// doesn't land inside a known image) silently fall through to
-    /// the `0x<hex>` rendering. We probe a clearly-unmapped userspace
-    /// address (`0xdeadbeef`) to verify dladdr's NULL-on-miss surfaces
-    /// as the hex fallback rather than a spurious symbol.
+    /// the `0x<hex>` rendering. We probe a high non-canonical
+    /// userspace address that's guaranteed unmapped on both x86_64
+    /// and aarch64 (the upper-half of the 48-bit virtual range is
+    /// reserved for the kernel on Linux and never returned to user
+    /// mmap on macOS) to verify dladdr's NULL-on-miss surfaces as
+    /// the hex fallback rather than a spurious symbol.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn dyld_fallback_returns_hex_for_unmapped_address() {
         let r = Resolver::empty().with_dyld_images();
-        let name = r.lookup(0xDEADBEEF);
+        let name = r.lookup(0xffff_ffff_ffff_ffe0);
         assert!(
             name.starts_with("0x"),
             "unmapped PC must surface as `0x<hex>` not a spurious symbol; got {name:?}"
@@ -448,10 +478,32 @@ xx\t00\tbar
     /// the demangled sigil-user names (`main`, `foo$$Int`) which
     /// dladdr would otherwise return in their mangled form
     /// (`sigil_user_main`, `sigil_user_foo____Int`).
+    ///
+    /// To actually exercise precedence we need a PC where *both*
+    /// paths would resolve: a real libc function pointer (`getpid`)
+    /// covered by a synthetic sidecar entry that names it differently.
+    /// If precedence were inverted (dladdr first), the dladdr-resolved
+    /// `getpid` would win; with the correct order the sidecar's
+    /// `"sidecar_wins"` does. Without this construction (i.e. a
+    /// non-runtime PC like `0x1010`), dladdr returns `None` regardless
+    /// of order and the test passes vacuously.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sidecar_takes_precedence_over_dladdr_fallback() {
-        let r = Resolver::from_entries(vec![(0x1000, 0x40, "main".into())]).with_dyld_images();
-        // PC inside the sidecar entry → sidecar wins.
-        assert_eq!(r.lookup(0x1010), "main");
+        extern "C" {
+            fn getpid() -> i32;
+        }
+        let pc = getpid as *const () as usize;
+        // image_base = 0 (from_entries default) makes the lookup
+        // treat the captured PC as image-relative, so a sidecar
+        // entry whose `address` equals the runtime PC covers it.
+        let r = Resolver::from_entries(vec![(pc as u64, 0x100, "sidecar_wins".into())])
+            .with_dyld_images();
+        let name = r.lookup(pc);
+        assert_eq!(
+            name, "sidecar_wins",
+            "sidecar must win over dladdr; if this returns a libc symbol \
+             like `getpid`, precedence is inverted"
+        );
     }
 }

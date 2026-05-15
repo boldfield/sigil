@@ -28,10 +28,6 @@ use crate::profile::sample::Sample;
 /// Write `samples` as a folded-stacks file. Returns the number of
 /// unique-stack rows emitted.
 pub fn write_folded(samples: &[Sample], out: &mut impl Write) -> io::Result<usize> {
-    // `.with_dyld_images()` enables a `dladdr(3)` fallback so PCs
-    // that miss the main-binary sidecar (libgc, libSystem, ...)
-    // resolve to their POSIX linker-table names instead of falling
-    // through to `0x<hex>`. Plan 2026-05-11.
     let resolver = resolve::Resolver::from_env_for_main_binary().with_dyld_images();
     // BTreeMap keys are deterministic (lex-sorted) — output bytes
     // are reproducible across runs.
