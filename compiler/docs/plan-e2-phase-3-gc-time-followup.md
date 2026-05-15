@@ -305,6 +305,16 @@ decomposition-and-verdict, not a steady-state guard.
   binaries don't have it. `diff-throughput.py` renders the
   pre value as `n/a`; the decomposition treats the missing
   pre value as 0.
+- **Pre-checkpoint `forced_gc_count` is absent.** The counter
+  slot (`CounterId::ForcedGcCount = 29`) was introduced by
+  the force-injection follow-up (#2); the pre-side cherry-
+  picked patch at `scripts/pre-checkpoint-cadence-patch.diff`
+  deliberately does NOT backport the counter, since doing so
+  would require a sibling patch to `counters.rs`. Pre-side
+  injection firing is inferred from `boehm_gc_time_ms`
+  advancement under the same N cadence; the post-side counter
+  acts as the operator's "did the injection fire?" sanity
+  check. `diff-throughput.py` renders the pre value as `n/a`.
 - **`use std.*;` strip on cherry-pick.** PR #173's
   qualified-only-imports surface added `use` statements to
   every workload that the pre-checkpoint parser (ca29d20,
@@ -420,7 +430,14 @@ doc's top-of-file TL;DR to reflect the resolved state — the
 
 Fill in from `throughput-data-{ubuntu-24.04,macos-14}` artifacts.
 Recommend one table per OS with columns:
-`workload | wall_clock_ms (pre/post) | boehm_gc_time_ms (pre/post) | SIGIL_COUNTER_FORCED_GC_COUNT (pre/post) | SIGIL_COUNTER_PRECISE_WALKER_NS (post) | alloc_count`.
+`workload | wall_clock_ms (pre/post) | boehm_gc_time_ms (pre/post) | SIGIL_COUNTER_FORCED_GC_COUNT (post) | SIGIL_COUNTER_PRECISE_WALKER_NS (post) | alloc_count`.
+
+The `SIGIL_COUNTER_FORCED_GC_COUNT` column is post-side only —
+the pre-side cherry-picked patch deliberately omits the counter
+slot (see "Methodology caveats" below). Pre-side firing is
+inferred from `boehm_gc_time_ms` advancement under the same
+cadence; the counter's job is sanity-checking the mechanism
+fired, not driving the verdict.
 
 ### Decomposition — TODO(operator)
 

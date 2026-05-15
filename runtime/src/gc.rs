@@ -319,8 +319,8 @@ pub extern "C" fn sigil_gc_init() {
         }
 
         // Plan E2 Phase 3 GC-time follow-up #2 — cadence-injection
-        // env var. Read once at init time so per-alloc dispatch is
-        // a single Relaxed load. Unset / empty / 0 / invalid → no
+        // env var. Parsed at init time so per-alloc dispatch is a
+        // single Relaxed load. Unset / empty / 0 / invalid → no
         // injection (Boehm's default pacing applies).
         //
         // The empty-string guard matches `SIGIL_MAX_HEAP_SIZE_KB`'s
@@ -330,6 +330,17 @@ pub extern "C" fn sigil_gc_init() {
         // unset). Without the empty-string guard, every default-
         // injection workflow run would emit a spurious warning per
         // workload invocation.
+        //
+        // We PARSE the env var here (before `GC_init`) but PUBLISH
+        // to `FORCE_GC_CADENCE` AFTER `GC_init` (see the `set` call
+        // below `GC_init`). Unlike `GC_set_max_heap_size` above,
+        // the cadence has no ordering constraint with Boehm's
+        // init — and publishing before init would open a tiny
+        // race window where a racing `sigil_alloc` could observe
+        // `FORCE_GC_CADENCE.get() == Some(Some(n))` and call
+        // `GC_gcollect()` before `GC_init()` has run. Impossible
+        // in practice (Sigil's main shim is synchronous) but
+        // closing the window is free.
         //
         // See `compiler/docs/plan-e2-phase-3-gc-time-followup.md`'s
         // "Force-injection follow-up" section.
@@ -354,12 +365,17 @@ pub extern "C" fn sigil_gc_init() {
             },
             _ => None,
         };
-        let _ = FORCE_GC_CADENCE.set(cadence);
 
         // SAFETY: `Once::call_once` guarantees exactly one invocation even
         // under concurrent entry, so Boehm's non-reentrant init runs on a
         // single thread.
         unsafe { GC_init() };
+
+        // Publish the cadence AFTER GC_init — see the parse block's
+        // doc comment for the ordering rationale. Any racing
+        // sigil_alloc that observes `Some(Some(n))` here is
+        // guaranteed to see an initialised Boehm.
+        let _ = FORCE_GC_CADENCE.set(cadence);
 
         // Wire the counter dump exactly once — doing it inside the Once
         // guarantees atexit sees exactly one registration per process.

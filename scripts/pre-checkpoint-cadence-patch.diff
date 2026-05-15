@@ -46,14 +46,15 @@
  /// Initialise Boehm GC. Safe to call multiple times from any number of
  /// threads; only the first caller runs `GC_init()` and all others wait on
  /// `Once` until init completes. The generated `main` shim calls this
-@@ -166,6 +175,34 @@
+@@ -166,11 +175,42 @@
  #[no_mangle]
  pub extern "C" fn sigil_gc_init() {
      GC_INIT.call_once(|| {
 +        // Plan E2 Phase 3 GC-time follow-up #2 (cherry-picked) —
-+        // cadence-injection env var. Read once at init time so
-+        // per-alloc dispatch is a single Relaxed load. Unset /
-+        // empty / 0 / invalid → no injection.
++        // cadence-injection env var. Parse here, but PUBLISH to
++        // FORCE_GC_CADENCE only AFTER GC_init() to close the
++        // tiny race window where a parallel sigil_alloc could
++        // observe the cadence and call GC_gcollect() pre-init.
 +        let cadence: Option<NonZeroU64> =
 +            match std::env::var("SIGIL_FORCE_GC_EVERY_N_ALLOCS") {
 +                Ok(s) if !s.is_empty() => match s.parse::<u64>() {
@@ -76,12 +77,19 @@
 +                },
 +                _ => None,
 +            };
-+        let _ = FORCE_GC_CADENCE.set(cadence);
 +
          // SAFETY: `Once::call_once` guarantees exactly one invocation even
          // under concurrent entry, so Boehm's non-reentrant init runs on a
          // single thread.
-@@ -356,6 +393,26 @@
+         unsafe { GC_init() };
+ 
++        // Publish AFTER GC_init — see the parse block's comment.
++        let _ = FORCE_GC_CADENCE.set(cadence);
++
+         // Wire the counter dump exactly once — doing it inside the Once
+         // guarantees atexit sees exactly one registration per process.
+         if std::env::var_os("SIGIL_PRINT_STATS").is_some() {
+@@ -356,6 +396,26 @@
          let hdr_ptr: *mut u64 = raw.cast();
          hdr_ptr.write(header);
      }
