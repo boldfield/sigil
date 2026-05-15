@@ -3,7 +3,7 @@
 **Status:** **Confirmed (ubuntu)** / **directionally confirmed within
 noise (macos)**. Code shipped 2026-05-15 at commit `4afc5ce`;
 throughput-report runs `25935200346` (Phase 2 baseline `pre_sha=4f7ec86`)
-and `25935615684` (corrected baseline `pre_sha=b1ff665`).
+and `25935615684` (apples-to-apples baseline `pre_sha=b1ff665`).
 
 Cross-link: closes the +21% (ubuntu) / +86% (macos)
 `descriptor_cache_stress` regression surfaced in
@@ -20,7 +20,7 @@ the runtime indexes into a static `Vec<GC_descr>` populated by
 allocation hot path; the per-call cost is one extra `iconst` + a direct
 load.
 
-**Measured outcome (corrected-baseline run against
+**Measured outcome (apples-to-apples run against
 `pre_sha=b1ff665`, the immediate parent of this PR's first commit):**
 
 - `descriptor_cache_stress` ubuntu: **260 → 180 ms (−80 ms / −30.8%)**
@@ -202,7 +202,7 @@ on branch `static-descriptor-table` HEAD = `4afc5ce`, `runs=5`, empty
   isolation of this PR's delta: pre side has Phase 3 + descriptor
   cache; post side has Phase 3 + static descriptor table.
 
-### Run B (corrected baseline `pre_sha=b1ff665`) — primary verdict
+### Run B — apples-to-apples baseline `pre_sha=b1ff665` (primary verdict)
 
 #### ubuntu-24.04
 
@@ -228,7 +228,7 @@ on branch `static-descriptor-table` HEAD = `4afc5ce`, `runs=5`, empty
 | `fib_perf`                 | 0 ± 0    | 0 ± 0    | +0      | n/a |
 | `deep_sync_call_chain`     | 20 ± 0   | 20 ± 0   | +0      | +0.0% |
 
-### Run A (confounded baseline `pre_sha=4f7ec86`) — recorded for context
+### Run A — confounded baseline `pre_sha=4f7ec86` (recorded for context)
 
 This run is **not** load-bearing on the verdict. It is documented so
 the negative-delta surprise is reproducible and the
@@ -318,15 +318,6 @@ noise (macos)** + **structurally confirmed (lock removal)**.
   pre-side workloads so the pre-Plan-F1 parser accepts them. The
   `b1ff665` baseline (Run B) post-dates PR #173, so this strip is a
   no-op on Run B — the pre side compiles workloads unmodified.
-
-- **Asymmetric counters.** `precise_walker_ns` (added by PR #172 /
-  Phase 3) and `forced_gc_count` (added by PR #177 / Phase 3 follow-up
-  #2) are absent on the pre side of Run A (pre-Phase-3) and present
-  on both sides of Run B (both post-Phase-3). This matches the
-  pattern in PR #176/#177's verdict docs. No counters are added by
-  THIS PR — `SHAPE_DESCRIPTORS` is internal state, not a counter
-  — so the counter table on Run B's post side is the same shape as
-  Run B's pre side.
 
 - **Boehm descriptor count.** First-allocation latency may be very
   slightly higher: the codegen-emitted table is built upfront at

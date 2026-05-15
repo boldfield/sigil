@@ -329,7 +329,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   a u32 `descriptor_index`; the runtime indexes into a static
   `Vec<GC_descr>`. ~150 lines of cache code removed
   (`runtime/src/gc/descriptor.rs` deleted).
-  **Measurement (corrected baseline `pre_sha=b1ff665` =
+  **Measurement (apples-to-apples baseline `pre_sha=b1ff665` =
   pre-PR-#178 HEAD):** `descriptor_cache_stress` ubuntu −80 ms /
   −30.8%; macos −20 ms / −11.1% (within IQR);
   `tree_stress_repeat_large` ubuntu −20% / macos −25%; other
