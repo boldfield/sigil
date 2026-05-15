@@ -205,17 +205,21 @@ Boehm-integration shape**, even under forced pressure. Specifically:
   extra full GCs to stay under it." This is the documented
   behaviour per `gc.h`; the env var is a hard ceiling, not
   a GC-aggression knob.
-- Forcing `GC_gcollect()` calls from the runtime would
-  produce the savings-measurement we'd want, but per the
-  plan body's design decision #2 ("Reject (b)
-  `GC_gcollect()` Sigil intrinsic. Adds permanent language
-  surface for a one-shot measurement aid."), that path was
-  rejected at design time.
-- Future work that wants to measure mark-phase savings
-  would need to use a different mechanism — likely a debug-
-  build-only injected `GC_gcollect()` call from the runtime
-  at a fixed allocation cadence — and that's a separate
-  plan.
+- The design body's option (b) rejection was specifically
+  of a **Sigil-language-surface `force_gc()` intrinsic** —
+  a user-callable builtin that becomes part of the
+  language permanently. The argument was "adds permanent
+  language surface for a one-shot measurement aid", which
+  remains correct for a language-level intrinsic.
+- A **runtime-internal debug-build-only `GC_gcollect()`
+  injection** is a different mechanism. No language-surface
+  change; just an env-var-gated runtime knob (e.g., fire
+  `GC_gcollect()` every N allocations under a debug build).
+  The design doc didn't explicitly consider this variant,
+  so it remains designable as a separate plan without
+  re-litigating option (b)'s rejection. Future work that
+  wants to measure mark-phase savings would follow this
+  path.
 
 What this follow-up DOES provide:
 
@@ -263,6 +267,19 @@ decomposition-and-verdict, not a steady-state guard.
   designed to force collection cadence higher than Boehm's
   default heuristic provides. Real-world Sigil programs
   running without the env var see Boehm's default pacing.
+- **Pre/post budget asymmetry.** The `SIGIL_MAX_HEAP_SIZE_KB`
+  env var is honored only by the post-checkpoint binary —
+  the read site landed in this PR. The pre-checkpoint
+  binary (`ca29d20`) runs unconstrained regardless of the
+  workflow input. The verdict ("Boehm refused to fire any
+  STW full GC even under the budget pin") is therefore
+  verified on the post side only; the pre side's behaviour
+  under budget is not measured. Future re-runs against a
+  post-merge `pre_sha` honor the budget symmetrically on
+  both sides. The verdict doesn't change either way — if
+  the post side under budget can't trigger GCs, the pre
+  side under budget wouldn't either (Boehm's heap-pin
+  semantics are version-stable across `8.2.6` ↔ `8.2.12`).
 - **Counter excludes chained-prior-proc.** Boehm's internal
   push_other_roots proc handles TLS roots + dynamic-library
   roots; its cost is not Phase 3's overhead. The counter
@@ -288,10 +305,32 @@ decomposition-and-verdict, not a steady-state guard.
   `tree_stress_repeat_large` ubuntu 30 → 40 ms with IQR=0);
   treat them as noise-floor rather than signal.
 - **The walker-cost numbers vary across runners.** Same
-  workload's walker_ns differs ~10× between ubuntu and
-  macos for `descriptor_cache_stress` (351k vs 66k). The
-  ratio reflects libgc version + runner CPU shape, not
-  workload semantics.
+  workload's walker_ns differs ~5× between ubuntu and macos
+  for `descriptor_cache_stress` (351k vs 66k), with
+  `deep_sync_call_chain` reversing the direction (420k vs
+  625k). The ratio reflects a combination of factors none of
+  which the verdict is sensitive to:
+  1. **libgc mark-callback firing frequency.** libgc 8.2.6
+     (ubuntu) vs 8.2.12 (macos) may differ in how often
+     `push_other_roots` fires for a given allocation volume;
+     more fires → more wall-clock accumulated even at
+     identical per-fire cost.
+  2. **Per-fire work shape.** The closure passed to
+     `walk_for_gc_with_callback_from` does FP-chain walking
+     + `GC_push_all_eager` calls; CPU branch predictors,
+     cache shape, and TLS access cost differ between
+     runner architectures (linux x86_64 vs apple-silicon
+     macos).
+  3. **`Instant::now()` resolution.** Linux's
+     `clock_gettime(CLOCK_MONOTONIC)` and macos's
+     `mach_absolute_time` are both fast but not identical;
+     for small per-call costs the timer overhead itself is
+     a measurable fraction.
+  The verdict ("walker has real but small cost") survives
+  any of these explanations. Future readers should treat the
+  walker-cost numbers as absolute-per-workload, not as
+  relative-per-callback — the ratio could shift under a
+  different workload mix or libgc version.
 
 ## Related work
 
