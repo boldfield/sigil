@@ -1546,9 +1546,9 @@ fn dump_color_multi_fn_pure_program() {
 /// top-level-fn call site to stdout, followed by a `# summary:` line.
 /// No codegen, no executable produced. CI-runs the binary against
 /// `examples/catch.sigil` — the smallest example known to produce a
-/// `FullyDischarged` call site (per the Phase 1 activation
-/// inventory recorded in `compiler/src/discharge.rs::phase_1_-
-/// activation_inventory_across_examples`).
+/// `FullyDischarged` call site (per the Phase 1 activation inventory
+/// recorded in
+/// `compiler/src/discharge.rs::tests::phase_1_activation_inventory_across_examples`).
 #[test]
 fn dump_discharge_catch_example_has_full_summary() {
     let root = workspace_root();

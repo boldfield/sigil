@@ -361,11 +361,27 @@ impl<'a> Ctx<'a> {
         let (callee_effects, callee_open_row) = collect_callee_effects(callee_decl);
         let (enclosing_discharged, enclosing_handle_spans) = self.snapshot_handle_stack();
         let status = classify(&callee_effects, callee_open_row, &enclosing_discharged);
-        let callee_color = self
-            .color_by_name
-            .get(callee_name)
-            .copied()
-            .unwrap_or(Color::Native);
+        // Invariant: every name in `fn_by_name` must have a matching
+        // entry in `color_by_name` — both maps are built from the
+        // same `mono.anf.checked.program.items` list (Item::Fn
+        // entries). A missing entry would indicate the color pass
+        // filtered an item the analyzer reached, which would be a
+        // real bug rather than a "default to Native" situation.
+        //
+        // `unreachable!` (not `unwrap_or`) so the bug surfaces loudly
+        // if a future refactor diverges the two maps. PR #175
+        // reviewer flagged the silent fallback explicitly.
+        // `Option::expect` is in `clippy.toml`'s disallowed list (the
+        // codebase routes user-facing failures through `CompilerError`
+        // and uses `unreachable!` for invariant violations like this
+        // one — see `color.rs::tarjan_scc` for the same pattern).
+        let callee_color = match self.color_by_name.get(callee_name) {
+            Some(c) => *c,
+            None => unreachable!(
+                "discharge: callee `{}` present in fn_by_name but missing from color_by_name",
+                callee_name
+            ),
+        };
         self.sites.push(CallSite {
             caller_name: self.caller_name.to_string(),
             callee_name: callee_name.to_string(),
@@ -503,9 +519,14 @@ fn format_call_site(s: &CallSite) -> String {
 }
 
 fn render_row(effects: &BTreeSet<String>, open: bool) -> String {
-    let mut parts: Vec<&str> = effects.iter().map(|s| s.as_str()).collect();
-    parts.sort();
-    let body = parts.join(", ");
+    // BTreeSet iteration is already in ascending key order, so no
+    // explicit sort is needed (PR #175 reviewer's nit). If `effects`
+    // ever switches to a HashSet, restore the explicit sort here.
+    let body = effects
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     match (effects.is_empty(), open) {
         (true, false) => "![]".to_string(),
         (true, true) => "![| e]".to_string(),
@@ -566,6 +587,14 @@ mod tests {
         assert!(lex_errs.is_empty(), "lex: {lex_errs:?}");
         let (prog, parse_errs) = parser::parse(file, &tokens);
         assert!(parse_errs.is_empty(), "parse: {parse_errs:?}");
+        // PR #175 reviewer fidelity nit: real pipeline runs
+        // imports::resolve between parse and resolve::resolve. Test
+        // sources are self-contained today (no `import` lines), but
+        // wiring it through here keeps the test pipeline identical
+        // to the real one so future tests that add stdlib imports
+        // don't silently regress.
+        let (prog, import_errs) = crate::imports::resolve(prog);
+        assert!(import_errs.is_empty(), "imports: {import_errs:?}");
         let (resolved, resolve_errs) = resolve::resolve(prog);
         assert!(resolve_errs.is_empty(), "resolve: {resolve_errs:?}");
         let (checked, tc_errs) = typecheck::typecheck(resolved.program);
@@ -865,11 +894,31 @@ mod tests {
     // binary on a .sigil file (the Cranelift OOM hazard CLAUDE.md
     // calls out).
 
-    fn analyze_example_file(rel: &str) -> DischargeAnalysis {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    /// Resolve `rel` against the workspace root and return its
+    /// absolute path. `None` if the path doesn't exist on disk —
+    /// callers should treat missing files as "skip" rather than
+    /// "fail" so the test surface works when the compiler crate is
+    /// consumed outside the cargo workspace (e.g., a future pre-
+    /// publish wheel that ships only `compiler/`).
+    fn example_path(rel: &str) -> Option<std::path::PathBuf> {
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("compiler manifest has workspace parent")
             .join(rel);
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    }
+
+    fn analyze_example_file(rel: &str) -> DischargeAnalysis {
+        let path = example_path(rel).unwrap_or_else(|| {
+            panic!(
+                "analyze_example_file: `{}` not found relative to workspace root",
+                rel
+            )
+        });
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
             panic!("failed to read {}: {e}", path.display());
         });
@@ -907,6 +956,10 @@ mod tests {
         // stable dump rather than asserting a specific
         // FullyDischarged count; the Phase 1 review surfaces the
         // actual inventory to the user.
+        if example_path("examples/state.sigil").is_none() {
+            eprintln!("skipping state_sigil_inventory test: examples/state.sigil not present");
+            return;
+        }
         let da = analyze_example_file("examples/state.sigil");
         let dump = dump_discharge(&da);
         assert!(
@@ -916,6 +969,65 @@ mod tests {
         // Determinism guard.
         let da2 = analyze_example_file("examples/state.sigil");
         assert_eq!(dump, dump_discharge(&da2));
+    }
+
+    #[test]
+    fn catch_example_has_one_fully_discharged_cps_site() {
+        // PR #175 review N1: hard-asserting regression guard against
+        // a single stable example. The Phase 1 inventory aggregator
+        // (above) asserts only `total_sites > 0`, which lets a
+        // future analyzer refactor silently undercount or overcount
+        // without surfacing in CI. This test pins one concrete
+        // count so a regression that mis-classifies the canonical
+        // `Raise.fail` discard-`k` shape from `examples/catch.sigil`
+        // breaks the build.
+        //
+        // `main -> risky` inside `handle risky(7) with { Raise.fail
+        // (_msg, k) => 42 }`:
+        //   - risky's row is `![Raise[String]]` (closed, single
+        //     effect).
+        //   - The enclosing handle's op_arms list a Raise.fail arm
+        //     → D_c = {Raise}.
+        //   - R_f ⊆ D_c → FullyDischarged.
+        //   - risky's body is `let result = raise(...); result + input`
+        //     — chained-let-yield-then-pure-tail shape; color.rs
+        //     classifies risky as Cps.
+        //
+        // The single FullyDischarged + Cps site is therefore the
+        // canonical positive case for Plan E3's intended target.
+        if example_path("examples/catch.sigil").is_none() {
+            eprintln!("skipping catch_example regression test: examples/catch.sigil not present");
+            return;
+        }
+        let da = analyze_example_file("examples/catch.sigil");
+        assert_eq!(
+            da.fully_discharged_cps_callees(),
+            1,
+            "examples/catch.sigil must produce exactly 1 FullyDischarged Cps-color call site; dump=\n{}",
+            dump_discharge(&da),
+        );
+    }
+
+    #[test]
+    fn div_recover_example_has_one_fully_discharged_cps_site() {
+        // Companion to the catch.sigil regression guard above. The
+        // div_recover example uses the typecheck-elaborated
+        // `ArithError` perform — same FullyDischarged shape but
+        // under a different effect surface. Pinning both gives a
+        // regression guard against effect-specific classifier bugs.
+        if example_path("examples/div_recover.sigil").is_none() {
+            eprintln!(
+                "skipping div_recover_example regression test: examples/div_recover.sigil not present"
+            );
+            return;
+        }
+        let da = analyze_example_file("examples/div_recover.sigil");
+        assert_eq!(
+            da.fully_discharged_cps_callees(),
+            1,
+            "examples/div_recover.sigil must produce exactly 1 FullyDischarged Cps-color call site; dump=\n{}",
+            dump_discharge(&da),
+        );
     }
 
     /// Aggregate the Phase-1 activation-gate inventory across the
@@ -936,11 +1048,16 @@ mod tests {
     /// bound` line) would be unreliable.
     #[test]
     fn analyzer_reaches_stdlib_fns_pulled_in_via_imports() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("examples/json.sigil");
-        let src = std::fs::read_to_string(&path).unwrap();
+        let path = match example_path("examples/json.sigil") {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "skipping analyzer_reaches_stdlib_fns test: examples/json.sigil not present"
+                );
+                return;
+            }
+        };
+        let src = std::fs::read_to_string(&path).expect("read examples/json.sigil");
         let file_label = path.display().to_string();
         let (tokens, _) = lexer::lex(&file_label, &src);
         let (prog, _) = parser::parse(&file_label, &tokens);
@@ -1080,6 +1197,12 @@ mod tests {
         // count is a property the Phase 1 review surfaces to the user
         // rather than a hard assertion (the example's structure can
         // evolve).
+        if example_path("examples/choose_demo.sigil").is_none() {
+            eprintln!(
+                "skipping choose_demo_sigil_inventory test: examples/choose_demo.sigil not present"
+            );
+            return;
+        }
         let da = analyze_example_file("examples/choose_demo.sigil");
         let dump = dump_discharge(&da);
         assert!(

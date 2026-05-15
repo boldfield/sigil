@@ -125,15 +125,20 @@ fn emit_errors(errs: &[CompilerError], format: ErrorFormat) {
     }
 }
 
-/// Plan B Task 50 — failure modes for [`dump_color`]. The driver in
-/// `main.rs` maps every variant to a non-zero exit code; downstream
-/// tooling (e.g., adversarial-review harnesses) can branch on the
-/// variant for clearer diagnostics.
+/// Failure modes for the read-only diagnostic pipelines ([`dump_color`],
+/// [`dump_discharge`]). The driver in `main.rs` maps every variant to a
+/// non-zero exit code; downstream tooling can branch on the variant for
+/// clearer diagnostics.
+///
+/// Pre-PR-#175 this was named `DumpColorError` and only served
+/// `dump_color`. PR #175 added `dump_discharge` and extracted the
+/// shared front-end helper [`run_frontend_to_color`]; renamed to
+/// `PipelineError` so the type matches its post-extraction role.
 #[derive(Debug)]
-pub enum DumpColorError {
+pub enum PipelineError {
     /// `std::fs::read_to_string` failed (missing file, permission
     /// denied, etc.). The underlying error is already printed to
-    /// stderr by `dump_color` before returning.
+    /// stderr by the caller before returning.
     ReadFailed,
     /// At least one front-end error fired (lex / parse / resolve /
     /// typecheck). The carried `usize` is the total error count for
@@ -141,18 +146,33 @@ pub enum DumpColorError {
     FrontEndErrors(usize),
 }
 
-/// Plan B Task 50 — `--dump-color`. Runs the front end through color
-/// inference and returns the rendered dump as a `String`. Front-end
-/// errors emit as usual on stderr and short-circuit with a typed
-/// [`DumpColorError`].
-pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorError> {
+/// Backwards-compat alias for callers that still reference the
+/// pre-rename type. New code uses [`PipelineError`] directly.
+#[deprecated(note = "renamed to PipelineError; will be removed once external callers update")]
+pub type DumpColorError = PipelineError;
+
+/// Run the front-end pipeline (lex → parse → imports → resolve →
+/// typecheck → elaborate → monomorphize → color) and return the
+/// [`color::ColoredProgram`]. Shared between [`dump_color`] and
+/// [`dump_discharge`] (and any future read-only diagnostic that wants
+/// the same input shape). Front-end errors emit on stderr and
+/// short-circuit with [`PipelineError`].
+///
+/// This helper does NOT cover codegen — [`compile`] keeps its own
+/// inline pipeline because it also threads the output path through
+/// link + symtab emission. Extracting a shared helper for `compile`
+/// would require a larger refactor outside Phase 1 scope.
+fn run_frontend_to_color(
+    input: &str,
+    format: ErrorFormat,
+) -> Result<color::ColoredProgram, PipelineError> {
     let src = match std::fs::read_to_string(input) {
         Ok(s) => s,
         Err(e) => {
             let stderr = std::io::stderr();
             let mut out = stderr.lock();
             let _ = writeln!(out, "sigil: cannot read `{input}`: {e}");
-            return Err(DumpColorError::ReadFailed);
+            return Err(PipelineError::ReadFailed);
         }
     };
 
@@ -179,7 +199,7 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
     {
         let n = all_errs.len();
         emit_errors(&all_errs, format);
-        return Err(DumpColorError::FrontEndErrors(n));
+        return Err(PipelineError::FrontEndErrors(n));
     }
 
     let (checked, tc_errs) = typecheck::typecheck(resolved.program);
@@ -191,13 +211,22 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
     {
         let n = all_errs.len();
         emit_errors(&all_errs, format);
-        return Err(DumpColorError::FrontEndErrors(n));
+        return Err(PipelineError::FrontEndErrors(n));
     }
 
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
     emit_errors(&all_errs, format);
+    Ok(colored)
+}
+
+/// Plan B Task 50 — `--dump-color`. Runs the front end through color
+/// inference and returns the rendered dump as a `String`. Front-end
+/// errors emit as usual on stderr and short-circuit with a typed
+/// [`PipelineError`].
+pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, PipelineError> {
+    let colored = run_frontend_to_color(input, format)?;
     Ok(color::dump_color(&colored))
 }
 
@@ -205,56 +234,8 @@ pub fn dump_color(input: &str, format: ErrorFormat) -> Result<String, DumpColorE
 /// color inference and Plan E3's per-call-site discharge analysis;
 /// returns the rendered dump as a `String`. Same failure modes as
 /// [`dump_color`].
-pub fn dump_discharge(input: &str, format: ErrorFormat) -> Result<String, DumpColorError> {
-    let src = match std::fs::read_to_string(input) {
-        Ok(s) => s,
-        Err(e) => {
-            let stderr = std::io::stderr();
-            let mut out = stderr.lock();
-            let _ = writeln!(out, "sigil: cannot read `{input}`: {e}");
-            return Err(DumpColorError::ReadFailed);
-        }
-    };
-
-    let mut all_errs: Vec<CompilerError> = Vec::new();
-
-    let (tokens, lex_errs) = lexer::lex(input, &src);
-    all_errs.extend(lex_errs);
-
-    let (prog, parse_errs) = parser::parse(input, &tokens);
-    all_errs.extend(parse_errs);
-
-    let (prog, import_errs) = imports::resolve(prog);
-    all_errs.extend(import_errs);
-
-    let (resolved, resolve_errs) = resolve::resolve(prog);
-    all_errs.extend(resolve_errs);
-
-    if all_errs
-        .iter()
-        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
-    {
-        let n = all_errs.len();
-        emit_errors(&all_errs, format);
-        return Err(DumpColorError::FrontEndErrors(n));
-    }
-
-    let (checked, tc_errs) = typecheck::typecheck(resolved.program);
-    all_errs.extend(tc_errs);
-
-    if all_errs
-        .iter()
-        .any(|e| matches!(e.severity, crate::errors::Severity::Error))
-    {
-        let n = all_errs.len();
-        emit_errors(&all_errs, format);
-        return Err(DumpColorError::FrontEndErrors(n));
-    }
-
-    let anf = elaborate::elaborate(checked);
-    let mono = monomorphize::monomorphize(anf);
-    let colored = color::infer_colors(mono);
+pub fn dump_discharge(input: &str, format: ErrorFormat) -> Result<String, PipelineError> {
+    let colored = run_frontend_to_color(input, format)?;
     let analysis = discharge::analyze(&colored);
-    emit_errors(&all_errs, format);
     Ok(discharge::dump_discharge(&analysis))
 }
