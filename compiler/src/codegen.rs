@@ -13725,10 +13725,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let payload_bytes: i64 = 8 + 8 * total_slots as i64;
                         let header_v = lowerer.builder.ins().iconst(types::I64, header as i64);
                         let payload_v = lowerer.builder.ins().iconst(pointer_ty, payload_bytes);
+                        let descriptor_index_v =
+                            lowerer.lower_alloc_descriptor_index(bitmap, count);
                         let cp = lower_alloc_call(
                             &mut lowerer.builder,
                             lowerer.builtins.alloc_ref,
-                            &[header_v, payload_v],
+                            &[header_v, payload_v, descriptor_index_v],
                         );
                         // Null code_ptr at offset 8.
                         let null_v = lowerer.builder.ins().iconst(pointer_ty, 0);
