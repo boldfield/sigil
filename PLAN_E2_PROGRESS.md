@@ -554,18 +554,24 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
-- Mark-phase hypothesis verdict (follow-up) — _measurement-run
-  pending_ — see
+- Mark-phase hypothesis verdict (follow-up) — ✅ **Inconclusive**
+  even under forced budget. See
   [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
   Adds the `SIGIL_MAX_HEAP_SIZE_KB` env var + the always-on
-  `SIGIL_COUNTER_PRECISE_WALKER_NS` counter so the
-  conservative-scan-savings vs. precise-walker-cost
-  decomposition becomes computable. The original throughput
-  report stays as a frozen snapshot of the unfalsifiable
-  state; the follow-up doc lands the verdict (confirmed /
-  disproven / inconclusive even under forced pressure).
-  TL;DR will be filled by the Task-4 workflow run on this
-  branch.
+  `SIGIL_COUNTER_PRECISE_WALKER_NS` counter. Workflow run
+  [`25899135194`](https://github.com/boldfield/sigil/actions/runs/25899135194)
+  at `SIGIL_MAX_HEAP_SIZE_KB=16384` (the smallest budget every
+  workload completes under): every workload × every
+  checkpoint × every OS shows `boehm_gc_time_ms = 0` — Boehm
+  refused to fire any STW full GC even under the budget pin.
+  The hypothesis remains structurally unfalsifiable; the
+  savings column is zero by measurement, not by inference.
+  The walker-cost column IS measurable — 0–625 µs cumulative
+  per workload run (~3.1% relative on the largest Cps
+  workload) — so half the decomposition was landed. Future
+  measurement would need a debug-injected `GC_gcollect()`
+  call from the runtime; per the plan body's design decision
+  #2 that path was rejected at this plan's scope.
 
 ## Deviations
 
