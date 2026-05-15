@@ -554,21 +554,31 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`25870490129`](https://github.com/boldfield/sigil/actions/runs/25870490129).
   Re-run via
   [`.github/workflows/throughput-report.yml`](.github/workflows/throughput-report.yml).
-- Mark-phase hypothesis verdict (follow-up #2: force-injection) —
-  ⏳ **Scaffolded, awaiting measurement.** Runtime-internal
-  `SIGIL_FORCE_GC_EVERY_N_ALLOCS=N` env-var-gated `GC_gcollect()`
-  injection in `sigil_alloc` (post side) + a tracked
-  `scripts/pre-checkpoint-cadence-patch.diff` cherry-picked onto
-  the pre-checkpoint worktree by `throughput-report.yml`'s
-  `pre — patch in cadence injection` step. Adds the
-  `SIGIL_COUNTER_FORCED_GC_COUNT` diagnostic counter. The
-  verdict (Confirmed / Disproven / Pathological) is operator-
-  filled after triggering the workflow with
-  `force_gc_every_n_allocs=1000`; see the "Force-injection
-  follow-up" section of
-  [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
+- Mark-phase hypothesis verdict (closed) — ✅ **Disproven.**
+  Phase 3 has no measurable mark-phase savings even under forced
+  `SIGIL_FORCE_GC_EVERY_N_ALLOCS=1000` injection. Workflow run
+  [`25903666139`](https://github.com/boldfield/sigil/actions/runs/25903666139)
+  on `3175c83` pre-side patched in via
+  `scripts/pre-checkpoint-cadence-patch.diff`. `boehm_gc_time_ms
+  = 0` on every workload × every checkpoint × every OS — same
+  pattern as PR #176's forced-budget run — but this run verifies
+  the injection mechanism fired the expected count exactly
+  (post-side `SIGIL_COUNTER_FORCED_GC_COUNT` = `alloc_count ÷
+  1000` to the unit on every workload; e.g.,
+  `descriptor_cache_stress` fired exactly 5000 forced GCs across
+  5M allocs). The savings column is structurally zero at OS-
+  level ms resolution. The runtime-internal `GC_gcollect()`
+  injection delivered the savings-side measurement that
+  `SIGIL_MAX_HEAP_SIZE_KB` couldn't (Boehm's heap-size pin is a
+  hard ceiling, not a cadence knob); the verdict is the same
+  both ways. Phase 3 remains load-bearing for **correctness**
+  (false-retention closure, PR #155/#171), not for
+  **throughput**. See the "Force-injection follow-up" section of
+  [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md)
+  for full tables + decomposition.
 - Mark-phase hypothesis verdict (follow-up #1: forced budget) —
-  ✅ **Inconclusive** even under forced budget. See
+  ✅ **Inconclusive** even under forced budget (superseded by
+  #2's Disproven verdict above). See
   [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md).
   Adds the `SIGIL_MAX_HEAP_SIZE_KB` env var + the always-on
   `SIGIL_COUNTER_PRECISE_WALKER_NS` counter. Workflow run

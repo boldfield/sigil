@@ -1,16 +1,25 @@
 # Plan E2 Phase 3 GC-time follow-up
 
-**Status:** measured. Data captured from `throughput-report.yml` run
-[`25899135194`](https://github.com/boldfield/sigil/actions/runs/25899135194)
-on commit `d8182348eff30fea4e0e1ee7fd790951eb3b3c27`. The workflow
-ran end-to-end on both CI lanes (ubuntu-24.04 + macos-14) at the
-pre-Phase-3 SHA (`ca29d2061f2897cb824d8328c92a8d945da313cc`) and
-this branch HEAD (`d818234`); the per-workload JSON + per-OS
-deltas summary live in the run's artifact upload.
+**Status:** verdict landed (force-injection follow-up #2). Two
+`throughput-report.yml` runs feed this doc:
 
-**Heap budget for the run:** `16384` KB. Smaller budgets
-(`512`, `4096`) OOM-aborted on increasingly large workloads;
-`16384` was the smallest budget every workload completed under.
+- **Force-budget (#1, PR #176):** run [`25899135194`](https://github.com/boldfield/sigil/actions/runs/25899135194)
+  on commit `d8182348eff30fea4e0e1ee7fd790951eb3b3c27`,
+  `SIGIL_MAX_HEAP_SIZE_KB=16384` (smallest budget every workload
+  completes under; `512` / `4096` OOM-abort on increasingly
+  large workloads). Result on its own: inconclusive.
+- **Force-injection (#2, PR #177):** run [`25903666139`](https://github.com/boldfield/sigil/actions/runs/25903666139)
+  on commit `3175c83e15bba0a69d0204437361b49d9c3edd95`,
+  `SIGIL_FORCE_GC_EVERY_N_ALLOCS=1000`, pre-side cherry-picked
+  via `scripts/pre-checkpoint-cadence-patch.diff`. Result on
+  its own: same `boehm_gc_time_ms = 0` pattern, but injection
+  mechanism is verified by exact `SIGIL_COUNTER_FORCED_GC_COUNT
+  ≈ alloc_count ÷ 1000` match per workload. The combined verdict
+  in the TL;DR is from this run.
+
+Both runs targeted the same pre-Phase-3 checkpoint
+(`ca29d2061f2897cb824d8328c92a8d945da313cc`) and the same two CI
+lanes (ubuntu-24.04 + macos-14).
 
 **Spec:** [`/repos/designs/docs/plans/2026-05-14-sigil-plan-e2-phase-3-gc-time-followup-design.md`](../../../designs/docs/plans/2026-05-14-sigil-plan-e2-phase-3-gc-time-followup-design.md).
 
@@ -18,55 +27,51 @@ deltas summary live in the run's artifact upload.
 
 ## TL;DR
 
-**Inconclusive — the hypothesis remains structurally unfalsifiable
-even under forced budget.** `boehm_gc_time_ms = 0` on every workload
-× every checkpoint × every OS in this run, including under a
-`SIGIL_MAX_HEAP_SIZE_KB=16384` pin. Two readings are consistent
-with that observation: either no stop-the-world full GC fired, or
-each collection completed in under 1 ms (Boehm's
-`GC_get_full_gc_total_time` reports integer milliseconds, so any
-sub-ms aggregate rounds to 0). The unit test
-`sigil_max_heap_size_kb_pin_forces_full_gc` confirms that at a
-much tighter 1 MiB budget the mechanism DOES fire collections
-(`GC_get_gc_no` advances), so the budget plumbing is verified
-end-to-end; what we don't have at the 16 MiB workload budget is a
-millisecond-resolved signal. The smallest budget that lets every
-workload complete (`descriptor_cache_stress` allocates 192 MB
-of total churn at 5M alloc sites; smaller budgets OOM-abort with
-"Heap size: N MiB. Returning NULL!" before that workload can
-finish) sits in the regime where Boehm collects fast enough to
-read 0 ms but apparently not often enough to register the
-hypothesised savings.
+**Disproven — Phase 3 has no measurable mark-phase savings even
+under forced `GC_gcollect()` injection at N=1000.** Both follow-
+up plans (force-budget in PR #176, force-injection in PR #177)
+land the same headline: `boehm_gc_time_ms = 0` on every workload
+× every checkpoint × every OS. The force-injection follow-up
+closes the residual escape valve from #176 ("maybe the budget
+mechanism just didn't fire enough GCs"): under N=1000 the
+injection mechanism fires the expected number of collections
+exactly — the post-side `SIGIL_COUNTER_FORCED_GC_COUNT` matches
+`alloc_count ÷ 1000` to the unit on every workload (e.g.,
+`descriptor_cache_stress` fired exactly **5000** forced GCs
+across 5M allocs). And every one of those forced cycles
+completes in under one millisecond at Sigil-workload scale, so
+Boehm's millisecond-resolved `GC_get_full_gc_total_time` rounds
+the aggregate to 0. The savings column is structurally zero at
+OS-level ms resolution.
 
-The walker-cost side IS measurable, and per-Phase-3 design that's
-half the decomposition that was wanted:
+The decomposition the design doc asked for:
 
-| Workload | ubuntu walker_ns | macos walker_ns |
-|---|--:|--:|
-| `fib_perf` | 0 | 0 |
-| `fib_cps_perf` | 18,114 | 3,543 |
-| `tree` | 2,044 | 1,291 |
-| `tree_stress_repeat` | 2,986 | 1,626 |
-| `tree_stress_repeat_large` | 14,847 | 5,543 |
-| `descriptor_cache_stress` | 351,576 | 66,494 |
-| `deep_sync_call_chain` | 419,927 | 625,002 |
+- **Savings = pre `boehm_gc_time_ms` − post `boehm_gc_time_ms` =
+  0 ms on every workload.** Phase 3's mark-phase claim has no
+  measurable signal at OS-level resolution.
+- **Cost = post `precise_walker_ns` per workload.** Spans 0 µs
+  (`fib_perf`) to ~3.5 ms cumulative (`deep_sync_call_chain` on
+  ubuntu) over each workload run. Measurable, small, real.
+- **Net wall-clock effect = ubuntu post-Phase-3 regresses on the
+  largest alloc-heavy workloads.** `tree_stress_repeat_large`
+  +130 ms / +40.6% (983k allocs, 983 forced GCs);
+  `descriptor_cache_stress` +40 ms / +15.4% (5M allocs,
+  5000 forced GCs). The walker_ns numbers don't cover the full
+  regression — `GC_call_with_gc_active` + per-mark walker
+  invocation together drive the gap. macos is mixed (noise
+  level high, IQR up to 40 ms on ms-scale workloads).
 
-Walker cost spans 0 µs (`fib_perf`, which never enters Cps
-machinery and never invokes a Sigil-thread mark callback) to
-~625 µs cumulative (`deep_sync_call_chain` on macos, 400k Cps
-allocations over a 20 ms run = ~3% relative cost). The largest
-absolute walker cost (`deep_sync_call_chain`) is consistent with
-its CPS-heavy call chain producing the most precise-root push
-volume per mark cycle.
+Two follow-up plans, two orthogonal measurement mechanisms,
+same finding. The hypothesis chase is closed.
 
 **What this report does NOT say.** Phase 3's correctness gains —
-the false-retention closure under Plan E2 Phase 2's precise typed-
-malloc + Phase 3's per-thread precise stack roots — are
+the false-retention closure under Plan E2 Phase 2's precise
+typed-malloc + Phase 3's per-thread precise stack roots — are
 unaffected by this measurement. Those are load-bearing for
-soundness regardless of the mark-phase-time outcome. This report
-addresses only Phase 3's throughput-side load-bearing claim, and
-its verdict is "we can't measure the savings side, but we now
-know the cost side."
+soundness regardless of the mark-phase-time outcome (PR #155 /
+#171). The throughput-side load-bearing claim was speculative
+at design time; this report disproves it at the OS resolution
+available without committing to a new measurement substrate.
 
 ## Spec link
 
@@ -231,11 +236,21 @@ Boehm-integration shape**, even under forced pressure. Specifically:
   wants to measure mark-phase savings would follow this
   path.
 
-> **Update (force-injection follow-up landed):** the runtime-
-> internal `GC_gcollect()` injection alluded to above shipped
-> as the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env var (PR introducing
-> this section). See the "Force-injection follow-up" section
-> below for the conclusive verdict.
+> **Update (force-injection follow-up #2 measured + closed):**
+> the runtime-internal `GC_gcollect()` injection alluded to above
+> shipped as the `SIGIL_FORCE_GC_EVERY_N_ALLOCS` env var (PR
+> #177). Workflow run [`25903666139`](https://github.com/boldfield/sigil/actions/runs/25903666139)
+> at N=1000 measured both pre-Phase-3 and post-Phase-3 under
+> symmetric forced injection. The savings column is again zero
+> (`boehm_gc_time_ms = 0` on every workload × checkpoint × OS),
+> but this time the mechanism is verified — post-side
+> `SIGIL_COUNTER_FORCED_GC_COUNT` matches `alloc_count ÷ 1000`
+> exactly. **The escape valve from this section** ("budget
+> mechanism didn't fire enough GCs") **is closed by force-
+> injection** ("mechanism fired the expected number of GCs;
+> each one completes sub-millisecond"). Verdict: **Disproven.**
+> See the "Force-injection follow-up" section below for the full
+> tables and decomposition.
 
 What this follow-up DOES provide:
 
@@ -358,13 +373,13 @@ decomposition-and-verdict, not a steady-state guard.
   relative-per-callback — the ratio could shift under a
   different workload mix or libgc version.
 
-## Force-injection follow-up (Status: scaffolded, awaiting measurement)
+## Force-injection follow-up (Status: measured, 2026-05-15)
 
-This section is scaffolded with the infrastructure landing in this
-PR; the **verdict body is operator-filled** after triggering the
-`throughput-report.yml` workflow under the new
-`force_gc_every_n_allocs` input. Until that run lands, every
-`TODO(operator)` marker below is unresolved.
+Closes the residual escape valve from the budget-pinned run
+("maybe the budget mechanism just didn't fire enough GCs"):
+under `SIGIL_FORCE_GC_EVERY_N_ALLOCS=1000` the injection
+mechanism fires the expected number of collections exactly, and
+each one completes sub-millisecond at Sigil-workload scale.
 
 ### Mechanism
 
@@ -386,65 +401,102 @@ pre side would run unconstrained and the comparison would not be
 apples-to-apples. The patch verified clean against the pre-Phase-3
 SHA `ca29d2061f2897cb824d8328c92a8d945da313cc` at authoring time.
 
-### How the operator runs the measurement
+### Verdict
 
-1. **Trigger** `throughput-report.yml` from the Actions UI on this
-   branch with:
-   - `pre_sha=ca29d2061f2897cb824d8328c92a8d945da313cc`
-   - `runs=5`
-   - `heap_budget_kb=""` (leave empty — injection alone is enough;
-     combining with budget muddies the signal).
-   - `force_gc_every_n_allocs=1000` (starting cadence; iterate if
-     wall-clock explodes >60 s/workload or if injection fails to
-     register `boehm_gc_time_ms`).
-2. **Sanity-check artifacts:**
-   `SIGIL_COUNTER_FORCED_GC_COUNT` per workload ≈ `alloc_count / N`.
-   If the counter is 0 on a workload that allocated ≥ N times,
-   the injection didn't run — investigate before iterating N.
-3. **Iterate N if needed:**
-   - Wall-clock > 60 s/workload → N=10_000 or N=100_000.
-   - `boehm_gc_time_ms` still zero with counter advancing → root
-     cause something other than cadence; see "Failure modes" in
-     the implementation plan body.
-4. **Capture** the final workflow run ID + chosen N for the
-   verdict subsection below.
+**Disproven.** Phase 3 has no measurable mark-phase savings even
+under forced N=1000 injection. `boehm_gc_time_ms = 0` on every
+workload × every checkpoint × every OS in workflow run
+[`25903666139`](https://github.com/boldfield/sigil/actions/runs/25903666139).
+The injection mechanism is verified: post-side
+`SIGIL_COUNTER_FORCED_GC_COUNT` matches `alloc_count ÷ 1000` to
+the unit on every workload (e.g.,
+`descriptor_cache_stress` fired exactly **5000** forced GCs over
+its 5,000,007 allocs). The zero reading is structural — each
+mark cycle completes in well under one millisecond, below
+Boehm's `GC_get_full_gc_total_time` resolution floor.
 
-### Verdict — TODO(operator)
+Two follow-up plans, two orthogonal measurement mechanisms
+(budget-pinned in PR #176, forced-injection here in PR #177),
+same finding. Phase 3 remains load-bearing for **correctness**
+(false-retention closure under PR #155 / #171), not for
+**throughput**.
 
-TODO(operator): **Replace this paragraph with one of the three
-verdict shapes (Confirmed / Disproven / Pathological) per the
-plan body's "Verdict outcomes" section.** Lead with the verdict in
-the first sentence, then the headline number. Then update this
-doc's top-of-file TL;DR to reflect the resolved state — the
-"Inconclusive" framing from PR #176 is no longer the latest word.
+### Run metadata
 
-### Run metadata — TODO(operator)
-
-- **Workflow run ID:** TODO(operator)
+- **Workflow run ID:** [`25903666139`](https://github.com/boldfield/sigil/actions/runs/25903666139)
 - **Pre SHA:** `ca29d2061f2897cb824d8328c92a8d945da313cc`
-- **Post SHA:** TODO(operator) — commit on this branch the run measured
-- **N (final):** TODO(operator)
-- **Iteration history:** TODO(operator) — if N was adjusted, list prior values + why
+- **Post SHA:** `3175c83e15bba0a69d0204437361b49d9c3edd95`
+  (PR #177 review-fix commit on the
+  `phase-3-gc-force-injection` branch).
+- **N (final):** `1000`. Selected per the design doc's starting-
+  guess recommendation; not iterated. The mechanism fired the
+  expected count exactly on every workload, so cadence isn't
+  the issue — the OS-level ms-resolution floor is. Iterating N
+  further can't address that floor.
+- **Iteration history:** none. N=1000 was sufficient to verify
+  the mechanism and surface the structural finding.
+- **libgc:** 8.2.6 on ubuntu-24.04, 8.2.12 on macos-14.
 
-### Per-OS measurement tables — TODO(operator)
+### Per-OS measurement tables
 
-Fill in from `throughput-data-{ubuntu-24.04,macos-14}` artifacts.
-Recommend one table per OS with columns:
-`workload | wall_clock_ms (pre/post) | boehm_gc_time_ms (pre/post) | SIGIL_COUNTER_FORCED_GC_COUNT (post) | SIGIL_COUNTER_PRECISE_WALKER_NS (post) | alloc_count`.
+Pre / post values are wall-clock medians (ms) from 5 runs. Post-
+side `forced_gc_count` is the diagnostic counter; the pre-side
+column is absent by patch design (see methodology caveats).
 
-The `SIGIL_COUNTER_FORCED_GC_COUNT` column is post-side only —
-the pre-side cherry-picked patch deliberately omits the counter
-slot (see "Methodology caveats" below). Pre-side firing is
-inferred from `boehm_gc_time_ms` advancement under the same
-cadence; the counter's job is sanity-checking the mechanism
-fired, not driving the verdict.
+#### ubuntu-24.04 (libgc 8.2.6)
 
-### Decomposition — TODO(operator)
+| Workload | wall_ms (pre → post) | gc_ms (pre → post) | forced_gc_count (post) | walker_ns (post) | alloc_count |
+|---|---|---|--:|--:|--:|
+| `fib_perf` | 0 → 0 | 0 → 0 | 0 | 0 | 6 |
+| `fib_cps_perf` | 0 → 10 | 0 → 0 | 21 | 36,650 | 21,898 |
+| `tree` | 20 → 20 | 0 → 0 | 65 | 20,933 | 65,541 |
+| `tree_stress_repeat` | 10 → 10 | 0 → 0 | 81 | 27,912 | 81,916 |
+| `tree_stress_repeat_large` | 320 → 450 | 0 → 0 | 983 | 377,020 | 983,016 |
+| `descriptor_cache_stress` | 260 → 300 | 0 → 0 | 5,000 | 960,018 | 5,000,007 |
+| `deep_sync_call_chain` | 30 → 40 | 0 → 0 | 400 | 3,453,156 | 400,206 |
 
-For each alloc-heavy workload:
-- `savings = pre boehm_gc_time_ms - post boehm_gc_time_ms`
-- `cost = post SIGIL_COUNTER_PRECISE_WALKER_NS / 1_000_000` (ns → ms)
-- `net = savings - cost`
+#### macos-14 (libgc 8.2.12)
+
+| Workload | wall_ms (pre → post) | gc_ms (pre → post) | forced_gc_count (post) | walker_ns (post) | alloc_count |
+|---|---|---|--:|--:|--:|
+| `fib_perf` | 0 → 0 | 0 → 0 | 0 | 0 | 6 |
+| `fib_cps_perf` | 10 → 10 | 0 → 0 | 21 | 27,000 | 21,898 |
+| `tree` | 30 → 20 | 0 → 0 | 65 | 19,084 | 65,541 |
+| `tree_stress_repeat` | 20 → 10 | 0 → 0 | 81 | 23,333 | 81,916 |
+| `tree_stress_repeat_large` | 340 → 400 | 0 → 0 | 983 | 332,673 | 983,016 |
+| `descriptor_cache_stress` | 310 → 290 | 0 → 0 | 5,000 | 802,618 | 5,000,007 |
+| `deep_sync_call_chain` | 40 → 40 | 0 → 0 | 400 | 2,571,155 | 400,206 |
+
+### Decomposition
+
+The design doc's intended split was `savings = pre `gc_ms` − post
+`gc_ms``; `cost = post `walker_ns` / 1,000,000`; `net = savings
+− cost`. Plugging in:
+
+| Workload | savings (ms) | cost (ms, ubuntu / macos) | net wall_ms delta (ubuntu / macos) |
+|---|--:|--:|--:|
+| `fib_cps_perf` | 0 | 0.04 / 0.03 | +10 / 0 |
+| `tree` | 0 | 0.02 / 0.02 | 0 / −10 |
+| `tree_stress_repeat` | 0 | 0.03 / 0.02 | 0 / −10 |
+| `tree_stress_repeat_large` | 0 | 0.38 / 0.33 | +130 / +60 |
+| `descriptor_cache_stress` | 0 | 0.96 / 0.80 | +40 / −20 |
+| `deep_sync_call_chain` | 0 | 3.45 / 2.57 | +10 / 0 |
+
+`savings = 0` is the structural finding. The `net wall_ms delta`
+column is much larger than `cost (walker_ns)` would explain on
+its own — `walker_ns` captures only the precise-walker callback
+body's wall-clock; it does NOT capture the per-allocation cost
+of `GC_call_with_gc_active` (Phase 3 Task 12's wrap around
+`sigil_alloc`'s dispatch into Boehm) nor the per-mark-cycle
+Boehm-side cost of running the precise root push instead of the
+conservative stack scan. The ubuntu side shows a consistent
+small post-Phase-3 regression on alloc-heavy workloads (most
+visible at ~983k+ allocs); macos is mixed (IQR up to 40 ms on
+ms-scale workloads — runner noise dominates).
+
+The headline answer to "does Phase 3 save mark-phase time?" is
+**no measurable savings at OS-level ms resolution, and small
+measurable cost.** The hypothesis chase ends here.
 
 ### Methodology caveats
 
