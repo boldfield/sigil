@@ -2255,14 +2255,8 @@ pub unsafe extern "C" fn sigil_run_loop(
             out,
             result: 0,
         };
-        // Plan E2 alloc-trampoline-elision — set the TLS
-        // `IS_THREAD_GC_BLOCKING` shadow for the lifetime of the
-        // `GC_do_blocking` call so `gc::alloc_dispatch_active`'s
-        // elision path knows this thread is parked and the
-        // `GC_call_with_gc_active` wrap is still load-bearing.
-        // Save/restore semantics in the guard handle nested
-        // re-entry of `sigil_run_loop` correctly. See
-        // `gc::threads::GcBlockingGuard`.
+        // Set the TLS shadow used by the alloc-elision fast path so
+        // it knows this thread is parked. See `GcBlockingGuard`.
         let _gc_blocking = crate::gc::threads::GcBlockingGuard::enter();
         // SAFETY: `GC_do_blocking` is documented as stack-disciplined
         // (`gc.h:1626`). It transitions the calling thread to "GC-

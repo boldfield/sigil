@@ -597,6 +597,25 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   **throughput**. See the "Force-injection follow-up" section of
   [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md)
   for full tables + decomposition.
+- Alloc-trampoline-elision follow-up (2026-05-16) — ⏳ **Phases
+  1+2 shipped default-off; Tasks 5–7 deferred to operator.**
+  PR #178's throughput attribution split the ~10–25 ns/alloc
+  Phase 3 overhead into (1) the per-alloc
+  `GC_call_with_gc_active` trampoline wrap and (2)
+  `SigilCallerFpGuard` capture/drop. (1) is conditionally
+  elidable when the thread is already in GC-active state. This
+  follow-up adds the elision behind `SIGIL_ALLOC_ELIDE_WRAP=1`
+  (default off): TLS shadow `IS_THREAD_GC_BLOCKING` maintained
+  by `GcBlockingGuard` (save/restore semantics for nested
+  `sigil_run_loop` re-entry); fast path in `alloc_dispatch_active`
+  short-circuits the env-gate first so default-off processes pay
+  zero per-alloc cost; `verify_active()` debug-only sanity check;
+  diagnostic counter `SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT`.
+  Tasks 5 (SIGIL_GC_CROSS_CHECK regression) + 6 (throughput-report
+  workflow with `SIGIL_ALLOC_ELIDE_WRAP=1` post-side) + 7
+  (default-on flip) are operator-triggered post-merge per the
+  plan's "Roll-out gating" rule. See plan
+  `done/2026-05-15-sigil-alloc-trampoline-elision.md`.
 - Mark-phase hypothesis verdict (follow-up #1: forced budget) —
   ✅ **Inconclusive** even under forced budget (superseded by
   #2's Disproven verdict above). See

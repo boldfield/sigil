@@ -114,20 +114,9 @@ pub enum CounterId {
     /// (alloc_count ÷ N should match this counter ± 1). Zero
     /// when the env var is unset.
     ForcedGcCount = 29,
-    /// Plan E2 alloc-trampoline-elision — count of
-    /// `alloc_dispatch_active` calls that took the elided fast
-    /// path (skipped `GC_call_with_gc_active`). Diagnostic
-    /// counter; lets the throughput-report Task 6 verdict
-    /// sanity-check that the elision mechanism actually fired
-    /// during the measurement run — by construction this is
-    /// `BoehmAllocCount - <count of allocs while thread parked>`
-    /// when `SIGIL_ALLOC_ELIDE_WRAP=1`, and stays at 0 when the
-    /// env var is unset / 0 / invalid. Without this counter, a
-    /// "no wall-time change" Task 6 result would be ambiguous
-    /// between "elision fires but TLS-read cost eats the win" and
-    /// "elision never fired because the env var didn't reach the
-    /// runtime", and the plan body's Task 6 conclusion branch
-    /// depends on telling those apart.
+    /// Count of `alloc_dispatch_active` calls that took the elided
+    /// fast path (skipped `GC_call_with_gc_active`). Zero when the
+    /// elision env var is not opted in.
     AllocWrapElidedCount = 30,
 }
 

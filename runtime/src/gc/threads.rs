@@ -192,62 +192,32 @@ thread_local! {
     /// startup phase before the first sigil_alloc fires.
     static CAPTURED_SIGIL_CALLER_FP: Cell<*const usize> = const { Cell::new(std::ptr::null()) };
 
-    /// Plan E2 Phase 3 alloc-trampoline-elision — TLS shadow of
-    /// "this thread is inside `GC_do_blocking`". Set to `true` by
-    /// [`GcBlockingGuard::enter`] immediately before the
-    /// `GC_do_blocking` call; cleared by the guard's `Drop` impl
-    /// immediately after. Read by `gc::alloc_dispatch_active`'s
-    /// fast path to decide whether the `GC_call_with_gc_active`
-    /// wrap can be safely elided — if the thread is NOT blocking,
-    /// it's already in GC-active state and the wrap is wasted work.
-    ///
-    /// Boehm does not expose a "am I blocking" predicate publicly,
-    /// so this TLS slot is the cheapest replacement. The cost of a
-    /// wrong reading is severe: an elided wrap on a parked thread
-    /// puts Boehm's precise walker against inconsistent thread
-    /// state. Every production path that calls `GC_do_blocking`
-    /// MUST go through [`GcBlockingGuard`] — there is one such site
-    /// today (`handlers::sigil_run_loop`'s blocking trampoline);
-    /// any future addition needs the guard too. The audit grep
-    /// `\bGC_do_blocking\b` in the runtime + compiler crates is the
-    /// surface to keep in sync.
+    /// TLS shadow of "this thread is inside `GC_do_blocking`".
+    /// Maintained by [`GcBlockingGuard`]; read by the alloc-elision
+    /// fast path. Boehm has no public "am I blocking" predicate, so
+    /// every production `GC_do_blocking` site must go through the
+    /// guard — a misread risks eliding the wrap on a parked thread
+    /// and crashing the precise walker.
     pub(crate) static IS_THREAD_GC_BLOCKING: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Read the current thread's GC-blocking flag. Used by
-/// `gc::alloc_dispatch_active`'s elision fast path; also exposed for
-/// tests that drive the [`GcBlockingGuard`] directly.
 #[inline]
 pub(crate) fn is_thread_gc_blocking() -> bool {
     IS_THREAD_GC_BLOCKING.with(Cell::get)
 }
 
-/// RAII guard around a `GC_do_blocking` region. Sets
-/// `IS_THREAD_GC_BLOCKING = true` on construction and restores the
-/// PRIOR value on `Drop`. The save/restore shape (rather than a bare
-/// `set(false)`) is load-bearing for nested `sigil_run_loop` calls:
-/// `GC_do_blocking` is documented as stack-disciplined (`gc.h:1626`)
-/// and may be re-entered, so a Sigil program that calls back into
-/// `sigil_run_loop` from inside a handler arm produces two stacked
-/// guards. A naive set/clear would let the inner guard's `Drop`
-/// clear the flag while the outer scope is still parked, which is
-/// exactly the misfire the plan's correctness rule forbids — Boehm's
-/// precise walker would fire against inconsistent thread state and
-/// crash. The same idiom is used by `handlers::sigil_run_loop_impl`
-/// for `RUN_LOOP_ENTRY_DEPTH` (`handlers.rs:2320`).
+/// RAII guard around a `GC_do_blocking` region. Sets the TLS shadow
+/// on `enter()` and **restores the prior value** on `Drop`.
 ///
-/// Use shape:
-/// ```ignore
-/// let _gc_blocking = GcBlockingGuard::enter();
-/// unsafe { GC_do_blocking(trampoline, ctx); }
-/// // _gc_blocking drops here, restoring the prior IS_THREAD_GC_BLOCKING.
-/// ```
-///
-/// `enter`/`drop` order MUST bracket the `GC_do_blocking` call: the
-/// TLS shadow must be `true` for the entire interval the thread is
-/// actually parked in Boehm's "inactive" state. A misalignment in
-/// either direction (set too late, cleared too early) misfires the
-/// alloc-trampoline elision.
+/// Save/restore (rather than a bare `set(false)` on Drop) is
+/// load-bearing for nested `sigil_run_loop` calls: `GC_do_blocking`
+/// is stack-disciplined (`gc.h:1626`) and may be re-entered, so a
+/// handler arm that calls back into `sigil_run_loop` produces two
+/// stacked guards. A naive Drop would clear the flag after the inner
+/// scope while the outer scope is still parked — the elision would
+/// then misfire and fire Boehm's precise walker against inconsistent
+/// thread state. Same idiom as `RUN_LOOP_ENTRY_DEPTH` at
+/// `handlers.rs:2320`.
 #[must_use = "GcBlockingGuard must be held for the lifetime of the GC_do_blocking call; binding to `_` drops it immediately"]
 pub(crate) struct GcBlockingGuard {
     prior: bool,
@@ -575,7 +545,6 @@ pub(crate) fn precise_walker_was_installed() -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
     use super::*;
 
@@ -620,17 +589,9 @@ mod tests {
         assert!(precise_walker_was_installed());
     }
 
-    // ============ Plan E2 alloc-trampoline-elision tests ===================
-
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn fresh_thread_starts_with_is_thread_gc_blocking_false() {
-        // The thread-local default is `false`. A fresh cargo-test
-        // worker that has never wrapped a `GC_do_blocking` call
-        // must observe `false` — anything else means the elision
-        // would misfire by skipping the wrap on a thread that
-        // never actually parked. Runs on a fresh worker thread
-        // per `#[test]`; no subprocess isolation needed since the
-        // TLS slot is per-thread.
         std::thread::spawn(|| {
             assert!(!is_thread_gc_blocking());
         })
@@ -639,13 +600,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn gc_blocking_guard_sets_flag_for_scope_then_clears_on_drop() {
-        // Scope-bounded set/clear. The guard is the SOLE way
-        // production code mutates `IS_THREAD_GC_BLOCKING` — this
-        // pins both the enter (set true) and drop (set false) sides
-        // in one shape. Runs on a fresh thread so any leak across
-        // the assertion surfaces as a hard failure rather than
-        // contaminating later tests on the same worker.
         std::thread::spawn(|| {
             assert!(!is_thread_gc_blocking(), "precondition: starts cleared");
             {
@@ -659,15 +615,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
     fn gc_blocking_guard_clears_flag_on_panic_unwind() {
-        // The guard's Drop runs on panic unwind, so the flag
-        // clears even when the wrapped operation panics. Without
-        // this, a panic inside `GC_do_blocking`'s body fn would
-        // leave the TLS shadow stuck at `true` for the rest of
-        // the thread's lifetime, permanently disabling elision
-        // even after the panic was caught somewhere above.
-        // `catch_unwind` is the standard verification shape for
-        // RAII-on-unwind guarantees.
+        // Standard `catch_unwind` shape for RAII-on-unwind: a panic
+        // inside the blocking region must not leave the TLS shadow
+        // stuck at `true`, which would permanently disable elision
+        // on this thread.
         std::thread::spawn(|| {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let _guard = GcBlockingGuard::enter();
@@ -684,16 +637,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn gc_blocking_guard_nests_via_stack_save_restore() {
-        // `sigil_run_loop` may be re-entered from inside a handler
-        // arm; `GC_do_blocking` is documented as stack-disciplined
-        // (`gc.h:1626`). Two stacked guards must keep the flag
-        // `true` across the inner scope's Drop and only restore
-        // `false` at the outermost Drop. This pins the save/restore
-        // shape: a bare `set(false)` on Drop would clear the flag
-        // after the inner guard exits while the outer scope is
-        // still parked — the exact correctness regression the
-        // plan's "no misfire" rule forbids.
+        // Pins the save/restore shape: a bare `set(false)` on Drop
+        // would clear the flag after the inner scope while the outer
+        // is still parked — the misfire the elision must not produce.
         std::thread::spawn(|| {
             assert!(!is_thread_gc_blocking(), "precondition: starts cleared");
             let outer = GcBlockingGuard::enter();
@@ -704,14 +652,10 @@ mod tests {
             }
             assert!(
                 is_thread_gc_blocking(),
-                "outer scope must still observe true after inner drop \
-                 (save/restore guard, not a bare set/clear)"
+                "outer scope must still observe true after inner drop"
             );
             drop(outer);
-            assert!(
-                !is_thread_gc_blocking(),
-                "outermost drop restores the original false"
-            );
+            assert!(!is_thread_gc_blocking(), "outermost drop restores false");
         })
         .join()
         .unwrap();
