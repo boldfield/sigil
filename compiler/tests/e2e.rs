@@ -21374,43 +21374,43 @@ fn cross_check_state_runs_cleanly() {
 // — the exact failure mode the plan's "no correctness regressions"
 // rule forbids.
 //
-// One sibling per pre-existing `cross_check_*_runs_cleanly`. Every
-// green CI build counts toward the plan's rollout-gating clause
+// Coverage is concentrated in four examples that each exercise a
+// distinct elision-relevant code path; the broader nine-test set
+// originally shipped in PR #182 was filler — non-parking, non-alloc-heavy
+// programs that would pass even if the elision were silently broken in
+// subtle ways. PR #183 (this one) drops the filler and adds a
+// counter-grounded firing assertion to the fib_cps_perf sibling.
+//
+// The four kept:
+//   - `fib_cps_perf` — only test that parks via `sigil_run_loop`, so the
+//     only one where the wrap path actually fires alongside elision. Now
+//     also asserts the elision counter is non-zero (proves the env-var
+//     pipeline reached the runtime AND the fast path fired) and that
+//     wrap-path allocs ran too (boehm_allocs > elided).
+//   - `nested_effects` — deepest `GC_do_blocking` re-entry, exercising
+//     `GcBlockingGuard` save/restore semantics.
+//   - `choose_demo` — preserves the rich coverage bounds (allocs > 0,
+//     records > 0, roots > 0, fns >= 6) under elision.
+//   - `tree_stress_repeat` — alloc-heaviest workload; the >=10k
+//     allocs_checked threshold pins density under elision.
+//
+// Every green CI build counts toward the plan's rollout-gating clause
 // ("SIGIL_GC_CROSS_CHECK suite stays green for 24+ hours of CI
 // iterations") before Task 7 flips the default.
 
-#[test]
-fn cross_check_hello_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/hello.sigil");
-    let (stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_hello_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("hello.sigil [elision]", &stderr, code);
-    assert_eq!(stdout, "hello, world\n");
-    assert_eq!(code, 0);
-}
-
-#[test]
-fn cross_check_option_demo_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/option_demo.sigil");
-    let (stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_option_demo_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("option_demo.sigil [elision]", &stderr, code);
-    assert_eq!(stdout, "42\n-1\n");
-    assert_eq!(code, 0);
+/// Parse a `SIGIL_COUNTER_*=N` line out of stderr (the format
+/// `sigil_counter_print_all` emits when `SIGIL_PRINT_STATS=1` is set).
+/// Returns 0 if the named counter line is absent — caller should
+/// assert `>0` when proving the counter actually fired, since a
+/// missing line and a literal `=0` value have the same observable
+/// stderr shape under the print-stats atexit path.
+fn parse_runtime_counter(stderr: &str, name: &str) -> u64 {
+    let prefix = format!("{name}=");
+    stderr
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 #[test]
@@ -21458,21 +21458,6 @@ fn cross_check_choose_demo_with_elision_runs_cleanly() {
 }
 
 #[test]
-fn cross_check_tree_stress_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/tree.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_tree_stress_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("tree.sigil [elision]", &stderr, code);
-}
-
-#[test]
 fn cross_check_tree_stress_drop_repeat_with_elision_runs_cleanly() {
     // The alloc-heaviest test in the suite — 81,910 allocs under
     // elision is the densest sample of "fast path fires + cross-check
@@ -21498,57 +21483,21 @@ fn cross_check_tree_stress_drop_repeat_with_elision_runs_cleanly() {
 }
 
 #[test]
-fn cross_check_arith_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/arith.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_arith_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("arith.sigil [elision]", &stderr, code);
-}
-
-#[test]
-fn cross_check_catch_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/catch.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_catch_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("catch.sigil [elision]", &stderr, code);
-}
-
-#[test]
-fn cross_check_div_recover_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/div_recover.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_div_recover_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("div_recover.sigil [elision]", &stderr, code);
-}
-
-#[test]
 fn cross_check_fib_cps_perf_with_elision_runs_cleanly() {
     // fib_cps_perf is `UserFnAbi::Sync` and parks the thread inside
-    // `sigil_run_loop` for the recursive CPS dispatch — the cross-
-    // check fires on user-program-side allocs (elided path) AND on
-    // handler-arm-side allocs (wrap path still load-bearing). Both
-    // dispatch shapes must converge to zero divergence here.
+    // `sigil_run_loop` for the recursive CPS dispatch — the only
+    // example in the suite where the wrap path fires alongside the
+    // elided path. Adds `SIGIL_PRINT_STATS=1` so the runtime's
+    // counter atexit hook dumps `SIGIL_COUNTER_*=N` lines to stderr,
+    // then asserts (a) elision-count > 0 — proves the env-var pipeline
+    // reached the runtime AND the fast path actually fired; (b)
+    // elision-count < boehm-alloc-count — proves the wrap path also
+    // fired (some allocs happened during `sigil_run_loop`'s parked
+    // region). Without (a), every test in this block would pass
+    // trivially if `compile_file_and_run_with_env` failed to propagate
+    // the elision env var to the spawned binary. Without (b), the
+    // wrap-AND-elide-both-fire claim in the section comment would be
+    // an unverified assertion.
     let root = workspace_root();
     let source = root.join("examples/fib_cps_perf.sigil");
     let (_stdout, stderr, code) = compile_file_and_run_with_env(
@@ -21557,39 +21506,38 @@ fn cross_check_fib_cps_perf_with_elision_runs_cleanly() {
         &[
             ("SIGIL_GC_CROSS_CHECK", "1"),
             ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+            ("SIGIL_PRINT_STATS", "1"),
         ],
     );
     assert_no_cross_check_abort("fib_cps_perf.sigil [elision]", &stderr, code);
-}
 
-#[test]
-fn cross_check_generic_map_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/generic_map.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_generic_map_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
+    let elided = parse_runtime_counter(&stderr, "SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT");
+    let boehm_allocs = parse_runtime_counter(&stderr, "SIGIL_COUNTER_BOEHM_ALLOC_COUNT");
+    assert!(
+        elided > 0,
+        "elision: SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT=0 — the fast \
+         path never fired. Most likely cause: the env-var pipeline \
+         (cargo→sigil binary→runtime) is not propagating \
+         SIGIL_ALLOC_ELIDE_WRAP=1, or `sigil_gc_init` is not reading it. \
+         elided={elided} boehm_allocs={boehm_allocs}\n--- stderr ---\n{stderr}",
     );
-    assert_no_cross_check_abort("generic_map.sigil [elision]", &stderr, code);
-}
-
-#[test]
-fn cross_check_higher_order_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/higher_order.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_higher_order_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
+    assert!(
+        boehm_allocs > 0,
+        "elision: SIGIL_COUNTER_BOEHM_ALLOC_COUNT=0 — fib_cps_perf made \
+         no allocs at all, which means either the workload is broken or \
+         SIGIL_PRINT_STATS is not surfacing counters. \
+         elided={elided} boehm_allocs={boehm_allocs}\n--- stderr ---\n{stderr}",
     );
-    assert_no_cross_check_abort("higher_order.sigil [elision]", &stderr, code);
+    assert!(
+        elided < boehm_allocs,
+        "elision: SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT={elided} \
+         == SIGIL_COUNTER_BOEHM_ALLOC_COUNT={boehm_allocs} — every alloc \
+         took the fast path, meaning the wrap path never fired on this \
+         workload. The section comment claims fib_cps_perf exercises both \
+         paths via `sigil_run_loop`'s parked region; if this assert trips, \
+         either the comment is wrong or `GcBlockingGuard` is not setting \
+         the TLS shadow correctly.\n--- stderr ---\n{stderr}",
+    );
 }
 
 #[test]
@@ -21608,21 +21556,6 @@ fn cross_check_nested_effects_with_elision_runs_cleanly() {
         ],
     );
     assert_no_cross_check_abort("nested_effects.sigil [elision]", &stderr, code);
-}
-
-#[test]
-fn cross_check_state_with_elision_runs_cleanly() {
-    let root = workspace_root();
-    let source = root.join("examples/state.sigil");
-    let (_stdout, stderr, code) = compile_file_and_run_with_env(
-        &source,
-        "cross_check_state_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-        ],
-    );
-    assert_no_cross_check_abort("state.sigil [elision]", &stderr, code);
 }
 
 // ===== Plan E2 Phase 3 Task 12 — deep recursion + GC stress ===============
