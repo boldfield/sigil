@@ -33,6 +33,7 @@
 #     "boehm_gc_time_ms": <int or null, from boehm_gc_time_ms>
 #     "precise_walker_ns": <int or null, from SIGIL_COUNTER_PRECISE_WALKER_NS>
 #     "forced_gc_count":  <int or null, from SIGIL_COUNTER_FORCED_GC_COUNT>
+#     "alloc_wrap_elided_count": <int or null, from SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT>
 #   }
 #
 # Wall-clock / RSS are aggregated across runs; alloc counters are
@@ -140,6 +141,7 @@ last_alloc_bytes=""
 last_gc_time_ms=""
 last_precise_walker_ns=""
 last_forced_gc_count=""
+last_alloc_wrap_elided_count=""
 
 for ((i = 1; i <= RUNS; i++)); do
     time_log="$(mktemp)"
@@ -223,6 +225,18 @@ for ((i = 1; i <= RUNS; i++)); do
         # would need a sibling patch), so pre-side reads as `null`.
         last_forced_gc_count=$(grep '^SIGIL_COUNTER_FORCED_GC_COUNT=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
+        # Plan E2 alloc-trampoline-elision Task 6 — count of allocs
+        # that took the elided fast path (`SIGIL_ALLOC_ELIDE_WRAP=1`
+        # AND thread not parked in `GC_do_blocking`). Counter is
+        # introduced post-PR-#181, so pre-checkpoint builds will not
+        # emit this line. The operator's sanity check for a green
+        # Task 6 run is `alloc_wrap_elided_count > 0` on the post
+        # side AND `null` on the pre side — disambiguates "elision
+        # fires but TLS-read cost eats the win" from "elision never
+        # fired because env didn't reach runtime", per the plan
+        # body's Task 6 conclusion-branch criteria.
+        last_alloc_wrap_elided_count=$(grep '^SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT=' "$stderr_log" \
+            | tail -1 | cut -d= -f2 || true)
         if [[ -z "$last_alloc_count" || -z "$last_alloc_bytes" ]]; then
             echo "measure-throughput: run $i — missing alloc counter line in stderr:" >&2
             cat "$stderr_log" >&2
@@ -238,6 +252,9 @@ for ((i = 1; i <= RUNS; i++)); do
         fi
         if [[ -z "$last_forced_gc_count" ]]; then
             last_forced_gc_count="null"
+        fi
+        if [[ -z "$last_alloc_wrap_elided_count" ]]; then
+            last_alloc_wrap_elided_count="null"
         fi
     fi
 
@@ -279,6 +296,7 @@ cat <<JSON
   "alloc_bytes": $last_alloc_bytes,
   "boehm_gc_time_ms": $last_gc_time_ms,
   "precise_walker_ns": $last_precise_walker_ns,
-  "forced_gc_count": $last_forced_gc_count
+  "forced_gc_count": $last_forced_gc_count,
+  "alloc_wrap_elided_count": $last_alloc_wrap_elided_count
 }
 JSON
