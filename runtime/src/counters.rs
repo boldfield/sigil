@@ -114,14 +114,19 @@ pub enum CounterId {
     /// (alloc_count ÷ N should match this counter ± 1). Zero
     /// when the env var is unset.
     ForcedGcCount = 29,
+    /// Count of `alloc_dispatch_active` calls that took the elided
+    /// fast path (skipped `GC_call_with_gc_active`). Zero when the
+    /// elision env var is not opted in.
+    AllocWrapElidedCount = 30,
 }
 
-const COUNTER_SLOTS: usize = 30;
+const COUNTER_SLOTS: usize = 31;
 
 /// Static backing storage for all counters. Mutable only via atomic relaxed
 /// operations; never touched by reference. This is the only global atomic
 /// state the runtime owns.
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -187,6 +192,7 @@ pub const NAMES: [&str; COUNTER_SLOTS] = [
     "SIGIL_COUNTER_CHAR_ALLOC_BYTES",
     "SIGIL_COUNTER_PRECISE_WALKER_NS",
     "SIGIL_COUNTER_FORCED_GC_COUNT",
+    "SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT",
 ];
 
 #[inline]
@@ -275,6 +281,10 @@ mod tests {
         assert_eq!(
             NAMES[CounterId::ForcedGcCount as usize],
             "SIGIL_COUNTER_FORCED_GC_COUNT"
+        );
+        assert_eq!(
+            NAMES[CounterId::AllocWrapElidedCount as usize],
+            "SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT"
         );
     }
 

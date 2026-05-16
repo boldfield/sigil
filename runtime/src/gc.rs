@@ -727,6 +727,17 @@ static FORCE_GC_ALLOC_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// "env var set to N" (`Some(Some(N))`).
 static FORCE_GC_CADENCE: OnceLock<Option<NonZeroU64>> = OnceLock::new();
 
+/// Parsed `SIGIL_ALLOC_ELIDE_WRAP` flag. `Some(true)` iff the env
+/// var was exactly `"1"` at `sigil_gc_init` time; pre-init reads as
+/// `None` and route through the safe wrap path.
+static ELISION_ENABLED: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+#[cfg(not(test))]
+fn elision_enabled() -> bool {
+    matches!(ELISION_ENABLED.get(), Some(true))
+}
+
 /// Initialise Boehm GC. Safe to call multiple times from any number of
 /// threads; only the first caller runs `GC_init()` and all others wait on
 /// `Once` until init completes. The generated `main` shim calls this
@@ -850,6 +861,12 @@ pub extern "C" fn sigil_gc_init() {
         // sigil_alloc that observes `Some(Some(n))` here is
         // guaranteed to see an initialised Boehm.
         let _ = FORCE_GC_CADENCE.set(cadence);
+
+        // Strict `"1"`-only opt-in — typos (`true`, `yes`, `on`) fail
+        // closed because the elision is safety-relevant, not a knob.
+        // Publish after `GC_init` to match `FORCE_GC_CADENCE` above.
+        let elision = matches!(std::env::var("SIGIL_ALLOC_ELIDE_WRAP"), Ok(ref s) if s == "1");
+        let _ = ELISION_ENABLED.set(elision);
 
         // Wire the counter dump exactly once — doing it inside the Once
         // guarantees atexit sees exactly one registration per process.
@@ -1067,22 +1084,32 @@ pub extern "C" fn sigil_alloc(header: u64, payload_bytes: usize, descriptor_inde
     raw
 }
 
-/// Plan E2 Phase 3 Task 12 — branch sigil_alloc's allocator dispatch
-/// through `GC_call_with_gc_active` on production builds so the actual
-/// `GC_malloc_*` call runs in GC-active state even when sigil_run_loop
-/// has parked the thread via `GC_do_blocking`. In test builds the
-/// thread is already GC-active (sigil_run_loop is not on the call
-/// stack), so the wrapper is bypassed.
+/// Branch sigil_alloc's allocator dispatch through
+/// `GC_call_with_gc_active` on production builds so the `GC_malloc_*`
+/// call runs in GC-active state even when sigil_run_loop has parked
+/// the thread via `GC_do_blocking`. In test builds the thread is
+/// already GC-active, so the wrapper is bypassed.
 ///
-/// The split into a separate helper keeps the dispatch logic in one
-/// place — the production path threads parameters through
-/// `AllocActiveCtx` because `GC_call_with_gc_active`'s C ABI takes a
-/// `*mut c_void` `cd` pointer, but the dispatch itself is identical
-/// regardless of which path entered it.
+/// When `SIGIL_ALLOC_ELIDE_WRAP=1` AND the calling thread is not
+/// inside a `GC_do_blocking` region (per the
+/// `gc::threads::IS_THREAD_GC_BLOCKING` TLS shadow), skip the
+/// trampoline and call `alloc_dispatch` directly.
 #[inline]
 fn alloc_dispatch_active(header: u64, total: usize, descriptor_index: u32) -> *mut u8 {
     #[cfg(not(test))]
     {
+        // Order matters: env-gate first so the default-off case
+        // short-circuits before the TLS read.
+        if elision_enabled() && !crate::gc::threads::is_thread_gc_blocking() {
+            debug_assert!(
+                verify_active(),
+                "elision fired but verify_active() returned false — \
+                 GC is uninitialised or a GcBlockingGuard is missing"
+            );
+            counters::incr(CounterId::AllocWrapElidedCount);
+            return alloc_dispatch(header, total, descriptor_index);
+        }
+
         let mut ctx = AllocActiveCtx {
             header,
             total,
@@ -1107,6 +1134,49 @@ fn alloc_dispatch_active(header: u64, total: usize, descriptor_index: u32) -> *m
     {
         alloc_dispatch(header, total, descriptor_index)
     }
+}
+
+/// Debug-only sanity check used by the elision fast path's
+/// `debug_assert!`. Calls `GC_call_with_gc_active` with a callback
+/// that writes a sentinel; returns `true` iff the callback ran.
+///
+/// What this proves: GC is initialised AND `GC_call_with_gc_active`
+/// invoked the callback. The hook does NOT independently verify
+/// Boehm's per-thread state agrees with our TLS shadow — Boehm
+/// doesn't expose that comparison publicly. The practical bug class
+/// it still catches is "elision fired before `sigil_gc_init` ran"
+/// (pre-init `GcBlockingGuard` mismatches or call-graph mis-orderings
+/// that put a `sigil_alloc` ahead of init).
+#[cfg(all(not(test), debug_assertions))]
+fn verify_active() -> bool {
+    let mut flag: u8 = 0;
+    // SAFETY: `GC_call_with_gc_active` is safe to call from any
+    // registered thread in any GC state. `&mut flag` outlives the
+    // call; the callback writes a single byte and returns null.
+    unsafe {
+        GC_call_with_gc_active(
+            verify_active_trampoline,
+            &mut flag as *mut u8 as *mut c_void,
+        );
+    }
+    flag == 1
+}
+
+#[cfg(all(not(test), debug_assertions))]
+extern "C" fn verify_active_trampoline(cd: *mut c_void) -> *mut c_void {
+    // SAFETY: `cd` is the `&mut u8` constructed in `verify_active`.
+    unsafe {
+        *(cd as *mut u8) = 1;
+    }
+    std::ptr::null_mut()
+}
+
+// Release stub: `debug_assert!` is a no-op when debug-assertions are
+// off, but the macro still needs the call site to type-check.
+#[cfg(all(not(test), not(debug_assertions)))]
+#[inline(always)]
+fn verify_active() -> bool {
+    true
 }
 
 #[cfg(not(test))]
@@ -2238,6 +2308,70 @@ mod tests {
              despite SIGIL_FORCE_GC_EVERY_N_ALLOCS being unset — the \
              zero-overhead gate regressed.",
         );
+    }
+
+    // SIGIL_ALLOC_ELIDE_WRAP parse-at-init tests. Subprocess-gated
+    // because the env var is read inside `sigil_gc_init`'s
+    // `Once::call_once` — each test needs a fresh process.
+
+    #[cfg(test)]
+    fn alloc_elide_wrap_cached() -> Option<bool> {
+        super::ELISION_ENABLED.get().copied()
+    }
+
+    #[test]
+    fn sigil_alloc_elide_wrap_set_to_one_caches_true() {
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_alloc_elide_wrap_set_to_one_caches_true",
+                &[("SIGIL_ALLOC_ELIDE_WRAP", "1")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        assert_eq!(alloc_elide_wrap_cached(), Some(true));
+    }
+
+    #[test]
+    fn sigil_alloc_elide_wrap_unset_caches_false() {
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess("sigil_alloc_elide_wrap_unset_caches_false");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        assert_eq!(alloc_elide_wrap_cached(), Some(false));
+    }
+
+    #[test]
+    fn sigil_alloc_elide_wrap_typo_values_cache_false() {
+        // Strict `"1"` opt-in: `"true"`/`"yes"`/`"on"` must all fail
+        // closed. One representative value covers the strict-match.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_alloc_elide_wrap_typo_values_cache_false",
+                &[("SIGIL_ALLOC_ELIDE_WRAP", "true")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        assert_eq!(alloc_elide_wrap_cached(), Some(false));
+    }
+
+    #[test]
+    fn sigil_alloc_elide_wrap_zero_caches_false() {
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_alloc_elide_wrap_zero_caches_false",
+                &[("SIGIL_ALLOC_ELIDE_WRAP", "0")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        assert_eq!(alloc_elide_wrap_cached(), Some(false));
     }
 
     #[test]

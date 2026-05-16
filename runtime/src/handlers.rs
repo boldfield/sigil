@@ -2255,6 +2255,9 @@ pub unsafe extern "C" fn sigil_run_loop(
             out,
             result: 0,
         };
+        // Set the TLS shadow used by the alloc-elision fast path so
+        // it knows this thread is parked. See `GcBlockingGuard`.
+        let _gc_blocking = crate::gc::threads::GcBlockingGuard::enter();
         // SAFETY: `GC_do_blocking` is documented as stack-disciplined
         // (`gc.h:1626`). It transitions the calling thread to "GC-
         // inactive" for the duration of the trampoline body, invokes
