@@ -21362,6 +21362,269 @@ fn cross_check_state_runs_cleanly() {
     assert_no_cross_check_abort("state.sigil", &stderr, code);
 }
 
+// ===== Alloc-trampoline-elision cross-check (PR #181 Task 5) ==============
+//
+// Re-runs the cross-check suite above with `SIGIL_ALLOC_ELIDE_WRAP=1`
+// also set so the production fast-path in `alloc_dispatch_active`
+// fires (calls `alloc_dispatch` directly without `GC_call_with_gc_active`)
+// on every alloc the calling thread makes while NOT parked inside
+// `GC_do_blocking`. The cross-check runs at the top of `sigil_alloc`
+// regardless of which dispatch path follows, so divergence here would
+// mean the elision corrupts thread state seen by the precise walker
+// — the exact failure mode the plan's "no correctness regressions"
+// rule forbids.
+//
+// One sibling per pre-existing `cross_check_*_runs_cleanly`. Every
+// green CI build counts toward the plan's rollout-gating clause
+// ("SIGIL_GC_CROSS_CHECK suite stays green for 24+ hours of CI
+// iterations") before Task 7 flips the default.
+
+#[test]
+fn cross_check_hello_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/hello.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_hello_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("hello.sigil [elision]", &stderr, code);
+    assert_eq!(stdout, "hello, world\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn cross_check_option_demo_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/option_demo.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_option_demo_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("option_demo.sigil [elision]", &stderr, code);
+    assert_eq!(stdout, "42\n-1\n");
+    assert_eq!(code, 0);
+}
+
+#[test]
+fn cross_check_choose_demo_with_elision_runs_cleanly() {
+    // Same rich coverage assertions as `cross_check_choose_demo_runs_cleanly`
+    // — the cross-check fires at the top of `sigil_alloc` before
+    // `alloc_dispatch_active`, so allocs/roots/records/fns counters
+    // are unaffected by which downstream path runs. A divergence in
+    // any of those bounds under elision would be a real regression.
+    let root = workspace_root();
+    let source = root.join("examples/choose_demo.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_choose_demo_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("choose_demo.sigil [elision]", &stderr, code);
+    let (allocs, roots, fns, records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs > 0,
+        "elision: expected >=1 alloc; summary: allocs={allocs} \
+         roots={roots} fns={fns} records={records}\n--- stderr ---\n{stderr}",
+    );
+    assert!(
+        records > 0,
+        "elision: expected >=1 resolved stackmap record; summary: \
+         allocs={allocs} roots={roots} fns={fns} records={records}\n\
+         --- stderr ---\n{stderr}",
+    );
+    assert!(
+        roots > 0,
+        "elision: walker must find >=1 precise root over the program's \
+         lifetime — under elision the cross-check is still load-bearing \
+         coverage. summary: allocs={allocs} roots={roots} fns={fns} \
+         records={records}\n--- stderr ---\n{stderr}",
+    );
+    assert!(
+        fns >= 6,
+        "elision: expected >=6 of 7 fn blocks to resolve via dlsym; \
+         got fns_resolved={fns}",
+    );
+}
+
+#[test]
+fn cross_check_tree_stress_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/tree.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("tree.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_tree_stress_drop_repeat_with_elision_runs_cleanly() {
+    // The alloc-heaviest test in the suite — 81,910 allocs under
+    // elision is the densest sample of "fast path fires + cross-check
+    // passes" we can get without doubling the workload further.
+    let root = workspace_root();
+    let source = root.join("examples/tree_stress_repeat.sigil");
+    let (stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_tree_stress_drop_repeat_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("tree_stress_repeat.sigil [elision]", &stderr, code);
+    assert_eq!(stdout.trim_end(), "40950");
+    assert_eq!(code, 0);
+    let (allocs, _roots, _fns, _records) = parse_cross_check_summary(&stderr);
+    assert!(
+        allocs >= 10_000,
+        "elision: expected >=10k cross-checks; allocs_checked={allocs}",
+    );
+}
+
+#[test]
+fn cross_check_arith_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/arith.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_arith_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("arith.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_catch_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/catch.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_catch_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("catch.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_div_recover_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/div_recover.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_div_recover_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("div_recover.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_fib_cps_perf_with_elision_runs_cleanly() {
+    // fib_cps_perf is `UserFnAbi::Sync` and parks the thread inside
+    // `sigil_run_loop` for the recursive CPS dispatch — the cross-
+    // check fires on user-program-side allocs (elided path) AND on
+    // handler-arm-side allocs (wrap path still load-bearing). Both
+    // dispatch shapes must converge to zero divergence here.
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_perf.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_fib_cps_perf_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("fib_cps_perf.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_generic_map_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/generic_map.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_generic_map_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("generic_map.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_higher_order_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/higher_order.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_higher_order_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("higher_order.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_nested_effects_with_elision_runs_cleanly() {
+    // Handler nesting drives the deepest GC_do_blocking re-entry the
+    // example suite exercises — the same shape the `GcBlockingGuard`
+    // save/restore semantics were specifically introduced to handle.
+    let root = workspace_root();
+    let source = root.join("examples/nested_effects.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_nested_effects_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("nested_effects.sigil [elision]", &stderr, code);
+}
+
+#[test]
+fn cross_check_state_with_elision_runs_cleanly() {
+    let root = workspace_root();
+    let source = root.join("examples/state.sigil");
+    let (_stdout, stderr, code) = compile_file_and_run_with_env(
+        &source,
+        "cross_check_state_with_elision",
+        &[
+            ("SIGIL_GC_CROSS_CHECK", "1"),
+            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
+        ],
+    );
+    assert_no_cross_check_abort("state.sigil [elision]", &stderr, code);
+}
+
 // ===== Plan E2 Phase 3 Task 12 — deep recursion + GC stress ===============
 //
 // Task 12 drops Boehm's conservative stack scan on Sigil program threads
