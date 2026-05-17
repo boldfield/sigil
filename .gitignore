@@ -9,10 +9,11 @@ __pycache__/
 # are local-only).
 spec/validation-results-*.jsonl
 
-# Cross-language comparison harness — per-run JSONL traces are
-# local-only; the markdown report at comp/log/comparison-log.md is
-# the checked-in summary.
+# Cross-language comparison harness — per-run JSONL traces and the
+# per-run markdown reports are local-only history; the latest-pointer
+# markdown report at comp/log/comparison-log.md is the checked-in summary.
 comp/log/comparison-results-*.jsonl
+comp/log/comparison-log-*.md
 
 # Cross-language harness — agent-driven run artifacts (the markdown
 # report at comp/log/comparison-log.md is the checked-in summary).

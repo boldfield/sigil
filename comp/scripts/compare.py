@@ -3,17 +3,23 @@
 compare.py — Cross-language LLM authorship comparison harness.
 
 For each (prompt × language × model) cell, runs N independent
-Claude API sessions with a language-specific system prompt, extracts
+`claude -p` sessions with a language-specific system prompt, extracts
 the produced program from the response, hands it to the matching
 language eval driver (compile + run + diff oracle), and records the
 result. On first-shot failure, an edit-loop turn feeds the failure
 back to the model; the second attempt is also recorded.
 
-Mirrors `scripts/validate_spec.py`'s pattern (Claude API client,
-edit-loop, K/N multi-run aggregation, JSONL trace + markdown report)
-but is wired to:
+Routes through Claude Code headless mode (`claude -p`) so calls are
+billed against the user's Claude subscription, not an API key. Auth
+precedence (per Claude Code): CLAUDE_CODE_OAUTH_TOKEN env var, or
+the OAuth token stored by a prior `claude /login`. For batch runs
+on a host without interactive login, generate a long-lived token
+with `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.
 
-- `comp/prompts.md`        cross-language prompts (C01..C10)
+Multi-turn edit loop uses `--resume <session-id>` so the system
+prompt (with the embedded Sigil spec) isn't resent on turn 2.
+
+- `comp/prompts.md`        cross-language prompts (C01..C20)
 - `comp/contexts/<lang>.md` per-language system prompt prefix
 - `comp/scripts/eval-<lang>.sh` per-language compile+run+oracle driver
 
@@ -21,15 +27,19 @@ Aggregates per (prompt, language, model) cell so the markdown report
 makes language-level pass-rate differences visible.
 
 Usage:
-    export ANTHROPIC_API_KEY=sk-...
+    # Prereq: `claude` on PATH and authenticated (claude /login OR
+    # CLAUDE_CODE_OAUTH_TOKEN env var).
     python3 comp/scripts/compare.py
+    python3 comp/scripts/compare.py                          # sigil only, Haiku+Sonnet
     python3 comp/scripts/compare.py --filter C01 --runs 3
     python3 comp/scripts/compare.py --langs sigil,python --models claude-opus-4-7
+    python3 comp/scripts/compare.py --all-langs              # cross-language baseline
+    python3 comp/scripts/compare.py --all-langs --full --runs 5  # full thesis comparison
 
 Exit codes:
     0  — every cell passed (all runs, all prompts, all langs, all models)
     1  — at least one cell failed
-    2  — harness error (missing env, missing files, bad config)
+    2  — harness error (missing binary, missing files, bad config)
 """
 
 from __future__ import annotations
@@ -41,12 +51,11 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from typing import Optional
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -57,14 +66,12 @@ EVAL_SCRIPTS_DIR = COMP_DIR / "scripts"
 LOG_DIR = COMP_DIR / "log"
 SPEC_PATH = REPO_ROOT / "spec" / "language.md"
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_API_VERSION = "2023-06-01"
-
-DEFAULT_LANGUAGES = ["sigil", "python", "go", "rust"]
-DEFAULT_MODELS = ["claude-opus-4-7", "claude-sonnet-4-6"]
+DEFAULT_LANGUAGES = ["sigil"]
+FULL_LANGUAGES = ["sigil", "python", "go", "rust"]
+DEFAULT_MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6"]
+FULL_MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"]
 DEFAULT_MAX_CONCURRENCY = 4
-DEFAULT_MAX_TOKENS = 4096
-DEFAULT_REQUEST_TIMEOUT_S = 120
+DEFAULT_REQUEST_TIMEOUT_S = 180
 DEFAULT_EVAL_TIMEOUT_S = 60
 
 # Token in `comp/contexts/sigil.md` that gets substituted with the
@@ -182,63 +189,104 @@ def load_system_prompt(lang: str, spec_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Anthropic API client (mirrors scripts/validate_spec.py)
+# Claude Code headless-mode client (subscription-auth via `claude -p`)
 # ---------------------------------------------------------------------------
 
 
-def call_claude(
+def call_claude_cli(
     *,
-    api_key: str,
     model: str,
-    system: str,
-    messages: list[dict],
-    max_tokens: int = DEFAULT_MAX_TOKENS,
+    user_message: str,
+    system: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
     timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S,
-) -> str:
-    body = json.dumps({
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": messages,
-    }).encode("utf-8")
+) -> tuple[str, str]:
+    """Invoke `claude -p` and return (response_text, session_id).
 
-    last_exc: Optional[Exception] = None
-    for attempt in range(3):
-        if attempt > 0:
-            time.sleep(2 ** attempt)
-        req = urllib.request.Request(
-            ANTHROPIC_API_URL,
-            data=body,
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": ANTHROPIC_API_VERSION,
-                "content-type": "application/json",
-            },
-            method="POST",
+    First turn: pass `system` to install the language-specific system
+    prompt (replaces Claude Code's default preamble). Subsequent turns:
+    pass `resume_session_id` from the prior call's return value to
+    continue the session — the system prompt and prior turns persist
+    server-side, so the spec isn't resent on turn 2.
+
+    Auth is whatever Claude Code is configured with (subscription OAuth
+    via `claude /login` or CLAUDE_CODE_OAUTH_TOKEN env). Rate-limit and
+    transient-failure retries are handled inside the CLI; a nonzero
+    exit here is a hard failure."""
+    if (system is None) == (resume_session_id is None):
+        raise ValueError(
+            "call_claude_cli: pass exactly one of `system` (new session) "
+            "or `resume_session_id` (continuation)"
         )
+
+    cmd = ["claude", "-p", "--model", model, "--output-format", "json"]
+    if system is not None:
+        cmd += ["--system-prompt", system]
+    else:
+        cmd += ["--resume", resume_session_id]
+
+    # Force the subscription/OAuth auth path. Claude Code's auth precedence
+    # prefers ANTHROPIC_API_KEY (and ANTHROPIC_AUTH_TOKEN) over the keychain
+    # OAuth token, which routes calls through API credit billing instead of
+    # the user's subscription. Scrub both from the child env so the keychain
+    # token (set by `claude /login`) or CLAUDE_CODE_OAUTH_TOKEN takes over.
+    child_env = os.environ.copy()
+    child_env.pop("ANTHROPIC_API_KEY", None)
+    child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=user_message,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            env=child_env,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "`claude` binary not on PATH; install Claude Code and run "
+            "`claude /login` or export CLAUDE_CODE_OAUTH_TOKEN"
+        ) from e
+
+    # claude -p stuffs API errors into the JSON `result` field with
+    # `is_error: true`, sometimes exiting nonzero and sometimes 0. Try
+    # JSON parse before bailing on the exit code so the actual error
+    # (rate limit, credit balance, auth failure) reaches the caller.
+    data: Optional[dict] = None
+    if proc.stdout.strip():
         try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-                return _extract_text_content(payload)
-        except urllib.error.HTTPError as e:
-            last_exc = e
-            if e.code == 429 or 500 <= e.code < 600:
-                continue
-            err_body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Claude API HTTP {e.code}: {err_body}") from e
-        except urllib.error.URLError as e:
-            last_exc = e
-            continue
-    raise RuntimeError(f"Claude API failed after retries: {last_exc}")
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            data = None
 
+    if data is None:
+        stderr_tail = (proc.stderr or "").strip()[-500:]
+        raise RuntimeError(
+            f"claude -p exited {proc.returncode} with no JSON on stdout; "
+            f"stderr tail: {stderr_tail!r}"
+        )
 
-def _extract_text_content(payload: dict) -> str:
-    content = payload.get("content", [])
-    out: list[str] = []
-    for block in content:
-        if block.get("type") == "text":
-            out.append(block.get("text", ""))
-    return "".join(out)
+    if data.get("is_error", False):
+        api_status = data.get("api_error_status")
+        subtype = data.get("subtype", "<no subtype>")
+        detail = str(data.get("result", ""))[:500]
+        raise RuntimeError(
+            f"claude -p error (api_status={api_status}, subtype={subtype}): {detail}"
+        )
+
+    text = data.get("result", "")
+    session_id = data.get("session_id", "")
+    if not text:
+        raise RuntimeError(
+            f"claude -p returned empty result; keys: {sorted(data.keys())}"
+        )
+    if not session_id:
+        # Resume needs this; surface immediately rather than failing on turn 2.
+        raise RuntimeError(
+            f"claude -p returned no session_id; keys: {sorted(data.keys())}"
+        )
+    return text, session_id
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +454,6 @@ def run_one_cell(
     language: str,
     model: str,
     run_idx: int,
-    api_key: str,
     spec_text: str,
     edit_loop: bool,
 ) -> CellResult:
@@ -418,16 +465,15 @@ def run_one_cell(
             first_attempt=None, edit_attempt=None, final_pass=False,
             error=f"system-prompt load failed: {e}",
         )
-    messages = [{"role": "user", "content": prompt.prompt_text}]
     try:
-        first_response = call_claude(
-            api_key=api_key, model=model, system=system, messages=messages,
+        first_response, session_id = call_claude_cli(
+            model=model, system=system, user_message=prompt.prompt_text,
         )
     except Exception as e:
         return CellResult(
             prompt_id=prompt.id, language=language, model=model, run_idx=run_idx,
             first_attempt=None, edit_attempt=None, final_pass=False,
-            error=f"api call failed: {e}",
+            error=f"claude -p (first turn) failed: {e}",
         )
     first_attempt = _execute_attempt(prompt.id, language, first_response)
     first_passed = first_attempt.eval is not None and first_attempt.eval.passed
@@ -438,19 +484,15 @@ def run_one_cell(
             final_pass=first_passed, error=None,
         )
     followup = _build_edit_followup(first_attempt, language)
-    edit_messages = messages + [
-        {"role": "assistant", "content": first_response},
-        {"role": "user", "content": followup},
-    ]
     try:
-        edit_response = call_claude(
-            api_key=api_key, model=model, system=system, messages=edit_messages,
+        edit_response, _ = call_claude_cli(
+            model=model, user_message=followup, resume_session_id=session_id,
         )
     except Exception as e:
         return CellResult(
             prompt_id=prompt.id, language=language, model=model, run_idx=run_idx,
             first_attempt=first_attempt, edit_attempt=None, final_pass=False,
-            error=f"edit-loop api call failed: {e}",
+            error=f"claude -p (edit-loop turn) failed: {e}",
         )
     edit_attempt = _execute_attempt(prompt.id, language, edit_response)
     edit_passed = edit_attempt.eval is not None and edit_attempt.eval.passed
@@ -671,17 +713,68 @@ def render_markdown_report(
 # ---------------------------------------------------------------------------
 
 
+def _build_run_slug(
+    *,
+    filter_expr: Optional[str],
+    full: bool,
+    all_langs: bool,
+    runs: int,
+    no_edit_loop: bool,
+) -> str:
+    """Compose a short slug describing the distinctive flags of this run.
+
+    Used in the per-run report filename (comparison-log-<ts>[-<slug>].md)
+    so a directory listing tells you what each historical report was.
+    Returns empty string when nothing is distinctive — the timestamp alone
+    is enough to uniquely identify a default-bank run."""
+    parts: list[str] = []
+    if filter_expr:
+        # Strip regex metacharacters so the filename stays readable; cap length.
+        sanitized = re.sub(r"[^A-Za-z0-9_-]+", "", filter_expr)[:32]
+        if sanitized:
+            parts.append(sanitized)
+    if all_langs:
+        parts.append("cross")
+    if full:
+        parts.append("full")
+    if runs > 1:
+        parts.append(f"r{runs}")
+    if no_edit_loop:
+        parts.append("noedit")
+    return "-".join(parts)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Cross-language LLM authorship comparison.")
     parser.add_argument(
         "--langs",
-        default=",".join(DEFAULT_LANGUAGES),
-        help=f"Comma-separated language list (default: {','.join(DEFAULT_LANGUAGES)})",
+        default=None,
+        help=f"Comma-separated language list. Default for iteration: "
+             f"{','.join(DEFAULT_LANGUAGES)}. Pass --all-langs to use "
+             f"{','.join(FULL_LANGUAGES)} instead.",
+    )
+    parser.add_argument(
+        "--all-langs",
+        action="store_true",
+        help=f"Run the full language set ({','.join(FULL_LANGUAGES)}). "
+             f"Reserve for cross-language thesis comparisons — sigil-only "
+             f"is the default for grammar-change iteration. Mutually "
+             f"exclusive with --langs.",
     )
     parser.add_argument(
         "--models",
-        default=",".join(DEFAULT_MODELS),
-        help=f"Comma-separated model IDs (default: {','.join(DEFAULT_MODELS)})",
+        default=None,
+        help=f"Comma-separated model IDs. Default for iteration: "
+             f"{','.join(DEFAULT_MODELS)}. Pass --full to use "
+             f"{','.join(FULL_MODELS)} instead.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help=f"Run the full model set ({','.join(FULL_MODELS)}). "
+             f"Reserve for before/after grammar-change comparisons — "
+             f"the Opus runs are the rate-limit bottleneck. Mutually "
+             f"exclusive with --models.",
     )
     parser.add_argument(
         "--filter",
@@ -713,9 +806,13 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("compare.py: ANTHROPIC_API_KEY not set in environment", file=sys.stderr)
+    if shutil.which("claude") is None:
+        print(
+            "compare.py: `claude` binary not on PATH. Install Claude Code "
+            "and authenticate via `claude /login` or "
+            "`claude setup-token` + export CLAUDE_CODE_OAUTH_TOKEN.",
+            file=sys.stderr,
+        )
         return 2
     if not PROMPTS_PATH.exists():
         print(f"compare.py: prompts missing at {PROMPTS_PATH}", file=sys.stderr)
@@ -733,8 +830,27 @@ def main() -> int:
         print(f"compare.py: --runs must be >= 1, got {args.runs}", file=sys.stderr)
         return 2
 
-    languages = [s.strip() for s in args.langs.split(",") if s.strip()]
-    models = [s.strip() for s in args.models.split(",") if s.strip()]
+    if args.full and args.models is not None:
+        print("compare.py: --full and --models are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.all_langs and args.langs is not None:
+        print("compare.py: --all-langs and --langs are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.full:
+        models_spec = ",".join(FULL_MODELS)
+    elif args.models is not None:
+        models_spec = args.models
+    else:
+        models_spec = ",".join(DEFAULT_MODELS)
+    if args.all_langs:
+        langs_spec = ",".join(FULL_LANGUAGES)
+    elif args.langs is not None:
+        langs_spec = args.langs
+    else:
+        langs_spec = ",".join(DEFAULT_LANGUAGES)
+
+    languages = [s.strip() for s in langs_spec.split(",") if s.strip()]
+    models = [s.strip() for s in models_spec.split(",") if s.strip()]
     prompts = parse_prompts(PROMPTS_PATH)
     if args.filter:
         pat = re.compile(args.filter)
@@ -759,8 +875,9 @@ def main() -> int:
 
     total = len(prompts) * len(languages) * len(models) * args.runs
     print(f"compare.py: {len(prompts)} prompt(s) × {len(languages)} lang(s) × "
-          f"{len(models)} model(s) × {args.runs} run(s) = {total} API calls; "
-          f"concurrency={args.max_concurrency}; edit_loop={edit_loop}", file=sys.stderr)
+          f"{len(models)} model(s) × {args.runs} run(s) = {total} `claude -p` "
+          f"sessions; concurrency={args.max_concurrency}; edit_loop={edit_loop}",
+          file=sys.stderr)
 
     work = [(p, lang, m, run_idx)
             for lang in languages
@@ -775,7 +892,7 @@ def main() -> int:
             pool.submit(
                 run_one_cell,
                 prompt=p, language=lang, model=m, run_idx=run_idx,
-                api_key=api_key, spec_text=spec_text, edit_loop=edit_loop,
+                spec_text=spec_text, edit_loop=edit_loop,
             ): (p.id, lang, m, run_idx)
             for p, lang, m, run_idx in work
         }
@@ -810,12 +927,23 @@ def main() -> int:
     results_dir = pathlib.Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%dT%H%M%S")
+    run_slug = _build_run_slug(
+        filter_expr=args.filter,
+        full=args.full,
+        all_langs=args.all_langs,
+        runs=args.runs,
+        no_edit_loop=args.no_edit_loop,
+    )
+    stem = f"comparison-log-{timestamp}" + (f"-{run_slug}" if run_slug else "")
     jsonl_path = results_dir / f"comparison-results-{timestamp}.jsonl"
-    md_path = results_dir / "comparison-log.md"
+    md_latest_path = results_dir / "comparison-log.md"
+    md_run_path = results_dir / f"{stem}.md"
     write_jsonl(results, jsonl_path)
-    render_markdown_report(results, prompts, languages, models, args.runs, md_path, jsonl_path)
-    print(f"compare.py: trace -> {jsonl_path}", file=sys.stderr)
-    print(f"compare.py: report -> {md_path}", file=sys.stderr)
+    render_markdown_report(results, prompts, languages, models, args.runs, md_latest_path, jsonl_path)
+    render_markdown_report(results, prompts, languages, models, args.runs, md_run_path, jsonl_path)
+    print(f"compare.py: trace      -> {jsonl_path}", file=sys.stderr)
+    print(f"compare.py: report     -> {md_latest_path}", file=sys.stderr)
+    print(f"compare.py: run report -> {md_run_path}", file=sys.stderr)
 
     failed = sum(1 for r in results if not r.final_pass)
     return 0 if failed == 0 else 1
