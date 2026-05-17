@@ -1417,8 +1417,28 @@ impl<'a> Monomorphizer<'a> {
                 // bound to `(Some(a), Some(b))` never enqueues
                 // `Option[Char]`, and codegen ICEs at the
                 // `Some$$Char` ctor_index lookup.
-                let elem_tys: Option<Vec<Ty>> = match scrut_ty {
-                    Some(Ty::Tuple(ts)) if ts.len() == ps.len() => Some(ts.clone()),
+                //
+                // The arity guard preserves the typecheck invariant
+                // (E0117 rejects mismatched arity upstream) — the
+                // debug_assert catches a typecheck bug eagerly while
+                // the release fallback degrades to None-threading
+                // rather than panicking.
+                let elem_tys: Option<&[Ty]> = match scrut_ty {
+                    Some(Ty::Tuple(ts)) => {
+                        debug_assert_eq!(
+                            ts.len(),
+                            ps.len(),
+                            "mono: Pattern::Tuple arity ({}) ≠ Ty::Tuple arity ({}) — \
+                             typecheck E0117 should have rejected this",
+                            ps.len(),
+                            ts.len(),
+                        );
+                        if ts.len() == ps.len() {
+                            Some(ts.as_slice())
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 };
                 Pattern::Tuple(
@@ -1426,7 +1446,7 @@ impl<'a> Monomorphizer<'a> {
                         .enumerate()
                         .map(|(i, sp)| {
                             let inner_scrut: Option<Ty> =
-                                elem_tys.as_ref().and_then(|ts| ts.get(i).cloned());
+                                elem_tys.and_then(|ts| ts.get(i).cloned());
                             self.rewrite_pattern(sp, &inner_scrut)
                         })
                         .collect(),
@@ -2673,11 +2693,10 @@ mod tests {
         // Regression: tuple-pattern lowering must thread per-element
         // scrut_ty to its sub-patterns so any inner ctor pattern can
         // pin its owning type's type_args and enqueue the matching
-        // monomorphic instance. Without this, a match like
+        // monomorphic instance. Pre-fix: a match like
         // `match (opt_a, opt_b) { (Some(x), Some(y)) => ... }` over a
-        // `(Option[Int], Option[Int])` scrutinee never enqueues
-        // Option[Int], and codegen ICEs at the `Some$$Int` lookup
-        // (the H01 × Haiku Wordle reproducer from the May 2026 comp run).
+        // `(Option[Int], Option[Int])` scrutinee never enqueued
+        // Option[Int], and codegen ICEd at the `Some$$Int` lookup.
         let src = r#"
             type Option[A] = | None | Some(A)
             fn main() -> Int ![] {
@@ -2712,6 +2731,105 @@ mod tests {
             find_type(&items, "Option$$Int").is_some(),
             "Option$$Int must be enqueued by the tuple-element rewrite path"
         );
+    }
+
+    #[test]
+    fn tuple_pattern_threads_inner_scrut_ty_to_inner_ctor_char_variant() {
+        // Pins the original ICE-trigger type (Option[Char]) — symmetric
+        // to the Int case in mono but cheap insurance that the type-arg
+        // threading isn't accidentally Int-specific.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let a: Option[Char] = Some('a');
+                let b: Option[Char] = Some('b');
+                match (a, b) {
+                    (Some(_x), Some(_y)) => 1,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(name, "Some", "tuple-element Some must be mangled (Char)");
+            if name == "Some$$Char" {
+                saw = true;
+            }
+        });
+        assert!(saw, "Some$$Char must appear in tuple-element positions");
+        assert!(find_type(&items, "Option$$Char").is_some());
+    }
+
+    #[test]
+    fn nested_tuple_pattern_threads_through_outer_and_inner_tuples() {
+        // Tuple-inside-tuple: the recursion must keep unpacking
+        // Ty::Tuple at each level so the deepest ctor sees the right
+        // user-type scrut. Shape `((Some(x), b), c)` over
+        // `((Option[Int], Bool), Bool)`.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let a: Option[Int] = Some(7);
+                let b: Bool = true;
+                let c: Bool = false;
+                match ((a, b), c) {
+                    ((Some(x), _), _) => x,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(name, "Some", "deeply-nested Some must still mangle");
+            if name == "Some$$Int" {
+                saw = true;
+            }
+        });
+        assert!(saw, "Some$$Int must reach mangling through two tuple levels");
+        assert!(find_type(&items, "Option$$Int").is_some());
+    }
+
+    #[test]
+    fn ctor_wrapping_tuple_with_inner_ctor_threads_both_paths() {
+        // Ctor-around-tuple-around-ctor: `Some((Some(x), b))` over
+        // `Option[(Option[Int], Bool)]`. Exercises Ctor → Tuple →
+        // Ctor recursion — both arms must thread scrut_ty correctly
+        // for the inner Some to pick up Int. Outer Some is mangled
+        // against the synthetic tuple type-arg (`Tuple$$Option$Int$Bool`
+        // or similar per mangle_type's tuple-canon scheme); the inner
+        // is mangled against Int.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let inner: Option[Int] = Some(7);
+                let outer: Option[(Option[Int], Bool)] = Some((inner, true));
+                match outer {
+                    Some((Some(x), _)) => x,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw_inner_some = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(
+                name, "Some",
+                "ctor-wrapping-tuple-wrapping-ctor: bare Some forbidden post-mono"
+            );
+            if name == "Some$$Int" {
+                saw_inner_some = true;
+            }
+        });
+        assert!(
+            saw_inner_some,
+            "Some$$Int (inner-most) must appear; otherwise Tuple arm dropped the field_ty"
+        );
+        assert!(find_type(&items, "Option$$Int").is_some());
     }
 
     #[test]
