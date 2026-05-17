@@ -21487,27 +21487,17 @@ fn cross_check_fib_cps_perf_with_elision_runs_cleanly() {
     // fib_cps_perf is `UserFnAbi::Sync` and parks the thread inside
     // `sigil_run_loop` for the recursive CPS dispatch — the only
     // example in the suite where the wrap path fires alongside the
-    // elided path. Adds `SIGIL_PRINT_STATS=1` so the runtime's
-    // counter atexit hook dumps `SIGIL_COUNTER_*=N` lines to stderr,
-    // then asserts (a) elision-count > 0 — proves the env-var pipeline
-    // reached the runtime AND the fast path actually fired; (b)
-    // elision-count < boehm-alloc-count — proves the wrap path also
-    // fired (some allocs happened during `sigil_run_loop`'s parked
-    // region). Without (a), every test in this block would pass
-    // trivially if `compile_file_and_run_with_env` failed to propagate
-    // the elision env var to the spawned binary. Without (b), the
-    // wrap-AND-elide-both-fire claim in the section comment would be
-    // an unverified assertion.
+    // elided path. Post-Task-7 elision is default-on, so this test
+    // does NOT set SIGIL_ALLOC_ELIDE_WRAP — the counter assertions
+    // pin that the default-on behavior is intact end-to-end. A
+    // regression that silently reverted the default (e.g., parse
+    // shape changed back to opt-in) would surface as elided=0.
     let root = workspace_root();
     let source = root.join("examples/fib_cps_perf.sigil");
     let (_stdout, stderr, code) = compile_file_and_run_with_env(
         &source,
         "cross_check_fib_cps_perf_with_elision",
-        &[
-            ("SIGIL_GC_CROSS_CHECK", "1"),
-            ("SIGIL_ALLOC_ELIDE_WRAP", "1"),
-            ("SIGIL_PRINT_STATS", "1"),
-        ],
+        &[("SIGIL_GC_CROSS_CHECK", "1"), ("SIGIL_PRINT_STATS", "1")],
     );
     assert_no_cross_check_abort("fib_cps_perf.sigil [elision]", &stderr, code);
 
@@ -21516,9 +21506,9 @@ fn cross_check_fib_cps_perf_with_elision_runs_cleanly() {
     assert!(
         elided > 0,
         "elision: SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT=0 — the fast \
-         path never fired. Most likely cause: the env-var pipeline \
-         (cargo→sigil binary→runtime) is not propagating \
-         SIGIL_ALLOC_ELIDE_WRAP=1, or `sigil_gc_init` is not reading it. \
+         path never fired. Default-on regressed: `sigil_gc_init`'s parse \
+         either reverted to opt-in shape or the env-var read site is \
+         no longer wired. \
          elided={elided} boehm_allocs={boehm_allocs}\n--- stderr ---\n{stderr}",
     );
     assert!(

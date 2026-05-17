@@ -598,8 +598,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   [`compiler/docs/plan-e2-phase-3-gc-time-followup.md`](compiler/docs/plan-e2-phase-3-gc-time-followup.md)
   for full tables + decomposition.
 - Alloc-trampoline-elision follow-up (2026-05-17) — ✅ **Tasks
-  1–6 complete; Task 7 (default-on flip) ready pending merge
-  authorization.** PR #178's throughput attribution split the
+  1–7 complete.** PR #178's throughput attribution split the
   ~10–25 ns/alloc Phase 3 overhead into (1) the per-alloc
   `GC_call_with_gc_active` trampoline wrap and (2)
   `SigilCallerFpGuard` capture/drop. (1) is conditionally
@@ -627,9 +626,19 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   empirically on the only workload that parks via
   `sigil_run_loop`). Verdict doc:
   [`compiler/docs/plan-e2-phase-3-alloc-trampoline-elision.md`](compiler/docs/plan-e2-phase-3-alloc-trampoline-elision.md).
-  **Task 7** is unblocked — gate ("SIGIL_GC_CROSS_CHECK suite
-  stays green for 24+ hours of CI iterations") satisfied; one-line
-  default-flip + counter-assertion-update PR pending authorization.
+  **Task 7** (default-on flip) shipped after the cross-check +
+  throughput gates cleared. `sigil_gc_init`'s parse flipped from
+  strict `"1"` opt-in to strict `"0"` opt-out — elision is now on
+  by default; users opt out by setting `SIGIL_ALLOC_ELIDE_WRAP=0`
+  (the escape valve the plan body explicitly preserved for
+  debugging). Runtime unit tests `sigil_alloc_elide_wrap_unset_caches_true`
+  + `sigil_alloc_elide_wrap_typo_values_cache_true` pin the new
+  default; `sigil_alloc_elide_wrap_zero_caches_false` and
+  `sigil_alloc_elide_wrap_set_to_one_caches_true` carry over
+  unchanged (both still describe valid post-flip behavior).
+  `cross_check_fib_cps_perf_with_elision_runs_cleanly` no longer
+  sets the env var — the `elided > 0` assertion now pins that the
+  default-on path is intact end-to-end.
 - Mark-phase hypothesis verdict (follow-up #1: forced budget) —
   ✅ **Inconclusive** even under forced budget (superseded by
   #2's Disproven verdict above). See
