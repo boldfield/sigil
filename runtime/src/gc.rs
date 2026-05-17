@@ -727,9 +727,11 @@ static FORCE_GC_ALLOC_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// "env var set to N" (`Some(Some(N))`).
 static FORCE_GC_CADENCE: OnceLock<Option<NonZeroU64>> = OnceLock::new();
 
-/// Parsed `SIGIL_ALLOC_ELIDE_WRAP` flag. `Some(true)` iff the env
-/// var was exactly `"1"` at `sigil_gc_init` time; pre-init reads as
-/// `None` and route through the safe wrap path.
+/// Parsed `SIGIL_ALLOC_ELIDE_WRAP` flag. `Some(true)` by default —
+/// the elision opts in unless the env var is exactly `"0"`. Pre-init
+/// reads as `None` and route through the safe wrap path. Task 7
+/// flipped the default to opt-out after the cross-check + throughput
+/// gates cleared (see `compiler/docs/plan-e2-phase-3-alloc-trampoline-elision.md`).
 static ELISION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[inline]
@@ -862,10 +864,13 @@ pub extern "C" fn sigil_gc_init() {
         // guaranteed to see an initialised Boehm.
         let _ = FORCE_GC_CADENCE.set(cadence);
 
-        // Strict `"1"`-only opt-in — typos (`true`, `yes`, `on`) fail
-        // closed because the elision is safety-relevant, not a knob.
-        // Publish after `GC_init` to match `FORCE_GC_CADENCE` above.
-        let elision = matches!(std::env::var("SIGIL_ALLOC_ELIDE_WRAP"), Ok(ref s) if s == "1");
+        // Default-on; opt-out is exactly `"0"`. Strict shape on the
+        // opt-out side mirrors the prior strict-`"1"` opt-in: typo
+        // values (`"false"`, `"off"`, `""`) leave elision enabled so
+        // users who want the safe path get the audit-trail benefit of
+        // having to type the value precisely. Publish after `GC_init`
+        // to match `FORCE_GC_CADENCE` above.
+        let elision = !matches!(std::env::var("SIGIL_ALLOC_ELIDE_WRAP"), Ok(ref s) if s == "0");
         let _ = ELISION_ENABLED.set(elision);
 
         // Wire the counter dump exactly once — doing it inside the Once
@@ -2334,30 +2339,32 @@ mod tests {
     }
 
     #[test]
-    fn sigil_alloc_elide_wrap_unset_caches_false() {
+    fn sigil_alloc_elide_wrap_unset_caches_true() {
+        // Task 7: default-on. No env var → elision enabled.
         if !in_gc_stress_subprocess() {
-            run_gc_stress_in_subprocess("sigil_alloc_elide_wrap_unset_caches_false");
+            run_gc_stress_in_subprocess("sigil_alloc_elide_wrap_unset_caches_true");
             return;
         }
         let _guard = crate::test_support::gc_test_lock();
         sigil_gc_init();
-        assert_eq!(alloc_elide_wrap_cached(), Some(false));
+        assert_eq!(alloc_elide_wrap_cached(), Some(true));
     }
 
     #[test]
-    fn sigil_alloc_elide_wrap_typo_values_cache_false() {
-        // Strict `"1"` opt-in: `"true"`/`"yes"`/`"on"` must all fail
-        // closed. One representative value covers the strict-match.
+    fn sigil_alloc_elide_wrap_typo_values_cache_true() {
+        // Task 7: only exact `"0"` opts out. Typo values
+        // (`"true"`/`"false"`/`"off"`/etc.) leave elision enabled —
+        // operator who wants the safe path must type `"0"` precisely.
         if !in_gc_stress_subprocess() {
             run_gc_stress_in_subprocess_with_env(
-                "sigil_alloc_elide_wrap_typo_values_cache_false",
-                &[("SIGIL_ALLOC_ELIDE_WRAP", "true")],
+                "sigil_alloc_elide_wrap_typo_values_cache_true",
+                &[("SIGIL_ALLOC_ELIDE_WRAP", "false")],
             );
             return;
         }
         let _guard = crate::test_support::gc_test_lock();
         sigil_gc_init();
-        assert_eq!(alloc_elide_wrap_cached(), Some(false));
+        assert_eq!(alloc_elide_wrap_cached(), Some(true));
     }
 
     #[test]
