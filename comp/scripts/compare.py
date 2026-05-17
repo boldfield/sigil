@@ -14,10 +14,23 @@ billed against the user's Claude subscription, not an API key. Auth
 precedence (per Claude Code): CLAUDE_CODE_OAUTH_TOKEN env var, or
 the OAuth token stored by a prior `claude /login`. For batch runs
 on a host without interactive login, generate a long-lived token
-with `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN.
+with `claude setup-token` and export CLAUDE_CODE_OAUTH_TOKEN. The
+harness scrubs `ANTHROPIC_*` and `CLAUDE_CODE_USE_*` env prefixes
+from the child env so API-credit and 3P-provider routing can't
+override the subscription path.
 
-Multi-turn edit loop uses `--resume <session-id>` so the system
-prompt (with the embedded Sigil spec) isn't resent on turn 2.
+Multi-turn edit loop pins a caller-generated `--session-id <uuid>`
+on turn 1 and resumes against the same uuid on turn 2, so the system
+prompt (with the embedded Sigil spec) isn't resent. The system
+prompt is passed via `--system-prompt-file <tempfile>` rather than
+`--system-prompt <argv>` to dodge the ARG_MAX ceiling — the Sigil
+spec is on a monotonic growth path.
+
+Each `claude -p` invocation is wrapped in a 3-attempt exponential-
+backoff loop on detectably transient failures (HTTP 429 / 5xx,
+process-level timeout). Hard failures — auth, 4xx-other, rate-limit
+exhaustion on the 5-hour/weekly subscription windows — bubble up
+and the cell is recorded as a failure rather than busy-waiting.
 
 - `comp/prompts.md`        cross-language prompts (C01..C20)
 - `comp/contexts/<lang>.md` per-language system prompt prefix
@@ -56,6 +69,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from typing import Optional
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -193,46 +207,78 @@ def load_system_prompt(lang: str, spec_text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def call_claude_cli(
+CLI_RETRY_ATTEMPTS = 3
+CLI_RETRY_BACKOFFS_S = (2.0, 4.0)  # gaps before attempts 2 and 3
+
+
+class _ClaudeCliTransientError(RuntimeError):
+    """Detectable transient failure (429 / 5xx / network blip). Eligible
+    for in-process retry. Surface as `RuntimeError` after the wrapper
+    exhausts attempts."""
+
+
+def _build_child_env() -> dict[str, str]:
+    """Build a child env for `claude -p` that forces Claude Code's
+    subscription/OAuth auth path.
+
+    Claude Code's auth precedence prefers `ANTHROPIC_API_KEY` /
+    `ANTHROPIC_AUTH_TOKEN` over the keychain OAuth token, which routes
+    calls through API credit billing instead of the user's subscription.
+    `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX` (and friends)
+    short-circuit further and route to a 3P provider. Scrubbing both
+    prefixes leaves Claude Code's keychain-OAuth or
+    `CLAUDE_CODE_OAUTH_TOKEN` path as the only choice."""
+    child_env = os.environ.copy()
+    for key in list(child_env):
+        if key == "CLAUDE_CODE_OAUTH_TOKEN":
+            continue
+        if key.startswith("ANTHROPIC_") or key.startswith("CLAUDE_CODE_USE_"):
+            child_env.pop(key, None)
+    return child_env
+
+
+def _is_retryable_cli_error(api_error_status: object) -> bool:
+    """Retryable: 429 (rate limit) and 5xx (server errors).
+
+    Not retryable: other 4xx (auth, bad request — won't fix themselves),
+    or no api_error_status at all (the error envelope didn't surface a
+    network/API status; safer to treat as opaque and fail fast)."""
+    if not isinstance(api_error_status, int):
+        return False
+    return api_error_status == 429 or 500 <= api_error_status < 600
+
+
+def _call_claude_cli_once(
     *,
     model: str,
     user_message: str,
-    system: Optional[str] = None,
-    resume_session_id: Optional[str] = None,
-    timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S,
+    system_prompt_path: Optional[str],
+    session_id: Optional[str],
+    resume_session_id: Optional[str],
+    timeout_s: int,
 ) -> tuple[str, str]:
-    """Invoke `claude -p` and return (response_text, session_id).
-
-    First turn: pass `system` to install the language-specific system
-    prompt (replaces Claude Code's default preamble). Subsequent turns:
-    pass `resume_session_id` from the prior call's return value to
-    continue the session — the system prompt and prior turns persist
-    server-side, so the spec isn't resent on turn 2.
-
-    Auth is whatever Claude Code is configured with (subscription OAuth
-    via `claude /login` or CLAUDE_CODE_OAUTH_TOKEN env). Rate-limit and
-    transient-failure retries are handled inside the CLI; a nonzero
-    exit here is a hard failure."""
-    if (system is None) == (resume_session_id is None):
-        raise ValueError(
-            "call_claude_cli: pass exactly one of `system` (new session) "
-            "or `resume_session_id` (continuation)"
-        )
-
+    """One subprocess invocation. Raises `_ClaudeCliTransientError` on
+    detectably transient failures (caller retries those) and `RuntimeError`
+    on hard failures."""
     cmd = ["claude", "-p", "--model", model, "--output-format", "json"]
-    if system is not None:
-        cmd += ["--system-prompt", system]
+    if system_prompt_path is not None:
+        # `--system-prompt-file <path>` (hidden from --help but real;
+        # documented in --bare's description). Switching off argv-passed
+        # `--system-prompt` removes the ARG_MAX ceiling — `spec/language.md`
+        # is on a monotonic growth path and the previous argv form would
+        # silently break with E2BIG around 4–5× current size on macOS.
+        cmd += ["--system-prompt-file", system_prompt_path]
+        # `--session-id <uuid>` lets the caller pin the session id
+        # explicitly. The edit-loop turn then resumes against the same
+        # uuid we chose, independent of however Claude Code's session-
+        # persistence layer would have named it. Concurrency-safe by
+        # construction since each cell generates a fresh uuid4.
+        if session_id is not None:
+            cmd += ["--session-id", session_id]
     else:
         cmd += ["--resume", resume_session_id]
 
-    # Force the subscription/OAuth auth path. Claude Code's auth precedence
-    # prefers ANTHROPIC_API_KEY (and ANTHROPIC_AUTH_TOKEN) over the keychain
-    # OAuth token, which routes calls through API credit billing instead of
-    # the user's subscription. Scrub both from the child env so the keychain
-    # token (set by `claude /login`) or CLAUDE_CODE_OAUTH_TOKEN takes over.
-    child_env = os.environ.copy()
-    child_env.pop("ANTHROPIC_API_KEY", None)
-    child_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    child_env = _build_child_env()
 
     try:
         proc = subprocess.run(
@@ -248,6 +294,12 @@ def call_claude_cli(
             "`claude` binary not on PATH; install Claude Code and run "
             "`claude /login` or export CLAUDE_CODE_OAUTH_TOKEN"
         ) from e
+    except subprocess.TimeoutExpired as e:
+        # Treat process-level timeout as transient — the model server
+        # may have been backed up but the next attempt could succeed.
+        raise _ClaudeCliTransientError(
+            f"claude -p timed out after {timeout_s}s"
+        ) from e
 
     # claude -p stuffs API errors into the JSON `result` field with
     # `is_error: true`, sometimes exiting nonzero and sometimes 0. Try
@@ -262,6 +314,14 @@ def call_claude_cli(
 
     if data is None:
         stderr_tail = (proc.stderr or "").strip()[-500:]
+        # The CLI reports session-id collisions on stderr with exit 1
+        # and no JSON. With caller-rotating session_id per attempt
+        # (see `call_claude_cli`), retry resolves these cleanly.
+        if "Session ID" in stderr_tail and "already in use" in stderr_tail:
+            raise _ClaudeCliTransientError(
+                f"claude -p session-id collision (will retry with fresh uuid): "
+                f"{stderr_tail!r}"
+            )
         raise RuntimeError(
             f"claude -p exited {proc.returncode} with no JSON on stdout; "
             f"stderr tail: {stderr_tail!r}"
@@ -271,22 +331,125 @@ def call_claude_cli(
         api_status = data.get("api_error_status")
         subtype = data.get("subtype", "<no subtype>")
         detail = str(data.get("result", ""))[:500]
-        raise RuntimeError(
-            f"claude -p error (api_status={api_status}, subtype={subtype}): {detail}"
-        )
+        msg = f"claude -p error (api_status={api_status}, subtype={subtype}): {detail}"
+        if _is_retryable_cli_error(api_status):
+            raise _ClaudeCliTransientError(msg)
+        raise RuntimeError(msg)
 
     text = data.get("result", "")
-    session_id = data.get("session_id", "")
+    response_session_id = data.get("session_id", "")
     if not text:
         raise RuntimeError(
             f"claude -p returned empty result; keys: {sorted(data.keys())}"
         )
-    if not session_id:
+    if not response_session_id:
         # Resume needs this; surface immediately rather than failing on turn 2.
         raise RuntimeError(
             f"claude -p returned no session_id; keys: {sorted(data.keys())}"
         )
-    return text, session_id
+    return text, response_session_id
+
+
+def call_claude_cli(
+    *,
+    model: str,
+    user_message: str,
+    system: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S,
+) -> tuple[str, str]:
+    """Invoke `claude -p` and return (response_text, session_id).
+
+    First turn: pass `system` to install the language-specific system
+    prompt (replaces Claude Code's default preamble). The wrapper
+    generates a fresh `uuid4` per attempt and pins it via
+    `--session-id` so resume on the next turn binds to a uuid we
+    chose (not whatever Claude Code's session-persistence layer
+    would have named); the actually-used `session_id` is returned
+    so the caller can pass it as `resume_session_id` on turn 2.
+
+    Subsequent turns: pass `resume_session_id` from turn 1's return
+    value to continue the session — the system prompt and prior turns
+    persist server-side, so the spec isn't resent on turn 2.
+
+    Auth is whatever Claude Code is configured with (subscription OAuth
+    via `claude /login` or `CLAUDE_CODE_OAUTH_TOKEN` env). Wraps the
+    once-helper in a 3-attempt exponential-backoff loop on detectably
+    transient failures (HTTP 429 / 5xx, process-level timeout, session-id
+    collision). Hard failures — auth errors, 4xx-other, rate-limit
+    *exhaustion* on the 5-hour/weekly subscription windows — bubble up
+    to the caller, which records them as cell failures rather than
+    busy-waiting for hours."""
+    if (system is None) == (resume_session_id is None):
+        raise ValueError(
+            "call_claude_cli: pass exactly one of `system` (new session) "
+            "or `resume_session_id` (continuation)"
+        )
+
+    # Write system prompt to a tempfile and pass via --system-prompt-file
+    # to dodge the argv-length ceiling (macOS ARG_MAX = 1 MB; the Sigil
+    # spec is on a growth path that would breach this within a few
+    # release cycles at the current rate).
+    system_prompt_path: Optional[str] = None
+    tmp_handle: Optional[tempfile._TemporaryFileWrapper] = None
+    if system is not None:
+        tmp_handle = tempfile.NamedTemporaryFile(
+            mode="w",
+            suffix=".system-prompt.md",
+            prefix="comp-",
+            delete=False,
+            encoding="utf-8",
+        )
+        try:
+            tmp_handle.write(system)
+            tmp_handle.flush()
+            tmp_handle.close()
+            system_prompt_path = tmp_handle.name
+        except Exception:
+            try:
+                tmp_handle.close()
+            except Exception:
+                pass
+            if tmp_handle and tmp_handle.name:
+                try:
+                    os.unlink(tmp_handle.name)
+                except FileNotFoundError:
+                    pass
+            raise
+
+    try:
+        last_exc: Optional[Exception] = None
+        for attempt in range(CLI_RETRY_ATTEMPTS):
+            if attempt > 0:
+                time.sleep(CLI_RETRY_BACKOFFS_S[attempt - 1])
+            # Rotate session_id per attempt for new sessions so a
+            # collision on attempt 1 (Claude Code already has that
+            # uuid reserved server-side somehow) doesn't recur on
+            # retry. For resume, the id is fixed by definition.
+            attempt_session_id: Optional[str] = (
+                str(uuid.uuid4()) if system is not None else None
+            )
+            try:
+                return _call_claude_cli_once(
+                    model=model,
+                    user_message=user_message,
+                    system_prompt_path=system_prompt_path,
+                    session_id=attempt_session_id,
+                    resume_session_id=resume_session_id,
+                    timeout_s=timeout_s,
+                )
+            except _ClaudeCliTransientError as e:
+                last_exc = e
+                continue
+        raise RuntimeError(
+            f"claude -p failed after {CLI_RETRY_ATTEMPTS} attempts: {last_exc}"
+        )
+    finally:
+        if system_prompt_path is not None:
+            try:
+                os.unlink(system_prompt_path)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +628,11 @@ def run_one_cell(
             first_attempt=None, edit_attempt=None, final_pass=False,
             error=f"system-prompt load failed: {e}",
         )
+    # `call_claude_cli` pins a fresh `--session-id <uuid4>` per
+    # attempt internally and returns the actually-used id so the
+    # edit-loop turn can resume against the exact same uuid. We don't
+    # pre-generate here — rotation per retry attempt is the wrapper's
+    # job, not the caller's.
     try:
         first_response, session_id = call_claude_cli(
             model=model, system=system, user_message=prompt.prompt_text,
@@ -940,7 +1108,9 @@ def main() -> int:
     md_run_path = results_dir / f"{stem}.md"
     write_jsonl(results, jsonl_path)
     render_markdown_report(results, prompts, languages, models, args.runs, md_latest_path, jsonl_path)
-    render_markdown_report(results, prompts, languages, models, args.runs, md_run_path, jsonl_path)
+    # Per-run report is a byte-identical copy of the latest pointer —
+    # one render, one copy. Cheaper and guarantees the two files agree.
+    shutil.copyfile(md_latest_path, md_run_path)
     print(f"compare.py: trace      -> {jsonl_path}", file=sys.stderr)
     print(f"compare.py: report     -> {md_latest_path}", file=sys.stderr)
     print(f"compare.py: run report -> {md_run_path}", file=sys.stderr)
