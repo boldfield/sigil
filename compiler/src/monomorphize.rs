@@ -2789,7 +2789,10 @@ mod tests {
                 saw = true;
             }
         });
-        assert!(saw, "Some$$Int must reach mangling through two tuple levels");
+        assert!(
+            saw,
+            "Some$$Int must reach mangling through two tuple levels"
+        );
         assert!(find_type(&items, "Option$$Int").is_some());
     }
 
