@@ -41,6 +41,10 @@ on:
         description: "Optional: force GC_gcollect() every N allocations (mark-phase savings measurement). Empty = no injection."
         required: false
         default: ""
+      alloc_elide_wrap:
+        description: "Optional: SIGIL_ALLOC_ELIDE_WRAP on the POST side only (plan body: elision env var set on post, unset on pre). Strict `1` opts in. Empty = no elision."
+        required: false
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -132,6 +136,9 @@ jobs:
           # cost at workload scale; see
           # `compiler/docs/plan-e2-phase-3-gc-time-followup.md`.
           SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}
+          # POST-side only per plan body. Pre-side measure step does
+          # NOT wire this; strict `"1"` opts in at runtime.
+          SIGIL_ALLOC_ELIDE_WRAP: ${{ inputs.alloc_elide_wrap }}
         run: |
           mkdir -p throughput-data/post
           for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
@@ -264,6 +271,8 @@ jobs:
           if [[ -z "$BUDGET" ]]; then BUDGET="(none)"; fi
           INJECT="${{ inputs.force_gc_every_n_allocs }}"
           if [[ -z "$INJECT" ]]; then INJECT="(none)"; fi
+          ELIDE="${{ inputs.alloc_elide_wrap }}"
+          if [[ -z "$ELIDE" ]]; then ELIDE="(none)"; fi
           {
             echo "## Deltas — ${{ matrix.os }}"
             echo ""
@@ -273,6 +282,7 @@ jobs:
             echo "libgc version: \`${LIBGC_VERSION}\`"
             echo "Heap budget: \`${BUDGET}\` KB"
             echo "Force-GC cadence: \`${INJECT}\` allocations"
+            echo "Alloc-elide-wrap (POST only): \`${ELIDE}\`"
             echo ""
             for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
               scripts/diff-throughput.py "${w}" \

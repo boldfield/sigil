@@ -94,12 +94,16 @@ def render(workload: str, pre: dict, post: dict) -> str:
     # pre renders as "n/a" while post is the operator's sanity check
     # (forced_gc_count ≈ alloc_count / N — confirms the
     # SIGIL_FORCE_GC_EVERY_N_ALLOCS injection actually fired).
+    # `alloc_wrap_elided_count` — pre renders n/a (counter slot
+    # doesn't exist pre-PR-#181); post > 0 is the operator's sanity
+    # check that elision fired.
     for key, unit in [
         ("alloc_count", ""),
         ("alloc_bytes", "bytes"),
         ("boehm_gc_time_ms", "ms"),
         ("precise_walker_ns", "ns"),
         ("forced_gc_count", ""),
+        ("alloc_wrap_elided_count", ""),
     ]:
         # Defensive: keys added by a later plan may be absent on a
         # JSON file produced by an older measure-throughput.sh.

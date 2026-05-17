@@ -92,4 +92,26 @@ if grep -REn '\bpanic!\(' compiler/src/ \
     echo "warning: grep saw panic!() sites in compiler/src/. clippy -D warnings above is the authority." >&2
 fi
 
+# Counter-name drift check: every SIGIL_COUNTER_* literal that
+# scripts/measure-throughput.sh extracts must exist in
+# runtime/src/counters.rs::NAMES. A runtime-side rename would
+# otherwise silently degrade the throughput-report's per-counter
+# columns to `null` for the renamed counter, masking the regression.
+say "discipline: measure-throughput.sh counter names exist in runtime NAMES"
+shell_counter_names=$(grep -oE 'SIGIL_COUNTER_[A-Z0-9_]+' scripts/measure-throughput.sh \
+  | sort -u)
+missing_counters=""
+for name in $shell_counter_names; do
+    if ! grep -qF "\"${name}\"" runtime/src/counters.rs; then
+        missing_counters="${missing_counters} ${name}"
+    fi
+done
+if [ -n "$missing_counters" ]; then
+    echo "ERROR: measure-throughput.sh references SIGIL_COUNTER_* not in runtime/src/counters.rs::NAMES:" >&2
+    for name in $missing_counters; do
+        echo "  - $name" >&2
+    done
+    exit 1
+fi
+
 say "OK — pod-verify passed"
