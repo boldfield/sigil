@@ -136,13 +136,8 @@ jobs:
           # cost at workload scale; see
           # `compiler/docs/plan-e2-phase-3-gc-time-followup.md`.
           SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}
-          # Plan E2 alloc-trampoline-elision Task 6 — POST-side only
-          # per plan body ("elision env var set on the post side,
-          # unset on the pre side"). Strict `"1"` opts in at runtime
-          # parse (sigil_gc_init); empty / "0" / typo → elision
-          # disabled. The pre-side measure step deliberately does
-          # NOT set this env var so the pre baseline runs without
-          # any elision plumbing in play.
+          # POST-side only per plan body. Pre-side measure step does
+          # NOT wire this; strict `"1"` opts in at runtime.
           SIGIL_ALLOC_ELIDE_WRAP: ${{ inputs.alloc_elide_wrap }}
         run: |
           mkdir -p throughput-data/post

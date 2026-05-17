@@ -94,15 +94,9 @@ def render(workload: str, pre: dict, post: dict) -> str:
     # pre renders as "n/a" while post is the operator's sanity check
     # (forced_gc_count ≈ alloc_count / N — confirms the
     # SIGIL_FORCE_GC_EVERY_N_ALLOCS injection actually fired).
-    # `alloc_wrap_elided_count` (Plan E2 alloc-trampoline-elision
-    # Task 6) is the count of allocs that took the elided fast path.
-    # Pre-checkpoint binaries do not have the counter slot (introduced
-    # post-PR-#181), so pre renders as "n/a"; post is the operator's
-    # sanity check that the elision actually fired (post > 0). The
-    # ratio `post elided / post alloc_count` quantifies how much of
-    # the workload's allocs ran the fast path vs the still-wrapped
-    # path (the rest are `sigil_run_loop`-parked allocs that the
-    # elision deliberately doesn't touch).
+    # `alloc_wrap_elided_count` — pre renders n/a (counter slot
+    # doesn't exist pre-PR-#181); post > 0 is the operator's sanity
+    # check that elision fired.
     for key, unit in [
         ("alloc_count", ""),
         ("alloc_bytes", "bytes"),

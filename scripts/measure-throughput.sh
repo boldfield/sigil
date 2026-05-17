@@ -225,16 +225,8 @@ for ((i = 1; i <= RUNS; i++)); do
         # would need a sibling patch), so pre-side reads as `null`.
         last_forced_gc_count=$(grep '^SIGIL_COUNTER_FORCED_GC_COUNT=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
-        # Plan E2 alloc-trampoline-elision Task 6 — count of allocs
-        # that took the elided fast path (`SIGIL_ALLOC_ELIDE_WRAP=1`
-        # AND thread not parked in `GC_do_blocking`). Counter is
-        # introduced post-PR-#181, so pre-checkpoint builds will not
-        # emit this line. The operator's sanity check for a green
-        # Task 6 run is `alloc_wrap_elided_count > 0` on the post
-        # side AND `null` on the pre side — disambiguates "elision
-        # fires but TLS-read cost eats the win" from "elision never
-        # fired because env didn't reach runtime", per the plan
-        # body's Task 6 conclusion-branch criteria.
+        # Elided-fast-path count. Pre-#181 builds don't emit this
+        # counter line; the extract falls through to `null` below.
         last_alloc_wrap_elided_count=$(grep '^SIGIL_COUNTER_ALLOC_WRAP_ELIDED_COUNT=' "$stderr_log" \
             | tail -1 | cut -d= -f2 || true)
         if [[ -z "$last_alloc_count" || -z "$last_alloc_bytes" ]]; then
