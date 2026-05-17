@@ -1408,12 +1408,51 @@ impl<'a> Monomorphizer<'a> {
                 }
                 p.clone()
             }
-            Pattern::Tuple(ps, span) => Pattern::Tuple(
-                ps.iter()
-                    .map(|sp| self.rewrite_pattern(sp, scrut_ty))
-                    .collect(),
-                span.clone(),
-            ),
+            Pattern::Tuple(ps, span) => {
+                // Thread element types through to the sub-pattern
+                // rewrites so any inner ctor patterns can pin their
+                // owning type's type_args and enqueue the right
+                // monomorphic instantiation. Without this, a match
+                // on `(string_char_at(s,0), string_char_at(s,1))`
+                // bound to `(Some(a), Some(b))` never enqueues
+                // `Option[Char]`, and codegen ICEs at the
+                // `Some$$Char` ctor_index lookup.
+                //
+                // The arity guard preserves the typecheck invariant
+                // (E0117 rejects mismatched arity upstream) — the
+                // debug_assert catches a typecheck bug eagerly while
+                // the release fallback degrades to None-threading
+                // rather than panicking.
+                let elem_tys: Option<&[Ty]> = match scrut_ty {
+                    Some(Ty::Tuple(ts)) => {
+                        debug_assert_eq!(
+                            ts.len(),
+                            ps.len(),
+                            "mono: Pattern::Tuple arity ({}) ≠ Ty::Tuple arity ({}) — \
+                             typecheck E0117 should have rejected this",
+                            ps.len(),
+                            ts.len(),
+                        );
+                        if ts.len() == ps.len() {
+                            Some(ts.as_slice())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                Pattern::Tuple(
+                    ps.iter()
+                        .enumerate()
+                        .map(|(i, sp)| {
+                            let inner_scrut: Option<Ty> =
+                                elem_tys.and_then(|ts| ts.get(i).cloned());
+                            self.rewrite_pattern(sp, &inner_scrut)
+                        })
+                        .collect(),
+                    span.clone(),
+                )
+            }
             Pattern::Ctor { name, fields, span } => {
                 // Resolve the ctor's owning type and determine the
                 // type-arg tuple to mangle the ctor name with.
@@ -2650,6 +2689,153 @@ mod tests {
     }
 
     #[test]
+    fn tuple_pattern_threads_inner_scrut_ty_to_inner_ctor() {
+        // Regression: tuple-pattern lowering must thread per-element
+        // scrut_ty to its sub-patterns so any inner ctor pattern can
+        // pin its owning type's type_args and enqueue the matching
+        // monomorphic instance. Pre-fix: a match like
+        // `match (opt_a, opt_b) { (Some(x), Some(y)) => ... }` over a
+        // `(Option[Int], Option[Int])` scrutinee never enqueued
+        // Option[Int], and codegen ICEd at the `Some$$Int` lookup.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let a: Option[Int] = Some(1);
+                let b: Option[Int] = Some(2);
+                match (a, b) {
+                    (Some(x), Some(y)) => x + y,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw_some_inner = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            // The bug surfaced as unmangled `Some` in tuple-element
+            // position, so guard explicitly against the pre-fix shape.
+            assert_ne!(
+                name, "Some",
+                "tuple-element Some must be mangled — Pattern::Tuple \
+                 must thread elem_tys into rewrite_pattern"
+            );
+            if name == "Some$$Int" {
+                saw_some_inner = true;
+            }
+        });
+        assert!(
+            saw_some_inner,
+            "Some$$Int must appear in tuple-element pattern positions"
+        );
+        assert!(
+            find_type(&items, "Option$$Int").is_some(),
+            "Option$$Int must be enqueued by the tuple-element rewrite path"
+        );
+    }
+
+    #[test]
+    fn tuple_pattern_threads_inner_scrut_ty_to_inner_ctor_char_variant() {
+        // Pins the original ICE-trigger type (Option[Char]) — symmetric
+        // to the Int case in mono but cheap insurance that the type-arg
+        // threading isn't accidentally Int-specific.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let a: Option[Char] = Some('a');
+                let b: Option[Char] = Some('b');
+                match (a, b) {
+                    (Some(_x), Some(_y)) => 1,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(name, "Some", "tuple-element Some must be mangled (Char)");
+            if name == "Some$$Char" {
+                saw = true;
+            }
+        });
+        assert!(saw, "Some$$Char must appear in tuple-element positions");
+        assert!(find_type(&items, "Option$$Char").is_some());
+    }
+
+    #[test]
+    fn nested_tuple_pattern_threads_through_outer_and_inner_tuples() {
+        // Tuple-inside-tuple: the recursion must keep unpacking
+        // Ty::Tuple at each level so the deepest ctor sees the right
+        // user-type scrut. Shape `((Some(x), b), c)` over
+        // `((Option[Int], Bool), Bool)`.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let a: Option[Int] = Some(7);
+                let b: Bool = true;
+                let c: Bool = false;
+                match ((a, b), c) {
+                    ((Some(x), _), _) => x,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(name, "Some", "deeply-nested Some must still mangle");
+            if name == "Some$$Int" {
+                saw = true;
+            }
+        });
+        assert!(
+            saw,
+            "Some$$Int must reach mangling through two tuple levels"
+        );
+        assert!(find_type(&items, "Option$$Int").is_some());
+    }
+
+    #[test]
+    fn ctor_wrapping_tuple_with_inner_ctor_threads_both_paths() {
+        // Ctor-around-tuple-around-ctor: `Some((Some(x), b))` over
+        // `Option[(Option[Int], Bool)]`. Exercises Ctor → Tuple →
+        // Ctor recursion — both arms must thread scrut_ty correctly
+        // for the inner Some to pick up Int. Outer Some is mangled
+        // against the synthetic tuple type-arg (`Tuple$$Option$Int$Bool`
+        // or similar per mangle_type's tuple-canon scheme); the inner
+        // is mangled against Int.
+        let src = r#"
+            type Option[A] = | None | Some(A)
+            fn main() -> Int ![] {
+                let inner: Option[Int] = Some(7);
+                let outer: Option[(Option[Int], Bool)] = Some((inner, true));
+                match outer {
+                    Some((Some(x), _)) => x,
+                    _ => 0,
+                }
+            }
+        "#;
+        let items = run_pipeline_to_mono(src);
+        let main = find_fn(&items, "main").expect("main");
+        let mut saw_inner_some = false;
+        walk_block_for_ctor_patterns(&main.body, &mut |name| {
+            assert_ne!(
+                name, "Some",
+                "ctor-wrapping-tuple-wrapping-ctor: bare Some forbidden post-mono"
+            );
+            if name == "Some$$Int" {
+                saw_inner_some = true;
+            }
+        });
+        assert!(
+            saw_inner_some,
+            "Some$$Int (inner-most) must appear; otherwise Tuple arm dropped the field_ty"
+        );
+        assert!(find_type(&items, "Option$$Int").is_some());
+    }
+
+    #[test]
     fn effect_row_var_preserved_on_clone_passes_codegen_walker() {
         // Reviewer round-3 closure: pin the effect_row_var
         // preservation invariant. Plan B v1 doesn't monomorphize
@@ -2818,21 +3004,39 @@ mod tests {
     }
 
     fn walk_pattern_for_ctor(p: &Pattern, cb: &mut impl FnMut(&str)) {
-        if let Pattern::Ctor { name, fields, .. } = p {
-            cb(name);
-            match fields {
-                CtorPatternFields::Unit => {}
-                CtorPatternFields::Positional(ps) => {
-                    for sp in ps {
-                        walk_pattern_for_ctor(sp, cb);
+        match p {
+            Pattern::Ctor { name, fields, .. } => {
+                cb(name);
+                match fields {
+                    CtorPatternFields::Unit => {}
+                    CtorPatternFields::Positional(ps) => {
+                        for sp in ps {
+                            walk_pattern_for_ctor(sp, cb);
+                        }
                     }
-                }
-                CtorPatternFields::Record(fs) => {
-                    for f in fs {
-                        walk_pattern_for_ctor(&f.pattern, cb);
+                    CtorPatternFields::Record(fs) => {
+                        for f in fs {
+                            walk_pattern_for_ctor(&f.pattern, cb);
+                        }
                     }
                 }
             }
+            // Tuple patterns nest sub-patterns whose ctors must also
+            // reach the mono pre-pass — e.g. `(Some(x), Some(y))` over
+            // a `(Option[T], Option[T])` scrutinee. Without this arm,
+            // the inner `Some` ctors never get registered and codegen
+            // ICEs at the ctor_index lookup.
+            Pattern::Tuple(ps, _) => {
+                for sp in ps {
+                    walk_pattern_for_ctor(sp, cb);
+                }
+            }
+            // Leaf patterns carry no nested ctors.
+            Pattern::IntLit(_, _)
+            | Pattern::BoolLit(_, _)
+            | Pattern::CharLit(_, _)
+            | Pattern::Wildcard(_)
+            | Pattern::Var(_, _) => {}
         }
     }
 }

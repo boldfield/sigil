@@ -1,8 +1,8 @@
 # Cross-language LLM authorship comparison
 
-Rough comparison harness for measuring LLM ability to produce working programs across **Sigil**, **Python**, and **Go**, given identical problem statements.
+Rough comparison harness for measuring LLM ability to produce working programs across **Sigil**, **Python**, **Go**, and **Rust**, given identical problem statements.
 
-This is a **sketch** — the structural pieces (prompts, oracles, per-language eval drivers) work today. The Claude-API integration step is a stub. A more rigorous methodology is being developed separately; this directory captures the rough shape so the methodology work has something concrete to evolve.
+This is a **sketch** — the structural pieces (prompts, oracles, per-language eval drivers) work today. Claude calls route through `claude -p` (Claude Code headless mode), so they bill against the user's Claude subscription rather than an API key. A more rigorous methodology is being developed separately; this directory captures the rough shape so the methodology work has something concrete to evolve.
 
 ## Thesis
 
@@ -20,11 +20,14 @@ comp/
     sigil.md                 system prompt prefix for Sigil sessions
     python.md                system prompt prefix for Python sessions
     go.md                    system prompt prefix for Go sessions
+    rust.md                  system prompt prefix for Rust sessions
   scripts/
     eval-sigil.sh            compile + run + diff oracle for one Sigil program
     eval-python.sh           same shape for Python
     eval-go.sh               same shape for Go
-    compare.sh               orchestrator: iterates (prompt × language), calls eval drivers
+    eval-rust.sh             same shape for Rust
+    compare.py               full harness: per-cell `claude -p` + edit loop + report
+    compare.sh               thin wrapper that invokes compare.py
   log/                       result logs (one file per run)
 ```
 
@@ -54,15 +57,26 @@ Each driver prints `pass` or `fail: <reason>` and exits 0/1.
 
 ## Running the full comparison
 
-`scripts/compare.py` (driven by `scripts/compare.sh`) implements the full Claude API loop. For each `(prompt × language × model × run)` it sends the prompt to Claude with the language-specific system context, extracts the program from the response's fenced code block, hands it to the matching `eval-<lang>.sh` driver, and records the result. On first-shot failure it sends a follow-up turn with the eval driver's failure category for an after-one-edit retry.
+`scripts/compare.py` (driven by `scripts/compare.sh`) implements the full Claude loop via `claude -p` (Claude Code headless mode). For each `(prompt × language × model × run)` it sends the prompt to Claude with the language-specific system context, extracts the program from the response's fenced code block, hands it to the matching `eval-<lang>.sh` driver, and records the result. On first-shot failure it sends a follow-up turn (via `--resume <session-id>`, so the system prompt isn't resent) with the eval driver's failure category for an after-one-edit retry.
+
+**Auth:** Calls go through the Claude Code CLI, which inherits your subscription auth (`claude /login`) or a long-lived OAuth token (`claude setup-token`, then export `CLAUDE_CODE_OAUTH_TOKEN`). No `ANTHROPIC_API_KEY` is needed or used.
+
+**Rate-limit reality:** Subscription access is metered by 5-hour and weekly windows, not per-request billing. Defaults are tuned for **grammar-change iteration** — Sigil only, Haiku + Sonnet. Two convenience flags expand scope:
+
+- `--all-langs` adds Python/Go/Rust for cross-language thesis comparisons.
+- `--full` adds Opus on top for before/after measurements.
+
+A full `(20 prompts × 4 langs × 3 models × N runs × ≤2 turns)` matrix can hit the rate-limit caps, especially the Opus runs. Use `--filter` and `--no-edit-loop` for cheap iteration and reserve `--all-langs --full` K/N runs for the comparisons that need it.
 
 ```shell
-export ANTHROPIC_API_KEY=sk-...
+# Prereq: Claude Code installed and authenticated.
 cargo build --release        # sigil eval driver invokes target/release/sigil
 
-./comp/scripts/compare.sh                                  # full bank, both models, all langs
+./comp/scripts/compare.sh                                  # full bank, sigil only, Haiku+Sonnet
 ./comp/scripts/compare.sh --filter C01 --runs 3            # one prompt, K/N aggregation
 ./comp/scripts/compare.sh --langs sigil,python --models claude-opus-4-7
+./comp/scripts/compare.sh --all-langs                      # cross-language baseline
+./comp/scripts/compare.sh --all-langs --full --runs 5      # full thesis comparison
 ./comp/scripts/compare.sh --no-edit-loop                   # measure first-shot only
 ```
 

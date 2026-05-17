@@ -9,9 +9,11 @@
 #
 # See comp/scripts/compare.py --help for full options.
 #
-# Required env: ANTHROPIC_API_KEY
+# Required: `claude` binary on PATH and authenticated (either via
+#           `claude /login` or `claude setup-token` + export
+#           CLAUDE_CODE_OAUTH_TOKEN). Subscription-billed; no API key.
 # Required build: `cargo build --release` (sigil eval driver invokes target/release/sigil)
-# Required tools: python3, go (1.21+) for the eval drivers
+# Required tools: python3, go (1.21+), rustc for the eval drivers
 
 set -euo pipefail
 
