@@ -728,10 +728,12 @@ static FORCE_GC_ALLOC_COUNTER: AtomicU64 = AtomicU64::new(0);
 static FORCE_GC_CADENCE: OnceLock<Option<NonZeroU64>> = OnceLock::new();
 
 /// Parsed `SIGIL_ALLOC_ELIDE_WRAP` flag. `Some(true)` by default —
-/// the elision opts in unless the env var is exactly `"0"`. Pre-init
-/// reads as `None` and route through the safe wrap path. Task 7
-/// flipped the default to opt-out after the cross-check + throughput
-/// gates cleared (see `compiler/docs/plan-e2-phase-3-alloc-trampoline-elision.md`).
+/// the elision opts in unless the env var is exactly `"0"`. Unset,
+/// empty (`""`), `"1"`, `"true"`, `"false"`, and any other value
+/// all leave elision enabled; only the literal `"0"` opts out
+/// (escape valve for debugging). Pre-init reads as `None` and route
+/// through the safe wrap path. Rationale + measurement provenance:
+/// `compiler/docs/plan-e2-phase-3-alloc-trampoline-elision.md`.
 static ELISION_ENABLED: OnceLock<bool> = OnceLock::new();
 
 #[inline]
@@ -2351,14 +2353,36 @@ mod tests {
     }
 
     #[test]
-    fn sigil_alloc_elide_wrap_typo_values_cache_true() {
-        // Task 7: only exact `"0"` opts out. Typo values
-        // (`"true"`/`"false"`/`"off"`/etc.) leave elision enabled —
-        // operator who wants the safe path must type `"0"` precisely.
+    fn sigil_alloc_elide_wrap_false_value_caches_true() {
+        // Only exact `"0"` opts out. Other non-`"0"` values
+        // (`"true"`/`"false"`/`"off"`/etc.) leave elision enabled.
+        // `"false"` is the representative; the parse uses a strict
+        // string match so the other shapes follow trivially.
         if !in_gc_stress_subprocess() {
             run_gc_stress_in_subprocess_with_env(
-                "sigil_alloc_elide_wrap_typo_values_cache_true",
+                "sigil_alloc_elide_wrap_false_value_caches_true",
                 &[("SIGIL_ALLOC_ELIDE_WRAP", "false")],
+            );
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        sigil_gc_init();
+        assert_eq!(alloc_elide_wrap_cached(), Some(true));
+    }
+
+    #[test]
+    fn sigil_alloc_elide_wrap_empty_string_caches_true() {
+        // Explicit pin: `SIGIL_ALLOC_ELIDE_WRAP=""` leaves elision
+        // enabled. Distinct from "unset" at the OS level (the env
+        // var is set, just to an empty value), but parsed identically
+        // here because the strict `"0"` shape rejects everything that
+        // isn't literally `"0"`. Codifies the intentional behavior so
+        // a future parse change can't silently flip empty-string
+        // semantics without tripping a test.
+        if !in_gc_stress_subprocess() {
+            run_gc_stress_in_subprocess_with_env(
+                "sigil_alloc_elide_wrap_empty_string_caches_true",
+                &[("SIGIL_ALLOC_ELIDE_WRAP", "")],
             );
             return;
         }
