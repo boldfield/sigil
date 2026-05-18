@@ -951,9 +951,11 @@ def _build_run_slug(
         parts.append("cross")
     if full:
         parts.append("full")
-    if runs > 1 and not tier:
-        # Skip r<N> when tier already implies the run count; keeps the
-        # slug from saying baseline-r10 redundantly.
+    tier_default = resolve_runs(tier=tier, explicit_runs=None) if tier else 1
+    if runs > 1 and runs != tier_default:
+        # Include r<N> when runs diverges from the tier default (or there's
+        # no tier). Omit it when the tier already implies the count, to
+        # avoid redundant baseline-r10 slugs.
         parts.append(f"r{runs}")
     if no_edit_loop:
         parts.append("noedit")
@@ -1171,8 +1173,8 @@ def main() -> int:
         tier=args.tier,
     )
     stem = f"comparison-log-{timestamp}" + (f"-{run_slug}" if run_slug else "")
-    tier_suffix = f"-{args.tier}" if args.tier else ""
-    jsonl_path = results_dir / f"comparison-results-{timestamp}{tier_suffix}.jsonl"
+    slug_suffix = f"-{run_slug}" if run_slug else ""
+    jsonl_path = results_dir / f"comparison-results-{timestamp}{slug_suffix}.jsonl"
     md_latest_path = results_dir / "comparison-log.md"
     md_run_path = results_dir / f"{stem}.md"
     write_jsonl(results, jsonl_path, tier=args.tier, corpus_version=corpus_version)

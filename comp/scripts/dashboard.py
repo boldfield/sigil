@@ -84,6 +84,11 @@ def load_traces(paths: list[pathlib.Path]) -> LoadedTraces:
     unique_tiers = set(non_null_tiers)
     tier = non_null_tiers[0] if len(unique_tiers) == 1 else None
     mixed_tiers = len(unique_tiers) > 1
+    if has_legacy and len(unique_tiers) >= 1:
+        # A legacy trace (no tier) loaded alongside a tiered trace mixes
+        # K-unknown cells with K=N cells — same hazard as multiple distinct
+        # tiers.
+        mixed_tiers = True
     return LoadedTraces(
         rows=rows,
         source_paths=paths,
@@ -96,11 +101,26 @@ def load_traces(paths: list[pathlib.Path]) -> LoadedTraces:
 
 
 def _resolve_latest_trace(tier: str) -> pathlib.Path:
-    """Find the newest comparison-results-*-<tier>.jsonl in LOG_DIR."""
-    candidates = sorted(LOG_DIR.glob(f"comparison-results-*-{tier}.jsonl"))
+    """Find the newest comparison-results-<ts>-<slug>.jsonl where the slug
+    contains <tier>. Slug may also encode --filter, --all-langs, --full,
+    --runs override, or --no-edit-loop, so multiple distinct runs can match
+    the same tier. We sort by file mtime (lexicographic order on the
+    timestamp prefix would also work today since timestamps are fixed-width
+    ISO, but mtime survives a future filename refactor)."""
+    candidates = sorted(
+        LOG_DIR.glob(f"comparison-results-*-{tier}*.jsonl"),
+        key=lambda p: p.stat().st_mtime,
+    )
     if not candidates:
         raise FileNotFoundError(
             f"no trace files matching tier {tier!r} in {LOG_DIR}"
+        )
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates)
+        print(
+            f"dashboard.py: --latest-tier {tier} matched {len(candidates)} candidates "
+            f"({names}); picking newest by mtime: {candidates[-1].name}",
+            file=sys.stderr,
         )
     return candidates[-1]
 
@@ -262,15 +282,22 @@ def _render_cluster_histogram(loaded: LoadedTraces) -> list[str]:
         models_per_cluster.setdefault(cluster.id, set()).add(row["model"])
         cluster_meta[cluster.id] = cluster
     cluster_meta.setdefault(clusters.UNCATEGORIZED.id, clusters.UNCATEGORIZED)
+    _compile_other = next(c for c in clusters.CLUSTER_TAXONOMY if c.id == "compile-other")
+    cluster_meta.setdefault("compile-other", _compile_other)
 
     out: list[str] = []
     out.append("## Cluster histogram\n")
+    out.append("Counts every failed attempt (first AND edit). A cell where both the first "
+               "and edit turn failed in the same category contributes twice — this is the "
+               "natural unit for prioritizing interventions, since a fix to the category "
+               "reduces failures on both turns.")
+    out.append("")
     if not counts:
         out.append("_No failures in the loaded traces._")
         out.append("")
         return out
     total = sum(counts.values())
-    out.append("| Cluster | Count | % of failures | Models affected | Suggested lever |")
+    out.append("| Cluster | Failed attempts | % of failures | Models affected | Suggested lever |")
     out.append("|---|---|---|---|---|")
     # Maintenance queue: uncategorized + compile-other first regardless of count.
     priority = ["uncategorized", "compile-other"]
@@ -310,11 +337,14 @@ def _render_ecode_histogram(loaded: LoadedTraces) -> list[str]:
 
     out: list[str] = []
     out.append("## Per-E-code histogram\n")
+    out.append("Counts E-codes per failed attempt, deduped within a single attempt. "
+               "A cell with the same E-code on both first and edit turns contributes twice.")
+    out.append("")
     if not counts:
         out.append("_No E-codes found in failure details._")
         out.append("")
         return out
-    out.append("| E-code | Count |")
+    out.append("| E-code | Failed attempts |")
     out.append("|---|---|")
     for code in sorted(counts, key=lambda c: (-counts[c], c)):
         out.append(f"| `{code}` | {counts[code]} |")
@@ -335,12 +365,14 @@ def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
         buckets.setdefault(cluster.id, []).append((row, attempt_name, attempt))
         cluster_meta[cluster.id] = cluster
 
-    # Harness-level failures — neither first_attempt nor edit_attempt exists.
-    # These rows are counted in topline but classify_failure can't see them,
-    # so surface them explicitly here so the topline denominators reconcile.
-    harness_rows = [r for r in loaded.rows if r.get("error") and r.get("first_attempt") is None]
+    # Pre-eval failures — the claude -p call (first or edit turn) threw before
+    # eval could run. These rows are counted in topline but classify_failure
+    # can't see them, so surface them explicitly here so the topline
+    # denominators reconcile. Note: edit-turn failures have first_attempt
+    # populated but edit_attempt=None and error set.
+    pre_eval_error_rows = [r for r in loaded.rows if r.get("error") is not None]
 
-    if not buckets and not harness_rows:
+    if not buckets and not pre_eval_error_rows:
         out.append("_No failures in the loaded traces._")
         out.append("")
         return out
@@ -363,12 +395,14 @@ def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
                 out.append("  ```")
         out.append("\n</details>\n")
 
-    if harness_rows:
-        out.append("### Harness errors\n")
-        out.append(f"<details><summary>{len(harness_rows)} cell(s) failed before eval</summary>\n")
-        for r in harness_rows:
+    if pre_eval_error_rows:
+        out.append("### Pre-eval run errors\n")
+        out.append(f"<details><summary>{len(pre_eval_error_rows)} cell(s) where the claude -p "
+                   f"call (first or edit turn) failed before eval</summary>\n")
+        for r in pre_eval_error_rows:
+            turn = "first turn" if r.get("first_attempt") is None else "edit turn"
             out.append(
-                f"- **{r['prompt_id']}** × `{r['model']}` (run {r['run_idx']}): "
+                f"- **{r['prompt_id']}** × `{r['model']}` (run {r['run_idx']}, {turn}): "
                 f"{r['error']}"
             )
         out.append("\n</details>\n")

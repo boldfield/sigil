@@ -68,6 +68,24 @@ def test_no_tier_defaults_to_runs_1():
     assert resolved == 1
 
 
+def test_build_run_slug_keeps_r_suffix_when_tier_and_runs_override():
+    slug = compare._build_run_slug(
+        filter_expr=None, full=False, all_langs=False,
+        runs=3, no_edit_loop=False, tier="baseline",
+    )
+    assert "r3" in slug
+    assert "baseline" in slug
+
+
+def test_build_run_slug_drops_r_suffix_when_runs_matches_tier_default():
+    slug = compare._build_run_slug(
+        filter_expr=None, full=False, all_langs=False,
+        runs=10, no_edit_loop=False, tier="baseline",
+    )
+    assert "r10" not in slug
+    assert slug == "baseline"
+
+
 def test_write_jsonl_emits_tier_and_corpus_version(tmp_path):
     out = tmp_path / "trace.jsonl"
     results = [

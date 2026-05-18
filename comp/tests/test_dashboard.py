@@ -391,7 +391,7 @@ def test_failure_detail_surfaces_harness_errors(tmp_path):
     }
     trace = _make_trace(tmp_path, "trace.jsonl", [harness_row])
     out = dashboard.render(dashboard.load_traces([trace]))
-    assert "Harness errors" in out
+    assert "Pre-eval run errors" in out
     assert "C01" in out
     assert "429" in out
 
@@ -403,3 +403,152 @@ def test_failure_detail_no_failures_when_no_buckets_and_no_harness(tmp_path):
     assert "Failure detail by cluster" in out
     detail = out.split("## Failure detail by cluster", 1)[1].split("## ", 1)[0]
     assert "No failures in the loaded traces" in detail
+
+
+# ---------------------------------------------------------------------------
+# Item A — pre-seed compile-other
+# ---------------------------------------------------------------------------
+
+def test_cluster_histogram_seeds_compile_other_at_zero_when_absent(tmp_path):
+    rows = [
+        # Only an arith failure; no compile-other failures.
+        _row(prompt_id="C07", first_passed=False,
+             first_detail="error[E0042]: requires `ArithError` in the enclosing function's effect row",
+             final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    cluster_section = out.split("## Cluster histogram", 1)[1].split("##", 1)[0]
+    # uncategorized and compile-other should both appear with count 0.
+    assert "uncategorized" in cluster_section
+    assert "compile-other" in cluster_section
+
+
+# ---------------------------------------------------------------------------
+# Item B — column rename + double-counting test
+# ---------------------------------------------------------------------------
+
+def test_cluster_histogram_counts_both_first_and_edit_failures(tmp_path):
+    """A cell with the same cluster on both turns contributes 2, not 1.
+    Per-attempt is the natural unit; the column is labeled accordingly."""
+    rows = [
+        {
+            "prompt_id": "C07", "language": "sigil",
+            "model": "claude-sonnet-4-6", "run_idx": 0,
+            "tier": "baseline",
+            "corpus_version": {"git_sha": "a", "teaching_hash": "1"},
+            "first_attempt": {
+                "program": "x", "raw_response": "x",
+                "eval_passed": False, "eval_category": "compile",
+                "eval_detail": "error[E0042]: requires `ArithError` in the enclosing function's effect row",
+                "eval_raw_output": "",
+            },
+            "edit_attempt": {
+                "program": "y", "raw_response": "y",
+                "eval_passed": False, "eval_category": "compile",
+                "eval_detail": "error[E0042]: requires `ArithError` in the enclosing function's effect row",
+                "eval_raw_output": "",
+            },
+            "final_pass": False, "error": None,
+        },
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    arith_line = next(l for l in out.splitlines() if "effect-row-missing-arith" in l)
+    assert "| 2 |" in arith_line
+    assert "Failed attempts" in out  # column label confirms the unit
+
+
+# ---------------------------------------------------------------------------
+# Item C — edit-turn error surfacing
+# ---------------------------------------------------------------------------
+
+def test_failure_detail_surfaces_edit_turn_errors(tmp_path):
+    """Row where first_attempt succeeded eval (well, failed it) but edit-turn
+    claude -p threw — error is set, first_attempt is populated, edit_attempt is None."""
+    edit_error_row = {
+        "prompt_id": "C09", "language": "sigil",
+        "model": "claude-sonnet-4-6", "run_idx": 0,
+        "tier": "baseline",
+        "corpus_version": {"git_sha": "a", "teaching_hash": "1"},
+        "first_attempt": {
+            "program": "x", "raw_response": "x",
+            "eval_passed": False, "eval_category": "compile",
+            "eval_detail": "error[E0010]", "eval_raw_output": "",
+        },
+        "edit_attempt": None,
+        "final_pass": False,
+        "error": "claude -p (edit-loop turn) failed: 429 Too Many Requests",
+    }
+    trace = _make_trace(tmp_path, "trace.jsonl", [edit_error_row])
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "Pre-eval run errors" in out
+    assert "edit turn" in out
+    assert "429" in out
+    assert "C09" in out
+
+
+# ---------------------------------------------------------------------------
+# Item D — resolve_latest_trace picks newest by mtime
+# ---------------------------------------------------------------------------
+
+def test_resolve_latest_trace_picks_newest_among_multiple(tmp_path, monkeypatch):
+    """Multiple matching files; pick the one with the newest mtime."""
+    import os
+    monkeypatch.setattr(dashboard, "LOG_DIR", tmp_path)
+    older = tmp_path / "comparison-results-20260101T000000-baseline.jsonl"
+    newer = tmp_path / "comparison-results-20260102T000000-baseline-cross.jsonl"
+    older.write_text('{"prompt_id":"C01","language":"sigil","model":"x","run_idx":0,'
+                     '"first_attempt":null,"edit_attempt":null,"final_pass":false,"error":"e"}\n')
+    newer.write_text('{"prompt_id":"C01","language":"sigil","model":"x","run_idx":0,'
+                     '"first_attempt":null,"edit_attempt":null,"final_pass":false,"error":"e"}\n')
+    # Make older actually older by mtime.
+    older_time = newer.stat().st_mtime - 100
+    os.utime(older, (older_time, older_time))
+    picked = dashboard._resolve_latest_trace("baseline")
+    assert picked.name == newer.name
+
+
+# ---------------------------------------------------------------------------
+# Item E — legacy + tiered → mixed_tiers=True
+# ---------------------------------------------------------------------------
+
+def test_load_traces_treats_legacy_plus_tiered_as_mixed_tiers(tmp_path):
+    cv = {"git_sha": "a", "teaching_hash": "1"}
+    legacy = {
+        "prompt_id": "C01", "language": "sigil", "model": "x",
+        "run_idx": 0,
+        # No tier or corpus_version fields — pre-schema row.
+        "first_attempt": {
+            "program": "x", "raw_response": "x", "eval_passed": True,
+            "eval_category": None, "eval_detail": "pass", "eval_raw_output": "pass",
+        },
+        "edit_attempt": None, "final_pass": True, "error": None,
+    }
+    legacy_path = _make_trace(tmp_path, "legacy.jsonl", [legacy])
+    tiered_path = _make_trace(tmp_path, "tiered.jsonl",
+                              [_row(tier="baseline", corpus_version=cv)])
+    loaded = dashboard.load_traces([legacy_path, tiered_path])
+    assert loaded.has_legacy_rows is True
+    assert loaded.mixed_tiers is True
+
+
+# ---------------------------------------------------------------------------
+# Item K — combined mixed_corpus_version + mixed_tier test
+# ---------------------------------------------------------------------------
+
+def test_render_header_warns_on_both_mixed_corpus_versions_and_mixed_tiers(tmp_path):
+    a = _make_trace(tmp_path, "a.jsonl",
+                    [_row(tier="baseline",
+                          corpus_version={"git_sha": "aaa", "teaching_hash": "111"})])
+    b = _make_trace(tmp_path, "b.jsonl",
+                    [_row(tier="iteration",
+                          corpus_version={"git_sha": "bbb", "teaching_hash": "222"})])
+    loaded = dashboard.load_traces([a, b])
+    assert loaded.mixed_corpus_versions is True
+    assert loaded.mixed_tiers is True
+    out = dashboard.render(loaded)
+    # Both warnings must appear in the header section.
+    assert out.count("⚠️ **WARNING:**") >= 2
+    assert "corpus_version" in out
+    assert "multiple tiers" in out
