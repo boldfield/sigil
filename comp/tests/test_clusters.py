@@ -82,11 +82,18 @@ def test_syntax_parse_error():
 
 
 def test_wrong_output_category():
-    row = _row(eval_category="wrong_output",
+    row = _row(eval_category="stdout",
                eval_detail="expected 42 got 24",
                eval_raw_output="diff: expected 42 got 24")
     cluster = clusters.classify_failure(row, attempt="first")
     assert cluster.id == "wrong-output"
+
+
+def test_no_code_block_category():
+    row = _row(eval_category="no-code-block",
+               eval_detail="model produced no extractable program")
+    cluster = clusters.classify_failure(row, attempt="first")
+    assert cluster.id == "no-code-block"
 
 
 def test_runtime_panic_category():
@@ -143,3 +150,30 @@ def test_edit_attempt_classification():
     edit = clusters.classify_failure(row, attempt="edit")
     assert first.id == "syntax-parse-error"
     assert edit.id == "mut-array-element-type"
+
+
+def test_classify_returns_none_when_eval_passed_is_none():
+    """Attempt present but eval failed to run (eval_passed is None) — skip it."""
+    row = {
+        "first_attempt": {
+            "eval_passed": None,
+            "eval_category": None,
+            "eval_detail": "",
+            "eval_raw_output": "",
+        },
+        "edit_attempt": None,
+    }
+    assert clusters.classify_failure(row, attempt="first") is None
+
+
+def test_classify_returns_none_when_edit_attempt_missing():
+    row = {
+        "first_attempt": {
+            "eval_passed": False,
+            "eval_category": "compile",
+            "eval_detail": "error[E0010]",
+            "eval_raw_output": "",
+        },
+        "edit_attempt": None,
+    }
+    assert clusters.classify_failure(row, attempt="edit") is None

@@ -30,7 +30,7 @@ class Cluster:
 
 
 def _re(pattern: str) -> re.Pattern[str]:
-    return re.compile(pattern, re.IGNORECASE | re.DOTALL)
+    return re.compile(pattern, re.IGNORECASE)
 
 
 def _category_is(want: str) -> Callable[[str, str, str], bool]:
@@ -102,7 +102,7 @@ CLUSTER_TAXONOMY: list[Cluster] = [
         id="wrong-output",
         description="Program ran but produced the wrong output (algorithmic mistake)",
         lever="spec/prompt (algorithmic)",
-        matcher=_category_is("wrong_output"),
+        matcher=_category_is("stdout"),
     ),
     Cluster(
         id="runtime-panic",
@@ -115,6 +115,12 @@ CLUSTER_TAXONOMY: list[Cluster] = [
         description="Program exceeded the eval timeout",
         lever="algorithmic / runtime",
         matcher=_category_is("timeout"),
+    ),
+    Cluster(
+        id="no-code-block",
+        description="Model returned no extractable code block",
+        lever="context (prompt formatting / fence instruction)",
+        matcher=_category_is("no-code-block"),
     ),
     # Catch-alls — must be last.
     Cluster(
@@ -139,7 +145,7 @@ def classify_failure(row: dict, *, attempt: Attempt) -> Optional[Cluster]:
     the attempt passed / is missing. Failures that don't match any
     seeded matcher fall back to UNCATEGORIZED."""
     a = row.get(f"{attempt}_attempt")
-    if a is None or a.get("eval_passed"):
+    if a is None or a.get("eval_passed") is not False:
         return None
     category = a.get("eval_category") or ""
     detail = a.get("eval_detail") or ""
