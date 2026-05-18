@@ -80,6 +80,39 @@ cargo build --release        # sigil eval driver invokes target/release/sigil
 ./comp/scripts/compare.sh --no-edit-loop                   # measure first-shot only
 ```
 
+### Tiered runs (recommended for the methodology campaign)
+
+For the first-pass-success measurement campaign, prefer tiered runs:
+
+```shell
+./comp/scripts/compare.sh --tier baseline       # K=10 per cell, authoritative
+./comp/scripts/compare.sh --tier iteration      # K=5 per cell, cheap spot-check
+```
+
+`--tier baseline` sets `--runs 10`; `--tier iteration` sets `--runs 5`.
+Explicit `--runs N` overrides the tier-implied K. The tier label is
+written into the output filename (`comparison-results-<ts>-<tier>.jsonl`)
+and into each JSONL row, so the dashboard can pick the newest baseline
+trace without parsing filenames.
+
+Each row also gets a `corpus_version` field: git short-sha plus a
+SHA-256 of `comp/contexts/sigil.md` and `spec/language.md`
+concatenated. The dashboard refuses (with a prominent warning) to mix
+runs across different `corpus_version`s.
+
+### Rendering the dashboard
+
+```shell
+# Render against the newest baseline-tier trace:
+python3 comp/scripts/dashboard.py --latest-tier baseline
+
+# Render against a specific trace file:
+python3 comp/scripts/dashboard.py --trace comp/log/comparison-results-….jsonl
+```
+
+Writes `comp/log/dashboard-<ts>[-<tier>].md`. Re-rendering is free —
+edit `comp/scripts/clusters.py` and re-run the dashboard in seconds.
+
 Outputs:
 - `comp/log/comparison-results-<timestamp>.jsonl` — per-cell trace (raw response, extracted program, eval pass/category/detail). Local-only (gitignored).
 - `comp/log/comparison-log.md` — markdown report: per-(language, model) pass-rate table + per-prompt × per-cell K/N matrix + **failure-category histogram per language** (the central thesis-relevant comparison).
