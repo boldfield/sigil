@@ -177,3 +177,15 @@ def test_classify_returns_none_when_edit_attempt_missing():
         "edit_attempt": None,
     }
     assert clusters.classify_failure(row, attempt="edit") is None
+
+
+def test_infra_harness_category():
+    row = _row(eval_category="harness", eval_detail="no sigil binary at target/debug")
+    cluster = clusters.classify_failure(row, attempt="first")
+    assert cluster.id == "infra-harness"
+
+
+def test_infra_input_category():
+    row = _row(eval_category="input", eval_detail="program file not found: /tmp/x.sigil")
+    cluster = clusters.classify_failure(row, attempt="first")
+    assert cluster.id == "infra-input"

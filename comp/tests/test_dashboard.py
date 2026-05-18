@@ -375,3 +375,31 @@ def test_after_edit_section_handles_no_failed_edits(tmp_path):
     # The "none" branch should produce a friendly message, not crash.
     after_section = out.split("## After-edit failure diffs", 1)[1]
     assert "no after-edit failures" in after_section.lower()
+
+
+def test_failure_detail_surfaces_harness_errors(tmp_path):
+    # Row with error set and no attempts — simulates run_one_cell catching
+    # a claude-cli exception before eval ever ran.
+    harness_row = {
+        "prompt_id": "C01", "language": "sigil",
+        "model": "claude-haiku-4-5", "run_idx": 0,
+        "tier": "baseline",
+        "corpus_version": {"git_sha": "abc", "teaching_hash": "111"},
+        "first_attempt": None, "edit_attempt": None,
+        "final_pass": False,
+        "error": "claude -p (first turn) failed: 429 Too Many Requests",
+    }
+    trace = _make_trace(tmp_path, "trace.jsonl", [harness_row])
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "Harness errors" in out
+    assert "C01" in out
+    assert "429" in out
+
+
+def test_failure_detail_no_failures_when_no_buckets_and_no_harness(tmp_path):
+    trace = _make_trace(tmp_path, "trace.jsonl", [_row(first_passed=True)])
+    out = dashboard.render(dashboard.load_traces([trace]))
+    # Walk the section and check the empty-state message is present.
+    assert "Failure detail by cluster" in out
+    detail = out.split("## Failure detail by cluster", 1)[1].split("## ", 1)[0]
+    assert "No failures in the loaded traces" in detail

@@ -40,6 +40,20 @@ def _category_is(want: str) -> Callable[[str, str, str], bool]:
 
 
 CLUSTER_TAXONOMY: list[Cluster] = [
+    # Infrastructure failures — highest specificity, fire before effect-row
+    # matchers in case a harness category ever reaches the taxonomy.
+    Cluster(
+        id="infra-input",
+        description="Eval driver could not find the program file (harness pre-flight)",
+        lever="infra (harness bug or filesystem race)",
+        matcher=_category_is("input"),
+    ),
+    Cluster(
+        id="infra-harness",
+        description="Eval driver hit a toolchain/oracle issue, not a corpus signal",
+        lever="infra (missing oracle, missing binary, etc.)",
+        matcher=_category_is("harness"),
+    ),
     # Effect-row teaching gaps — most specific first.
     Cluster(
         id="effect-row-missing-arith",
@@ -160,10 +174,3 @@ def classify_failure(row: dict, *, attempt: Attempt) -> Optional[Cluster]:
             if m(category, detail, raw):
                 return cluster
     return UNCATEGORIZED
-
-
-def all_known_cluster_ids() -> list[str]:
-    """For the dashboard — render zero-count rows for known clusters in
-    seed order. Includes UNCATEGORIZED at the front of the maintenance
-    queue."""
-    return [UNCATEGORIZED.id] + [c.id for c in CLUSTER_TAXONOMY]

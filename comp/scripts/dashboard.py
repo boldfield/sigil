@@ -334,10 +334,17 @@ def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
             continue
         buckets.setdefault(cluster.id, []).append((row, attempt_name, attempt))
         cluster_meta[cluster.id] = cluster
-    if not buckets:
+
+    # Harness-level failures — neither first_attempt nor edit_attempt exists.
+    # These rows are counted in topline but classify_failure can't see them,
+    # so surface them explicitly here so the topline denominators reconcile.
+    harness_rows = [r for r in loaded.rows if r.get("error") and r.get("first_attempt") is None]
+
+    if not buckets and not harness_rows:
         out.append("_No failures in the loaded traces._")
         out.append("")
         return out
+
     for cluster_id in sorted(buckets, key=lambda cid: (-len(buckets[cid]), cid)):
         meta = cluster_meta[cluster_id]
         cluster_items = buckets[cluster_id]
@@ -355,6 +362,17 @@ def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
                     out.append(f"  {detail_line}")
                 out.append("  ```")
         out.append("\n</details>\n")
+
+    if harness_rows:
+        out.append("### Harness errors\n")
+        out.append(f"<details><summary>{len(harness_rows)} cell(s) failed before eval</summary>\n")
+        for r in harness_rows:
+            out.append(
+                f"- **{r['prompt_id']}** × `{r['model']}` (run {r['run_idx']}): "
+                f"{r['error']}"
+            )
+        out.append("\n</details>\n")
+
     return out
 
 
