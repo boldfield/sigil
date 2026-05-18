@@ -119,3 +119,46 @@ def test_render_header_warns_on_legacy_rows(tmp_path):
     trace = _make_trace(tmp_path, "legacy.jsonl", [legacy_row])
     out = dashboard.render(dashboard.load_traces([trace]))
     assert "legacy trace" in out.lower() or "missing corpus_version" in out.lower()
+
+
+def test_load_traces_detects_mixed_tiers(tmp_path):
+    cv = {"git_sha": "aaa", "teaching_hash": "111"}
+    a = _make_trace(tmp_path, "a.jsonl",
+                    [_row(tier="baseline", corpus_version=cv)])
+    b = _make_trace(tmp_path, "b.jsonl",
+                    [_row(tier="iteration", corpus_version=cv)])
+    loaded = dashboard.load_traces([a, b])
+    assert loaded.mixed_tiers is True
+    assert loaded.tier is None
+
+
+def test_load_traces_single_tier_not_mixed(tmp_path):
+    a = _make_trace(tmp_path, "a.jsonl", [_row(tier="baseline")])
+    b = _make_trace(tmp_path, "b.jsonl", [_row(tier="baseline")])
+    loaded = dashboard.load_traces([a, b])
+    assert loaded.mixed_tiers is False
+    assert loaded.tier == "baseline"
+
+
+def test_render_header_warns_on_mixed_tiers(tmp_path):
+    cv = {"git_sha": "aaa", "teaching_hash": "111"}
+    a = _make_trace(tmp_path, "a.jsonl",
+                    [_row(tier="baseline", corpus_version=cv)])
+    b = _make_trace(tmp_path, "b.jsonl",
+                    [_row(tier="iteration", corpus_version=cv)])
+    out = dashboard.render(dashboard.load_traces([a, b]))
+    assert "multiple tiers" in out.lower() or "mixed tier" in out.lower()
+    assert "WARNING" in out
+
+
+def test_load_traces_raises_on_malformed_json(tmp_path):
+    p = tmp_path / "bad.jsonl"
+    p.write_text('{"valid": "row"}\nnot valid json\n')
+    with pytest.raises(ValueError, match="malformed JSON"):
+        dashboard.load_traces([p])
+
+
+def test_resolve_latest_trace_raises_on_empty_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard, "LOG_DIR", tmp_path)
+    with pytest.raises(FileNotFoundError, match="no trace files"):
+        dashboard._resolve_latest_trace("baseline")

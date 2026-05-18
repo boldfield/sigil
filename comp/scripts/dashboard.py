@@ -43,6 +43,7 @@ class LoadedTraces:
     tier: Optional[str]
     corpus_versions: list[dict]
     mixed_corpus_versions: bool
+    mixed_tiers: bool
     has_legacy_rows: bool
 
 
@@ -53,11 +54,16 @@ def load_traces(paths: list[pathlib.Path]) -> LoadedTraces:
     tiers_seen: set[Optional[str]] = set()
     has_legacy = False
     for p in paths:
-        for line in p.read_text().splitlines():
-            line = line.strip()
-            if not line:
+        for line_num, raw_line in enumerate(p.read_text().splitlines(), start=1):
+            stripped = raw_line.strip()
+            if not stripped:
                 continue
-            row = json.loads(line)
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"malformed JSON in {p}:{line_num}: {e}"
+                ) from e
             # Tolerate legacy rows that pre-date the schema additions.
             row.setdefault("tier", None)
             row.setdefault("corpus_version", None)
@@ -73,13 +79,16 @@ def load_traces(paths: list[pathlib.Path]) -> LoadedTraces:
                 corpus_versions.append(cv)
     # If every row had the same tier, surface it; else None (mixed/unknown).
     non_null_tiers = [t for t in tiers_seen if t is not None]
-    tier = non_null_tiers[0] if len(set(non_null_tiers)) == 1 else None
+    unique_tiers = set(non_null_tiers)
+    tier = non_null_tiers[0] if len(unique_tiers) == 1 else None
+    mixed_tiers = len(unique_tiers) > 1
     return LoadedTraces(
         rows=rows,
         source_paths=paths,
         tier=tier,
         corpus_versions=corpus_versions,
         mixed_corpus_versions=len(corpus_versions) > 1,
+        mixed_tiers=mixed_tiers,
         has_legacy_rows=has_legacy,
     )
 
@@ -128,6 +137,12 @@ def _render_header(loaded: LoadedTraces) -> list[str]:
                    "`comp/contexts/sigil.md` or `spec/language.md` states; "
                    "treat comparisons across versions with care.")
         out.append("")
+    if loaded.mixed_tiers:
+        out.append("> ⚠️ **WARNING:** these traces span multiple tiers "
+                   "(e.g. baseline + iteration). Aggregate K/N counts mix "
+                   "runs with different K, which makes per-cell pass rates "
+                   "misleading.")
+        out.append("")
     if loaded.has_legacy_rows:
         out.append("> ℹ️  One or more rows are missing `corpus_version` "
                    "(legacy trace pre-dating the schema). Their `corpus_version` "
@@ -159,7 +174,11 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.latest_tier:
-        paths = [_resolve_latest_trace(args.latest_tier)]
+        try:
+            paths = [_resolve_latest_trace(args.latest_tier)]
+        except FileNotFoundError as e:
+            print(f"dashboard.py: {e}", file=sys.stderr)
+            return 2
     else:
         paths = args.trace
         for p in paths:
