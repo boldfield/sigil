@@ -233,3 +233,71 @@ def test_per_prompt_tables_render_first_and_final(tmp_path):
     # Allow that 3/3 may also appear in topline; check the per-prompt row layout.
     assert "**C01**" in out
     assert "**C02**" in out
+
+
+def test_cluster_histogram_counts_and_levers(tmp_path):
+    rows = [
+        # 2 ArithError misses on sonnet.
+        _row(prompt_id="C07", model="claude-sonnet-4-6", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0042]: requires `ArithError` in the enclosing function's effect row",
+             final_pass=False),
+        _row(prompt_id="C07", model="claude-sonnet-4-6", run_idx=1,
+             first_passed=False,
+             first_detail="error[E0042]: requires `ArithError` in the enclosing function's effect row",
+             final_pass=False),
+        # 1 MutArray[Char] miss on haiku.
+        _row(prompt_id="H01", model="claude-haiku-4-5", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0150]: `MutArray[A]` element type `Char` is not supported",
+             final_pass=False),
+        # 1 pass — should not appear in cluster counts.
+        _row(prompt_id="C01", model="claude-haiku-4-5", run_idx=0, first_passed=True),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## Cluster histogram" in out
+    assert "effect-row-missing-arith" in out
+    assert "mut-array-element-type" in out
+    # Counts in the table: 2 for arith, 1 for mut-array.
+    arith_line = next(l for l in out.splitlines() if "effect-row-missing-arith" in l)
+    mut_line = next(l for l in out.splitlines() if "mut-array-element-type" in l)
+    assert "| 2 |" in arith_line
+    assert "| 1 |" in mut_line
+    # Suggested lever should appear.
+    assert "spec/context" in arith_line
+
+
+def test_cluster_histogram_surfaces_uncategorized_at_top(tmp_path):
+    rows = [
+        _row(prompt_id="X01", first_passed=False,
+             first_detail="error[E9999]: completely novel diagnostic",
+             final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    # uncategorized must appear even with a single hit, at top of section.
+    cluster_section = out.split("## Cluster histogram", 1)[1].split("##", 1)[0]
+    lines = [l for l in cluster_section.splitlines() if "|" in l]
+    # First data row (skip header + divider) should be uncategorized.
+    first_data_row = lines[2]
+    assert "uncategorized" in first_data_row
+
+
+def test_ecode_histogram_extracts_codes(tmp_path):
+    rows = [
+        _row(prompt_id="C07", first_passed=False,
+             first_detail="error[E0042]: requires `ArithError`", final_pass=False),
+        _row(prompt_id="C15", first_passed=False,
+             first_detail="error[E0010]: expected an expression", final_pass=False),
+        _row(prompt_id="C16", first_passed=False,
+             first_detail="error[E0042]: requires `ArithError`", final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## Per-E-code histogram" in out
+    # E0042 should count 2, E0010 should count 1.
+    e42_line = next(l for l in out.splitlines() if "E0042" in l)
+    e10_line = next(l for l in out.splitlines() if "E0010" in l)
+    assert "| 2 |" in e42_line
+    assert "| 1 |" in e10_line

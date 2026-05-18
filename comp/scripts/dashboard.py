@@ -26,6 +26,7 @@ import argparse
 import dataclasses
 import json
 import pathlib
+import re
 import sys
 import time
 from typing import Optional
@@ -107,6 +108,8 @@ def render(loaded: LoadedTraces) -> str:
     lines: list[str] = []
     lines.extend(_render_header(loaded))
     lines.extend(_render_topline(loaded))
+    lines.extend(_render_cluster_histogram(loaded))
+    lines.extend(_render_ecode_histogram(loaded))
     lines.extend(_render_per_prompt_tables(loaded))
     return "\n".join(lines) + "\n"
 
@@ -228,6 +231,91 @@ def _render_per_prompt_tables(loaded: LoadedTraces) -> list[str]:
 
     emit_table("Per-prompt × model — first-pass", first_passed)
     emit_table("Per-prompt × model — final-pass", final_passed)
+    return out
+
+
+_ECODE = re.compile(r"E\d{4}")
+
+
+def _iter_failed_attempts(loaded: LoadedTraces):
+    """Yield (row, attempt_name, attempt_dict) for every failed attempt."""
+    for row in loaded.rows:
+        for name in ("first", "edit"):
+            attempt = row.get(f"{name}_attempt")
+            if attempt is None or attempt.get("eval_passed"):
+                continue
+            yield row, name, attempt
+
+
+def _render_cluster_histogram(loaded: LoadedTraces) -> list[str]:
+    counts: dict[str, int] = {}
+    models_per_cluster: dict[str, set[str]] = {}
+    cluster_meta: dict[str, clusters.Cluster] = {}
+    for row, attempt_name, _attempt in _iter_failed_attempts(loaded):
+        cluster = clusters.classify_failure(row, attempt=attempt_name)
+        if cluster is None:
+            continue
+        counts[cluster.id] = counts.get(cluster.id, 0) + 1
+        models_per_cluster.setdefault(cluster.id, set()).add(row["model"])
+        cluster_meta[cluster.id] = cluster
+    cluster_meta.setdefault(clusters.UNCATEGORIZED.id, clusters.UNCATEGORIZED)
+
+    out: list[str] = []
+    out.append("## Cluster histogram\n")
+    if not counts:
+        out.append("_No failures in the loaded traces._")
+        out.append("")
+        return out
+    total = sum(counts.values())
+    out.append("| Cluster | Count | % of failures | Models affected | Suggested lever |")
+    out.append("|---|---|---|---|---|")
+    # Maintenance queue: uncategorized + compile-other first regardless of count.
+    priority = ["uncategorized", "compile-other"]
+    rest = sorted(
+        (cid for cid in counts if cid not in priority),
+        key=lambda cid: (-counts[cid], cid),
+    )
+    ordered = [cid for cid in priority if cid in cluster_meta] + rest
+    for cid in ordered:
+        cluster_count = counts.get(cid, 0)
+        meta = cluster_meta.get(cid)
+        if meta is None:
+            continue
+        if cid in priority and cluster_count == 0:
+            # Still surface the maintenance queue row, marked empty.
+            out.append(f"| `{cid}` | 0 | — | — | {meta.lever} |")
+            continue
+        pct = f"{100.0 * cluster_count / total:.1f}%"
+        affected_models = ", ".join(sorted(models_per_cluster.get(cid, set())))
+        out.append(f"| `{cid}` | {cluster_count} | {pct} | {affected_models} | {meta.lever} |")
+    out.append("")
+    return out
+
+
+def _render_ecode_histogram(loaded: LoadedTraces) -> list[str]:
+    counts: dict[str, int] = {}
+    for _row, _attempt_name, attempt in _iter_failed_attempts(loaded):
+        haystack = (attempt.get("eval_detail") or "") + "\n" + (attempt.get("eval_raw_output") or "")
+        seen_in_attempt: set[str] = set()
+        for matched_code in _ECODE.findall(haystack):
+            # Count each E-code at most once per attempt — otherwise a
+            # diagnostic that repeats the code in a hint inflates counts.
+            if matched_code in seen_in_attempt:
+                continue
+            seen_in_attempt.add(matched_code)
+            counts[matched_code] = counts.get(matched_code, 0) + 1
+
+    out: list[str] = []
+    out.append("## Per-E-code histogram\n")
+    if not counts:
+        out.append("_No E-codes found in failure details._")
+        out.append("")
+        return out
+    out.append("| E-code | Count |")
+    out.append("|---|---|")
+    for code in sorted(counts, key=lambda c: (-counts[c], c)):
+        out.append(f"| `{code}` | {counts[code]} |")
+    out.append("")
     return out
 
 
