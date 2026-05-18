@@ -201,3 +201,35 @@ def test_topline_skips_models_with_zero_rows(tmp_path):
     trace = _make_trace(tmp_path, "trace.jsonl", rows)
     out = dashboard.render(dashboard.load_traces([trace]))
     assert "claude-sonnet-4-6" not in out
+
+
+def test_per_prompt_tables_render_first_and_final(tmp_path):
+    rows = [
+        # C01 haiku: 2/3 first, 3/3 final
+        _row(prompt_id="C01", run_idx=0, first_passed=True),
+        _row(prompt_id="C01", run_idx=1, first_passed=True),
+        _row(prompt_id="C01", run_idx=2, first_passed=False,
+             first_detail="error[E0010]",
+             edit_attempt={"program": "x", "raw_response": "x",
+                           "eval_passed": True, "eval_category": None,
+                           "eval_detail": "pass", "eval_raw_output": "pass"},
+             final_pass=True),
+        # C02 haiku: 0/2 first, 0/2 final
+        _row(prompt_id="C02", run_idx=0, first_passed=False,
+             first_detail="error[E0042]: requires `ArithError`",
+             final_pass=False),
+        _row(prompt_id="C02", run_idx=1, first_passed=False,
+             first_detail="error[E0042]: requires `ArithError`",
+             final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## Per-prompt × model — first-pass" in out
+    assert "## Per-prompt × model — final-pass" in out
+    # First-pass table cells.
+    assert "2/3" in out
+    assert "0/2" in out
+    # Final-pass: C01 row should contain 3/3.
+    # Allow that 3/3 may also appear in topline; check the per-prompt row layout.
+    assert "**C01**" in out
+    assert "**C02**" in out

@@ -107,6 +107,7 @@ def render(loaded: LoadedTraces) -> str:
     lines: list[str] = []
     lines.extend(_render_header(loaded))
     lines.extend(_render_topline(loaded))
+    lines.extend(_render_per_prompt_tables(loaded))
     return "\n".join(lines) + "\n"
 
 
@@ -178,6 +179,55 @@ def _render_topline(loaded: LoadedTraces) -> list[str]:
                    f"{first_pass}/{n} ({100.0 * first_pass / n:.1f}%) | "
                    f"{final}/{n} ({100.0 * final / n:.1f}%) |")
     out.append("")
+    return out
+
+
+def _cell_kn(cell_rows: list[dict], passed_pred) -> str:
+    n = len(cell_rows)
+    if n == 0:
+        return "—"
+    k = sum(1 for r in cell_rows if passed_pred(r))
+    return f"{k}/{n}"
+
+
+def _render_per_prompt_tables(loaded: LoadedTraces) -> list[str]:
+    out: list[str] = []
+    # Discover models + prompts in first-seen order.
+    models: list[str] = []
+    prompts: list[str] = []
+    seen_models: set[str] = set()
+    seen_prompts: set[str] = set()
+    by_cell: dict[tuple[str, str], list[dict]] = {}
+    for row in loaded.rows:
+        if row["model"] not in seen_models:
+            seen_models.add(row["model"])
+            models.append(row["model"])
+        if row["prompt_id"] not in seen_prompts:
+            seen_prompts.add(row["prompt_id"])
+            prompts.append(row["prompt_id"])
+        by_cell.setdefault((row["prompt_id"], row["model"]), []).append(row)
+
+    def first_passed(r: dict) -> bool:
+        a = r.get("first_attempt")
+        return bool(a and a.get("eval_passed"))
+
+    def final_passed(r: dict) -> bool:
+        return bool(r.get("final_pass"))
+
+    def emit_table(title: str, predicate) -> None:
+        out.append(f"## {title}\n")
+        headers = ["Prompt"] + [f"`{m}`" for m in models]
+        out.append("| " + " | ".join(headers) + " |")
+        out.append("|" + "|".join(["---"] * len(headers)) + "|")
+        for pid in prompts:
+            row_cells = [f"**{pid}**"]
+            for model in models:
+                row_cells.append(_cell_kn(by_cell.get((pid, model), []), predicate))
+            out.append("| " + " | ".join(row_cells) + " |")
+        out.append("")
+
+    emit_table("Per-prompt × model — first-pass", first_passed)
+    emit_table("Per-prompt × model — final-pass", final_passed)
     return out
 
 
