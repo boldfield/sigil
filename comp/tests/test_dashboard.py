@@ -301,3 +301,77 @@ def test_ecode_histogram_extracts_codes(tmp_path):
     e10_line = next(l for l in out.splitlines() if "E0010" in l)
     assert "| 2 |" in e42_line
     assert "| 1 |" in e10_line
+
+
+def test_failure_detail_grouped_by_cluster(tmp_path):
+    rows = [
+        _row(prompt_id="C07", model="claude-sonnet-4-6", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0042]: requires `ArithError` in the enclosing function's effect row\n"
+                          "  --> .../program.sigil:9:23",
+             final_pass=False),
+        _row(prompt_id="H01", model="claude-haiku-4-5", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0150]: `MutArray[A]` element type `Char` is not supported",
+             final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## Failure detail by cluster" in out
+    # Both cluster sub-headers should appear.
+    assert "### `effect-row-missing-arith`" in out
+    assert "### `mut-array-element-type`" in out
+    # Cell identifiers should appear under the right cluster.
+    arith_section = out.split("### `effect-row-missing-arith`", 1)[1].split("### `", 1)[0]
+    assert "C07" in arith_section
+    assert "claude-sonnet-4-6" in arith_section
+    assert "ArithError" in arith_section
+
+
+def test_after_edit_diff_section_only_shows_failed_edits(tmp_path):
+    rows = [
+        # First failed, edit also failed — should appear in diff section.
+        _row(prompt_id="X01", model="claude-sonnet-4-6", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0010]: expected an expression",
+             edit_attempt={
+                 "program": "fn main() -> Int ![IO] { 1 }\n",
+                 "raw_response": "```sigil\nfn main()...\n```",
+                 "eval_passed": False, "eval_category": "compile",
+                 "eval_detail": "error[E0042]: requires `ArithError`",
+                 "eval_raw_output": "error[E0042]: requires `ArithError`",
+             },
+             final_pass=False),
+        # First failed, edit passed — should NOT appear in diff section.
+        _row(prompt_id="X02", model="claude-sonnet-4-6", run_idx=0,
+             first_passed=False,
+             first_detail="error[E0010]: expected an expression",
+             edit_attempt={
+                 "program": "fn main() -> Int ![IO] { 0 }\n",
+                 "raw_response": "```sigil\n...\n```",
+                 "eval_passed": True, "eval_category": None,
+                 "eval_detail": "pass", "eval_raw_output": "pass",
+             },
+             final_pass=True),
+    ]
+    # Give the first row a first_attempt.program so the diff has both sides.
+    rows[0]["first_attempt"]["program"] = "fn main() -> Int ![IO] { 0 }\n"
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## After-edit failure diffs" in out
+    assert "X01" in out.split("## After-edit failure diffs", 1)[1]
+    assert "X02" not in out.split("## After-edit failure diffs", 1)[1]
+    # Unified diff markers should appear (presence of '---' or '+++' headers).
+    diff_section = out.split("## After-edit failure diffs", 1)[1]
+    assert "---" in diff_section
+    assert "+++" in diff_section
+
+
+def test_after_edit_section_handles_no_failed_edits(tmp_path):
+    rows = [_row(prompt_id="C01", first_passed=True)]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## After-edit failure diffs" in out
+    # The "none" branch should produce a friendly message, not crash.
+    after_section = out.split("## After-edit failure diffs", 1)[1]
+    assert "no after-edit failures" in after_section.lower()

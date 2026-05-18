@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import difflib
 import json
 import pathlib
 import re
@@ -111,6 +112,8 @@ def render(loaded: LoadedTraces) -> str:
     lines.extend(_render_cluster_histogram(loaded))
     lines.extend(_render_ecode_histogram(loaded))
     lines.extend(_render_per_prompt_tables(loaded))
+    lines.extend(_render_failure_detail(loaded))
+    lines.extend(_render_after_edit_diffs(loaded))
     return "\n".join(lines) + "\n"
 
 
@@ -316,6 +319,93 @@ def _render_ecode_histogram(loaded: LoadedTraces) -> list[str]:
     for code in sorted(counts, key=lambda c: (-counts[c], c)):
         out.append(f"| `{code}` | {counts[code]} |")
     out.append("")
+    return out
+
+
+def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
+    out: list[str] = []
+    out.append("## Failure detail by cluster\n")
+    # Bucket (row, attempt_name) by cluster_id.
+    buckets: dict[str, list[tuple[dict, str, dict]]] = {}
+    cluster_meta: dict[str, clusters.Cluster] = {}
+    for row, attempt_name, attempt in _iter_failed_attempts(loaded):
+        cluster = clusters.classify_failure(row, attempt=attempt_name)
+        if cluster is None:
+            continue
+        buckets.setdefault(cluster.id, []).append((row, attempt_name, attempt))
+        cluster_meta[cluster.id] = cluster
+    if not buckets:
+        out.append("_No failures in the loaded traces._")
+        out.append("")
+        return out
+    for cluster_id in sorted(buckets, key=lambda cid: (-len(buckets[cid]), cid)):
+        meta = cluster_meta[cluster_id]
+        cluster_items = buckets[cluster_id]
+        out.append(f"### `{cluster_id}` — {meta.description}\n")
+        out.append(f"<details><summary>{len(cluster_items)} failure(s)</summary>\n")
+        for (row, attempt_name, attempt) in cluster_items:
+            label = (f"- **{row['prompt_id']}** × `{row['model']}` "
+                     f"(run {row['run_idx']}, attempt={attempt_name})")
+            out.append(label)
+            detail = (attempt.get("eval_detail") or "").strip()
+            snippet = "\n".join(detail.splitlines()[:6])
+            if snippet:
+                out.append("  ```")
+                for detail_line in snippet.splitlines():
+                    out.append(f"  {detail_line}")
+                out.append("  ```")
+        out.append("\n</details>\n")
+    return out
+
+
+def _render_after_edit_diffs(loaded: LoadedTraces) -> list[str]:
+    out: list[str] = []
+    out.append("## After-edit failure diffs\n")
+    after_edit_failures: list[dict] = []
+    for row in loaded.rows:
+        if row.get("final_pass"):
+            continue
+        first_attempt = row.get("first_attempt")
+        edit_attempt = row.get("edit_attempt")
+        if first_attempt is None or edit_attempt is None:
+            continue
+        if edit_attempt.get("eval_passed"):
+            continue  # final_pass=False contradicts this, but be defensive
+        after_edit_failures.append(row)
+    if not after_edit_failures:
+        out.append("_No after-edit failures in the loaded traces._")
+        out.append("")
+        return out
+    out.append(f"_{len(after_edit_failures)} cell(s) where the edit-loop turn also failed._\n")
+    for row in after_edit_failures:
+        first_attempt = row["first_attempt"]
+        edit_attempt = row["edit_attempt"]
+        out.append(f"### `{row['prompt_id']}` × `{row['model']}` (run {row['run_idx']})\n")
+        out.append("**Edit-attempt failure:**")
+        edit_detail = (edit_attempt.get("eval_detail") or "").strip()
+        if edit_detail:
+            out.append("```")
+            for detail_line in edit_detail.splitlines()[:8]:
+                out.append(detail_line)
+            out.append("```")
+        first_program_lines = (first_attempt.get("program") or "").splitlines(keepends=True)
+        edit_program_lines = (edit_attempt.get("program") or "").splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(
+            first_program_lines,
+            edit_program_lines,
+            fromfile=f"{row['prompt_id']}-first.sigil",
+            tofile=f"{row['prompt_id']}-edit.sigil",
+            n=3,
+        ))
+        if diff_lines:
+            out.append("**Diff (first → edit):**")
+            out.append("```diff")
+            for diff_line in diff_lines:
+                out.append(diff_line.rstrip("\n"))
+            out.append("```")
+        else:
+            out.append("_(no textual diff between first and edit programs)_")
+        out.append("")
     return out
 
 
