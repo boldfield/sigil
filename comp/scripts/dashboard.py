@@ -262,6 +262,10 @@ _ECODE = re.compile(r"E\d{4}")
 
 def _iter_failed_attempts(loaded: LoadedTraces):
     """Yield (row, attempt_name, attempt_dict) for every failed attempt."""
+    # Cluster + E-code histograms and failure detail each iterate this
+    # generator and re-classify. Per-render cost is sub-millisecond at
+    # current corpus scale (≈250 cells × ≈14 patterns); not worth caching
+    # in load_traces until that changes.
     for row in loaded.rows:
         for name in ("first", "edit"):
             attempt = row.get(f"{name}_attempt")
@@ -387,11 +391,14 @@ def _render_failure_detail(loaded: LoadedTraces) -> list[str]:
                      f"(run {row['run_idx']}, attempt={attempt_name})")
             out.append(label)
             detail = (attempt.get("eval_detail") or "").strip()
-            snippet = "\n".join(detail.splitlines()[:6])
-            if snippet:
+            all_detail_lines = detail.splitlines()
+            snippet_lines = all_detail_lines[:6]
+            if snippet_lines:
                 out.append("  ```")
-                for detail_line in snippet.splitlines():
+                for detail_line in snippet_lines:
                     out.append(f"  {detail_line}")
+                if len(all_detail_lines) > 6:
+                    out.append(f"  ... ({len(all_detail_lines) - 6} more line(s))")
                 out.append("  ```")
         out.append("\n</details>\n")
 
@@ -436,9 +443,12 @@ def _render_after_edit_diffs(loaded: LoadedTraces) -> list[str]:
         out.append("**Edit-attempt failure:**")
         edit_detail = (edit_attempt.get("eval_detail") or "").strip()
         if edit_detail:
+            all_edit_lines = edit_detail.splitlines()
             out.append("```")
-            for detail_line in edit_detail.splitlines()[:8]:
-                out.append(detail_line)
+            for line in all_edit_lines[:8]:
+                out.append(line)
+            if len(all_edit_lines) > 8:
+                out.append(f"... ({len(all_edit_lines) - 8} more line(s))")
             out.append("```")
         first_program_lines = (first_attempt.get("program") or "").splitlines(keepends=True)
         edit_program_lines = (edit_attempt.get("program") or "").splitlines(keepends=True)

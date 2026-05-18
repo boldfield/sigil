@@ -114,8 +114,17 @@ Writes `comp/log/dashboard-<ts>[-<tier>].md`. Re-rendering is free —
 edit `comp/scripts/clusters.py` and re-run the dashboard in seconds.
 
 Outputs:
-- `comp/log/comparison-results-<timestamp>.jsonl` — per-cell trace (raw response, extracted program, eval pass/category/detail). Local-only (gitignored).
-- `comp/log/comparison-log.md` — markdown report: per-(language, model) pass-rate table + per-prompt × per-cell K/N matrix + **failure-category histogram per language** (the central thesis-relevant comparison).
+- `comp/log/comparison-results-<timestamp>[-<slug>].jsonl` — per-cell trace
+  (raw response, extracted program, eval pass/category/detail). `<slug>` encodes
+  `--tier`, `--filter`, `--all-langs`, `--full`, `--no-edit-loop`, and any
+  non-default `--runs` count. Local-only (gitignored).
+- `comp/log/comparison-log.md` — lightweight latest-run pointer markdown
+  (per-(language, model) pass-rate table + per-prompt × per-cell K/N matrix +
+  per-language failure-category histogram). Also written as a slug-suffixed
+  per-run copy.
+- `comp/log/dashboard-<timestamp>[-<tier>].md` — rich attribution report from
+  `dashboard.py` (cluster histogram, per-E-code histogram, failure detail
+  grouped by cluster, after-edit failure diffs).
 
 See `scripts/compare.py --help` for the full CLI.
 

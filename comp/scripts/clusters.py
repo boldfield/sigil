@@ -26,7 +26,7 @@ class Cluster:
     # Either a compiled regex (matched against detail+raw_output) or a
     # predicate on (category, detail, raw_output). First-match wins,
     # ordered for specificity (e.g. arith before "any E0042").
-    matcher: object
+    matcher: "re.Pattern[str] | Callable[[str, str, str], bool]"
 
 
 def _re(pattern: str) -> re.Pattern[str]:
