@@ -39,6 +39,13 @@ def test_compute_corpus_version_handles_missing_git(monkeypatch):
     assert cv["git_sha"] == "unknown"
 
 
+def test_compute_corpus_version_handles_missing_teaching_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(compare, "SIGIL_CONTEXT_PATH", tmp_path / "nonexistent.md")
+    monkeypatch.setattr(compare, "SPEC_PATH", tmp_path / "nonexistent.md")
+    cv = compare.compute_corpus_version()
+    assert cv["teaching_hash"] == "unknown"
+
+
 def test_tier_baseline_implies_runs_10():
     # `--tier baseline` with no explicit --runs should yield runs=10.
     resolved = compare.resolve_runs(tier="baseline", explicit_runs=None)

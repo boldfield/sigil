@@ -943,6 +943,7 @@ def _build_run_slug(
     if tier:
         parts.append(tier)
     if filter_expr:
+        # Strip regex metacharacters so the filename stays readable; cap length.
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "", filter_expr)[:32]
         if sanitized:
             parts.append(sanitized)
@@ -1029,6 +1030,15 @@ def main() -> int:
     )
     args = parser.parse_args()
     args.runs = resolve_runs(tier=args.tier, explicit_runs=args.runs)
+    if args.tier and resolve_runs(tier=args.tier, explicit_runs=None) != args.runs:
+        tier_default = resolve_runs(tier=args.tier, explicit_runs=None)
+        print(
+            f"compare.py: warning: --tier {args.tier} normally implies "
+            f"--runs {tier_default}, but --runs {args.runs} was passed; the "
+            f"tier label in the trace will be {args.tier!r} despite the "
+            f"non-standard run count.",
+            file=sys.stderr,
+        )
 
     if shutil.which("claude") is None:
         print(
