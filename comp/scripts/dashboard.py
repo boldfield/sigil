@@ -106,6 +106,7 @@ def _resolve_latest_trace(tier: str) -> pathlib.Path:
 def render(loaded: LoadedTraces) -> str:
     lines: list[str] = []
     lines.extend(_render_header(loaded))
+    lines.extend(_render_topline(loaded))
     return "\n".join(lines) + "\n"
 
 
@@ -148,6 +149,35 @@ def _render_header(loaded: LoadedTraces) -> list[str]:
                    "(legacy trace pre-dating the schema). Their `corpus_version` "
                    "is treated as unknown.")
         out.append("")
+    return out
+
+
+def _render_topline(loaded: LoadedTraces) -> list[str]:
+    out: list[str] = []
+    out.append("## Topline pass rates\n")
+    out.append("| Language | Model | First-pass | Final-pass |")
+    out.append("|---|---|---|---|")
+    # Group rows by (language, model) preserving first-seen order.
+    seen: list[tuple[str, str]] = []
+    grouped: dict[tuple[str, str], list[dict]] = {}
+    for row in loaded.rows:
+        key = (row["language"], row["model"])
+        if key not in grouped:
+            seen.append(key)
+            grouped[key] = []
+        grouped[key].append(row)
+    for (lang, model) in seen:
+        cell_rows = grouped[(lang, model)]
+        n = len(cell_rows)
+        first_pass = sum(
+            1 for r in cell_rows
+            if r["first_attempt"] and r["first_attempt"].get("eval_passed")
+        )
+        final = sum(1 for r in cell_rows if r["final_pass"])
+        out.append(f"| `{lang}` | `{model}` | "
+                   f"{first_pass}/{n} ({100.0 * first_pass / n:.1f}%) | "
+                   f"{final}/{n} ({100.0 * final / n:.1f}%) |")
+    out.append("")
     return out
 
 

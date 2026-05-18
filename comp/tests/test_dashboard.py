@@ -162,3 +162,42 @@ def test_resolve_latest_trace_raises_on_empty_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(dashboard, "LOG_DIR", tmp_path)
     with pytest.raises(FileNotFoundError, match="no trace files"):
         dashboard._resolve_latest_trace("baseline")
+
+
+def test_topline_table_renders_first_and_final_pass_rates(tmp_path):
+    rows = [
+        # haiku: 2/3 first, 3/3 final
+        _row(prompt_id="C01", model="claude-haiku-4-5", run_idx=0,
+             first_passed=True, final_pass=True),
+        _row(prompt_id="C01", model="claude-haiku-4-5", run_idx=1,
+             first_passed=True, final_pass=True),
+        _row(prompt_id="C01", model="claude-haiku-4-5", run_idx=2,
+             first_passed=False, first_detail="error[E0010]: expected an expression",
+             edit_attempt={"program": "x", "raw_response": "x",
+                           "eval_passed": True, "eval_category": None,
+                           "eval_detail": "pass", "eval_raw_output": "pass"},
+             final_pass=True),
+        # sonnet: 1/2 first, 1/2 final
+        _row(prompt_id="C01", model="claude-sonnet-4-6", run_idx=0,
+             first_passed=True, final_pass=True),
+        _row(prompt_id="C01", model="claude-sonnet-4-6", run_idx=1,
+             first_passed=False, first_detail="error[E0042]: requires `ArithError`",
+             edit_attempt=None, final_pass=False),
+    ]
+    trace = _make_trace(tmp_path, "trace-baseline.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "## Topline pass rates" in out
+    # Haiku row.
+    assert "claude-haiku-4-5" in out
+    assert "2/3" in out  # first-pass
+    assert "3/3" in out  # final-pass
+    # Sonnet row.
+    assert "claude-sonnet-4-6" in out
+    assert "1/2" in out
+
+
+def test_topline_skips_models_with_zero_rows(tmp_path):
+    rows = [_row(prompt_id="C01", model="claude-haiku-4-5")]
+    trace = _make_trace(tmp_path, "trace.jsonl", rows)
+    out = dashboard.render(dashboard.load_traces([trace]))
+    assert "claude-sonnet-4-6" not in out
