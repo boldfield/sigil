@@ -33142,6 +33142,7 @@ mod tests {
             mono,
             colors: vec![("f".to_string(), Color::Native)],
             reasons: vec![("f".to_string(), "test: forced Native".to_string())],
+            auto_promotions: Vec::new(),
         };
         // Sanity: the body IS simple-tail-perform; if not for the
         // forced-Native classification, the fn would be Cps.

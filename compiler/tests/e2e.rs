@@ -21731,3 +21731,221 @@ fn precise_walker_deep_chain_under_cross_check() {
     assert_eq!(stdout.trim_end(), "500500");
     assert_eq!(code, 0);
 }
+
+// ===== Plan A1 — Auto-CPS-promote non-tail self-recursive Sync fns =========
+//
+// The plan eliminates the silent OS-stack-overflow class for Sigil
+// functions with non-tail self-calls. Pre-Plan-A1, a `sum_to(n) = n +
+// sum_to(n-1)` at depth 1_000_000 segfaulted (exit 139). Post-plan,
+// any fn with a non-tail self-call is auto-promoted to CPS color so
+// the trampoline handles unbounded recursion depth at ~5-10× per-call
+// cost.
+//
+// The tests below pin:
+//   - depth-1M non-tail self-recursion runs cleanly (was segfault),
+//   - tail-recursive self-call stays Sync (perf-floor regression check),
+//   - non-recursive fns stay Native (`--dump-color` assertion),
+//   - the W0001 info diagnostic surfaces on `--human-errors`,
+//   - auto-promotion composes with handler installation,
+//   - mutual recursion still segfaults at depth (v1 scope boundary —
+//     `#[ignore]`'d with a named successor: a future SCC-based detector
+//     promotes the WHOLE cycle to CPS, not just direct self-recursion).
+
+#[test]
+fn non_tail_self_recursive_handles_1m_depth() {
+    // Pre-Plan-A1: this segfaulted at depth ~100k–1M on the host OS
+    // stack. Post-plan: auto-promoted to CPS, runs cleanly via the
+    // trampoline. Sum 1..1_000_000 = 500_000_500_000.
+    let source = "import std.io\n\
+use std.io.{IO};\n\
+fn sum_to(n: Int) -> Int ![] {\n\
+  if n <= 0 { 0 } else { n + sum_to(n - 1) }\n\
+}\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(sum_to(1000000)));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "non_tail_self_recursive_1m");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "500000500000");
+}
+
+#[test]
+fn tail_self_recursive_stays_native_under_dump_color() {
+    // `loop_n(n, acc)` calls itself in tail position. The auto-
+    // promotion logic must NOT fire here — the existing Sync->Sync
+    // TCO (return_call) handles unbounded depth at zero per-call
+    // overhead. `--dump-color` is the structural assertion: `loop_n`
+    // line starts with `loop_n native`. A regression that
+    // over-promotes tail-recursive fns would show `loop_n cps`.
+    let source = "fn loop_n(n: Int, acc: Int) -> Int ![] {\n\
+  if n <= 0 { acc } else { loop_n(n - 1, acc + 1) }\n\
+}\n\
+fn main() -> Int ![] {\n\
+  loop_n(1000, 0)\n\
+}\n";
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_tail_self_recursive_stays_native_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color");
+    let _ = std::fs::remove_file(&src_path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--dump-color failed: stdout={stdout}, stderr={stderr}"
+    );
+    // Exact line shape: `<name> <color> <reason>`. Check loop_n stays
+    // native AND that no auto-promotion W0001 info appears on stderr.
+    assert!(
+        stdout.lines().any(|l| l.starts_with("loop_n native ")),
+        "loop_n must be native in --dump-color output:\n{stdout}"
+    );
+    // W0001 would appear on stderr only with --human-errors. Pin that
+    // no informational diagnostic fires regardless: a stray emission
+    // would mean the auto-promotion misfired.
+    assert!(
+        !stderr.contains("W0001"),
+        "no W0001 should fire for tail-recursive loop_n: stderr={stderr}"
+    );
+}
+
+#[test]
+fn non_recursive_stays_native_under_dump_color() {
+    // `square(n) = n * n` — no recursion at all. Native.
+    let source = "fn square(n: Int) -> Int ![] { n * n }\n\
+fn main() -> Int ![] { square(10) }\n";
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_non_recursive_native_{}.sigil",
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let sigil_bin = sigil_binary();
+    let out = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("--dump-color")
+        .output()
+        .expect("invoke sigil --dump-color");
+    let _ = std::fs::remove_file(&src_path);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "--dump-color failed: {stdout}");
+    assert!(
+        stdout.lines().any(|l| l.starts_with("square native ")),
+        "square must be native in --dump-color output:\n{stdout}"
+    );
+}
+
+#[test]
+fn auto_promotion_emits_w0001_info() {
+    // `--human-errors` output for a non-tail self-recursive program
+    // must include the W0001 info code. The catalog entry's content
+    // ships via `sigil explain W0001`.
+    let source = "fn sum_to(n: Int) -> Int ![] {\n\
+  if n <= 0 { 0 } else { n + sum_to(n - 1) }\n\
+}\n\
+fn main() -> Int ![] { sum_to(3) }\n";
+    let src_path =
+        std::env::temp_dir().join(format!("sigil_e2e_w0001_info_{}.sigil", std::process::id()));
+    std::fs::write(&src_path, source).expect("write source");
+    let bin_path = std::env::temp_dir().join(format!("sigil_e2e_w0001_bin_{}", std::process::id()));
+    let sigil_bin = sigil_binary();
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .arg("--human-errors")
+        .output()
+        .expect("invoke sigil --human-errors");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        compile.status.success(),
+        "compile must succeed (W0001 is info, not error): stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("W0001"),
+        "stderr missing W0001 anchor: {stderr}"
+    );
+    assert!(
+        stderr.contains("info[W0001]"),
+        "stderr missing `info[W0001]:` severity prefix: {stderr}"
+    );
+    assert!(
+        stderr.contains("sum_to"),
+        "diagnostic must name the promoted fn `sum_to`: {stderr}"
+    );
+    assert!(
+        stderr.contains("non-tail self-recursion") || stderr.contains("non-tail"),
+        "diagnostic must explain WHY the auto-promotion fired: {stderr}"
+    );
+    assert!(
+        stderr.contains("tail-recursive") || stderr.contains("accumulator"),
+        "diagnostic hint must point at the rewrite path: {stderr}"
+    );
+}
+
+#[test]
+fn non_tail_recursion_with_outer_handler_works() {
+    // Pin that auto-promotion composes with the effect machinery: a
+    // non-tail self-recursive fn invoked inside a `handle` body
+    // produces the correct answer end-to-end. Without this test, a
+    // regression where the promoted fn's CPS dispatch broke handler
+    // scope would slip past the depth + W0001 tests.
+    //
+    // Workload: count_down(3) sums 3+2+1+0 = 6 with non-tail
+    // recursion (auto-promoted), wrapped in a handle for an IO
+    // effect that the program performs.
+    let source = "import std.io\n\
+use std.io.{IO};\n\
+fn count_down(n: Int) -> Int ![] {\n\
+  if n <= 0 { 0 } else { n + count_down(n - 1) }\n\
+}\n\
+fn main() -> Int ![IO] {\n\
+  let total: Int = count_down(3);\n\
+  perform IO.println(int_to_string(total));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "non_tail_recursion_with_outer_handler");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "6");
+}
+
+#[test]
+#[ignore = "v1 scope boundary: SCC-based mutual-recursion auto-promotion is queued as the design's named successor. v1 detects only direct f->f self-recursion."]
+fn mutual_recursion_segfaults_in_v1() {
+    // Documents the v1 scope boundary explicitly. `f -> g -> f` with
+    // non-tail calls at both legs still segfaults at deep depth
+    // because v1's promoter only walks direct self-calls, not SCC
+    // cycles. The design doc's "Scope boundaries — Out of scope (v1):
+    // mutual recursion" section names this as the v2 successor:
+    // extend the existing call graph + SCC walk in color.rs to
+    // promote the entire SCC when any member has a non-tail call to
+    // another SCC member.
+    //
+    // When v2 lands, drop the `#[ignore]` and flip the assertion:
+    // the program should exit cleanly with the expected sum, not
+    // exit 139.
+    let source = "fn f(n: Int) -> Int ![] {\n\
+  if n <= 0 { 0 } else { n + g(n - 1) }\n\
+}\n\
+fn g(n: Int) -> Int ![] {\n\
+  if n <= 0 { 0 } else { n + f(n - 1) }\n\
+}\n\
+fn main() -> Int ![] { f(1000000) }\n";
+    let (_stdout, _stderr, code) = compile_and_run(source, "mutual_recursion_v1_xfail");
+    // v1 behavior: segfaults at depth (exit 139 SIGSEGV) because
+    // neither f nor g auto-promotes. Pinned as the failure mode that
+    // motivates the v2 follow-up.
+    assert_eq!(
+        code, 139,
+        "expected SIGSEGV — v1 doesn't promote mutual recursion"
+    );
+}

@@ -60,6 +60,12 @@ impl Span {
 pub enum Severity {
     Error,
     Warning,
+    /// Non-error advisory — `info[Wxxxx]: ...`. Surfaces compiler
+    /// transformations the user benefits from knowing about but that
+    /// do not fail the build (e.g., auto-CPS-promotion of non-tail
+    /// self-recursive Sync fns). Counted alongside Warning by the
+    /// pipeline's "any errors?" guard via the `is_error()` helper.
+    Info,
 }
 
 impl Severity {
@@ -67,7 +73,15 @@ impl Severity {
         match self {
             Severity::Error => "error",
             Severity::Warning => "warning",
+            Severity::Info => "info",
         }
+    }
+
+    /// True for `Severity::Error` only. Used by the pipeline's
+    /// "stop on errors before codegen" guard to ignore Warning and
+    /// Info entries.
+    pub fn is_error(self) -> bool {
+        matches!(self, Severity::Error)
     }
 }
 
@@ -102,6 +116,10 @@ impl CompilerError {
 
     pub fn warning(code: ErrorCode, span: Span, message: impl Into<String>) -> Self {
         Self::new(Severity::Warning, code, span, message)
+    }
+
+    pub fn info(code: ErrorCode, span: Span, message: impl Into<String>) -> Self {
+        Self::new(Severity::Info, code, span, message)
     }
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {

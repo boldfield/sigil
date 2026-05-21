@@ -1900,6 +1900,69 @@ entries in `PLAN_C_DEVIATIONS.md` for the architectural walk
 through all three TCO mechanisms (Sync `return_call`, Cps→Cps
 `NextStep::Call` return, and indirect-call `return_call_indirect`).
 
+#### §12.2 — Auto-CPS-promotion of non-tail self-recursion
+
+Tail-position self-recursion is depth-unbounded via §12.1's
+`return_call` TCO. The *non-tail* case (e.g.,
+`sum_to(n) = n + sum_to(n - 1)`) has no native tail-call lowering
+to apply — the surrounding `+` consumes the call's value, so the
+recursive call leaves a host stack frame behind. Left as Sync, such
+a fn segfaults at depth ~100k–1M depending on local-frame size.
+
+Sigil **auto-promotes** any user function with at least one non-tail
+direct self-call to [`Color::Cps`](#12-runtime-model) at color-
+analysis time. The CPS trampoline (`sigil_run_loop`) then handles
+recursion depth without growing the host stack, at the cost of
+~5–10× per-call overhead vs the Sync calling convention.
+
+The promotion fires automatically — no annotation needed — and
+emits an info-level diagnostic at the function's declaration:
+
+```
+info[W0001]: function `sum_to` was auto-promoted to CPS due to
+non-tail self-recursion at sum_to.sigil:2:21.
+  --> sum_to.sigil:2:1
+  = hint: rewrite as tail-recursive (accumulator pattern) or as an
+          iterative loop to recover Sync performance; the CPS
+          trampoline gives this function unbounded recursion depth
+          at ~5-10× per-call overhead.
+```
+
+`sigil explain W0001` prints the long-form rationale + the canonical
+accumulator-pattern fix example.
+
+**Performance escape.** To recover Sync performance, rewrite the
+recursion as tail-recursive (accumulator pattern). The promotion
+checks for any non-tail self-call after color analysis runs, so a
+fn whose entire recursive surface is in tail position falls back
+to Native:
+
+```sigil
+// Auto-promoted to CPS (sum_to has a non-tail self-call):
+fn sum_to(n: Int) -> Int ![] {
+  if n <= 0 { 0 } else { n + sum_to(n - 1) }
+}
+
+// Stays Native (accumulator pattern, tail-recursive):
+fn sum_to_acc(n: Int, acc: Int) -> Int ![] {
+  if n <= 0 { acc } else { sum_to_acc(n - 1, acc + n) }
+}
+```
+
+**v1 scope: direct self-recursion only.** The detector finds only
+`f → f` cycles. Mutual recursion across the Sync call graph
+(`f → g → f`) is not yet auto-promoted; programs that need
+unbounded mutual recursion through Sync-colored fns must either
+(a) inject a no-op `perform` to force CPS coloring via the existing
+local-color path, or (b) wait for the v2 SCC-based detector that
+extends auto-promotion to the entire SCC when any member has a
+non-tail call to another SCC member.
+
+The diagnostic is **info**, not warning — the auto-promotion is
+correct by default; the program now works at arbitrary depth.
+Surfacing the transformation lets the author opt for the
+tail-recursive rewrite only when the per-call overhead matters.
+
 ### §13 — Stdlib reference
 
 Each module is documented in its own `std/<name>.sigil` source
