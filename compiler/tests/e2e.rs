@@ -21756,7 +21756,9 @@ fn non_tail_self_recursive_handles_1m_depth() {
     // Pre-Plan-A1: this segfaulted at depth ~100k–1M on the host OS
     // stack. Post-plan: auto-promoted to CPS, runs cleanly via the
     // trampoline. Sum 1..1_000_000 = 500_000_500_000.
-    let source = "import std.io\n\
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
 use std.io.{IO};\n\
 fn sum_to(n: Int) -> Int ![] {\n\
   if n <= 0 { 0 } else { n + sum_to(n - 1) }\n\
@@ -21903,7 +21905,9 @@ fn non_tail_recursion_with_outer_handler_works() {
     // Workload: count_down(3) sums 3+2+1+0 = 6 with non-tail
     // recursion (auto-promoted), wrapped in a handle for an IO
     // effect that the program performs.
-    let source = "import std.io\n\
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
 use std.io.{IO};\n\
 fn count_down(n: Int) -> Int ![] {\n\
   if n <= 0 { 0 } else { n + count_down(n - 1) }\n\
@@ -21932,7 +21936,9 @@ fn mutual_recursion_handles_1m_depth() {
     //
     // Pre-SCC-aware promotion: this segfaulted at depth ~100k–1M
     // (exit 139). Post-fix: clean exit.
-    let source = "import std.io\n\
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
 use std.io.{IO};\n\
 fn f(n: Int) -> Int ![] {\n\
   if n <= 0 { 0 } else { n + g(n - 1) }\n\
