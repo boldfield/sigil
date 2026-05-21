@@ -479,6 +479,13 @@ fn compute_user_fn_abi(
     if is_compound_match_with_arm_perform_body(body, &ctors).is_some() {
         return UserFnAbi::Cps;
     }
+    // Auto-promoted fns (non-tail self/SCC recursion) are CPS ABI even
+    // though their body shape doesn't match any existing classifier above.
+    // The colorer already promoted them to CPS color; this ensures the ABI
+    // selection agrees.
+    if colored.auto_promotions.iter().any(|ap| ap.fn_name == name) {
+        return UserFnAbi::Cps;
+    }
     UserFnAbi::Sync
 }
 
@@ -11401,6 +11408,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
 
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
+
+                // Auto-CPS fns get their own emit path (Task 3). For now,
+                // skip body emit — the fn is declared with cps_signature
+                // but its body definition is deferred until the auto-CPS
+                // emit infrastructure lands. This prevents the debug_assert
+                // below from firing.
+                if cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name) {
+                    continue;
+                }
+
                 // Plan A Phase 2 — extract body_first_step from the same
                 // rewritten body shape that ABI selection (line ~9020) and
                 // chain-step materialization (line ~9228) saw. Without
@@ -30043,13 +30060,22 @@ fn is_supported_cps_user_fn_inner(
             }
             is_supported_cps_user_fn_inner(inner_name, fns_by_name, colored, ctors, visited)
         };
-        is_let_yield_prefix_then_branched_cps_tail_body(
+        if is_let_yield_prefix_then_branched_cps_tail_body(
             &f.body,
             ctors,
             &inner_lookup,
             &branch_leaf_lookup,
         )
         .is_some()
+        {
+            return true;
+        }
+        // Auto-promoted fns (non-tail self/SCC recursion) are supported CPS
+        // callees once codegen handles their body shape.
+        if colored.auto_promotions.iter().any(|ap| ap.fn_name == callee_name) {
+            return true;
+        }
+        false
     })();
     visited.borrow_mut().remove(callee_name);
     result
@@ -33563,6 +33589,110 @@ mod tests {
             UserFnAbi::Cps,
             "B.1 wires compound-match-with-arm-perform shape into ABI \
              selection; iterate-Generator representative should now be Cps"
+        );
+    }
+
+    #[test]
+    fn compute_user_fn_abi_cps_for_auto_promoted_non_tail_recursive_fn() {
+        // Auto-promoted fns (non-tail self-recursive calls promoted to CPS
+        // by color analysis) must get CPS ABI even though their body shape
+        // doesn't match any existing classifier (simple-tail-perform,
+        // chained-let-yield, compound-match). The auto_promotions gate in
+        // compute_user_fn_abi catches them.
+        //
+        // sum_to(n) = if n <= 0 { 0 } else { n + sum_to(n-1) }
+        // The `n + sum_to(n-1)` is a non-tail self-call — the colorer
+        // auto-promotes sum_to to CPS and populates auto_promotions.
+        use crate::ast::{Block, Expr, FnDecl, Item, Param, Program, TypeExpr};
+        use crate::color::{AutoPromotion, Color, ColoredProgram};
+        use crate::elaborate::AnfProgram;
+        use crate::errors::Span;
+        use crate::monomorphize::MonoProgram;
+        use crate::typecheck::CheckedProgram;
+        let span = Span::synthetic("test.sigil");
+        // Body doesn't matter for this test — the auto_promotions gate
+        // fires before any body-shape classifier. Use a trivial body.
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(Expr::IntLit(0, span.clone())),
+            span: span.clone(),
+        };
+        let fn_decl = FnDecl {
+            name: "sum_to".to_string(),
+            name_span: span.clone(),
+            generic_params: Vec::new(),
+            params: vec![Param {
+                name: "n".to_string(),
+                ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                span: span.clone(),
+            }],
+            return_type: TypeExpr::Named("Int".to_string(), span.clone()),
+            effects: Vec::new(),
+            effect_row_var: None,
+            body: body.clone(),
+            span: span.clone(),
+        };
+        let program = Program {
+            items: vec![Item::Fn(Box::new(fn_decl))],
+            file: "test.sigil".to_string(),
+            stdlib_files: std::collections::BTreeSet::new(),
+        };
+        let checked = CheckedProgram {
+            program,
+            string_literals: Vec::new(),
+            lambda_captures: Vec::new(),
+            types: std::collections::BTreeMap::new(),
+            match_scrut_tys: std::collections::BTreeMap::new(),
+            call_callee_tys: std::collections::BTreeMap::new(),
+            fn_schemes: std::collections::BTreeMap::new(),
+            call_site_instantiations: std::collections::BTreeMap::new(),
+            ctor_site_instantiations: std::collections::BTreeMap::new(),
+            effects: std::collections::BTreeMap::new(),
+            effect_ids: std::collections::BTreeMap::new(),
+            op_ids: std::collections::BTreeMap::new(),
+            handle_arm_captures: std::collections::BTreeMap::new(),
+            handle_return_arm_captures: std::collections::BTreeMap::new(),
+            handle_body_ty: std::collections::BTreeMap::new(),
+        };
+        let anf = AnfProgram { checked };
+        let mono = MonoProgram {
+            anf,
+            lambda_captures_resolved: std::collections::BTreeMap::new(),
+            match_scrut_tys_resolved: std::collections::BTreeMap::new(),
+            handle_body_ty_resolved: std::collections::BTreeMap::new(),
+            call_callee_tys_resolved: std::collections::BTreeMap::new(),
+        };
+        // Build ColoredProgram with CPS color and an auto_promotions
+        // entry for sum_to — simulating what infer_colors produces for
+        // a fn with a non-tail self-recursive call.
+        let colored = ColoredProgram {
+            mono,
+            colors: vec![("sum_to".to_string(), Color::Cps)],
+            reasons: vec![("sum_to".to_string(), "auto-promoted: non-tail self-call".to_string())],
+            auto_promotions: vec![AutoPromotion {
+                fn_name: "sum_to".to_string(),
+                fn_decl_span: span.clone(),
+                call_span: span.clone(),
+                callee_name: "sum_to".to_string(),
+            }],
+        };
+        // Sanity: colorer says CPS.
+        assert!(colored.needs_cps_transform("sum_to"));
+        // The actual assertion: CPS ABI via auto_promotions gate.
+        assert_eq!(
+            compute_user_fn_abi(
+                "sum_to",
+                &body,
+                &[Param {
+                    name: "n".to_string(),
+                    ty: TypeExpr::Named("Int".to_string(), span.clone()),
+                    span: span.clone(),
+                }],
+                &colored,
+                &build_fns_by_name(&colored),
+            ),
+            UserFnAbi::Cps,
+            "auto-promoted non-tail recursive fn must classify as CPS ABI"
         );
     }
 
