@@ -21919,33 +21919,32 @@ fn main() -> Int ![IO] {\n\
 }
 
 #[test]
-#[ignore = "v1 scope boundary: SCC-based mutual-recursion auto-promotion is queued as the design's named successor. v1 detects only direct f->f self-recursion."]
-fn mutual_recursion_segfaults_in_v1() {
-    // Documents the v1 scope boundary explicitly. `f -> g -> f` with
-    // non-tail calls at both legs still segfaults at deep depth
-    // because v1's promoter only walks direct self-calls, not SCC
-    // cycles. The design doc's "Scope boundaries — Out of scope (v1):
-    // mutual recursion" section names this as the v2 successor:
-    // extend the existing call graph + SCC walk in color.rs to
-    // promote the entire SCC when any member has a non-tail call to
-    // another SCC member.
+fn mutual_recursion_handles_1m_depth() {
+    // `f → g → f` with non-tail calls at both legs. The SCC-aware
+    // auto-promotion in color.rs Step 4b promotes BOTH `f` and `g`
+    // to CPS because each has a non-tail intra-SCC call. The
+    // trampoline then handles the cycle at depth 1M without growing
+    // the host stack.
     //
-    // When v2 lands, drop the `#[ignore]` and flip the assertion:
-    // the program should exit cleanly with the expected sum, not
-    // exit 139.
-    let source = "fn f(n: Int) -> Int ![] {\n\
+    // The recursion shape: f(n) → g(n-1) → f(n-2) → g(n-3) → ... → 0,
+    // with each step adding `n` to the running sum. Total sum
+    // 1_000_000 + 999_999 + ... + 1 + 0 = 500_000_500_000.
+    //
+    // Pre-SCC-aware promotion: this segfaulted at depth ~100k–1M
+    // (exit 139). Post-fix: clean exit.
+    let source = "import std.io\n\
+use std.io.{IO};\n\
+fn f(n: Int) -> Int ![] {\n\
   if n <= 0 { 0 } else { n + g(n - 1) }\n\
 }\n\
 fn g(n: Int) -> Int ![] {\n\
   if n <= 0 { 0 } else { n + f(n - 1) }\n\
 }\n\
-fn main() -> Int ![] { f(1000000) }\n";
-    let (_stdout, _stderr, code) = compile_and_run(source, "mutual_recursion_v1_xfail");
-    // v1 behavior: segfaults at depth (exit 139 SIGSEGV) because
-    // neither f nor g auto-promotes. Pinned as the failure mode that
-    // motivates the v2 follow-up.
-    assert_eq!(
-        code, 139,
-        "expected SIGSEGV — v1 doesn't promote mutual recursion"
-    );
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(f(1000000)));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "mutual_recursion_1m");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "500000500000");
 }

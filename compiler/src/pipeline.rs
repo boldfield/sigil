@@ -137,10 +137,26 @@ fn auto_promotion_diagnostics(colored: &color::ColoredProgram) -> Vec<CompilerEr
         .auto_promotions
         .iter()
         .map(|p| {
-            let msg = format!(
-                "function `{}` was auto-promoted to CPS due to non-tail self-recursion at {}:{}:{}",
-                p.fn_name, p.call_span.file, p.call_span.line, p.call_span.column,
-            );
+            // The message differentiates direct self-recursion (the
+            // callee name matches the promoted fn) from mutual
+            // recursion (callee is a different fn in the same SCC).
+            // The fn's own name + the offending call's location give
+            // the author enough context to find the recursion cycle.
+            let msg = if p.callee_name == p.fn_name {
+                format!(
+                    "function `{}` was auto-promoted to CPS due to non-tail self-recursion at {}:{}:{}",
+                    p.fn_name, p.call_span.file, p.call_span.line, p.call_span.column,
+                )
+            } else {
+                format!(
+                    "function `{}` was auto-promoted to CPS due to non-tail mutually-recursive call to `{}` at {}:{}:{}",
+                    p.fn_name,
+                    p.callee_name,
+                    p.call_span.file,
+                    p.call_span.line,
+                    p.call_span.column,
+                )
+            };
             CompilerError::info(code, p.fn_decl_span.clone(), msg).with_hint(
                 "rewrite as tail-recursive (accumulator pattern) or as an iterative loop \
                  to recover Sync performance; the CPS trampoline gives this function \

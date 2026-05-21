@@ -1298,24 +1298,28 @@ pub const CATALOG: &[ErrorEntry] = &[
     },
     ErrorEntry {
         code: "W0001",
-        short: "function auto-promoted to CPS due to non-tail self-recursion",
+        short: "function auto-promoted to CPS due to non-tail recursion",
         long: "Sigil colors functions either Native (Sync ABI, runs on the host \
                OS stack — fast but depth-bounded by the thread's stack size) or \
                CPS (returns NextStep packets to a trampoline — unbounded depth \
-               at ~5–10× per-call overhead). A function that calls itself in a \
+               at ~5–10× per-call overhead). A function that calls another fn \
+               in the same strongly-connected component of the call graph in a \
                non-tail position cannot use Cranelift's `return_call` TCO and \
                would silently segfault at sufficient depth if left on the host \
                stack. The compiler therefore auto-promotes any such function to \
                CPS-colored during color analysis, so the trampoline handles \
                arbitrarily deep recursion.\n\n\
+               Same-SCC membership covers uniformly:\n\
+               - Direct self-recursion (`f → f`).\n\
+               - Mutual recursion (`f → g → f`, or larger cycles).\n\n\
                This diagnostic is informational: the program is correct \
                post-promotion. It surfaces so the author can recover Native \
                performance if the per-call overhead matters, either by \
                rewriting the recursion to be tail-recursive (accumulator \
                pattern) or by switching to an iterative shape over an `Array` / \
-               `List`. v1 only detects DIRECT self-recursion (`f → f`); mutual \
-               recursion (`f → g → f`) across the call graph is NOT yet \
-               auto-promoted and remains a v1 scope boundary.",
+               `List`. For mutual recursion, the fix is the same shape: thread \
+               an accumulator through both legs so every recursive call lands \
+               in tail position.",
         fix_example: "// Original — non-tail self-call, auto-promoted to CPS:\n\
                       fn sum_to(n: Int) -> Int ![] {\n  \
                         if n <= 0 { 0 } else { n + sum_to(n - 1) }\n\

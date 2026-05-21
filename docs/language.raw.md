@@ -1886,23 +1886,33 @@ entries in `PLAN_C_DEVIATIONS.md` for the architectural walk
 through all three TCO mechanisms (Sync `return_call`, Cps→Cps
 `NextStep::Call` return, and indirect-call `return_call_indirect`).
 
-#### §12.2 — Auto-CPS-promotion of non-tail self-recursion
+#### §12.2 — Auto-CPS-promotion of non-tail recursion
 
-Tail-position self-recursion is depth-unbounded via §12.1's
-`return_call` TCO. The *non-tail* case (e.g.,
-`sum_to(n) = n + sum_to(n - 1)`) has no native tail-call lowering
-to apply — the surrounding `+` consumes the call's value, so the
-recursive call leaves a host stack frame behind. Left as Sync, such
-a fn segfaults at depth ~100k–1M depending on local-frame size.
+Tail-position recursion is depth-unbounded via §12.1's `return_call`
+TCO. The *non-tail* case (e.g., `sum_to(n) = n + sum_to(n - 1)`,
+or mutual `f → g → f` where every leg has a non-tail call) has no
+native tail-call lowering to apply — the surrounding operator
+consumes the call's value, so each recursive call leaves a host
+stack frame behind. Left as Sync, such a fn segfaults at depth
+~100k–1M depending on local-frame size.
 
 Sigil **auto-promotes** any user function with at least one non-tail
-direct self-call to [`Color::Cps`](#12-runtime-model) at color-
-analysis time. The CPS trampoline (`sigil_run_loop`) then handles
-recursion depth without growing the host stack, at the cost of
-~5–10× per-call overhead vs the Sync calling convention.
+call to another fn in its strongly-connected component to
+[`Color::Cps`](#12-runtime-model) at color-analysis time. Same-SCC
+membership covers uniformly:
+
+- **Direct self-recursion** (`f → f`, singleton SCC `{f}`).
+- **Mutual recursion** (`f → g → f`, SCC `{f, g}`); each member's
+  non-tail intra-SCC call drives its own promotion.
+- **Larger cycles** (`a → b → c → a`) — same shape.
+
+The CPS trampoline (`sigil_run_loop`) then handles recursion depth
+without growing the host stack, at the cost of ~5–10× per-call
+overhead vs the Sync calling convention.
 
 The promotion fires automatically — no annotation needed — and
-emits an info-level diagnostic at the function's declaration:
+emits an info-level diagnostic at each promoted function's
+declaration:
 
 ```
 info[W0001]: function `sum_to` was auto-promoted to CPS due to
@@ -1914,14 +1924,16 @@ non-tail self-recursion at sum_to.sigil:2:21.
           at ~5-10× per-call overhead.
 ```
 
+For mutual recursion, the message reads `non-tail mutually-recursive
+call to `<callee>`` and the diagnostic fires once per member.
 `sigil explain W0001` prints the long-form rationale + the canonical
 accumulator-pattern fix example.
 
 **Performance escape.** To recover Sync performance, rewrite the
 recursion as tail-recursive (accumulator pattern). The promotion
-checks for any non-tail self-call after color analysis runs, so a
-fn whose entire recursive surface is in tail position falls back
-to Native:
+checks for any non-tail intra-SCC call after color analysis runs,
+so a fn whose entire recursive surface is in tail position falls
+back to Native:
 
 ```sigil
 // Auto-promoted to CPS (sum_to has a non-tail self-call):
@@ -1935,14 +1947,10 @@ fn sum_to_acc(n: Int, acc: Int) -> Int ![] {
 }
 ```
 
-**v1 scope: direct self-recursion only.** The detector finds only
-`f → f` cycles. Mutual recursion across the Sync call graph
-(`f → g → f`) is not yet auto-promoted; programs that need
-unbounded mutual recursion through Sync-colored fns must either
-(a) inject a no-op `perform` to force CPS coloring via the existing
-local-color path, or (b) wait for the v2 SCC-based detector that
-extends auto-promotion to the entire SCC when any member has a
-non-tail call to another SCC member.
+For mutual recursion the same fix shape applies — thread an
+accumulator through both legs so every recursive call lands in tail
+position. §12.1's cross-fn `return_call` TCO then handles unbounded
+depth at zero per-call overhead.
 
 The diagnostic is **info**, not warning — the auto-promotion is
 correct by default; the program now works at arbitrary depth.
