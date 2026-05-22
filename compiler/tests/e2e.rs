@@ -1123,20 +1123,13 @@ fn mod_by_zero_traps() {
     );
 }
 
-/// Plan B Task 57 — `examples/div_recover.sigil` exercises algebraic
-/// recovery from a div-by-zero via a user-installed `ArithError`
-/// handler. Confirms that:
-///
-/// - typecheck accepts `![ArithError]` on the inner fn doing
-///   division, and `![IO]` on the outer fn whose handle expression
-///   discharges `ArithError`;
-/// - elaborate's `BinOp::Div` rewrite produces a perform-bearing
-///   form that flows through `sigil_perform`;
-/// - the user's `ArithError.div_by_zero(k) => 999` handler frame
-///   intercepts the perform before the top-level shim's default
-///   (the frame walk is inward-first);
-/// - the recovery value `999` flows back to the outer fn's handle
-///   expression, and the program prints `999` then exits 0.
+/// arith-trap — `examples/div_recover.sigil` recovers from a zero
+/// divisor via `checked_div` (std.int), which returns
+/// `Result[Int, String]`. Handler-based recovery on `/` is no longer
+/// possible (the operator traps and cannot be intercepted by a
+/// `handle` arm). The example matches `Err(_) => 999`, so:
+/// - stdout reads `999\n`
+/// - exit code is 0 (no trap fires — the divisor is checked first)
 #[test]
 fn div_recover_example_returns_999() {
     let root = workspace_root();
