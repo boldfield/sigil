@@ -114,20 +114,18 @@ order; the first matching arm wins.
 import std.int
 import std.io
 import std.option
-import std.raise
 use std.int.{int_to_string};
 use std.io.{IO};
 use std.option.{None, Option, Some};
-use std.raise.{ArithError};
 
-fn safe_div(num: Int, den: Int) -> Option[Int] ![ArithError] {
+fn safe_div(num: Int, den: Int) -> Option[Int] ![] {
   match den {
     0 => None,
     _ => Some(num / den),
   }
 }
 
-fn main() -> Int ![IO, ArithError] {
+fn main() -> Int ![IO] {
   match safe_div(10, 0) {
     Some(v) => perform IO.println(int_to_string(v)),
     None => perform IO.println("zero divisor"),
@@ -767,7 +765,9 @@ return `Int`. Its effect row may only contain effects discharged by
 the top-level shim:
 
 - `IO` — `print`, `println`, `read_line` arms (`std.io`)
-- `ArithError` — div-by-zero / mod-by-zero default handlers
+- `ArithError` — explicit `perform ArithError.*` only (the `/` and
+  `%` operators trap directly and do not perform it); default
+  handler exits 2
 - `Mem` — marker effect (no shim handler; allowed for type-level
   gating)
 - `Env` — `args`, `var`, `vars` (`std.env`)
@@ -972,14 +972,10 @@ see §3.2.1 for the doubled-row form.
 > **Operator effects to remember.** Several built-in operators carry
 > non-empty effect rows that propagate to their enclosing function:
 >
-> - **`/` and `%`** carry `![ArithError]` (may abort on zero divisor).
->   Any function whose body contains `/` or `%` MUST include
->   `ArithError` in its declared effect row, even when the divisor
->   is a non-zero literal — the requirement is structural, not
->   flow-sensitive. Trying to substitute one for the other (e.g.,
->   `n - (n / d) * d` instead of `n % d`) does NOT eliminate the
->   row requirement. See §4.2 for the full operator table and
->   discharge guidance.
+> - **`/` and `%`** trap (abort + exit 2) on a zero divisor and
+>   carry NO effect — a dividing function needs nothing on its row.
+>   For recoverable division use `checked_div` / `checked_mod`
+>   (`std.int`), which return `Result[Int, String]`. See §4.2.
 > - **`perform Effect.op(...)`** carries `![Effect]` (the effect
 >   you're performing). Helper functions that perform effects need
 >   the effect in their declared row.
@@ -1033,51 +1029,39 @@ suggested fix.
 | Category | Operators | Type |
 |----------|-----------|------|
 | Arithmetic | `+`, `-`, `*` | `(Int, Int) -> Int ![]` |
-| Arithmetic (may abort) | `/`, `%` | `(Int, Int) -> Int ![ArithError]` |
+| Arithmetic (traps on zero) | `/`, `%` | `(Int, Int) -> Int ![]` |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` | `(Int, Int) -> Bool ![]` |
 | Logic | `&&`, `\|\|`, `!` | `(Bool, Bool) -> Bool ![]` |
 | String compare | `string_compare(a, b)` (from `std.ordering`) | `(String, String) -> Ordering ![]` |
 
-> **Effect-row gotcha — `/` and `%` carry `ArithError`.** The
-> division and modulo operators perform `ArithError.div_by_zero` /
-> `ArithError.mod_by_zero` on zero divisors, so any function whose
-> body contains `/` or `%` MUST include `ArithError` in its declared
-> effect row. This is purely structural — even when the divisor is
-> a non-zero literal, the typechecker requires the row entry. A
-> `fn main() -> Int ![IO]` that contains `n % 2` fires E0042
-> ("`operator '%' (may abort with ArithError)` requires `ArithError`
-> in the enclosing function's effect row"); the row must be
-> `![ArithError, IO]`.
+> **`/` and `%` trap on a zero divisor — they carry no effect.**
+> Division and modulo abort the process on a zero divisor: the
+> runtime writes `sigil: arithmetic error: division by zero`
+> (resp. `remainder by zero`) to stderr and exits with status 2.
+> This is a *trap*, like an out-of-bounds array access or `panic` —
+> not an effect. A function that divides needs NO `ArithError` (or
+> any other) entry on its row; `fn main() -> Int ![]` may contain
+> `n % 2` and compiles.
 >
-> The top-level `main` shim installs default handlers that print
-> to stderr and exit 2 on uncaught `ArithError`. To recover in
-> source, install your own `handle` arm covering BOTH
-> `ArithError.div_by_zero` AND `ArithError.mod_by_zero` (E0142
-> requires exhaustive arm coverage per effect).
->
-> **If you're tempted to dodge the row by rewriting `n % d` as
-> `n - (n / d) * d`, STOP and declare the row instead.** That
-> workaround substitutes one may-abort op (`%`) for another (`/`),
-> so the row requirement doesn't go away — your function STILL
-> needs `![ArithError]`. Don't write the dodge; just declare the
-> row. The canonical pattern is:
+> A trap cannot be intercepted by a `handle` arm. When a zero
+> divisor is a recoverable condition rather than a programming bug,
+> use `checked_div` / `checked_mod` from `std.int`, which pre-check
+> the divisor and return `Result[Int, String]`:
 >
 > ```sigil
-> fn helper(n: Int, d: Int) -> Int ![ArithError] {
->   n % d
-> }
-> fn main() -> Int ![ArithError, IO] {
->   perform IO.println(int_to_string(helper(10, 3)));
+> import std.int
+> use std.int.{checked_div};
+> use std.result.{Err, Ok, Result};
+> fn main() -> Int ![] {
+>   let r: Result[Int, String] = checked_div(10, 0);  // Err("division by zero")
 >   0
 > }
 > ```
 >
-> If a particular use case truly cannot tolerate `ArithError` in the
-> row (e.g., a pure-row library helper meant to compose with discharging
-> contexts), use a different ALGORITHM — not a different operator.
-> Examples: comparing magnitudes via subtraction for parity, or
-> recursive predecessor walks instead of integer division. Substituting
-> one may-abort operator for another is never the right path.
+> The `ArithError` effect still exists and can be performed and
+> handled explicitly (`perform ArithError.div_by_zero()` inside a
+> `![ArithError]` row), but the `/` and `%` operators no longer
+> perform it.
 
 #### §4.3 — Match patterns
 
