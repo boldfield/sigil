@@ -28980,8 +28980,17 @@ fn emit_auto_cps_branch(
 /// Context the auto-CPS simple expression evaluator needs to lower
 /// constructor applications (e.g. `Node(1, $rec0, $rec1)` in `build`'s
 /// residual). Bundled so the recursive evaluator threads one ref rather
-/// than four. `alloc_ref` must already be declared in the current
-/// function (`module.declare_func_in_func(builtins.alloc, builder.func)`).
+/// than four.
+///
+/// **Lifetime contract:** `alloc_ref` is a `FuncRef`, which is scoped to
+/// ONE `builder.func` — it is the result of
+/// `module.declare_func_in_func(builtins.alloc, builder.func)`. A
+/// `FuncRef` is meaningless in a different function body, so an
+/// `AutoCpsExprCtx` must NOT be reused across builders: construct a
+/// fresh context (re-declaring `alloc_ref`) for each function/synth-cont
+/// emit. Today every emit site does exactly this — the body emit, the
+/// match-scrutinee emit, and the continuation emit each build their own
+/// context against their own builder.
 struct AutoCpsExprCtx<'a> {
     ctor_index: &'a std::collections::BTreeMap<String, (String, usize)>,
     type_layouts: &'a std::collections::BTreeMap<String, crate::layout::TypeLayout>,
@@ -38639,6 +38648,139 @@ mod tests {
             !body_has_non_trivial_non_recursive_calls(&body, &scc, &ctors),
             "ctor call Node(...) must NOT be flagged — ctors are lowerable by the residual evaluator"
         );
+    }
+
+    // Build a `call_site_instantiations` map that resolves the call
+    // at `ident_span` to a self-recursive call to `name`. Mirrors what
+    // typecheck populates for a monomorphic self-call.
+    fn rec_inst_map(
+        ident_span: &crate::errors::Span,
+        name: &str,
+    ) -> std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>
+    {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            ident_span.clone(),
+            crate::typecheck::GenericInstantiation {
+                name: name.to_string(),
+                type_args: Vec::new(),
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn extract_first_recursive_call_single_call_in_binary() {
+        // `n + sum_to(n - 1)` → extracts `sum_to(n-1)`, residual `n + $rec0`.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        let call_span = Span::synthetic("call.sigil");
+        let rec_call = Expr::Call {
+            callee: Box::new(Expr::Ident("sum_to".to_string(), call_span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+            rhs: Box::new(rec_call),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        let insts = rec_inst_map(&call_span, "sum_to");
+        let got = extract_first_recursive_call(&expr, &scc, &insts, 0);
+        let (callee, args, residual) = got.expect("must extract the recursive call");
+        assert_eq!(callee, "sum_to");
+        assert_eq!(args.len(), 1);
+        // Residual: `n + $rec0`.
+        match residual {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(lhs.as_ref(), Expr::Ident(n, _) if n == "n"));
+                assert!(matches!(rhs.as_ref(), Expr::Ident(p, _) if p == "$rec0"));
+            }
+            other => panic!("unexpected residual shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_first_recursive_call_leftmost_of_two() {
+        // `sum_tree(l) + sum_tree(r)` → extracts the LEFT call first,
+        // residual `$rec0 + sum_tree(r)` (the right call survives for the
+        // next extraction pass).
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        let lspan = Span::synthetic("left.sigil");
+        let rspan = Span::synthetic("right.sigil");
+        let mk = |arg: &str, cspan: &Span| Expr::Call {
+            callee: Box::new(Expr::Ident("sum_tree".to_string(), cspan.clone())),
+            args: vec![Expr::Ident(arg.to_string(), span.clone())],
+            span: span.clone(),
+        };
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(mk("l", &lspan)),
+            rhs: Box::new(mk("r", &rspan)),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_tree".to_string()]);
+        let mut insts = rec_inst_map(&lspan, "sum_tree");
+        insts.insert(
+            rspan.clone(),
+            crate::typecheck::GenericInstantiation {
+                name: "sum_tree".to_string(),
+                type_args: Vec::new(),
+            },
+        );
+        let (callee, args, residual) =
+            extract_first_recursive_call(&expr, &scc, &insts, 0).expect("must extract left call");
+        assert_eq!(callee, "sum_tree");
+        // The extracted call's arg is `l` (leftmost).
+        assert!(matches!(&args[0], Expr::Ident(a, _) if a == "l"));
+        // Residual: `$rec0 + sum_tree(r)` — left replaced, right intact.
+        match residual {
+            Expr::Binary {
+                op: BinOp::Add,
+                lhs,
+                rhs,
+                ..
+            } => {
+                assert!(matches!(lhs.as_ref(), Expr::Ident(p, _) if p == "$rec0"));
+                assert!(matches!(rhs.as_ref(), Expr::Call { .. }));
+            }
+            other => panic!("unexpected residual shape: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_first_recursive_call_none_for_pure_expr() {
+        // `n + 1` has no recursive call → None.
+        use crate::ast::{BinOp, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        let expr = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+            rhs: Box::new(Expr::IntLit(1, span.clone())),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        let insts = std::collections::BTreeMap::new();
+        assert!(extract_first_recursive_call(&expr, &scc, &insts, 0).is_none());
     }
 
     #[test]

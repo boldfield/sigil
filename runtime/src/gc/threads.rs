@@ -237,10 +237,35 @@ pub(crate) struct TrampolineFrame {
     pub arg_count: u32,
 }
 
-/// Push an in-flight trampoline dispatch frame. Called by the
-/// trampoline immediately before invoking a dispatched Cps fn.
+/// RAII guard bracketing one in-flight trampoline dispatch. Pushes a
+/// [`TrampolineFrame`] on construction via [`trampoline_inflight_enter`]
+/// and pops it on `Drop`, so the frame is removed even if the dispatched
+/// fn unwinds. (Sigil's panic story is abort-not-unwind, so the leak
+/// path is bounded to a dying thread; the guard makes it defensible
+/// regardless and keeps the push/pop pairing impossible to desync.)
+pub(crate) struct TrampolineInflightGuard {
+    _private: (),
+}
+
+impl Drop for TrampolineInflightGuard {
+    #[inline]
+    fn drop(&mut self) {
+        TRAMPOLINE_INFLIGHT.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+/// Push an in-flight trampoline dispatch frame and return a guard that
+/// pops it on drop. Called by the trampoline immediately before
+/// invoking a dispatched Cps fn; hold the returned guard across the
+/// call.
 #[inline]
-pub(crate) fn trampoline_inflight_push(closure_ptr: usize, args_ptr: usize, arg_count: u32) {
+pub(crate) fn trampoline_inflight_enter(
+    closure_ptr: usize,
+    args_ptr: usize,
+    arg_count: u32,
+) -> TrampolineInflightGuard {
     TRAMPOLINE_INFLIGHT.with(|s| {
         s.borrow_mut().push(TrampolineFrame {
             closure_ptr,
@@ -248,15 +273,7 @@ pub(crate) fn trampoline_inflight_push(closure_ptr: usize, args_ptr: usize, arg_
             arg_count,
         })
     });
-}
-
-/// Pop the most-recent in-flight trampoline dispatch frame. Called by
-/// the trampoline immediately after the dispatched Cps fn returns.
-#[inline]
-pub(crate) fn trampoline_inflight_pop() {
-    TRAMPOLINE_INFLIGHT.with(|s| {
-        s.borrow_mut().pop();
-    });
+    TrampolineInflightGuard { _private: () }
 }
 
 #[inline]

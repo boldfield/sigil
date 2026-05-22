@@ -2612,19 +2612,21 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                 // leaf Sigil frame — a deep auto-CPS continuation chain
                 // is reachable ONLY through this state. The
                 // `push_other_roots` callback scans every published frame.
-                // Push/pop bracket the call so nested `sigil_run_loop`s
-                // each keep their own frame. (args_buf lives on this
-                // frame's stack, valid for the whole call.)
-                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array on this frame; this pointer is only read by the push_other_roots callback during a GC that fires within the bracketed f(...) call below, while this frame and args_buf are live; the frame is popped immediately after).
+                // The RAII guard brackets the call so the frame pops even
+                // on an unwinding/aborting `f`, and nested
+                // `sigil_run_loop`s each keep their own frame. `args_buf`
+                // is a stack-local array (`[u64; MAX_INLINE_ARGS]`) on
+                // this frame, valid for the whole bracketed call.
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array on this frame; this pointer is only read by the push_other_roots callback during a GC that fires within the bracketed f(...) call below, while this frame and args_buf are live; the guard pops the frame immediately after).
                 let args_buf_addr = args_buf.as_ptr() as usize;
-                crate::gc::threads::trampoline_inflight_push(
+                let _inflight = crate::gc::threads::trampoline_inflight_enter(
                     closure_ptr as usize,
                     args_buf_addr,
                     arg_count,
                 );
-                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local Vec, not GC-managed; pointer is consumed within this call before args_buf can be dropped or reallocated).
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array, not GC-managed; pointer is consumed within this call before args_buf can be dropped).
                 current = f(closure_ptr, args_buf.as_ptr(), arg_count, out);
-                crate::gc::threads::trampoline_inflight_pop();
+                drop(_inflight);
             }
             _ => {
                 eprintln!("sigil_run_loop: unknown NextStep tag {tag}");
