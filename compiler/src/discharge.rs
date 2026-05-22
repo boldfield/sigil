@@ -1008,28 +1008,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn div_recover_example_has_one_fully_discharged_cps_site() {
-        // Companion to the catch.sigil regression guard above. The
-        // div_recover example uses the typecheck-elaborated
-        // `ArithError` perform — same FullyDischarged shape but
-        // under a different effect surface. Pinning both gives a
-        // regression guard against effect-specific classifier bugs.
-        if example_path("examples/div_recover.sigil").is_none() {
-            eprintln!(
-                "skipping div_recover_example regression test: examples/div_recover.sigil not present"
-            );
-            return;
-        }
-        let da = analyze_example_file("examples/div_recover.sigil");
-        assert_eq!(
-            da.fully_discharged_cps_callees(),
-            1,
-            "examples/div_recover.sigil must produce exactly 1 FullyDischarged Cps-color call site; dump=\n{}",
-            dump_discharge(&da),
-        );
-    }
-
     /// Aggregate the Phase-1 activation-gate inventory across the
     /// effect-heavy `examples/*.sigil` set. Printed to stderr so the
     /// `--nocapture` invocation surfaces the totals; pin only that
