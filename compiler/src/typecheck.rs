@@ -2611,6 +2611,60 @@ const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
     // coverage.
 ];
 
+/// Intrinsics deliberately NOT preluded. These remain `use`-gated:
+///   - The `*_validate` / `*_parse` halves are a two-call protocol the
+///     stdlib wraps into safe `Result`-returning *source* fns (which
+///     stay `use`-gated); exposing the raw halves globally invites
+///     misuse.
+///   - `sigil_ref_*` are internal Ref machinery, used through the
+///     `std.state` API rather than directly.
+const PRELUDE_EXCLUDED: &[&str] = &[
+    "string_to_int_validate",
+    "string_to_int_parse",
+    "string_to_float_validate",
+    "string_to_float_parse",
+    "string_from_bytes_validate",
+    "string_from_bytes_alloc",
+    "sigil_ref_alloc",
+    "sigil_ref_deref",
+    "sigil_ref_set",
+];
+
+/// Is `name` a user-facing compiler intrinsic available in the prelude
+/// (resolvable bare, no `use` line needed)? True iff it's in
+/// [`BUILTIN_TO_MODULE_FILE`] and not in [`PRELUDE_EXCLUDED`].
+///
+/// Compiler intrinsics have no `.sigil` source — codegen emits them
+/// directly — and globally-unique names, so calling them bare is
+/// unambiguous. Stdlib *source* fns (`std.list.map`, …) are NOT
+/// intrinsics; they require `use`.
+fn is_prelude_builtin(name: &str) -> bool {
+    if PRELUDE_EXCLUDED.contains(&name) {
+        return false;
+    }
+    BUILTIN_TO_MODULE_FILE.iter().any(|(n, _)| *n == name)
+}
+
+/// The canonical `std.<module>.<name>` key for a preluded intrinsic, or
+/// `None` if `name` isn't preluded. Mirrors the key form
+/// [`register_builtin_file_qualified_mirrors`] registers, so a prelude-
+/// resolved reference rewrites to exactly the same target an explicit
+/// `use std.X.{name}` would.
+fn prelude_canonical_key(name: &str) -> Option<String> {
+    if PRELUDE_EXCLUDED.contains(&name) {
+        return None;
+    }
+    let module_file = BUILTIN_TO_MODULE_FILE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, mf)| *mf)?;
+    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
+        .iter()
+        .map(|(_, mf)| (*mf).to_string())
+        .collect();
+    Some(canonical_fn_key(module_file, name, &synthetic_stdlib_files))
+}
+
 /// Plan F1 — mirror every bare-key builtin fn_scheme onto its
 /// `<module_label>.<name>` form so `use std.X.{name}` works under
 /// the strict resolver. The canonical-key shape matches the
@@ -10217,6 +10271,39 @@ mod tests {
         all.extend(res_errs);
         all.extend(tc_errs);
         all
+    }
+
+    #[test]
+    fn prelude_membership_covers_intrinsics_and_excludes_plumbing() {
+        // Universal-prior intrinsics: in.
+        assert!(is_prelude_builtin("int_to_string"));
+        assert!(is_prelude_builtin("panic"));
+        assert!(is_prelude_builtin("assert"));
+        assert!(is_prelude_builtin("float_add"));
+        assert!(is_prelude_builtin("char_to_int"));
+        assert!(is_prelude_builtin("byte_to_int"));
+        assert!(is_prelude_builtin("array_get"));
+        // Two-step parse plumbing: out.
+        assert!(!is_prelude_builtin("string_to_int_validate"));
+        assert!(!is_prelude_builtin("string_to_int_parse"));
+        assert!(!is_prelude_builtin("string_from_bytes_alloc"));
+        // Internal Ref machinery: out.
+        assert!(!is_prelude_builtin("sigil_ref_alloc"));
+        // Stdlib source fns (and the safe parse wrapper) are not
+        // intrinsics: out.
+        assert!(!is_prelude_builtin("map"));
+        assert!(!is_prelude_builtin("unwrap_or"));
+        assert!(!is_prelude_builtin("string_to_int"));
+        // Canonical-key form matches `std.<module>.<name>`.
+        assert_eq!(
+            prelude_canonical_key("int_to_string").as_deref(),
+            Some("std.int.int_to_string")
+        );
+        assert_eq!(
+            prelude_canonical_key("float_add").as_deref(),
+            Some("std.float.float_add")
+        );
+        assert_eq!(prelude_canonical_key("sigil_ref_alloc"), None);
     }
 
     fn has_code(errs: &[CompilerError], code: &str) -> bool {
