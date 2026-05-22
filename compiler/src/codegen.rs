@@ -9203,6 +9203,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         .declare_function("sigil_panic", Linkage::Import, &sigil_panic_sig)
         .map_err(|e| format!("declare sigil_panic: {e}"))?;
 
+    // arith traps: sigil_arith_div_by_zero_trap() -> ! and
+    // sigil_arith_mod_by_zero_trap() -> !  (no params, no Cranelift
+    // returns; the runtime fn exits the process — codegen emits a
+    // `trap` after the call so the block has a terminator).
+    let arith_trap_sig = Signature::new(isa_call_conv(&module));
+    let arith_div_trap = module
+        .declare_function(
+            "sigil_arith_div_by_zero_trap",
+            Linkage::Import,
+            &arith_trap_sig,
+        )
+        .map_err(|e| format!("declare sigil_arith_div_by_zero_trap: {e}"))?;
+    let arith_mod_trap = module
+        .declare_function(
+            "sigil_arith_mod_by_zero_trap",
+            Linkage::Import,
+            &arith_trap_sig,
+        )
+        .map_err(|e| format!("declare sigil_arith_mod_by_zero_trap: {e}"))?;
+
     // Plan D Task 117 (b) Phase 4 — Continuation value object alloc
     // + load helpers. Used at sites that flow a continuation into a
     // fn-parameter (boxing the (k_closure, k_fn, return_closure,
@@ -10848,6 +10868,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             int_shr,
             int_abs,
             sigil_panic,
+            arith_div_trap,
+            arith_mod_trap,
             cont_alloc,
             cont_invoke,
             sigil_ref_alloc,
@@ -12033,6 +12055,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 shape_table: &shape_table,
                                 alloc_ref: module.declare_func_in_func(
                                     per_fn_refs_ctx.builtins.alloc,
+                                    builder.func,
+                                ),
+                                arith_div_trap_ref: module.declare_func_in_func(
+                                    per_fn_refs_ctx.builtins.arith_div_trap,
+                                    builder.func,
+                                ),
+                                arith_mod_trap_ref: module.declare_func_in_func(
+                                    per_fn_refs_ctx.builtins.arith_mod_trap,
                                     builder.func,
                                 ),
                             };
@@ -20145,6 +20175,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             shape_table: &shape_table,
                             alloc_ref: module
                                 .declare_func_in_func(per_fn_refs_ctx.builtins.alloc, builder.func),
+                            arith_div_trap_ref: module.declare_func_in_func(
+                                per_fn_refs_ctx.builtins.arith_div_trap,
+                                builder.func,
+                            ),
+                            arith_mod_trap_ref: module.declare_func_in_func(
+                                per_fn_refs_ctx.builtins.arith_mod_trap,
+                                builder.func,
+                            ),
                         };
 
                         match auto_cps_role {
@@ -27674,23 +27712,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             BinOp::Sub => self.builder.ins().isub(l, r),
             BinOp::Mul => self.builder.ins().imul(l, r),
             BinOp::Div | BinOp::Mod => {
-                // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
-                // surface in the AST only as user source. Elaborate
-                // rewrites every such site to `if rhs == 0 {
-                // perform ArithError.{div,mod}_by_zero() } else {
-                // BinOp::SdivUnchecked / SremUnchecked }`. By the
-                // time codegen runs, every reachable BinOp::Div /
-                // Mod has been rewritten away. Reaching this arm
-                // means the elaborate pass missed a site — surface
-                // as an internal-invariant violation. See
-                // `[DEVIATION Task 57] BinOp::Div and BinOp::Mod
-                // elaborate to perform-bearing form` in
-                // `PLAN_B_DEVIATIONS.md`.
-                unreachable!(
-                    "codegen: BinOp::{op:?} should have been rewritten by elaborate \
-                     into an `if rhs == 0 {{ perform ArithError.* }} else {{ \
-                     SdivUnchecked / SremUnchecked }}` form; reaching this arm \
-                     indicates an elaborate-pass regression (Task 57)"
+                let div_ref = self.builtins.arith_div_trap_ref;
+                let mod_ref = self.builtins.arith_mod_trap_ref;
+                emit_guarded_div(
+                    &mut self.builder,
+                    l,
+                    r,
+                    matches!(op, BinOp::Div),
+                    div_ref,
+                    mod_ref,
                 )
             }
             BinOp::SdivUnchecked => self.builder.ins().sdiv(l, r),
@@ -28762,6 +28792,53 @@ const TRAP_HANDLE_DISCIPLINE_VIOLATION: u8 = 0x42;
 /// recognisable abort signature instead of a generic IR violation.
 const TRAP_PANIC_UNREACHABLE: u8 = 0x43;
 
+/// User trap code emitted after the (noreturn) call to
+/// `sigil_arith_{div,mod}_by_zero_trap` so the basic block has a
+/// terminator. A distinct code from `TRAP_PANIC_UNREACHABLE` makes a
+/// post-mortem trap signature unambiguously identify the arith-trap
+/// path if the runtime fn ever returns instead of exiting.
+const TRAP_ARITH_UNREACHABLE: u8 = 0x44;
+
+/// Emit a zero-guarded signed division (`is_div == true`) or
+/// remainder (`is_div == false`). On a zero divisor, branches to a
+/// cold block that calls the (noreturn) runtime trap and emits a
+/// `trap` terminator; otherwise computes `sdiv`/`srem` in a fresh
+/// block. Returns the quotient/remainder Value in the now-current
+/// (ok) block. Shared by `Lowerer::emit_binop` and the auto-CPS
+/// residual evaluator so the guard semantics can't drift between
+/// the two paths.
+fn emit_guarded_div(
+    builder: &mut FunctionBuilder<'_>,
+    l: Value,
+    r: Value,
+    is_div: bool,
+    div_trap_ref: FuncRef,
+    mod_trap_ref: FuncRef,
+) -> Value {
+    let int_ty = builder.func.dfg.value_type(r);
+    let zero = builder.ins().iconst(int_ty, 0);
+    let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
+    let trap_block = builder.create_block();
+    let ok_block = builder.create_block();
+    builder.ins().brif(is_zero, trap_block, &[], ok_block, &[]);
+
+    builder.switch_to_block(trap_block);
+    builder.seal_block(trap_block);
+    let trap_ref = if is_div { div_trap_ref } else { mod_trap_ref };
+    builder.ins().call(trap_ref, &[]);
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(TRAP_ARITH_UNREACHABLE));
+
+    builder.switch_to_block(ok_block);
+    builder.seal_block(ok_block);
+    if is_div {
+        builder.ins().sdiv(l, r)
+    } else {
+        builder.ins().srem(l, r)
+    }
+}
+
 /// Emit one branch (arm) of an auto-CPS fn body. Returns the NextStep
 /// pointer for this branch.
 #[allow(clippy::too_many_arguments)]
@@ -28791,6 +28868,10 @@ fn emit_auto_cps_branch(
         type_layouts,
         shape_table,
         alloc_ref: module.declare_func_in_func(per_fn_refs_ctx.builtins.alloc, builder.func),
+        arith_div_trap_ref: module
+            .declare_func_in_func(per_fn_refs_ctx.builtins.arith_div_trap, builder.func),
+        arith_mod_trap_ref: module
+            .declare_func_in_func(per_fn_refs_ctx.builtins.arith_mod_trap, builder.func),
     };
     match branch {
         AutoCpsBranchKind::BaseCase(expr) => {
@@ -28996,6 +29077,8 @@ struct AutoCpsExprCtx<'a> {
     type_layouts: &'a std::collections::BTreeMap<String, crate::layout::TypeLayout>,
     shape_table: &'a std::cell::RefCell<ShapeTable>,
     alloc_ref: FuncRef,
+    arith_div_trap_ref: FuncRef,
+    arith_mod_trap_ref: FuncRef,
 }
 
 /// Free-function constructor allocator for the auto-CPS residual
@@ -29114,8 +29197,22 @@ fn lower_auto_cps_simple_expr(
                 BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
                 BinOp::Mul => builder.ins().imul(lhs_v, rhs_v),
-                BinOp::Div => builder.ins().sdiv(lhs_v, rhs_v),
-                BinOp::Mod => builder.ins().srem(lhs_v, rhs_v),
+                BinOp::Div => emit_guarded_div(
+                    builder,
+                    lhs_v,
+                    rhs_v,
+                    true,
+                    ctx.arith_div_trap_ref,
+                    ctx.arith_mod_trap_ref,
+                ),
+                BinOp::Mod => emit_guarded_div(
+                    builder,
+                    lhs_v,
+                    rhs_v,
+                    false,
+                    ctx.arith_div_trap_ref,
+                    ctx.arith_mod_trap_ref,
+                ),
                 BinOp::Eq => {
                     let cmp = builder.ins().icmp(IntCC::Equal, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)
@@ -29759,6 +29856,10 @@ struct BuiltinFuncIds {
     /// Backs the `panic` builtin; `assert` lowers to a brif whose
     /// taken branch calls this same primitive.
     sigil_panic: cranelift_module::FuncId,
+    /// Backs zero-guarded `/` and `%`: noreturn runtime fns that
+    /// print a banner and exit 2 on a zero divisor.
+    arith_div_trap: cranelift_module::FuncId,
+    arith_mod_trap: cranelift_module::FuncId,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// `alloc` (boxes the (k_closure, k_fn, return_closure,
     /// return_fn) quadruple at sites that flow a continuation
@@ -29902,6 +30003,9 @@ struct BuiltinFuncRefs {
     int_abs_ref: FuncRef,
     /// Plan C addendum (panic / assert) — `sigil_panic` FuncRef.
     sigil_panic_ref: FuncRef,
+    /// Zero-guarded `/` / `%` noreturn trap FuncRefs.
+    arith_div_trap_ref: FuncRef,
+    arith_mod_trap_ref: FuncRef,
     /// Plan D Task 117 (b) Phase 4 — Continuation value object
     /// alloc + invoke helpers (FuncRefs). The load helpers
     /// (`sigil_continuation_load_*`) are called only from inside
@@ -30190,6 +30294,8 @@ fn prepare_builtin_func_refs(
         int_shr_ref: module.declare_func_in_func(ids.int_shr, builder.func),
         int_abs_ref: module.declare_func_in_func(ids.int_abs, builder.func),
         sigil_panic_ref: module.declare_func_in_func(ids.sigil_panic, builder.func),
+        arith_div_trap_ref: module.declare_func_in_func(ids.arith_div_trap, builder.func),
+        arith_mod_trap_ref: module.declare_func_in_func(ids.arith_mod_trap, builder.func),
         cont_alloc_ref: module.declare_func_in_func(ids.cont_alloc, builder.func),
         cont_invoke_ref: module.declare_func_in_func(ids.cont_invoke, builder.func),
         sigil_ref_alloc_ref: module.declare_func_in_func(ids.sigil_ref_alloc, builder.func),
