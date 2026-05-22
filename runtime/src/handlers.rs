@@ -2604,8 +2604,29 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                 // arg so handle-exit terminal writes from inside the
                 // dispatched Cps callee land in the caller-owned slot.
                 let f: CpsFn = core::mem::transmute(fn_ptr);
-                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local Vec, not GC-managed; pointer is consumed within this call before args_buf can be dropped or reallocated).
+                // Publish this dispatch's state so a GC triggered inside
+                // `f` keeps the in-flight continuation rooted. Under
+                // `GC_do_blocking` the trampoline's stack-local
+                // `closure_ptr` + `args_buf` are below the conservative-
+                // scan boundary and the precise walker only covers the
+                // leaf Sigil frame — a deep auto-CPS continuation chain
+                // is reachable ONLY through this state. The
+                // `push_other_roots` callback scans every published frame.
+                // The RAII guard brackets the call so the frame pops even
+                // on an unwinding/aborting `f`, and nested
+                // `sigil_run_loop`s each keep their own frame. `args_buf`
+                // is a stack-local array (`[u64; MAX_INLINE_ARGS]`) on
+                // this frame, valid for the whole bracketed call.
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array on this frame; this pointer is only read by the push_other_roots callback during a GC that fires within the bracketed f(...) call below, while this frame and args_buf are live; the guard pops the frame immediately after).
+                let args_buf_addr = args_buf.as_ptr() as usize;
+                let _inflight = crate::gc::threads::trampoline_inflight_enter(
+                    closure_ptr as usize,
+                    args_buf_addr,
+                    arg_count,
+                );
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array, not GC-managed; pointer is consumed within this call before args_buf can be dropped).
                 current = f(closure_ptr, args_buf.as_ptr(), arg_count, out);
+                drop(_inflight);
             }
             _ => {
                 eprintln!("sigil_run_loop: unknown NextStep tag {tag}");

@@ -13,7 +13,7 @@ use crate::codegen;
 use crate::color;
 use crate::discharge;
 use crate::elaborate;
-use crate::errors::{CompilerError, DiagnosticEmitter, ErrorFormat};
+use crate::errors::{self, CompilerError, DiagnosticEmitter, ErrorFormat};
 use crate::imports;
 use crate::lexer;
 use crate::link;
@@ -91,6 +91,7 @@ pub fn compile(
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
+    all_errs.extend(auto_promotion_diagnostics(&colored));
     let cc = closure_convert::convert(colored);
 
     // Emit object file to a temp location alongside the output.
@@ -115,6 +116,54 @@ pub fn compile(
 
     emit_errors(&all_errs, format);
     Ok(all_errs.len())
+}
+
+/// Convert each `ColoredProgram::auto_promotions` entry into a
+/// `W0001` info diagnostic. Primary span is the fn's name span
+/// (where the user can see the `fn <name>(...)` declaration); the
+/// offending call site is named in the message so the author can
+/// jump to it. Hint suggests the tail-recursive rewrite path that
+/// recovers Sync performance.
+///
+/// Returns an empty Vec when no fn was auto-promoted (the common
+/// case — most programs don't have non-tail self-recursive Sync
+/// helpers).
+fn auto_promotion_diagnostics(colored: &color::ColoredProgram) -> Vec<CompilerError> {
+    let code = match errors::ErrorCode::new("W0001") {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    colored
+        .auto_promotions
+        .iter()
+        .map(|p| {
+            // The message differentiates direct self-recursion (the
+            // callee name matches the promoted fn) from mutual
+            // recursion (callee is a different fn in the same SCC).
+            // The fn's own name + the offending call's location give
+            // the author enough context to find the recursion cycle.
+            let msg = if p.callee_name == p.fn_name {
+                format!(
+                    "function `{}` was auto-promoted to CPS due to non-tail self-recursion at {}:{}:{}",
+                    p.fn_name, p.call_span.file, p.call_span.line, p.call_span.column,
+                )
+            } else {
+                format!(
+                    "function `{}` was auto-promoted to CPS due to non-tail mutually-recursive call to `{}` at {}:{}:{}",
+                    p.fn_name,
+                    p.callee_name,
+                    p.call_span.file,
+                    p.call_span.line,
+                    p.call_span.column,
+                )
+            };
+            CompilerError::info(code, p.fn_decl_span.clone(), msg).with_hint(
+                "rewrite as tail-recursive (accumulator pattern) or as an iterative loop \
+                 to recover Sync performance; the CPS trampoline gives this function \
+                 unbounded recursion depth at ~5-10× per-call overhead",
+            )
+        })
+        .collect()
 }
 
 fn emit_errors(errs: &[CompilerError], format: ErrorFormat) {
@@ -217,6 +266,7 @@ fn run_frontend_to_color(
     let anf = elaborate::elaborate(checked);
     let mono = monomorphize::monomorphize(anf);
     let colored = color::infer_colors(mono);
+    all_errs.extend(auto_promotion_diagnostics(&colored));
     emit_errors(&all_errs, format);
     Ok(colored)
 }

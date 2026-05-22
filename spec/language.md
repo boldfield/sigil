@@ -1886,6 +1886,100 @@ entries in `PLAN_C_DEVIATIONS.md` for the architectural walk
 through all three TCO mechanisms (Sync `return_call`, Cps→Cps
 `NextStep::Call` return, and indirect-call `return_call_indirect`).
 
+#### §12.2 — Auto-CPS-promotion of non-tail recursion
+
+Tail-position recursion is depth-unbounded via §12.1's `return_call`
+TCO. The *non-tail* case (e.g., `sum_to(n) = n + sum_to(n - 1)`,
+or mutual `f → g → f` where every leg has a non-tail call) has no
+native tail-call lowering to apply — the surrounding operator
+consumes the call's value, so each recursive call leaves a host
+stack frame behind. Left as Sync, such a fn segfaults at depth
+~100k–1M depending on local-frame size.
+
+Sigil **auto-promotes** any user function with at least one non-tail
+call to another fn in its strongly-connected component to
+[`Color::Cps`](#12-runtime-model) at color-analysis time. Same-SCC
+membership covers uniformly:
+
+- **Direct self-recursion** (`f → f`, singleton SCC `{f}`).
+- **Mutual recursion** (`f → g → f`, SCC `{f, g}`); each member's
+  non-tail intra-SCC call drives its own promotion.
+- **Larger cycles** (`a → b → c → a`) — same shape.
+
+The CPS trampoline (`sigil_run_loop`) then handles recursion depth
+without growing the host stack, at the cost of ~5–10× per-call
+overhead vs the Sync calling convention.
+
+The promotion fires automatically — no annotation needed — and
+emits an info-level diagnostic at each promoted function's
+declaration:
+
+```
+info[W0001]: function `sum_to` was auto-promoted to CPS due to
+non-tail self-recursion at sum_to.sigil:2:21.
+  --> sum_to.sigil:2:1
+  = hint: rewrite as tail-recursive (accumulator pattern) or as an
+          iterative loop to recover Sync performance; the CPS
+          trampoline gives this function unbounded recursion depth
+          at ~5-10× per-call overhead.
+```
+
+For mutual recursion, the message reads `non-tail mutually-recursive
+call to `<callee>`` and the diagnostic fires once per member.
+`sigil explain W0001` prints the long-form rationale + the canonical
+accumulator-pattern fix example.
+
+**Performance escape.** To recover Sync performance, rewrite the
+recursion as tail-recursive (accumulator pattern). The promotion
+checks for any non-tail intra-SCC call after color analysis runs,
+so a fn whose entire recursive surface is in tail position falls
+back to Native:
+
+```sigil
+// Auto-promoted to CPS (sum_to has a non-tail self-call):
+fn sum_to(n: Int) -> Int ![] {
+  if n <= 0 { 0 } else { n + sum_to(n - 1) }
+}
+
+// Stays Native (accumulator pattern, tail-recursive):
+fn sum_to_acc(n: Int, acc: Int) -> Int ![] {
+  if n <= 0 { acc } else { sum_to_acc(n - 1, acc + n) }
+}
+```
+
+For mutual recursion the same fix shape applies — thread an
+accumulator through both legs so every recursive call lands in tail
+position. §12.1's cross-fn `return_call` TCO then handles unbounded
+depth at zero per-call overhead.
+
+The diagnostic is **info**, not warning — the auto-promotion is
+correct by default; the program now works at arbitrary depth.
+Surfacing the transformation lets the author opt for the
+tail-recursive rewrite only when the per-call overhead matters.
+
+**Coverage.** Auto-promotion handles arbitrary non-tail recursive
+shapes via chained continuations:
+
+- **Single call per branch** — `sum_to(n) = n + sum_to(n - 1)`,
+  `sum_list(c) = v + sum_list(rest)`.
+- **Multiple calls per branch** — `fib(n) = fib(n - 1) + fib(n - 2)`,
+  `sum_tree(t) = v + sum_tree(l) + sum_tree(r)`. Each call becomes a
+  yield point with its own continuation; intermediate continuations
+  thread captured state forward to the next call.
+- **Pointer-returning recursion** — `build(d) = Node(1, build(d-1),
+  build(d-1))`, `build_list(n) = Cons(n, build_list(n-1))`. The
+  reconstructed value (a heap record) flows through the continuation
+  chain; the GC roots the in-flight chain across collections.
+- **Mutual recursion** — `f → g → f` where every leg has a non-tail
+  call; each SCC member is promoted.
+
+The one shape that stays Sync: a recursive arm containing a **genuine
+non-recursive function call** (a real `foo(x)` call, as opposed to a
+constructor application or a recursive call), since the residual
+evaluator can only lower arithmetic, comparisons, identifiers, and
+constructor applications. Such a function keeps the Sync calling
+convention and remains depth-bounded by the host stack.
+
 ### §13 — Stdlib reference
 
 Each module is documented in its own `std/<name>.sigil` source

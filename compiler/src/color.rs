@@ -61,6 +61,13 @@ pub struct ColoredProgram {
     /// reason text is stable, machine-readable enough for tests, and
     /// human-readable enough for `--dump-color`.
     pub reasons: Vec<(String, String)>,
+    /// Plan: Auto-CPS-promote non-tail self-recursive Sync fns. One
+    /// entry per fn that color analysis promoted to CPS solely because
+    /// of a non-tail self-call (i.e., the fn would have been Native
+    /// otherwise). Consumed by the pipeline to emit one `W0001` info
+    /// diagnostic per entry. Empty in the common case where no fn
+    /// needed auto-promotion.
+    pub auto_promotions: Vec<AutoPromotion>,
 }
 
 impl ColoredProgram {
@@ -221,6 +228,79 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
     // node order is ascending.
     let (sccs, scc_of) = tarjan_scc(n, &edges);
 
+    // -------- Step 4b: auto-CPS-promote non-tail recursive Sync fns --------
+    //
+    // A function that calls another fn in the same strongly-connected
+    // component in NON-tail position cannot be lowered with
+    // Cranelift's `return_call` TCO (operand-of-`+`, value of a
+    // `Let`, etc.), so it leaves a host OS stack frame behind on
+    // every recursion. At depth ~100k–1M this segfaults. The
+    // trampoline (`sigil_run_loop`) makes recursion depth-unbounded
+    // for CPS-colored fns; auto-promote any Sync candidate with a
+    // non-tail intra-SCC call so the trampoline handles it.
+    //
+    // Same-SCC membership generalises uniformly over:
+    //   - Direct self-recursion (`f → f`, singleton SCC `{f}`).
+    //   - Mutual recursion (`f → g → f`, SCC `{f, g}`); each member's
+    //     non-tail call to another member drives its own promotion.
+    //   - Larger cycles (`a → b → c → a`); same shape.
+    //
+    // Only fires for fns the local analysis would otherwise classify
+    // Native — if a fn is already locally Cps (open row, declared
+    // effect, perform site), the promotion would be redundant and we
+    // skip the bookkeeping. The diagnostic emitted by the pipeline
+    // therefore fires only on the user-actionable case (the fn would
+    // have been a stack-overflow waiting to happen but wasn't yet Cps
+    // for any other reason).
+    //
+    // Runs AFTER Tarjan so we can use `scc_of` to identify intra-SCC
+    // call sites uniformly. The promotion mutates `local[i]` to Cps
+    // BEFORE the SCC color propagation in Step 5, so the new Cps
+    // member surfaces as an intrinsic-CPS member in its SCC and
+    // drags any non-promoted siblings along via the existing bridge
+    // logic.
+    let mut auto_promotions: Vec<AutoPromotion> = Vec::new();
+    // Pre-compute each SCC's member-name set for O(1) lookup during
+    // the body walk. SCC indices are stable; this map is built once.
+    let scc_members: Vec<BTreeSet<String>> = sccs
+        .iter()
+        .map(|scc| scc.iter().map(|&idx| fn_names[idx].clone()).collect())
+        .collect();
+    for (i, f) in fn_decls.iter().enumerate() {
+        if !matches!(local[i], LocalColor::Native(_)) {
+            continue;
+        }
+        let my_scc = scc_of[i];
+        let rec_calls = collect_recursive_calls(f, calls, &scc_members[my_scc]);
+        if let Some(non_tail) = rec_calls.iter().find(|c| !c.in_tail_position) {
+            // Reason text differentiates self vs mutual recursion for
+            // `--dump-color` readability. The diagnostic emitted by
+            // the pipeline uses the structured AutoPromotion fields
+            // and doesn't depend on this string's exact shape.
+            let reason = if non_tail.callee_name == f.name {
+                format!(
+                    "cps: non-tail self-recursive call at {}:{}:{}",
+                    non_tail.span.file, non_tail.span.line, non_tail.span.column,
+                )
+            } else {
+                format!(
+                    "cps: non-tail recursive call to `{}` (same SCC) at {}:{}:{}",
+                    non_tail.callee_name,
+                    non_tail.span.file,
+                    non_tail.span.line,
+                    non_tail.span.column,
+                )
+            };
+            local[i] = LocalColor::Cps(reason);
+            auto_promotions.push(AutoPromotion {
+                fn_name: f.name.clone(),
+                fn_decl_span: f.name_span.clone(),
+                call_span: non_tail.span.clone(),
+                callee_name: non_tail.callee_name.clone(),
+            });
+        }
+    }
+
     // -------- Step 5: propagate CPS color across SCCs --------
     let mut scc_color: Vec<Color> = vec![Color::Native; sccs.len()];
     let mut node_reason: Vec<String> = vec![String::new(); n];
@@ -325,6 +405,7 @@ pub fn infer_colors(mono: MonoProgram) -> ColoredProgram {
         mono,
         colors,
         reasons,
+        auto_promotions,
     }
 }
 
@@ -685,6 +766,248 @@ fn collect_calls_in_expr(
         Expr::Tuple { elems, .. } => {
             for e in elems {
                 collect_calls_in_expr(e, fn_index, calls, out);
+            }
+        }
+    }
+}
+
+/// Auto-CPS-promote non-tail recursive Sync fns. Records every call
+/// site inside a fn body whose callee resolves to a fn in the SAME
+/// strongly-connected component as the enclosing fn — covering both
+/// direct self-recursion (`f → f`, singleton SCC `{f}`) and mutual
+/// recursion (`f → g → f`, SCC `{f, g}`). A fn with ≥1 non-tail
+/// intra-SCC call gets auto-promoted to [`Color::Cps`] so the
+/// trampoline handles unbounded recursion depth — the host OS stack
+/// would otherwise segfault at ~100k–1M frames for a Sync recursive
+/// call chain that can't use `return_call` TCO.
+///
+/// `callee_name` is the resolved callee's name (equals `caller_name`
+/// for direct self-recursion; differs for mutual recursion).
+/// `span` is the **call expression** span (the whole `f(...)` site),
+/// referenced in the W0001 info diagnostic so the author can locate it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RecursiveCallInfo {
+    pub callee_name: String,
+    pub span: Span,
+    pub in_tail_position: bool,
+}
+
+/// One record per fn that color analysis promoted to CPS solely
+/// because of a non-tail recursive call (either to itself or to
+/// another fn in the same SCC). The fn would have been Native
+/// otherwise. [`ColoredProgram::auto_promotions`] carries these for
+/// the pipeline to convert into `W0001` info diagnostics.
+///
+/// `fn_decl_span` is the promoted fn's name span (used as the primary
+/// `-->` arrow). `call_span` is the FIRST non-tail intra-SCC call
+/// site found in the body. `callee_name` is the resolved callee
+/// (equals `fn_name` for direct self-recursion).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoPromotion {
+    pub fn_name: String,
+    pub fn_decl_span: Span,
+    pub call_span: Span,
+    pub callee_name: String,
+}
+
+/// Walk a fn body and collect every call site whose callee resolves
+/// (via [`crate::typecheck::CheckedProgram::call_site_instantiations`])
+/// to a fn in `same_scc_members`, classified as tail / non-tail
+/// relative to the surrounding fn's body. Returns the sites in source
+/// order.
+///
+/// The instantiations map is the source of truth for env-precedence
+/// resolution — it already filters out lambda params, let-bindings,
+/// match arm patterns, and handler-arm params that lexically shadow a
+/// top-level fn name, so we don't duplicate the scope walk here.
+///
+/// Tail-position classification mirrors the rules in `spec/language.md`
+/// §12.1 — tail positions are: the fn body's `Block.tail` slot, and
+/// recursively the tail of any tail-preserving descent through
+/// `Match`/`If`/`Block`/`Handle.return_arm.body`. `Handle.body` is
+/// NOT tail-preserving (the body runs under a sync run_loop driver;
+/// per the language spec §12.1 a TCO out of the body would skip the
+/// handler machinery). `Lambda.body` is NOT in tail position relative
+/// to the outer fn (the lambda is a value-producing leaf).
+pub(crate) fn collect_recursive_calls(
+    f: &FnDecl,
+    calls: &BTreeMap<Span, GenericInstantiation>,
+    same_scc_members: &BTreeSet<String>,
+) -> Vec<RecursiveCallInfo> {
+    let mut out = Vec::new();
+    walk_block_for_recursive_calls(&f.body, calls, same_scc_members, true, &mut out);
+    out
+}
+
+fn walk_block_for_recursive_calls(
+    b: &Block,
+    calls: &BTreeMap<Span, GenericInstantiation>,
+    scc: &BTreeSet<String>,
+    in_tail: bool,
+    out: &mut Vec<RecursiveCallInfo>,
+) {
+    // Statements never reach the surrounding context's tail — only
+    // `Block.tail` does. So every stmt-nested expr walks with
+    // `in_tail = false`.
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => walk_expr_for_recursive_calls(&l.value, calls, scc, false, out),
+            Stmt::Expr(e) => walk_expr_for_recursive_calls(e, calls, scc, false, out),
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    walk_expr_for_recursive_calls(a, calls, scc, false, out);
+                }
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        walk_expr_for_recursive_calls(t, calls, scc, in_tail, out);
+    }
+}
+
+fn walk_expr_for_recursive_calls(
+    e: &Expr,
+    calls: &BTreeMap<Span, GenericInstantiation>,
+    scc: &BTreeSet<String>,
+    in_tail: bool,
+    out: &mut Vec<RecursiveCallInfo>,
+) {
+    match e {
+        // Leaves: no nested expressions.
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
+        | Expr::Ident(_, _)
+        | Expr::ClosureEnvLoad { .. } => {}
+
+        Expr::Call {
+            callee, args, span, ..
+        } => {
+            // Resolve via the typechecker's call_site_instantiations
+            // map. The map is keyed by the callee Ident's span;
+            // lambda-local / let-bound names that happen to share a
+            // top-level fn name resolve to env entries during
+            // typecheck and are absent from this map, so the check
+            // automatically excludes shadowed references.
+            if let Expr::Ident(ident_name, ident_span) = callee.as_ref() {
+                if let Some(inst) = calls.get(ident_span) {
+                    // Defence-in-depth: pin that the resolved
+                    // instantiation matches the literal callee name in
+                    // source. Real typecheck output always agrees;
+                    // synthetic-program tests that share a single
+                    // `span()` across all idents would otherwise
+                    // collapse the calls map and return an unrelated
+                    // name on lookup.
+                    if &inst.name == ident_name && scc.contains(&inst.name) {
+                        out.push(RecursiveCallInfo {
+                            callee_name: inst.name.clone(),
+                            span: span.clone(),
+                            in_tail_position: in_tail,
+                        });
+                    }
+                }
+            }
+            // Recurse into the callee expr (defensive; non-Ident callees
+            // come from indirect call shapes and may carry nested
+            // sub-expressions). The callee POSITION itself is never a
+            // tail-eligible spot for this `Call`'s recursive-call
+            // classification — it's the call's callee, not the call.
+            walk_expr_for_recursive_calls(callee, calls, scc, false, out);
+            // Args are never in tail position.
+            for a in args {
+                walk_expr_for_recursive_calls(a, calls, scc, false, out);
+            }
+        }
+
+        Expr::Perform(p) => {
+            for a in &p.args {
+                walk_expr_for_recursive_calls(a, calls, scc, false, out);
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            walk_expr_for_recursive_calls(lhs, calls, scc, false, out);
+            walk_expr_for_recursive_calls(rhs, calls, scc, false, out);
+        }
+        Expr::Unary { operand, .. } => {
+            walk_expr_for_recursive_calls(operand, calls, scc, false, out);
+        }
+
+        // Tail-preserving descents — `in_tail` propagates into the
+        // child's tail position. Scrutinee / condition / non-arm
+        // sub-exprs are never tail.
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            walk_expr_for_recursive_calls(cond, calls, scc, false, out);
+            walk_block_for_recursive_calls(then_block, calls, scc, in_tail, out);
+            walk_block_for_recursive_calls(else_block, calls, scc, in_tail, out);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            walk_expr_for_recursive_calls(scrutinee, calls, scc, false, out);
+            for MatchArm { body, .. } in arms {
+                walk_expr_for_recursive_calls(body, calls, scc, in_tail, out);
+            }
+        }
+        Expr::Block(b) => walk_block_for_recursive_calls(b, calls, scc, in_tail, out),
+
+        // Lambda body: a closure value's body executes when CALLED,
+        // not as part of the outer fn's tail. Always `in_tail = false`
+        // when descending. A recursive call buried in a captured
+        // lambda is conservatively non-tail — a Cps promotion of the
+        // outer fn from such a call would be sound (and rare).
+        Expr::Lambda { body, .. } => {
+            walk_expr_for_recursive_calls(body, calls, scc, false, out);
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            // Post-closure-conversion node; shouldn't appear at
+            // color-time, but handle defensively.
+            for ex in env_exprs {
+                walk_expr_for_recursive_calls(ex, calls, scc, false, out);
+            }
+        }
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                walk_expr_for_recursive_calls(&f.value, calls, scc, false, out);
+            }
+        }
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            // Handle body runs under a synchronous `sigil_run_loop`
+            // driver — a tail call out of the body would skip handler
+            // machinery (mirrors codegen's `lower_expr_in_tail_pos`
+            // contract). Always non-tail.
+            walk_expr_for_recursive_calls(body, calls, scc, false, out);
+            // Return-arm body IS tail-preserving: when the surrounding
+            // handle expression sits in tail position, the return
+            // arm's value flows directly to the fn's return.
+            if let Some(ra) = return_arm {
+                walk_expr_for_recursive_calls(&ra.body, calls, scc, in_tail, out);
+            }
+            // Op-arm bodies always run under the trampoline (the arm
+            // is invoked by `sigil_run_loop` when the wrapped body
+            // performs). The fn is already CPS-colored if it contains
+            // any handle, so recursive calls inside an op arm don't
+            // drive the promotion regardless. Walk non-tail for
+            // completeness.
+            for arm in op_arms {
+                walk_expr_for_recursive_calls(&arm.body, calls, scc, false, out);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                walk_expr_for_recursive_calls(e, calls, scc, false, out);
             }
         }
     }
@@ -2158,6 +2481,190 @@ use std.io.{IO};
         assert_eq!(
             cps_fns,
             vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    // ===== Auto-CPS-promote non-tail self-recursive Sync fns =====
+
+    #[test]
+    fn non_tail_self_recursion_auto_promotes_to_cps() {
+        // `sum_to(n) = n + sum_to(n-1)` — single self-call, in
+        // non-tail position (operand of `+`). The walker finds it,
+        // tags it non-tail, and infer_colors promotes the fn.
+        let src = r#"
+            fn sum_to(n: Int) -> Int ![] {
+                if n <= 0 { 0 } else { n + sum_to(n - 1) }
+            }
+            fn main() -> Int ![] { sum_to(10) }
+        "#;
+        let cp = color_from_src(src);
+        assert_eq!(cp.auto_promotions.len(), 1);
+        assert_eq!(cp.auto_promotions[0].fn_name, "sum_to");
+        assert_eq!(color_of(&cp, "sum_to"), Color::Cps);
+        let r = reason_of(&cp, "sum_to");
+        assert!(
+            r.contains("non-tail self-recursive"),
+            "unexpected reason: {r:?}"
+        );
+    }
+
+    #[test]
+    fn tail_self_recursion_stays_native() {
+        // `loop_n(n, acc) = if n <= 0 { acc } else { loop_n(n-1, acc+1) }`
+        // — single self-call, in tail position (`if`-arm body, which is
+        // the body's tail). No auto-promotion fires; the fn stays Native.
+        let src = r#"
+            fn loop_n(n: Int, acc: Int) -> Int ![] {
+                if n <= 0 { acc } else { loop_n(n - 1, acc + 1) }
+            }
+            fn main() -> Int ![] { loop_n(100, 0) }
+        "#;
+        let cp = color_from_src(src);
+        assert!(
+            cp.auto_promotions.is_empty(),
+            "expected no auto-promotions (loop_n is tail-recursive), got {:?}",
+            cp.auto_promotions
+        );
+        assert_eq!(color_of(&cp, "loop_n"), Color::Native);
+        assert_eq!(reason_of(&cp, "loop_n"), "native: pure row");
+    }
+
+    #[test]
+    fn non_recursive_stays_native_with_no_auto_promotion() {
+        // `square(n) = n * n` — no recursion at all. Native. No
+        // auto-promotion entry.
+        let src = r#"
+            fn square(n: Int) -> Int ![] { n * n }
+            fn main() -> Int ![] { square(7) }
+        "#;
+        let cp = color_from_src(src);
+        assert!(cp.auto_promotions.is_empty());
+        assert_eq!(color_of(&cp, "square"), Color::Native);
+    }
+
+    #[test]
+    fn auto_promotion_drives_caller_propagation_via_existing_bridge() {
+        // `caller` calls `sum_to` (which auto-promotes to Cps). The
+        // call is in tail position of `caller`'s body, but caller
+        // transitively reaches a Cps fn — so it should be Cps too via
+        // the existing SCC bridge logic, NOT via auto-promotion.
+        // Caller has no auto-promotion entry (only `sum_to` does).
+        let src = r#"
+            fn sum_to(n: Int) -> Int ![] {
+                if n <= 0 { 0 } else { n + sum_to(n - 1) }
+            }
+            fn caller(n: Int) -> Int ![] { sum_to(n) }
+            fn main() -> Int ![] { caller(10) }
+        "#;
+        let cp = color_from_src(src);
+        let names: Vec<&str> = cp
+            .auto_promotions
+            .iter()
+            .map(|p| p.fn_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["sum_to"]);
+        assert_eq!(color_of(&cp, "sum_to"), Color::Cps);
+        assert_eq!(color_of(&cp, "caller"), Color::Cps);
+        // caller's reason references sum_to via the bridge.
+        let r = reason_of(&cp, "caller");
+        assert!(
+            r.contains("sum_to") && r.contains("cps"),
+            "expected bridge-form reason, got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_non_tail_auto_promotes_both_members() {
+        // `f` calls `g` in non-tail position (operand of `+`); `g`
+        // calls `f` in non-tail position. Both belong to the same SCC
+        // `{f, g}`; both should auto-promote independently because
+        // each has a non-tail intra-SCC outgoing call.
+        let src = r#"
+            fn f(n: Int) -> Int ![] {
+                if n <= 0 { 0 } else { n + g(n - 1) }
+            }
+            fn g(n: Int) -> Int ![] {
+                if n <= 0 { 0 } else { n + f(n - 1) }
+            }
+            fn main() -> Int ![] { f(10) }
+        "#;
+        let cp = color_from_src(src);
+        // Both `f` and `g` are auto-promoted (order is program order:
+        // f then g). Each entry's `callee_name` points at the OTHER
+        // member of the mutual cycle, distinguishing the diagnostic
+        // from the direct-self-recursion case.
+        let promotions: Vec<(&str, &str)> = cp
+            .auto_promotions
+            .iter()
+            .map(|p| (p.fn_name.as_str(), p.callee_name.as_str()))
+            .collect();
+        assert_eq!(promotions, vec![("f", "g"), ("g", "f")]);
+        assert_eq!(color_of(&cp, "f"), Color::Cps);
+        assert_eq!(color_of(&cp, "g"), Color::Cps);
+        // Reasons reflect mutual-recursion phrasing.
+        let f_reason = reason_of(&cp, "f");
+        assert!(
+            f_reason.contains("non-tail recursive call to `g`"),
+            "unexpected f reason: {f_reason:?}"
+        );
+        let g_reason = reason_of(&cp, "g");
+        assert!(
+            g_reason.contains("non-tail recursive call to `f`"),
+            "unexpected g reason: {g_reason:?}"
+        );
+    }
+
+    #[test]
+    fn mutual_recursion_all_tail_stays_native() {
+        // `f` and `g` mutually recurse, but every recursive call is
+        // in tail position (the `if`-arm body is the body's tail).
+        // The existing `return_call` TCO handles cross-fn tail calls
+        // when signatures match (§12.1); auto-promotion must NOT fire.
+        let src = r#"
+            fn f(n: Int, acc: Int) -> Int ![] {
+                if n <= 0 { acc } else { g(n - 1, acc + 1) }
+            }
+            fn g(n: Int, acc: Int) -> Int ![] {
+                if n <= 0 { acc } else { f(n - 1, acc + 1) }
+            }
+            fn main() -> Int ![] { f(100, 0) }
+        "#;
+        let cp = color_from_src(src);
+        assert!(
+            cp.auto_promotions.is_empty(),
+            "tail-recursive mutual fns must not auto-promote, got: {:?}",
+            cp.auto_promotions
+        );
+        assert_eq!(color_of(&cp, "f"), Color::Native);
+        assert_eq!(color_of(&cp, "g"), Color::Native);
+    }
+
+    #[test]
+    fn already_cps_fn_does_not_record_auto_promotion() {
+        // `f` performs IO (so locally Cps already) AND has a non-tail
+        // self-call. We should NOT record an auto-promotion entry —
+        // the fn was going to be Cps anyway and the W0001 diagnostic
+        // would be noise. The fn IS Cps in the final color (because
+        // of the perform); the bookkeeping just skips it.
+        let src = r#"
+            import std.io
+            use std.io.{IO};
+            fn f(n: Int) -> Int ![IO] {
+                if n <= 0 {
+                    0
+                } else {
+                    perform IO.println("step");
+                    n + f(n - 1)
+                }
+            }
+            fn main() -> Int ![IO] { f(3) }
+        "#;
+        let cp = color_from_src(src);
+        assert_eq!(color_of(&cp, "f"), Color::Cps);
+        assert!(
+            cp.auto_promotions.is_empty(),
+            "f was already locally Cps; auto_promotions should stay empty, got: {:?}",
+            cp.auto_promotions
         );
     }
 }
