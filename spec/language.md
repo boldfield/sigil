@@ -1957,20 +1957,28 @@ correct by default; the program now works at arbitrary depth.
 Surfacing the transformation lets the author opt for the
 tail-recursive rewrite only when the per-call overhead matters.
 
-**v1 restrictions.** Auto-promotion currently covers "Pattern A"
-shapes: at most one non-tail recursive call per branch, and no
-non-recursive function calls (including constructor applications) in
-the recursive arm's body beyond arithmetic and comparisons. Shapes
-with multiple recursive calls per branch — like
-`fib(n) = fib(n - 1) + fib(n - 2)`, or tree-building
-`Node(1, build(d - 1), build(d - 1))` — remain depth-bounded by the
-host stack. The CPS continuation infrastructure for chained
-multi-call branches (the `Intermediate` continuation role) is in
-place; follow-up work will lift the single-call restriction.
-Constructor applications in recursive arms (e.g.,
-`Cons(n, f(n - 1))`) are similarly gated out for now — relaxing the
-conservative non-recursive-call predicate to accept ctors is a
-planned incremental improvement.
+**Coverage.** Auto-promotion handles arbitrary non-tail recursive
+shapes via chained continuations:
+
+- **Single call per branch** — `sum_to(n) = n + sum_to(n - 1)`,
+  `sum_list(c) = v + sum_list(rest)`.
+- **Multiple calls per branch** — `fib(n) = fib(n - 1) + fib(n - 2)`,
+  `sum_tree(t) = v + sum_tree(l) + sum_tree(r)`. Each call becomes a
+  yield point with its own continuation; intermediate continuations
+  thread captured state forward to the next call.
+- **Pointer-returning recursion** — `build(d) = Node(1, build(d-1),
+  build(d-1))`, `build_list(n) = Cons(n, build_list(n-1))`. The
+  reconstructed value (a heap record) flows through the continuation
+  chain; the GC roots the in-flight chain across collections.
+- **Mutual recursion** — `f → g → f` where every leg has a non-tail
+  call; each SCC member is promoted.
+
+The one shape that stays Sync: a recursive arm containing a **genuine
+non-recursive function call** (a real `foo(x)` call, as opposed to a
+constructor application or a recursive call), since the residual
+evaluator can only lower arithmetic, comparisons, identifiers, and
+constructor applications. Such a function keeps the Sync calling
+convention and remains depth-bounded by the host stack.
 
 ### §13 — Stdlib reference
 

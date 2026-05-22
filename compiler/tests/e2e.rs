@@ -202,6 +202,25 @@ fn compile_and_run(source: &str, test_name: &str) -> (String, String, i32) {
     out
 }
 
+/// Inline-source variant of [`compile_file_and_run_with_env`]: write
+/// `source` to a temp `.sigil`, compile + run with `env_vars` set on
+/// the child process, return `(stdout, stderr, exit_code)`.
+fn compile_and_run_with_env(
+    source: &str,
+    test_name: &str,
+    env_vars: &[(&str, &str)],
+) -> (String, String, i32) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let out = compile_file_and_run_with_env(&src_path, test_name, env_vars);
+    let _ = std::fs::remove_file(&src_path);
+    out
+}
+
 /// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
 /// e2e tests that pin specific compile-failure E-codes.
 ///
@@ -21953,4 +21972,102 @@ fn main() -> Int ![IO] {\n\
     let (stdout, stderr, code) = compile_and_run(source, "mutual_recursion_1m");
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "500000500000");
+}
+
+#[test]
+fn multi_call_per_branch_fib_handles_chained_continuations() {
+    // `fib(n) = fib(n-1) + fib(n-2)` — TWO non-tail self-calls in one
+    // branch. Auto-CPS lowers this via chained continuations: the first
+    // continuation captures `n` + the outer k, receives fib(n-1), then
+    // dispatches fib(n-2) with a second continuation that computes the
+    // sum. Pre-multi-call: this stayed Sync (gated). fib(30) = 832040.
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
+use std.io.{IO};\n\
+fn fib(n: Int) -> Int ![] {\n\
+  if n <= 1 { n } else { fib(n - 1) + fib(n - 2) }\n\
+}\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(fib(30)));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "multi_call_fib");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "832040");
+}
+
+#[test]
+fn pointer_returning_recursion_deep_list_stays_rooted() {
+    // `build_list` returns a heap `Lst` via non-tail recursion
+    // (`Cons(1, build_list(n-1))`), so its continuations ALLOCATE and a
+    // GC can fire mid-chain. The reconstructed list must stay rooted
+    // through the deep continuation chain — pre-fix the precise-root
+    // walker missed the trampoline's in-flight continuation and the
+    // chain was collected (SIGSEGV / silent wrong sum). Depth 1_000_000
+    // also exceeds the host stack, so this only completes via the CPS
+    // trampoline. Sum of 1_000_000 ones = 1_000_000.
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
+use std.io.{IO};\n\
+type Lst = | Nil | Cons(Int, Lst)\n\
+fn build_list(n: Int) -> Lst ![] {\n\
+  match n {\n\
+    0 => Nil,\n\
+    _ => Cons(1, build_list(n - 1)),\n\
+  }\n\
+}\n\
+fn sum_list(c: Lst) -> Int ![] {\n\
+  match c {\n\
+    Nil => 0,\n\
+    Cons(v, rest) => v + sum_list(rest),\n\
+  }\n\
+}\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(sum_list(build_list(1000000))));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "ptr_recursion_deep_list");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "1000000");
+}
+
+#[test]
+fn pointer_returning_multi_call_tree_under_gc_cross_check() {
+    // `build` (returns `Tree`) + `sum_tree` — pointer-returning
+    // multi-call recursion. `build(d) = Node(1, build(d-1), build(d-1))`
+    // has two pointer-returning recursive calls per branch; the
+    // partial subtrees flow through chained continuations that
+    // allocate. Run under SIGIL_GC_CROSS_CHECK=1 so every alloc
+    // validates precise-vs-conservative root agreement — pinning the
+    // in-flight-continuation rooting fix. Depth 16 = 2^16 - 1 = 65535.
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
+use std.io.{IO};\n\
+type Tree = | Leaf | Node(Int, Tree, Tree)\n\
+fn sum_tree(t: Tree) -> Int ![] {\n\
+  match t {\n\
+    Leaf => 0,\n\
+    Node(v, l, r) => v + sum_tree(l) + sum_tree(r),\n\
+  }\n\
+}\n\
+fn build(depth: Int) -> Tree ![] {\n\
+  match depth {\n\
+    0 => Leaf,\n\
+    _ => Node(1, build(depth - 1), build(depth - 1)),\n\
+  }\n\
+}\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(sum_tree(build(16))));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run_with_env(
+        source,
+        "ptr_multi_call_tree_xcheck",
+        &[("SIGIL_GC_CROSS_CHECK", "1")],
+    );
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "65535");
 }

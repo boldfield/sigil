@@ -3672,13 +3672,10 @@ enum AutoCpsContRole {
     /// the source-level arg expressions for that call, and
     /// `next_cont_func_id` is the FuncId of the next continuation.
     ///
-    /// NOTE: currently unreachable — `count_max_recursive_calls_per_branch`
-    /// gates multi-call-per-branch fns to Sync ABI, so only `Final` is
-    /// exercised. Lifting the single-call restriction (to support shapes
-    /// like `fib(n-1) + fib(n-2)` or `Node(1, build(d-1), build(d-1))`)
-    /// will activate this path. Follow-up: relax the `max_calls <= 1`
-    /// gate in `compute_user_fn_abi` and exercise with a multi-call e2e
-    /// test (e.g. `fib(30)` → 832040 via chained continuations).
+    /// Used for multi-call-per-branch shapes (`fib(n-1) + fib(n-2)`,
+    /// `Node(1, build(d-1), build(d-1))`): step `i`'s continuation is
+    /// Intermediate for i < N-1 (dispatches step i+1) and Final for the
+    /// last step (computes the residual, resumes the caller's k).
     Intermediate {
         next_callee_name: String,
         next_call_args: Vec<crate::ast::Expr>,
