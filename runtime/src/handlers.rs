@@ -2615,9 +2615,11 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                 // Push/pop bracket the call so nested `sigil_run_loop`s
                 // each keep their own frame. (args_buf lives on this
                 // frame's stack, valid for the whole call.)
+                // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local array on this frame; this pointer is only read by the push_other_roots callback during a GC that fires within the bracketed f(...) call below, while this frame and args_buf are live; the frame is popped immediately after).
+                let args_buf_addr = args_buf.as_ptr() as usize;
                 crate::gc::threads::trampoline_inflight_push(
                     closure_ptr as usize,
-                    args_buf.as_ptr() as usize,
+                    args_buf_addr,
                     arg_count,
                 );
                 // SAFETY: gc-heap-ptr arithmetic (args_buf is a stack-local Vec, not GC-managed; pointer is consumed within this call before args_buf can be dropped or reallocated).
