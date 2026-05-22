@@ -10363,9 +10363,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     cont_func_ids.push(cont_func_id);
                                 }
 
+                                // Extract match arm patterns for capture analysis.
+                                // Branches correspond 1:1 with match arms.
+                                let arm_patterns: Vec<Option<&crate::ast::Pattern>> =
+                                    match f.body.tail.as_ref() {
+                                        Some(crate::ast::Expr::Match { arms, .. }) => {
+                                            arms.iter().map(|a| Some(&a.pattern)).collect()
+                                        }
+                                        _ => Vec::new(),
+                                    };
+
                                 // Build CpsContinuationSynth entries.
                                 let mut cont_idx = 0;
-                                for branch in &branches {
+                                for (branch_idx, branch) in branches.iter().enumerate() {
                                     if let AutoCpsBranchKind::Recursive {
                                         steps,
                                         residual_expr,
@@ -10432,6 +10442,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                                 kind: crate::ast::EnvSlotKind::Int,
                                                             });
                                                         }
+                                                    }
+                                                }
+                                            }
+                                            // Capture match-arm pattern bindings (e.g., `v`
+                                            // from `C(v, rest) => v + sum_list(rest)`).
+                                            if let Some(Some(arm_pat)) = arm_patterns.get(branch_idx) {
+                                                let pat_captures = collect_pattern_binding_captures(
+                                                    arm_pat,
+                                                    &ctor_index,
+                                                    &type_layouts,
+                                                    None,
+                                                );
+                                                for pc in pat_captures {
+                                                    if free_vars.contains(&pc.name) {
+                                                        captures.push(pc);
                                                     }
                                                 }
                                             }
@@ -12027,9 +12052,35 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             // Always matches — unconditional jump.
                                             builder.ins().jump(arm_body_block, &[]);
                                         }
+                                        crate::ast::Pattern::Ctor { name, .. } => {
+                                            // Ctor pattern: check discriminant.
+                                            // Load discriminant from scrutinee at offset +8
+                                            // (past 8-byte header).
+                                            let disc_v = builder.ins().load(
+                                                types::I64,
+                                                MemFlags::trusted(),
+                                                scrut_v,
+                                                8,
+                                            );
+                                            let expected_disc = ctor_index
+                                                .get(name)
+                                                .map(|(type_name, variant_idx)| {
+                                                    type_layouts[type_name].variants[*variant_idx]
+                                                        .discriminant
+                                                })
+                                                .unwrap_or(0);
+                                            let expected_v = builder.ins().iconst(
+                                                types::I64,
+                                                i64::from(expected_disc),
+                                            );
+                                            let cmp = builder.ins().icmp(
+                                                IntCC::Equal, disc_v, expected_v,
+                                            );
+                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
+                                        }
                                         _ => {
-                                            // For other patterns (Ctor, Tuple), fall through
-                                            // unconditionally for now. TODO: proper ctor dispatch.
+                                            // Other patterns (Tuple, etc.) — unconditional.
                                             builder.ins().jump(arm_body_block, &[]);
                                         }
                                     }
@@ -12038,10 +12089,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     builder.switch_to_block(arm_body_block);
                                     builder.seal_block(arm_body_block);
 
-                                    // For Var patterns, bind the scrutinee to the var name.
+                                    // Bind pattern variables into the arm environment.
                                     let mut arm_env = env.clone();
                                     if let crate::ast::Pattern::Var(name, _) = &arm.pattern {
                                         arm_env.insert(name.clone(), scrut_v);
+                                    }
+                                    // For Ctor patterns, extract positional field bindings
+                                    // from the heap object. Layout: [8-byte header | 8-byte
+                                    // discriminant at +8 | field0 at +16 | field1 at +24 | ...].
+                                    if let crate::ast::Pattern::Ctor {
+                                        fields: crate::ast::CtorPatternFields::Positional(patterns),
+                                        ..
+                                    } = &arm.pattern
+                                    {
+                                        for (field_idx, sub_pat) in patterns.iter().enumerate() {
+                                            if let crate::ast::Pattern::Var(field_name, _) = sub_pat {
+                                                let offset: i32 = 16 + 8 * field_idx as i32;
+                                                let field_v = builder.ins().load(
+                                                    pointer_ty,
+                                                    MemFlags::trusted(),
+                                                    scrut_v,
+                                                    offset,
+                                                );
+                                                arm_env.insert(field_name.clone(), field_v);
+                                            }
+                                        }
                                     }
 
                                     let ns_ptr = emit_auto_cps_branch(
@@ -17138,7 +17210,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                             if let crate::ast::Expr::Ident(n, _) =
                                                                 callee.as_ref()
                                                             {
-                                                                cc.colored.needs_cps_transform(n)
+                                                                matches!(
+                                                                    lowerer.user_fns.get(n.as_str()).map(|e| e.abi),
+                                                                    Some(UserFnAbi::Cps)
+                                                                )
                                                             } else {
                                                                 false
                                                             }
@@ -31347,6 +31422,17 @@ fn is_supported_cps_user_fn_inner(
         // recognition, not termination analysis.
         let branch_leaf_lookup = |inner_name: &str| {
             if visited.borrow().contains(inner_name) {
+                // Tied-knot accept: self/mutual-recursive Pattern C is
+                // structurally valid when the fn actually has effects or
+                // is auto-promoted. But a purely transitively-colored fn
+                // (no performs, not auto-promoted) should NOT self-accept
+                // — its Pattern C classification would mishandle arm stmts
+                // that call CPS-colored-but-Sync-ABI fns.
+                if let Some(inner_fn) = fns_by_name.get(inner_name) {
+                    let has_effects = block_contains_perform(&inner_fn.body);
+                    let is_auto = colored.auto_promotions.iter().any(|ap| ap.fn_name == inner_name);
+                    return has_effects || is_auto;
+                }
                 return true;
             }
             is_supported_cps_user_fn_inner(inner_name, fns_by_name, colored, ctors, visited)
