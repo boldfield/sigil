@@ -73,9 +73,11 @@ fn main() -> Int ![IO] {
 effects. The compiler rejects any function with an `![]` row that
 contains `perform` or that calls a function with a non-empty row.
 
-`int_to_string(n: Int) -> String ![]` is a builtin (§13.2). String
-literals use `"..."` with C-style backslash escapes (`\\`, `\"`,
-`\n`, `\t`).
+`int_to_string(n: Int) -> String ![]` is a compiler intrinsic in the
+prelude (§13.2) — it is in scope everywhere, no `import` / `use`
+needed (the example above imports it explicitly, which still works but
+is redundant). String literals use `"..."` with C-style backslash
+escapes (`\\`, `\"`, `\n`, `\t`).
 
 ### E3 — Recursion and exhaustive `match`
 
@@ -1621,8 +1623,8 @@ but binds **no symbols** — by itself it lets you write
 bare namespace, so `Some(7)` and `map(opt, f)` work without a
 prefix.
 
-This is **strict by design** — Plan F1 (2026-05-14) removed the
-old auto-prelude. The only globally-available names are:
+Imports are **strict by design** — Plan F1 (2026-05-14) removed the
+old auto-prelude of stdlib *types*. The globally-available names are:
 
 - **Primitive type names:** `Int`, `Bool`, `String`, `Char`,
   `Byte`, `Float`, `Int64`, `Unit`.
@@ -1635,15 +1637,53 @@ old auto-prelude. The only globally-available names are:
   the constructors are file-gated to that one source by E0148,
   but the type name is in scope everywhere for type-annotation
   purposes).
+- **Compiler intrinsic functions (the prelude)** — the primitive
+  operations the compiler emits directly (no `.sigil` source).
+  Because Sigil has no operator overloading, these *are* the
+  language's primitive operations: `int_to_string(n)`,
+  `float_add(a, b)`, `char_to_int(c)`, `array_get(xs, i)`,
+  `string_concat(a, b)`, `panic(msg)`, and so on. Their names are
+  globally unique, so calling them bare is unambiguous and needs no
+  `import` / `use`. The intrinsic surface is enumerated by
+  `BUILTIN_TO_MODULE_FILE`; §13.2 lists the module-less primitives,
+  and the per-module tables in §13 list the rest (e.g. `std.float`'s
+  `float_add`) — all of which are intrinsics callable bare.
 
-The authoritative list is registered in
-`typecheck::builtin_types()` and the matching `builtin_fn_env_*`
-helpers — the bullets above mirror that registration.
+The authoritative lists are registered in
+`typecheck::builtin_types()` (types) and `BUILTIN_TO_MODULE_FILE`
+(intrinsic functions) — the bullets above mirror that registration.
 
-Every other name — including `Option`, `Result`, `Some`, `None`,
-`Ok`, `Err`, `List`, `Cons`, `Nil`, and any stdlib fn like `map`,
-`int_to_string`, `string_concat`, `read_dir`, etc. — must come
-from an `import` + `use` line, or be qualified at the call site.
+**Intrinsics vs. stdlib source.** The prelude covers compiler
+intrinsics only. Stdlib *source* functions — written in `.sigil`,
+living in modules, and able to share names across modules (`map` in
+`std.list` vs `std.option`) — are NOT in the prelude. Every such name
+— `Option`, `Result`, `Some`, `None`, `Ok`, `Err`, `List`, `Cons`,
+`Nil`, and source fns like `map`, `unwrap_or`, `read_dir`, the safe
+`string_to_int`/`string_to_float` parse wrappers, etc. — must come
+from an `import` + `use` line, or be qualified at the call site. The
+line is exactly intrinsic-vs-source: a name with one possible meaning
+is global; a name you pick a module for needs the `use`.
+
+**The prelude obeys the no-shadowing rule** (see §9's "There is no
+shadowing"):
+
+- A top-level `fn`, redefining a prelude intrinsic name is a
+  redefinition error (E0020) — you can no more redefine
+  `int_to_string` than the type `Int`.
+- A local `let` / parameter *may* shadow a prelude intrinsic within
+  its scope, exactly as a local may shadow a top-level `fn` of the
+  same name (local-first lookup). This is not a violation of the
+  no-shadowing rule, which forbids only re-binding the *same* name in
+  the *same* scope (`let x = 1; let x = 2;`).
+- A redundant explicit `use std.int.{int_to_string};` still compiles:
+  it binds the name to the *same* intrinsic the prelude provides, so
+  it is not shadowing — just redundant. Pre-prelude code that imports
+  intrinsics keeps compiling unchanged.
+
+Two intrinsic categories are intentionally NOT preluded and still
+require a `use`: the low-level `*_validate` / `*_parse` parsing halves
+(use the safe `Result`-returning `std.string` / `std.float` wrappers
+instead) and the internal `Ref` cell ops (use the `std.state` API).
 
 **Module aliases.** `import` accepts an `as` alias for shorter
 qualified-call paths:
@@ -2072,7 +2112,11 @@ reason and have walked through the asymmetry above.
 
 #### §13.2 — Builtin primitives (not in stdlib modules)
 
-These functions are available without any `import`:
+These functions are compiler intrinsics in the prelude — available
+without any `import` (see §10's prelude rules). This table covers the
+primitives with no conceptual stdlib module; the numeric/char/string/
+array intrinsics live under their conceptual module in §13's tables
+and are equally prelude-callable.
 
 | Function | Type | Description |
 |----------|------|-------------|
