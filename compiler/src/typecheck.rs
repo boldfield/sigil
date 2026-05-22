@@ -1532,6 +1532,37 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // declared generic to a specific type).
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // No-shadowing law (spec §9 "There is no shadowing"): a user
+            // fn may not redefine a preluded compiler intrinsic. The name
+            // is already bound globally, like the builtin types — a
+            // redefinition is rejected with a clear collision diagnostic
+            // rather than silently overwriting the builtin. (Pre-prelude,
+            // the bare-name seed was last-wins and a user `fn
+            // int_to_string` silently shadowed it; the prelude makes
+            // intrinsics first-class globals, so the shadow is now an
+            // error, consistent with the rest of the language.)
+            //
+            // Scoped to user files: `imports::resolve` appends stdlib
+            // source items into `program.items`, but intrinsics have no
+            // `.sigil` source, so a stdlib fn never legitimately bears an
+            // intrinsic name (asserted disjoint by
+            // `prelude_names_disjoint_from_stdlib_source_fns`). Guarding
+            // on file origin keeps a future stdlib-source/intrinsic name
+            // clash from emitting a nonsensical "cannot be redefined"
+            // against a stdlib file.
+            if user_redefines_prelude_builtin(f, &tc.stdlib_files) {
+                tc.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0020"),
+                    f.name_span.clone(),
+                    format!(
+                        "`{}` is a builtin (prelude intrinsic) and cannot be \
+                         redefined; it is already in scope everywhere without an import",
+                        f.name
+                    ),
+                ));
+                continue;
+            }
             // Task 78.5 G2.a — strip bracketed `[e]` GP entries that
             // alias the row var name (`![... | e]`); see
             // `effective_fn_generic_params` doc-comment for rationale.
@@ -1710,6 +1741,13 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
     for item in &program.items {
         match item {
+            // Skip body-checking a user fn that redefines a prelude
+            // intrinsic: the pre-pass already emitted E0020 and skipped
+            // its scheme registration. Running `check_fn` would
+            // re-register the user's (wrong) scheme over the builtin's,
+            // producing confusing cascading diagnostics at OTHER call
+            // sites of the intrinsic in the same compilation.
+            Item::Fn(f) if user_redefines_prelude_builtin(f, &tc.stdlib_files) => {}
             Item::Fn(f) => tc.check_fn(f),
             Item::Import(_) | Item::Use(_) => {}
             // Plan A3 task 38 / Plan B task 48: validate variant
@@ -2611,6 +2649,87 @@ const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
     // coverage.
 ];
 
+/// Intrinsics deliberately NOT preluded. These remain `use`-gated:
+///   - The `*_validate` / `*_parse` / `*_alloc` halves are a two-call
+///     protocol the stdlib wraps into safe `Result`-returning *source*
+///     fns (which stay `use`-gated); exposing the raw halves globally
+///     invites misuse.
+///   - `sigil_ref_*` are internal Ref machinery, used through the
+///     `std.state` API rather than directly.
+///
+/// ASYMMETRY NOTE: excluded names return `is_prelude_builtin == false`,
+/// so the no-shadowing redefinition guard does NOT protect them — a user
+/// `fn string_to_int_validate(...)` still silently last-wins-overwrites
+/// the builtin (the pre-prelude footgun). This is intentional: excluded
+/// intrinsics are second-class plumbing, not part of the user-facing
+/// prelude surface. Only the 93 preluded names are redefinition-protected.
+const PRELUDE_EXCLUDED: &[&str] = &[
+    "string_to_int_validate",
+    "string_to_int_parse",
+    "string_to_float_validate",
+    "string_to_float_parse",
+    "string_from_bytes_validate",
+    "string_from_bytes_alloc",
+    "sigil_ref_alloc",
+    "sigil_ref_deref",
+    "sigil_ref_set",
+];
+
+/// Synthetic `stdlib_files` set covering every intrinsic's conceptual
+/// module file, built once. Shared by `prelude_canonical_key` (hot,
+/// per-bare-name-resolution) and `register_builtin_file_qualified_mirrors`
+/// (setup) so both compute canonical keys against an identical set — the
+/// load-bearing invariant that a prelude-resolved name rewrites to the
+/// same key an explicit `use` produces.
+static INTRINSIC_MODULE_FILES: std::sync::LazyLock<BTreeSet<String>> =
+    std::sync::LazyLock::new(|| {
+        BUILTIN_TO_MODULE_FILE
+            .iter()
+            .map(|(_, mf)| (*mf).to_string())
+            .collect()
+    });
+
+/// Is `name` a user-facing compiler intrinsic available in the prelude
+/// (resolvable bare, no `use` line needed)? True iff it's in
+/// [`BUILTIN_TO_MODULE_FILE`] and not in [`PRELUDE_EXCLUDED`].
+///
+/// Compiler intrinsics have no `.sigil` source — codegen emits them
+/// directly — and globally-unique names, so calling them bare is
+/// unambiguous. Stdlib *source* fns (`std.list.map`, …) are NOT
+/// intrinsics; they require `use`.
+fn is_prelude_builtin(name: &str) -> bool {
+    if PRELUDE_EXCLUDED.contains(&name) {
+        return false;
+    }
+    BUILTIN_TO_MODULE_FILE.iter().any(|(n, _)| *n == name)
+}
+
+/// The canonical `std.<module>.<name>` key for a preluded intrinsic, or
+/// `None` if `name` isn't preluded. Mirrors the key form
+/// [`register_builtin_file_qualified_mirrors`] registers, so a prelude-
+/// resolved reference rewrites to exactly the same target an explicit
+/// `use std.X.{name}` would.
+fn prelude_canonical_key(name: &str) -> Option<String> {
+    if PRELUDE_EXCLUDED.contains(&name) {
+        return None;
+    }
+    let module_file = BUILTIN_TO_MODULE_FILE
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, mf)| *mf)?;
+    Some(canonical_fn_key(module_file, name, &INTRINSIC_MODULE_FILES))
+}
+
+/// Does user fn `f` redefine a prelude intrinsic? True iff its name is a
+/// preluded intrinsic AND it originates from a user (non-stdlib) file.
+/// Used by both the redefinition guard (emit E0020 + skip registration)
+/// and the body-check loop (skip `check_fn` so the rejected fn's scheme
+/// never overwrites the builtin's). See the redefinition guard for why
+/// the file-origin check matters.
+fn user_redefines_prelude_builtin(f: &FnDecl, stdlib_files: &BTreeSet<String>) -> bool {
+    is_prelude_builtin(&f.name) && !stdlib_files.contains(&f.span.file)
+}
+
 /// Plan F1 — mirror every bare-key builtin fn_scheme onto its
 /// `<module_label>.<name>` form so `use std.X.{name}` works under
 /// the strict resolver. The canonical-key shape matches the
@@ -2627,16 +2746,15 @@ fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
     // imports; we use a synthetic stdlib_files set listing every
     // module_file in our table, so the canonical key uses the
     // `std.X` form.
-    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
-        .iter()
-        .map(|(_, mf)| (*mf).to_string())
-        .collect();
+    // Shared with `prelude_canonical_key` (built once) so both compute
+    // canonical keys against an identical set.
+    let synthetic_stdlib_files = &*INTRINSIC_MODULE_FILES;
     for (name, module_file) in BUILTIN_TO_MODULE_FILE {
         let scheme = match tc.fn_schemes.get(*name).cloned() {
             Some(s) => s,
             None => continue,
         };
-        let qualified = canonical_fn_key(module_file, name, &synthetic_stdlib_files);
+        let qualified = canonical_fn_key(module_file, name, synthetic_stdlib_files);
         tc.fn_schemes.entry(qualified).or_insert(scheme);
     }
 }
@@ -3986,23 +4104,50 @@ impl Tc {
             }
             None
         } else {
-            // Bare name. Consult the current file's `use` bindings.
-            let bindings = self.file_use_bindings.get(file)?;
-            let resolved = bindings.get(name)?;
-            let canonical = canonical_fn_key(
-                &resolved.module_file,
-                &resolved.source_name,
-                &self.stdlib_files,
-            );
-            if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
-                return Some((scheme, canonical));
+            // Bare name. Consult the current file's explicit `use`
+            // bindings first — they take precedence over the prelude.
+            if let Some(resolved) = self
+                .file_use_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(name))
+            {
+                let canonical = canonical_fn_key(
+                    &resolved.module_file,
+                    &resolved.source_name,
+                    &self.stdlib_files,
+                );
+                if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                    return Some((scheme, canonical));
+                }
+                // Builtin schemes use bare-name keys only — fall back so
+                // a `use std.int.{int_to_string}` line resolves correctly.
+                // Builtin names are globally unique so this never
+                // dispatches to the wrong target.
+                if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
+                    return Some((scheme, resolved.source_name.clone()));
+                }
+                return None;
             }
-            // Builtin schemes use bare-name keys only — fall back so
-            // a `use std.int.{int_to_string}` line resolves correctly.
-            // Builtin names are globally unique so this never
-            // dispatches to the wrong target.
-            if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
-                return Some((scheme, resolved.source_name.clone()));
+            // PRELUDE FALLBACK: no explicit `use` brought this name in,
+            // but a user-facing compiler intrinsic is implicitly in
+            // scope. Resolve it to the same canonical key an explicit
+            // `use std.X.{name}` would, so the resolved-idents rewrite
+            // and codegen dispatch are identical to the imported case
+            // (the prelude is, mechanically, an implicit `use` of every
+            // intrinsic's canonical name). Intrinsic names are globally
+            // unique, so this reopens none of the cross-module ambiguity
+            // that Plan F1's qualified-imports model closed.
+            if is_prelude_builtin(name) {
+                if let Some(canonical) = prelude_canonical_key(name) {
+                    let scheme = self
+                        .fn_schemes
+                        .get(&canonical)
+                        .or_else(|| self.fn_schemes.get(name))
+                        .cloned();
+                    if let Some(scheme) = scheme {
+                        return Some((scheme, canonical));
+                    }
+                }
             }
             None
         }
@@ -10219,6 +10364,172 @@ mod tests {
         all
     }
 
+    #[test]
+    fn prelude_membership_covers_intrinsics_and_excludes_plumbing() {
+        // Universal-prior intrinsics: in.
+        assert!(is_prelude_builtin("int_to_string"));
+        assert!(is_prelude_builtin("panic"));
+        assert!(is_prelude_builtin("assert"));
+        assert!(is_prelude_builtin("float_add"));
+        assert!(is_prelude_builtin("char_to_int"));
+        assert!(is_prelude_builtin("byte_to_int"));
+        assert!(is_prelude_builtin("array_get"));
+        // Two-step parse plumbing: out.
+        assert!(!is_prelude_builtin("string_to_int_validate"));
+        assert!(!is_prelude_builtin("string_to_int_parse"));
+        assert!(!is_prelude_builtin("string_from_bytes_alloc"));
+        // Internal Ref machinery: out.
+        assert!(!is_prelude_builtin("sigil_ref_alloc"));
+        // Stdlib source fns (and the safe parse wrapper) are not
+        // intrinsics: out.
+        assert!(!is_prelude_builtin("map"));
+        assert!(!is_prelude_builtin("unwrap_or"));
+        assert!(!is_prelude_builtin("string_to_int"));
+        // Canonical-key form matches `std.<module>.<name>`.
+        assert_eq!(
+            prelude_canonical_key("int_to_string").as_deref(),
+            Some("std.int.int_to_string")
+        );
+        assert_eq!(
+            prelude_canonical_key("float_add").as_deref(),
+            Some("std.float.float_add")
+        );
+        assert_eq!(prelude_canonical_key("sigil_ref_alloc"), None);
+    }
+
+    #[test]
+    fn bare_prelude_intrinsic_resolves_without_use() {
+        // No `import std.int` / `use std.int.{int_to_string}` — bare call.
+        // The prelude must resolve it; no E0046.
+        let src = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(42));\n\
+  0\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0046"),
+            "bare int_to_string must resolve via the prelude; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn local_let_may_shadow_prelude_intrinsic() {
+        // Sigil's no-shadowing rule (E0020) forbids ONLY re-binding the
+        // same name in the same scope (`let x; let x`). A local `let` /
+        // param shadowing a GLOBAL is allowed (local-first lookup) — a
+        // `let helper = 5` legally shadows a top-level `fn helper`.
+        // Prelude intrinsics are globals, so a local may shadow one too,
+        // for the same reason. (Top-level *redefinition* of an intrinsic
+        // is still rejected — see `user_cannot_redefine_int_to_string_builtin`.)
+        let src = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  let int_to_string: Int = 5;\n\
+  perform IO.println(\"x\");\n\
+  int_to_string\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "a local let may shadow a prelude intrinsic (local-first lookup); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn prelude_names_disjoint_from_stdlib_source_fns() {
+        // INVARIANT: no stdlib SOURCE fn shares a name with a compiler
+        // intrinsic. The redefinition guard is scoped to user files, but
+        // this disjointness is what guarantees a stdlib source fn never
+        // *needs* that scoping — and that a future intrinsic/source name
+        // clash is caught here (at the right layer) rather than as a
+        // nonsensical "cannot redefine" against a stdlib file.
+        use std::collections::BTreeSet;
+        let intrinsics: BTreeSet<&str> = BUILTIN_TO_MODULE_FILE.iter().map(|(n, _)| *n).collect();
+        let mut collisions = Vec::new();
+        for path in glob_std_sigil_files() {
+            let src = std::fs::read_to_string(&path).expect("read std file");
+            for line in src.lines() {
+                let t = line.trim_start();
+                if let Some(rest) = t.strip_prefix("fn ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if intrinsics.contains(name.as_str()) {
+                        collisions.push(format!("{}: fn {name}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "stdlib source fns must not collide with intrinsic names \
+             (would make the stdlib fail to compile with a bogus \
+             'cannot redefine' error): {collisions:?}"
+        );
+    }
+
+    /// Resolve `std/**/*.sigil` paths relative to the crate root for the
+    /// disjointness invariant test.
+    fn glob_std_sigil_files() -> Vec<std::path::PathBuf> {
+        // CARGO_MANIFEST_DIR is `<repo>/compiler`; std/ is a sibling.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler/ has a parent")
+            .join("std");
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("sigil") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bare_excluded_intrinsic_still_needs_use() {
+        // Excluded intrinsics (e.g. `string_to_int_validate`) are NOT in
+        // the prelude, so calling them bare must still fail to resolve
+        // (E0046) — closing the gap between "excluded from the prelude
+        // set" (unit-tested membership) and "actually unresolvable bare".
+        let src = "fn main() -> Int ![] {\n\
+  let _: Bool = string_to_int_validate(\"42\");\n\
+  0\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0046"),
+            "excluded intrinsics must not resolve bare; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_non_intrinsic_still_needs_use() {
+        // `string_to_int` is a stdlib SOURCE fn (not an intrinsic), so the
+        // prelude must NOT resolve it — it still requires `use` and emits
+        // E0046 + an import hint. Guards the intrinsic-vs-source line.
+        let src = "fn main() -> Int ![] {\n\
+  match string_to_int(\"42\") { _ => 0 }\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0046"),
+            "string_to_int is a source fn, not preluded — must still fail; got {errs:?}"
+        );
+    }
+
     fn has_code(errs: &[CompilerError], code: &str) -> bool {
         errs.iter().any(|e| e.code.as_str() == code)
     }
@@ -11061,11 +11372,12 @@ mod tests {
     }
 
     #[test]
-    fn user_can_shadow_int_to_string_builtin() {
-        // Seeded builtin is overwritten by the user's `fn
-        // int_to_string` in the pre-pass. The user's signature is
-        // what typecheck uses; arg-type checking follows the user's
-        // definition, not the builtin.
+    fn user_cannot_redefine_int_to_string_builtin() {
+        // No-shadowing law + the intrinsic prelude: `int_to_string` is a
+        // prelude builtin, in scope everywhere. A user `fn int_to_string`
+        // is a redefinition error (E0020), NOT a silent shadow. (This
+        // inverts the pre-prelude `user_can_shadow_int_to_string_builtin`
+        // behavior, where the seeded builtin was last-wins overwritten.)
         let src = "import std.io\n\
                use std.io.{IO};\n\
                fn int_to_string(s: String) -> String ![] { s }\n\
@@ -11075,9 +11387,13 @@ mod tests {
                }\n\
                ";
         let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0020")
+            .unwrap_or_else(|| panic!("expected E0020 for builtin redefinition; got: {errs:?}"));
         assert!(
-            errs.is_empty(),
-            "user shadow of int_to_string should typecheck clean; got: {errs:?}"
+            e.message.contains("int_to_string") && e.message.contains("builtin"),
+            "error must name the builtin collision: {e:?}"
         );
     }
 
@@ -15528,9 +15844,11 @@ mod tests {
         // a concrete fn whose `A`/`B` map to Int/String pins both
         // positions through unification. Typechecks cleanly iff
         // unification flows the concrete types through `A` + `B`.
-        let src = "fn int_to_string(n: Int) -> String ![] { \"x\" }\n\
+        // (Uses `stringify`, not `int_to_string`, since the latter is
+        // now a prelude builtin that may not be redefined.)
+        let src = "fn stringify(n: Int) -> String ![] { \"x\" }\n\
                    fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
-                   fn main() -> Int ![] { let _: String = apply(int_to_string, 42); 0 }\n";
+                   fn main() -> Int ![] { let _: String = apply(stringify, 42); 0 }\n";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),

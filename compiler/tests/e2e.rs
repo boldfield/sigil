@@ -21975,6 +21975,64 @@ fn main() -> Int ![IO] {\n\
 }
 
 #[test]
+fn prelude_int_to_string_runs_without_import() {
+    // `int_to_string` is a prelude intrinsic — no `import std.int` /
+    // `use std.int.{int_to_string}` needed. Compiles + runs + prints 42.
+    let source = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(42));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "prelude_int_to_string");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "42");
+}
+
+#[test]
+fn prelude_float_add_runs_without_import() {
+    // `float_from_int`, `float_add`, `float_to_string` are all prelude
+    // intrinsics with NO bare-name codegen special-case (unlike
+    // int_to_string). They must dispatch via the canonical
+    // `std.float.*` key after prelude resolution records it in
+    // resolved_idents — verifying the prelude works for the general
+    // intrinsic, not just the special-cased one. 2.0 + 3.0 = 5.0.
+    let source = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  let a: Float = float_from_int(2);\n\
+  let b: Float = float_from_int(3);\n\
+  perform IO.println(float_to_string(float_add(a, b)));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "prelude_float_add");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "5.0");
+}
+
+#[test]
+fn redundant_use_of_prelude_intrinsic_still_compiles() {
+    // The entire pre-prelude corpus writes `use std.int.{int_to_string}`.
+    // With the prelude that name is already in scope, but the redundant
+    // `use` MUST still compile — it binds to the SAME canonical symbol
+    // the prelude provides (idempotent, not shadowing). Backward compat.
+    let source = "import std.int\n\
+import std.io\n\
+use std.int.{int_to_string};\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(7));\n\
+  0\n\
+}\n";
+    let (stdout, stderr, code) = compile_and_run(source, "redundant_use_prelude");
+    assert_eq!(
+        code, 0,
+        "redundant use of a prelude intrinsic must compile; stderr={stderr}"
+    );
+    assert_eq!(stdout.trim_end(), "7");
+}
+
+#[test]
 fn multi_call_per_branch_fib_handles_chained_continuations() {
     // `fib(n) = fib(n-1) + fib(n-2)` — TWO non-tail self-calls in one
     // branch. Auto-CPS lowers this via chained continuations: the first
