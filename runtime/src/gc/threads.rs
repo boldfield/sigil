@@ -199,6 +199,64 @@ thread_local! {
     /// guard — a misread risks eliding the wrap on a parked thread
     /// and crashing the precise walker.
     pub(crate) static IS_THREAD_GC_BLOCKING: Cell<bool> = const { Cell::new(false) };
+
+    /// Stack of in-flight trampoline dispatch frames. The trampoline
+    /// (`sigil_run_loop_impl`) pushes a frame just before invoking a
+    /// dispatched Cps fn and pops it on return. Each frame records the
+    /// `(closure_ptr, args_ptr, arg_count)` the trampoline passed to
+    /// that fn.
+    ///
+    /// **Why this exists.** Under `GC_do_blocking` the conservative
+    /// stack scan is restricted to above the blocking-entry SP, so the
+    /// trampoline's own stack-local dispatch state (the closure record
+    /// it's about to run + the args buffer it copied) is NOT scanned.
+    /// The precise walker only covers the single leaf Sigil frame that
+    /// called `sigil_alloc` — it cannot see the trampoline's in-flight
+    /// continuation. A deep auto-CPS continuation chain (built by
+    /// non-tail recursion) is reachable only through this dispatch
+    /// state, so without rooting it the chain is collected mid-flight.
+    /// `push_sigil_thread_precise_roots` scans every frame here so the
+    /// in-flight continuation closure + its args (which may hold heap
+    /// pointers like a partial list being folded) stay rooted across a
+    /// GC triggered inside the dispatched fn. A Vec (not a single cell)
+    /// covers nested `sigil_run_loop` calls — each active dispatch
+    /// across all nesting levels keeps its own frame.
+    pub(crate) static TRAMPOLINE_INFLIGHT: std::cell::RefCell<Vec<TrampolineFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One in-flight trampoline dispatch — see [`TRAMPOLINE_INFLIGHT`].
+#[derive(Clone, Copy)]
+pub(crate) struct TrampolineFrame {
+    /// The dispatched fn's `closure_ptr` arg (a heap closure record,
+    /// or null for top-level Cps user fns). Rooted by-value.
+    pub closure_ptr: usize,
+    /// Pointer to the trampoline's stack-local args buffer.
+    pub args_ptr: usize,
+    /// Number of u64 args in the buffer.
+    pub arg_count: u32,
+}
+
+/// Push an in-flight trampoline dispatch frame. Called by the
+/// trampoline immediately before invoking a dispatched Cps fn.
+#[inline]
+pub(crate) fn trampoline_inflight_push(closure_ptr: usize, args_ptr: usize, arg_count: u32) {
+    TRAMPOLINE_INFLIGHT.with(|s| {
+        s.borrow_mut().push(TrampolineFrame {
+            closure_ptr,
+            args_ptr,
+            arg_count,
+        })
+    });
+}
+
+/// Pop the most-recent in-flight trampoline dispatch frame. Called by
+/// the trampoline immediately after the dispatched Cps fn returns.
+#[inline]
+pub(crate) fn trampoline_inflight_pop() {
+    TRAMPOLINE_INFLIGHT.with(|s| {
+        s.borrow_mut().pop();
+    });
 }
 
 #[inline]
@@ -508,6 +566,11 @@ extern "C" fn push_sigil_thread_precise_roots() {
         );
         return;
     }
+    // Root the trampoline's in-flight dispatch state FIRST, before the
+    // captured-FP gate — it must run whenever a dispatch is in flight,
+    // even if `captured_fp` is null (e.g. a GC fired from a runtime
+    // alloc while the trampoline holds a live continuation).
+    push_trampoline_inflight_roots();
     let captured_fp = CAPTURED_SIGIL_CALLER_FP.with(Cell::get);
     if captured_fp.is_null() {
         crate::counters::add(
@@ -532,6 +595,44 @@ extern "C" fn push_sigil_thread_precise_roots() {
         crate::counters::CounterId::PreciseWalkerNs,
         walker_start.elapsed().as_nanos() as u64,
     );
+}
+
+/// Push the trampoline's in-flight dispatch frames as GC roots. See
+/// [`TRAMPOLINE_INFLIGHT`] for why this is needed under `GC_do_blocking`.
+fn push_trampoline_inflight_roots() {
+    TRAMPOLINE_INFLIGHT.with(|s| {
+        // `try_borrow` defends against the (currently impossible)
+        // re-entrant case where GC fires while push/pop holds a mutable
+        // borrow — GC only fires at `sigil_alloc` safepoints, never
+        // mid-`Vec` op, so a failed borrow would be a future bug, not a
+        // crash to absorb silently. Skip the scan rather than panic.
+        let frames = match s.try_borrow() {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        for frame in frames.iter() {
+            // Root the closure_ptr by-value: scan the 8-byte field in
+            // this (Rust-heap-stable) Vec entry so Boehm sees the
+            // pointer value and traces the closure record's descriptor.
+            let cp_addr = (&frame.closure_ptr as *const usize) as usize;
+            unsafe {
+                GC_push_all_eager(
+                    cp_addr as *mut c_void,
+                    (cp_addr.wrapping_add(8)) as *mut c_void,
+                );
+            }
+            // Conservatively scan the args buffer the trampoline copied
+            // for this dispatch. Holds the (k_closure, k_fn) pair plus
+            // any user args; heap-pointer values are traced, scalars
+            // (Ints) are harmlessly ignored by Boehm.
+            if frame.arg_count > 0 && frame.args_ptr != 0 {
+                let bottom = frame.args_ptr as *mut c_void;
+                let top =
+                    (frame.args_ptr.wrapping_add(frame.arg_count as usize * 8)) as *mut c_void;
+                unsafe { GC_push_all_eager(bottom, top) };
+            }
+        }
+    });
 }
 
 #[cfg(test)]

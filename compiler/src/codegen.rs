@@ -482,13 +482,13 @@ fn compute_user_fn_abi(
     // Auto-promoted fns (non-tail self/SCC recursion) are CPS ABI even
     // though their body shape doesn't match any existing classifier above.
     // The colorer already promoted them to CPS color; this ensures the ABI
-    // selection agrees.
-    // RESTRICTION: only single-call-per-branch auto-promoted fns get CPS ABI.
-    // Multi-call fns (like fib with fib(n-1) + fib(n-2)) stay Sync until
-    // the intermediate continuation machinery is complete.
+    // selection agrees. Auto-CPS handles single- and multi-call-per-branch
+    // shapes (sum_to, fib, sum_tree, build) via chained continuations. The
+    // only restriction: the recursive arms must contain no genuine
+    // non-recursive function calls (a real `foo(x)` call the simple
+    // residual evaluator can't lower). Constructor applications and
+    // recursive calls are fine.
     if colored.auto_promotions.iter().any(|ap| ap.fn_name == name) {
-        // Quick check: count max non-tail recursive calls across all
-        // branches of the body. If any branch has > 1, stay Sync.
         let mut scc_members = std::collections::BTreeSet::new();
         for ap in &colored.auto_promotions {
             if ap.fn_name == name {
@@ -496,18 +496,19 @@ fn compute_user_fn_abi(
             }
         }
         scc_members.insert(name.to_string());
-        let _max_calls = count_max_recursive_calls_per_branch(body, &scc_members);
-        if !body_has_non_trivial_non_recursive_calls(body, &scc_members) {
+        if !body_has_non_trivial_non_recursive_calls(body, &scc_members, &ctors) {
             return UserFnAbi::Cps;
         }
-        // Non-trivial non-recursive calls: stay Sync.
+        // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
     UserFnAbi::Sync
 }
 
 /// Count the maximum number of non-tail recursive calls in any single
-/// branch of a function body. Used by `compute_user_fn_abi` to gate
-/// auto-CPS promotion to only single-call patterns.
+/// branch of a function body. Retained as a test helper / analysis
+/// utility; auto-CPS no longer gates on call count (multi-call shapes
+/// are handled via chained continuations).
+#[cfg(test)]
 fn count_max_recursive_calls_per_branch(
     body: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
@@ -593,70 +594,72 @@ fn count_max_recursive_calls_per_branch(
 /// Check whether a fn body contains non-recursive Call expressions
 /// (lambda IIFEs, closure calls, calls to non-SCC fns) that the simple
 /// auto-CPS evaluator can't handle. If true, the fn should stay Sync.
-/// Conservative check: does the body contain any non-recursive Call?
-/// Currently flags ALL non-recursive calls including constructor
-/// applications (`Node(...)`, `Some(x)`) and pure builtins
-/// (`int_to_string`). This is more restrictive than necessary —
-/// ctors are lowered by `lower_auto_cps_simple_expr` and should be
-/// safe. Relaxing this to accept ctor applications (and eventually
-/// pure builtins) would let shapes like `fn f(n) = if n <= 0 { Nil }
-/// else { Cons(n, f(n-1)) }` use auto-CPS instead of falling to Sync.
+/// Conservative check: does the body contain a non-recursive Call that
+/// the auto-CPS simple evaluator can't lower? Recursive calls (SCC
+/// members) and constructor applications (names in `ctor_index`) are
+/// fine — recursive calls become yield points, ctors are lowered by
+/// `lower_auto_cps_simple_expr`. Any OTHER call (a real function call
+/// like `int_to_string(x)` or a higher-order/closure call) forces the
+/// fn to Sync ABI, since the simple evaluator has no way to lower it.
 fn body_has_non_trivial_non_recursive_calls(
     body: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
+    ctor_names: &std::collections::BTreeSet<String>,
 ) -> bool {
-    fn has_non_rec_call(e: &crate::ast::Expr, scc: &std::collections::BTreeSet<String>) -> bool {
+    fn walk(
+        e: &crate::ast::Expr,
+        scc: &std::collections::BTreeSet<String>,
+        ctors: &std::collections::BTreeSet<String>,
+    ) -> bool {
         use crate::ast::Expr;
         match e {
             Expr::Call { callee, args, .. } => {
-                let is_recursive = if let Expr::Ident(name, _) = callee.as_ref() {
-                    scc.contains(name)
-                } else {
-                    false
+                let callee_name = match callee.as_ref() {
+                    Expr::Ident(name, _) => Some(name.as_str()),
+                    _ => None,
                 };
-                if !is_recursive {
-                    return true; // non-recursive call found
+                let is_recursive = callee_name.is_some_and(|n| scc.contains(n));
+                let is_ctor = callee_name.is_some_and(|n| ctors.contains(n));
+                if !is_recursive && !is_ctor {
+                    return true; // real non-recursive fn call
                 }
-                args.iter().any(|a| has_non_rec_call(a, scc))
+                // Recursive or ctor call: check args for nested disallowed calls.
+                args.iter().any(|a| walk(a, scc, ctors))
             }
-            Expr::Binary { lhs, rhs, .. } => {
-                has_non_rec_call(lhs, scc) || has_non_rec_call(rhs, scc)
-            }
-            Expr::Unary { operand, .. } => has_non_rec_call(operand, scc),
-            Expr::Block(b) => has_non_rec_call_in_block(b, scc),
+            Expr::Binary { lhs, rhs, .. } => walk(lhs, scc, ctors) || walk(rhs, scc, ctors),
+            Expr::Unary { operand, .. } => walk(operand, scc, ctors),
+            Expr::Block(b) => walk_block(b, scc, ctors),
             Expr::If {
                 cond,
                 then_block,
                 else_block,
                 ..
             } => {
-                has_non_rec_call(cond, scc)
-                    || has_non_rec_call_in_block(then_block, scc)
-                    || has_non_rec_call_in_block(else_block, scc)
+                walk(cond, scc, ctors)
+                    || walk_block(then_block, scc, ctors)
+                    || walk_block(else_block, scc, ctors)
             }
             Expr::Match {
                 scrutinee, arms, ..
-            } => {
-                has_non_rec_call(scrutinee, scc)
-                    || arms.iter().any(|a| has_non_rec_call(&a.body, scc))
-            }
+            } => walk(scrutinee, scc, ctors) || arms.iter().any(|a| walk(&a.body, scc, ctors)),
             Expr::ClosureRecord { .. } | Expr::Lambda { .. } => true,
             _ => false,
         }
     }
-    fn has_non_rec_call_in_block(
+    fn walk_block(
         b: &crate::ast::Block,
         scc: &std::collections::BTreeSet<String>,
+        ctors: &std::collections::BTreeSet<String>,
     ) -> bool {
         for s in &b.stmts {
             match s {
                 crate::ast::Stmt::Let(l) => {
-                    if has_non_rec_call(&l.value, scc) {
+                    if walk(&l.value, scc, ctors) {
                         return true;
                     }
                 }
                 crate::ast::Stmt::Expr(e) => {
-                    if has_non_rec_call(e, scc) {
+                    if walk(e, scc, ctors) {
                         return true;
                     }
                 }
@@ -664,12 +667,12 @@ fn body_has_non_trivial_non_recursive_calls(
             }
         }
         if let Some(t) = &b.tail {
-            has_non_rec_call(t, scc)
+            walk(t, scc, ctors)
         } else {
             false
         }
     }
-    has_non_rec_call_in_block(body, scc_members)
+    walk_block(body, scc_members, ctor_names)
 }
 
 /// Map a surface-syntax `TypeExpr` to the Cranelift IR type codegen uses
@@ -3646,6 +3649,14 @@ enum CpsContinuationKind {
         /// For a single-call fn this is always 0; for multi-call chains
         /// (fib, sum_tree) it ranges 0..N-1.
         step_index: usize,
+        /// Whether the recursive result (`args_ptr[0]`) is a heap pointer
+        /// (the recursive callee returns a user/pointer type, e.g. `build`
+        /// returns `Tree`). When true, the continuation MUST load it via
+        /// `lower_heap_pointer_load` so it becomes a precise GC stack root
+        /// — otherwise a subsequent alloc in the continuation can collect
+        /// the value the result points at. Int-returning fns (sum_to, fib,
+        /// sum_tree) set this false.
+        rec_result_is_pointer: bool,
     },
 }
 
@@ -10584,6 +10595,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     tail_expr: Box::new(residual_expr.clone()),
                                                     auto_cps_role: role,
                                                     step_index: step_idx,
+                                                    rec_result_is_pointer: rec_slot_kind(step_idx)
+                                                        .is_pointer(),
                                                 },
                                             });
 
@@ -12017,11 +12030,21 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             scrutinee, arms, ..
                         } => {
                             // Lower the scrutinee.
+                            let scrut_expr_ctx = AutoCpsExprCtx {
+                                ctor_index: &ctor_index,
+                                type_layouts: &type_layouts,
+                                shape_table: &shape_table,
+                                alloc_ref: module.declare_func_in_func(
+                                    per_fn_refs_ctx.builtins.alloc,
+                                    builder.func,
+                                ),
+                            };
                             let scrut_v = lower_auto_cps_simple_expr(
                                 &mut builder,
                                 scrutinee,
                                 &env,
                                 pointer_ty,
+                                &scrut_expr_ctx,
                             );
 
                             // For the common desugared-if pattern (match bool
@@ -12074,6 +12097,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         next_step_args_ptr_ref,
                                         &shape_table,
                                         &per_fn_refs_ctx,
+                                        &ctor_index,
+                                        &type_layouts,
                                     );
                                     builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
                                 }
@@ -12234,6 +12259,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         next_step_args_ptr_ref,
                                         &shape_table,
                                         &per_fn_refs_ctx,
+                                        &ctor_index,
+                                        &type_layouts,
                                     );
                                     builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
 
@@ -12275,6 +12302,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 next_step_args_ptr_ref,
                                 &shape_table,
                                 &per_fn_refs_ctx,
+                                &ctor_index,
+                                &type_layouts,
                             );
                             builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
                         }
@@ -20057,6 +20086,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         tail_expr,
                         auto_cps_role,
                         step_index,
+                        rec_result_is_pointer,
                     } => {
                         // Auto-CPS recursive continuation body emit.
                         // Entry: unpack result from args_ptr[0], load
@@ -20067,11 +20097,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let args_ptr = block_params[1];
                         let _terminal_out = block_params[3];
 
-                        // Load the recursive result from args_ptr[0].
-                        let rec_result_widened =
+                        // Load the recursive result from args_ptr[0]. When the
+                        // recursive callee returns a heap pointer (e.g. `build`
+                        // → `Tree`), route through `lower_heap_pointer_load` so
+                        // the value becomes a precise GC stack root — otherwise
+                        // a subsequent alloc in this continuation could collect
+                        // what it points at. Int results take the plain load.
+                        let rec_result_widened = if *rec_result_is_pointer {
+                            lower_heap_pointer_load(&mut builder, pointer_ty, args_ptr, 0)
+                        } else {
                             builder
                                 .ins()
-                                .load(types::I64, MemFlags::trusted(), args_ptr, 0);
+                                .load(types::I64, MemFlags::trusted(), args_ptr, 0)
+                        };
 
                         // Load captures from closure_ptr at offsets
                         // 16 + 8*i (past TAG_CLOSURE header at +0 and
@@ -20104,6 +20142,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // (`$rec0..$rec{step_index-1}`) come from captures.
                         env.insert(format!("$rec{step_index}"), rec_result_widened);
 
+                        let cont_expr_ctx = AutoCpsExprCtx {
+                            ctor_index: &ctor_index,
+                            type_layouts: &type_layouts,
+                            shape_table: &shape_table,
+                            alloc_ref: module
+                                .declare_func_in_func(per_fn_refs_ctx.builtins.alloc, builder.func),
+                        };
+
                         match auto_cps_role {
                             AutoCpsContRole::Final => {
                                 // Load k_closure and k_fn from captures
@@ -20124,6 +20170,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     tail_expr,
                                     &env,
                                     pointer_ty,
+                                    &cont_expr_ctx,
                                 );
                                 let tail_ty = builder.func.dfg.value_type(tail_value);
                                 let widened_result = if tail_ty == types::I64 {
@@ -20249,6 +20296,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         arg_expr,
                                         &env,
                                         pointer_ty,
+                                        &cont_expr_ctx,
                                     );
                                     arg_values.push(v);
                                 }
@@ -28738,11 +28786,19 @@ fn emit_auto_cps_branch(
     next_step_args_ptr_ref: FuncRef,
     shape_table: &std::cell::RefCell<ShapeTable>,
     per_fn_refs_ctx: &PerFnRefsCtx<'_>,
+    ctor_index: &std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &std::collections::BTreeMap<String, crate::layout::TypeLayout>,
 ) -> Value {
+    let expr_ctx = AutoCpsExprCtx {
+        ctor_index,
+        type_layouts,
+        shape_table,
+        alloc_ref: module.declare_func_in_func(per_fn_refs_ctx.builtins.alloc, builder.func),
+    };
     match branch {
         AutoCpsBranchKind::BaseCase(expr) => {
             // Evaluate the expression and resume caller's k.
-            let result_v = lower_auto_cps_simple_expr(builder, expr, env, pointer_ty);
+            let result_v = lower_auto_cps_simple_expr(builder, expr, env, pointer_ty, &expr_ctx);
             let result_ty = builder.func.dfg.value_type(result_v);
             let widened = if result_ty == types::I64 {
                 result_v
@@ -28770,7 +28826,8 @@ fn emit_auto_cps_branch(
             let mut env = env.clone();
             for stmt in pre_stmts {
                 if let crate::ast::Stmt::Let(l) = stmt {
-                    let v = lower_auto_cps_simple_expr(builder, &l.value, &env, pointer_ty);
+                    let v =
+                        lower_auto_cps_simple_expr(builder, &l.value, &env, pointer_ty, &expr_ctx);
                     env.insert(l.name.clone(), v);
                 }
             }
@@ -28849,7 +28906,7 @@ fn emit_auto_cps_branch(
             // Lower args for the recursive call.
             let mut arg_values: Vec<Value> = Vec::new();
             for arg_expr in &first_step.call_args {
-                let v = lower_auto_cps_simple_expr(builder, arg_expr, &env, pointer_ty);
+                let v = lower_auto_cps_simple_expr(builder, arg_expr, &env, pointer_ty, &expr_ctx);
                 arg_values.push(v);
             }
 
@@ -28923,31 +28980,130 @@ fn emit_auto_cps_branch(
     }
 }
 
-/// Simple expression evaluator for auto-CPS continuation bodies.
-/// Handles the common patterns that appear in recursive fn residuals:
-/// Binary(op, Ident, Ident), Ident, IntLit, and nested Binary.
-/// Does NOT handle arbitrary expressions — only the shapes that
-/// `extract_first_recursive_call` produces as residuals.
+/// Context the auto-CPS simple expression evaluator needs to lower
+/// constructor applications (e.g. `Node(1, $rec0, $rec1)` in `build`'s
+/// residual). Bundled so the recursive evaluator threads one ref rather
+/// than four. `alloc_ref` must already be declared in the current
+/// function (`module.declare_func_in_func(builtins.alloc, builder.func)`).
+struct AutoCpsExprCtx<'a> {
+    ctor_index: &'a std::collections::BTreeMap<String, (String, usize)>,
+    type_layouts: &'a std::collections::BTreeMap<String, crate::layout::TypeLayout>,
+    shape_table: &'a std::cell::RefCell<ShapeTable>,
+    alloc_ref: FuncRef,
+}
+
+/// Free-function constructor allocator for the auto-CPS residual
+/// evaluator. Mirrors `Lowerer::lower_ctor_alloc` exactly (header at +0,
+/// discriminant word at +8, fields at `16 + 8*i`); factored out so the
+/// non-`Lowerer` auto-CPS emit can build heap records too.
+fn lower_ctor_alloc_raw(
+    builder: &mut FunctionBuilder<'_>,
+    ctx: &AutoCpsExprCtx<'_>,
+    type_name: &str,
+    variant_index: usize,
+    field_values: &[Value],
+    pointer_ty: Type,
+) -> Value {
+    let layout = &ctx.type_layouts[type_name];
+    let variant = &layout.variants[variant_index];
+    let header = crate::layout::variant_header_word(layout.type_tag, variant);
+    let payload_bytes: i64 = (variant.payload_words as i64) * 8;
+
+    let header_v = builder.ins().iconst(types::I64, header as i64);
+    let size_v = builder.ins().iconst(pointer_ty, payload_bytes);
+    let descriptor_index = ctx
+        .shape_table
+        .borrow_mut()
+        .alloc_descriptor_index(variant.pointer_bitmap, variant.payload_words);
+    let descriptor_v = builder.ins().iconst(types::I32, descriptor_index as i64);
+    let ptr = lower_alloc_call(builder, ctx.alloc_ref, &[header_v, size_v, descriptor_v]);
+
+    // Discriminant in payload word 0 (bytes 8..16 past header).
+    let disc_v = builder
+        .ins()
+        .iconst(types::I64, i64::from(variant.discriminant));
+    builder.ins().store(MemFlags::trusted(), disc_v, ptr, 8);
+
+    // Fields in payload words 1..N at offsets 16 + 8*i.
+    for (i, &val) in field_values.iter().enumerate() {
+        let val_ty = builder.func.dfg.value_type(val);
+        let store_val = if val_ty == types::I64 || val_ty == pointer_ty {
+            val
+        } else {
+            builder.ins().uextend(types::I64, val)
+        };
+        let offset: i32 = 16 + 8 * i as i32;
+        builder
+            .ins()
+            .store(MemFlags::trusted(), store_val, ptr, offset);
+    }
+    ptr
+}
+
+/// Simple expression evaluator for auto-CPS continuation bodies and
+/// residuals. Handles the shapes `extract_first_recursive_call` leaves
+/// behind: Ident, IntLit, BoolLit, Binary, Unary, and constructor
+/// applications (`Ctor(args...)`). Genuine non-recursive function calls
+/// are gated out upstream by `body_has_non_trivial_non_recursive_calls`,
+/// so any other expression is `unreachable!`.
 fn lower_auto_cps_simple_expr(
     builder: &mut FunctionBuilder<'_>,
     expr: &crate::ast::Expr,
     env: &BTreeMap<String, Value>,
-    _pointer_ty: Type,
+    pointer_ty: Type,
+    ctx: &AutoCpsExprCtx<'_>,
 ) -> Value {
     use crate::ast::{BinOp, Expr};
     match expr {
         Expr::Ident(name, _) => match env.get(name).copied() {
             Some(v) => v,
-            None => unreachable!(
-                "auto-CPS simple evaluator: unresolved ident `{name}` — \
-                     the analysis pass should have captured this variable"
-            ),
+            // A bare ident that isn't a bound variable may be a nullary
+            // constructor (`Leaf`, `Nil`, `None`) — allocate it with zero
+            // fields. Otherwise it's a genuinely unresolved name (bug).
+            None => {
+                if let Some((type_name, variant_idx)) = ctx.ctor_index.get(name).cloned() {
+                    lower_ctor_alloc_raw(builder, ctx, &type_name, variant_idx, &[], pointer_ty)
+                } else {
+                    unreachable!(
+                        "auto-CPS simple evaluator: unresolved ident `{name}` — \
+                         the analysis pass should have captured this variable"
+                    )
+                }
+            }
         },
         Expr::IntLit(n, _) => builder.ins().iconst(types::I64, *n),
         Expr::BoolLit(b, _) => builder.ins().iconst(types::I8, *b as i64),
+        Expr::Call { callee, args, .. } => {
+            let ctor_name = match callee.as_ref() {
+                Expr::Ident(n, _) => n.as_str(),
+                _ => unreachable!(
+                    "auto-CPS simple evaluator: non-Ident callee {callee:?} — \
+                     should have been gated to Sync ABI"
+                ),
+            };
+            let (type_name, variant_idx) =
+                ctx.ctor_index.get(ctor_name).cloned().unwrap_or_else(|| {
+                    unreachable!(
+                        "auto-CPS simple evaluator: call to non-ctor `{ctor_name}` — \
+                         body_has_non_trivial_non_recursive_calls should have gated this"
+                    )
+                });
+            let field_vals: Vec<Value> = args
+                .iter()
+                .map(|a| lower_auto_cps_simple_expr(builder, a, env, pointer_ty, ctx))
+                .collect();
+            lower_ctor_alloc_raw(
+                builder,
+                ctx,
+                &type_name,
+                variant_idx,
+                &field_vals,
+                pointer_ty,
+            )
+        }
         Expr::Binary { op, lhs, rhs, .. } => {
-            let lhs_v = lower_auto_cps_simple_expr(builder, lhs, env, _pointer_ty);
-            let rhs_v = lower_auto_cps_simple_expr(builder, rhs, env, _pointer_ty);
+            let lhs_v = lower_auto_cps_simple_expr(builder, lhs, env, pointer_ty, ctx);
+            let rhs_v = lower_auto_cps_simple_expr(builder, rhs, env, pointer_ty, ctx);
             match op {
                 BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
@@ -28995,7 +29151,7 @@ fn lower_auto_cps_simple_expr(
             }
         }
         Expr::Unary { op, operand, .. } => {
-            let v = lower_auto_cps_simple_expr(builder, operand, env, _pointer_ty);
+            let v = lower_auto_cps_simple_expr(builder, operand, env, pointer_ty, ctx);
             match op {
                 crate::ast::UnOp::Neg => builder.ins().ineg(v),
                 crate::ast::UnOp::Not => {
@@ -31543,8 +31699,9 @@ fn is_supported_cps_user_fn_inner(
             return true;
         }
         // Auto-promoted fns (non-tail self/SCC recursion) are supported CPS
-        // callees only if they actually get CPS ABI (single-call per branch,
-        // no non-trivial non-recursive calls).
+        // callees iff they actually get CPS ABI — i.e. their recursive arms
+        // contain no genuine non-recursive fn call (ctors and recursive
+        // calls are fine). Mirrors the gate in `compute_user_fn_abi`.
         if colored
             .auto_promotions
             .iter()
@@ -31558,14 +31715,11 @@ fn is_supported_cps_user_fn_inner(
                     }
                 }
                 scc_members_callee.insert(callee_name.to_string());
-                let max_calls =
-                    count_max_recursive_calls_per_branch(&callee_fn.body, &scc_members_callee);
-                if max_calls <= 1
-                    && !body_has_non_trivial_non_recursive_calls(
-                        &callee_fn.body,
-                        &scc_members_callee,
-                    )
-                {
+                if !body_has_non_trivial_non_recursive_calls(
+                    &callee_fn.body,
+                    &scc_members_callee,
+                    ctors,
+                ) {
                     return true;
                 }
             }
@@ -38351,8 +38505,9 @@ mod tests {
             span: span.clone(),
         };
         let scc = BTreeSet::from(["sum_to".to_string()]);
+        let ctors = BTreeSet::new();
         assert!(
-            !body_has_non_trivial_non_recursive_calls(&body, &scc),
+            !body_has_non_trivial_non_recursive_calls(&body, &scc, &ctors),
             "body with only recursive calls and arithmetic should not flag as having non-trivial non-recursive calls"
         );
     }
@@ -38415,8 +38570,9 @@ mod tests {
             span: span.clone(),
         };
         let scc = BTreeSet::from(["sum_to".to_string()]);
+        let ctors = BTreeSet::new();
         assert!(
-            body_has_non_trivial_non_recursive_calls(&body, &scc),
+            body_has_non_trivial_non_recursive_calls(&body, &scc, &ctors),
             "body with a call to external fn `foo` must be flagged as having non-trivial non-recursive calls"
         );
     }
@@ -38424,9 +38580,9 @@ mod tests {
     #[test]
     fn body_has_non_trivial_non_recursive_calls_with_ctor() {
         // Body: `match d { 0 => Leaf, _ => Node(1, build(d - 1), build(d - 1)) }`
-        // `Node(...)` is a call that is not in the scc — conservative analysis
-        // flags it as a non-trivial non-recursive call even though ctors are
-        // safe. This documents the current restrictive behavior.
+        // `Node(...)` is a constructor application, not a genuine fn call —
+        // when `Node` is in the ctor set, it must NOT be flagged (the simple
+        // residual evaluator lowers ctors, so build qualifies for auto-CPS).
         use crate::ast::{BinOp, Block, Expr, MatchArm, Pattern};
         use crate::errors::Span;
         use std::collections::BTreeSet;
@@ -38480,10 +38636,11 @@ mod tests {
             span: span.clone(),
         };
         let scc = BTreeSet::from(["build".to_string()]);
-        // Conservative: Node ctor call is not in scc and is flagged.
+        let ctors = BTreeSet::from(["Node".to_string(), "Leaf".to_string()]);
+        // Node is a ctor — not flagged. build's recursive arm is auto-CPS-eligible.
         assert!(
-            body_has_non_trivial_non_recursive_calls(&body, &scc),
-            "ctor call Node(...) is not in scc and must be flagged by conservative analysis"
+            !body_has_non_trivial_non_recursive_calls(&body, &scc, &ctors),
+            "ctor call Node(...) must NOT be flagged — ctors are lowerable by the residual evaluator"
         );
     }
 
