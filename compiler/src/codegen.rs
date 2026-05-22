@@ -28902,15 +28902,13 @@ fn lower_auto_cps_simple_expr(
 ) -> Value {
     use crate::ast::{BinOp, Expr};
     match expr {
-        Expr::Ident(name, _) => {
-            match env.get(name).copied() {
-                Some(v) => v,
-                None => unreachable!(
-                    "auto-CPS simple evaluator: unresolved ident `{name}` — \
+        Expr::Ident(name, _) => match env.get(name).copied() {
+            Some(v) => v,
+            None => unreachable!(
+                "auto-CPS simple evaluator: unresolved ident `{name}` — \
                      the analysis pass should have captured this variable"
-                ),
-            }
-        }
+            ),
+        },
         Expr::IntLit(n, _) => builder.ins().iconst(types::I64, *n),
         Expr::BoolLit(b, _) => builder.ins().iconst(types::I8, *b as i64),
         Expr::Binary { op, lhs, rhs, .. } => {
@@ -38392,11 +38390,7 @@ mod tests {
         // Node(1, build(d - 1), build(d - 1)) — ctor call, not in scc
         let node_call = Expr::Call {
             callee: Box::new(Expr::Ident("Node".to_string(), span.clone())),
-            args: vec![
-                Expr::IntLit(1, span.clone()),
-                build_call,
-                build_call2,
-            ],
+            args: vec![Expr::IntLit(1, span.clone()), build_call, build_call2],
             span: span.clone(),
         };
         let match_expr = Expr::Match {

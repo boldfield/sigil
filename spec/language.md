@@ -1957,6 +1957,21 @@ correct by default; the program now works at arbitrary depth.
 Surfacing the transformation lets the author opt for the
 tail-recursive rewrite only when the per-call overhead matters.
 
+**v1 restrictions.** Auto-promotion currently covers "Pattern A"
+shapes: at most one non-tail recursive call per branch, and no
+non-recursive function calls (including constructor applications) in
+the recursive arm's body beyond arithmetic and comparisons. Shapes
+with multiple recursive calls per branch — like
+`fib(n) = fib(n - 1) + fib(n - 2)`, or tree-building
+`Node(1, build(d - 1), build(d - 1))` — remain depth-bounded by the
+host stack. The CPS continuation infrastructure for chained
+multi-call branches (the `Intermediate` continuation role) is in
+place; follow-up work will lift the single-call restriction.
+Constructor applications in recursive arms (e.g.,
+`Cons(n, f(n - 1))`) are similarly gated out for now — relaxing the
+conservative non-recursive-call predicate to accept ctors is a
+planned incremental improvement.
+
 ### §13 — Stdlib reference
 
 Each module is documented in its own `std/<name>.sigil` source
