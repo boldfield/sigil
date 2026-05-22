@@ -593,6 +593,14 @@ fn count_max_recursive_calls_per_branch(
 /// Check whether a fn body contains non-recursive Call expressions
 /// (lambda IIFEs, closure calls, calls to non-SCC fns) that the simple
 /// auto-CPS evaluator can't handle. If true, the fn should stay Sync.
+/// Conservative check: does the body contain any non-recursive Call?
+/// Currently flags ALL non-recursive calls including constructor
+/// applications (`Node(...)`, `Some(x)`) and pure builtins
+/// (`int_to_string`). This is more restrictive than necessary —
+/// ctors are lowered by `lower_auto_cps_simple_expr` and should be
+/// safe. Relaxing this to accept ctor applications (and eventually
+/// pure builtins) would let shapes like `fn f(n) = if n <= 0 { Nil }
+/// else { Cons(n, f(n-1)) }` use auto-CPS instead of falling to Sync.
 fn body_has_non_trivial_non_recursive_calls(
     body: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
@@ -3646,6 +3654,14 @@ enum AutoCpsContRole {
     /// The `next_callee_name` is the fn to call, `next_call_args` are
     /// the source-level arg expressions for that call, and
     /// `next_cont_func_id` is the FuncId of the next continuation.
+    ///
+    /// NOTE: currently unreachable — `count_max_recursive_calls_per_branch`
+    /// gates multi-call-per-branch fns to Sync ABI, so only `Final` is
+    /// exercised. Lifting the single-call restriction (to support shapes
+    /// like `fib(n-1) + fib(n-2)` or `Node(1, build(d-1), build(d-1))`)
+    /// will activate this path. Follow-up: relax the `max_calls <= 1`
+    /// gate in `compute_user_fn_abi` and exercise with a multi-call e2e
+    /// test (e.g. `fib(30)` → 832040 via chained continuations).
     Intermediate {
         next_callee_name: String,
         next_call_args: Vec<crate::ast::Expr>,
@@ -10489,6 +10505,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 }
                                             }
                                             // Always capture k_closure and k_fn.
+                                            // SAFETY: `$`-prefixed names are synthetic and cannot
+                                            // collide with user identifiers — Sigil's lexer rejects
+                                            // `$` in user-written names. If a future lexer change
+                                            // relaxes this, the residual rewriting in
+                                            // `analyze_single_branch_block` would silently corrupt.
                                             captures.push(SynthContCapture {
                                                 name: "$k_closure".to_string(),
                                                 kind: crate::ast::EnvSlotKind::Closure,
@@ -28884,11 +28905,10 @@ fn lower_auto_cps_simple_expr(
         Expr::Ident(name, _) => {
             match env.get(name).copied() {
                 Some(v) => v,
-                None => {
-                    // Unknown name — emit a zero as fallback (shouldn't
-                    // happen for well-formed auto-CPS residuals).
-                    builder.ins().iconst(types::I64, 0)
-                }
+                None => unreachable!(
+                    "auto-CPS simple evaluator: unresolved ident `{name}` — \
+                     the analysis pass should have captured this variable"
+                ),
             }
         }
         Expr::IntLit(n, _) => builder.ins().iconst(types::I64, *n),
@@ -28952,10 +28972,10 @@ fn lower_auto_cps_simple_expr(
                 }
             }
         }
-        // For any expression not handled by the simple evaluator,
-        // emit iconst(0) as a placeholder. This shouldn't be reached
-        // for well-formed auto-CPS patterns.
-        _ => builder.ins().iconst(types::I64, 0),
+        _ => unreachable!(
+            "auto-CPS simple evaluator: unsupported expression {expr:?} — \
+             body_has_non_trivial_non_recursive_calls should have gated this fn to Sync ABI"
+        ),
     }
 }
 
@@ -38044,6 +38064,367 @@ mod tests {
             result.is_none(),
             "Approach 6 detector should reject ctor-shaped calls (Cons isn't \
              a user fn; lookup returns None)"
+        );
+    }
+
+    #[test]
+    fn count_max_recursive_calls_per_branch_single_call() {
+        // Body: `if n <= 0 { 0 } else { n + sum_to(n - 1) }`
+        // The else branch has exactly one recursive call.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        // Build: sum_to(n - 1)
+        let recursive_call = Expr::Call {
+            callee: Box::new(Expr::Ident("sum_to".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        // Build: n + sum_to(n - 1)
+        let else_tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+            rhs: Box::new(recursive_call),
+            span: span.clone(),
+        };
+        // Build: if n <= 0 { 0 } else { n + sum_to(n - 1) }
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::LtEq,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            then_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(else_tail),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(if_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        assert_eq!(
+            count_max_recursive_calls_per_branch(&body, &scc),
+            1,
+            "else branch has exactly one recursive call to sum_to"
+        );
+    }
+
+    #[test]
+    fn count_max_recursive_calls_per_branch_two_calls() {
+        // Body: `if n <= 0 { 0 } else { fib(n-1) + fib(n-2) }`
+        // The else branch has two recursive calls.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        // fib(n - 1)
+        let fib_n_minus_1 = Expr::Call {
+            callee: Box::new(Expr::Ident("fib".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        // fib(n - 2)
+        let fib_n_minus_2 = Expr::Call {
+            callee: Box::new(Expr::Ident("fib".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(2, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        // fib(n-1) + fib(n-2)
+        let else_tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(fib_n_minus_1),
+            rhs: Box::new(fib_n_minus_2),
+            span: span.clone(),
+        };
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::LtEq,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            then_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(else_tail),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(if_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["fib".to_string()]);
+        assert_eq!(
+            count_max_recursive_calls_per_branch(&body, &scc),
+            2,
+            "else branch has two recursive calls to fib"
+        );
+    }
+
+    #[test]
+    fn count_max_recursive_calls_per_branch_no_calls() {
+        // Body: `if n <= 0 { 0 } else { n + 1 }` — no recursive calls at all.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::LtEq,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            then_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                    rhs: Box::new(Expr::IntLit(1, span.clone())),
+                    span: span.clone(),
+                }),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(if_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        assert_eq!(
+            count_max_recursive_calls_per_branch(&body, &scc),
+            0,
+            "neither branch contains any recursive call"
+        );
+    }
+
+    #[test]
+    fn body_has_non_trivial_non_recursive_calls_pure_arithmetic() {
+        // Body: `if n <= 0 { 0 } else { n + sum_to(n - 1) }`
+        // The only call is the recursive `sum_to` — no non-recursive calls.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        let recursive_call = Expr::Call {
+            callee: Box::new(Expr::Ident("sum_to".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let else_tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+            rhs: Box::new(recursive_call),
+            span: span.clone(),
+        };
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::LtEq,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            then_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(else_tail),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(if_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        assert!(
+            !body_has_non_trivial_non_recursive_calls(&body, &scc),
+            "body with only recursive calls and arithmetic should not flag as having non-trivial non-recursive calls"
+        );
+    }
+
+    #[test]
+    fn body_has_non_trivial_non_recursive_calls_with_external_call() {
+        // Body: `if n <= 0 { 0 } else { foo(n) + sum_to(n - 1) }`
+        // `foo` is not in scc — this should be flagged as having a non-trivial
+        // non-recursive call.
+        use crate::ast::{BinOp, Block, Expr};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        // foo(n) — non-recursive call
+        let foo_call = Expr::Call {
+            callee: Box::new(Expr::Ident("foo".to_string(), span.clone())),
+            args: vec![Expr::Ident("n".to_string(), span.clone())],
+            span: span.clone(),
+        };
+        // sum_to(n - 1) — recursive call
+        let recursive_call = Expr::Call {
+            callee: Box::new(Expr::Ident("sum_to".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        // foo(n) + sum_to(n - 1)
+        let else_tail = Expr::Binary {
+            op: BinOp::Add,
+            lhs: Box::new(foo_call),
+            rhs: Box::new(recursive_call),
+            span: span.clone(),
+        };
+        let if_expr = Expr::If {
+            cond: Box::new(Expr::Binary {
+                op: BinOp::LtEq,
+                lhs: Box::new(Expr::Ident("n".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            then_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(Expr::IntLit(0, span.clone())),
+                span: span.clone(),
+            }),
+            else_block: Box::new(Block {
+                stmts: Vec::new(),
+                tail: Some(else_tail),
+                span: span.clone(),
+            }),
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(if_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["sum_to".to_string()]);
+        assert!(
+            body_has_non_trivial_non_recursive_calls(&body, &scc),
+            "body with a call to external fn `foo` must be flagged as having non-trivial non-recursive calls"
+        );
+    }
+
+    #[test]
+    fn body_has_non_trivial_non_recursive_calls_with_ctor() {
+        // Body: `match d { 0 => Leaf, _ => Node(1, build(d - 1), build(d - 1)) }`
+        // `Node(...)` is a call that is not in the scc — conservative analysis
+        // flags it as a non-trivial non-recursive call even though ctors are
+        // safe. This documents the current restrictive behavior.
+        use crate::ast::{BinOp, Block, Expr, MatchArm, Pattern};
+        use crate::errors::Span;
+        use std::collections::BTreeSet;
+        let span = Span::synthetic("test.sigil");
+        // build(d - 1)
+        let build_call = Expr::Call {
+            callee: Box::new(Expr::Ident("build".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("d".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        let build_call2 = Expr::Call {
+            callee: Box::new(Expr::Ident("build".to_string(), span.clone())),
+            args: vec![Expr::Binary {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Ident("d".to_string(), span.clone())),
+                rhs: Box::new(Expr::IntLit(1, span.clone())),
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+        // Node(1, build(d - 1), build(d - 1)) — ctor call, not in scc
+        let node_call = Expr::Call {
+            callee: Box::new(Expr::Ident("Node".to_string(), span.clone())),
+            args: vec![
+                Expr::IntLit(1, span.clone()),
+                build_call,
+                build_call2,
+            ],
+            span: span.clone(),
+        };
+        let match_expr = Expr::Match {
+            scrutinee: Box::new(Expr::Ident("d".to_string(), span.clone())),
+            arms: vec![
+                MatchArm {
+                    pattern: Pattern::IntLit(0, span.clone()),
+                    body: Expr::Ident("Leaf".to_string(), span.clone()),
+                    span: span.clone(),
+                },
+                MatchArm {
+                    pattern: Pattern::Wildcard(span.clone()),
+                    body: node_call,
+                    span: span.clone(),
+                },
+            ],
+            span: span.clone(),
+        };
+        let body = Block {
+            stmts: Vec::new(),
+            tail: Some(match_expr),
+            span: span.clone(),
+        };
+        let scc = BTreeSet::from(["build".to_string()]);
+        // Conservative: Node ctor call is not in scc and is flagged.
+        assert!(
+            body_has_non_trivial_non_recursive_calls(&body, &scc),
+            "ctor call Node(...) is not in scc and must be flagged by conservative analysis"
         );
     }
 
