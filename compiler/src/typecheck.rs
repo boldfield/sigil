@@ -10373,6 +10373,29 @@ fn main() -> Int ![IO] {\n\
     }
 
     #[test]
+    fn local_let_may_shadow_prelude_intrinsic() {
+        // Sigil's no-shadowing rule (E0020) forbids ONLY re-binding the
+        // same name in the same scope (`let x; let x`). A local `let` /
+        // param shadowing a GLOBAL is allowed (local-first lookup) — a
+        // `let helper = 5` legally shadows a top-level `fn helper`.
+        // Prelude intrinsics are globals, so a local may shadow one too,
+        // for the same reason. (Top-level *redefinition* of an intrinsic
+        // is still rejected — see `user_cannot_redefine_int_to_string_builtin`.)
+        let src = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  let int_to_string: Int = 5;\n\
+  perform IO.println(\"x\");\n\
+  int_to_string\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            errs.is_empty(),
+            "a local let may shadow a prelude intrinsic (local-first lookup); got {errs:?}"
+        );
+    }
+
+    #[test]
     fn bare_non_intrinsic_still_needs_use() {
         // `string_to_int` is a stdlib SOURCE fn (not an intrinsic), so the
         // prelude must NOT resolve it — it still requires `use` and emits
