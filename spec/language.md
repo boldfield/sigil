@@ -1644,14 +1644,13 @@ old auto-prelude of stdlib *types*. The globally-available names are:
   `float_add(a, b)`, `char_to_int(c)`, `array_get(xs, i)`,
   `string_concat(a, b)`, `panic(msg)`, and so on. Their names are
   globally unique, so calling them bare is unambiguous and needs no
-  `import` / `use`. The intrinsic surface is enumerated by
-  `BUILTIN_TO_MODULE_FILE`; §13.2 lists the module-less primitives,
-  and the per-module tables in §13 list the rest (e.g. `std.float`'s
+  `import` / `use`. §13.2 lists the module-less primitives, and the
+  per-module tables in §13 list the rest (e.g. `std.float`'s
   `float_add`) — all of which are intrinsics callable bare.
 
-The authoritative lists are registered in
-`typecheck::builtin_types()` (types) and `BUILTIN_TO_MODULE_FILE`
-(intrinsic functions) — the bullets above mirror that registration.
+The compiler maintains the authoritative registrations of the builtin
+type names and the intrinsic-function surface; the bullets above
+mirror them.
 
 **Intrinsics vs. stdlib source.** The prelude covers compiler
 intrinsics only. Stdlib *source* functions — written in `.sigil`,
@@ -1667,7 +1666,7 @@ is global; a name you pick a module for needs the `use`.
 **The prelude obeys the no-shadowing rule** (see §9's "There is no
 shadowing"):
 
-- A top-level `fn`, redefining a prelude intrinsic name is a
+- A top-level `fn` redefining a prelude intrinsic name is a
   redefinition error (E0020) — you can no more redefine
   `int_to_string` than the type `Int`.
 - A local `let` / parameter *may* shadow a prelude intrinsic within
@@ -1681,9 +1680,10 @@ shadowing"):
   intrinsics keeps compiling unchanged.
 
 Two intrinsic categories are intentionally NOT preluded and still
-require a `use`: the low-level `*_validate` / `*_parse` parsing halves
-(use the safe `Result`-returning `std.string` / `std.float` wrappers
-instead) and the internal `Ref` cell ops (use the `std.state` API).
+require a `use`: the low-level `*_validate` / `*_parse` / `*_alloc`
+parsing-and-allocation halves (use the safe `Result`-returning wrappers
+in `std.string`, `std.float`, and `std.byte_array` instead) and the
+internal `Ref` cell ops (use the `std.state` API).
 
 **Module aliases.** `import` accepts an `as` alias for shorter
 qualified-call paths:
@@ -1734,12 +1734,13 @@ still opts the names in (`use std.io.{IO};`, etc.).
 
 Several other modules — `std.int`, `std.float`, `std.array`,
 `std.mut_array`, `std.byte_array`, `std.mut_byte_array` — are
-**mixed**: they ship some compiler-builtin entries (registered
-via `BUILTIN_TO_MODULE_FILE`) alongside source-level fn
-declarations. From the user's perspective the two categories are
-indistinguishable — both come into scope via the same `import` +
-`use` pair. The distinction matters only to the compiler's name
-registration machinery.
+**mixed**: they ship some compiler-intrinsic entries alongside
+source-level fn declarations. The two categories now differ from the
+user's perspective: the intrinsic entries are in the prelude (callable
+bare, no `import` / `use`), while the source-level fns require a `use`
+like any other stdlib symbol. Importing the module and `use`-ing a
+name always works for both; the intrinsics simply also work without
+it.
 
 **Resolver semantics.** Three resolution paths cover every Ident
 that names a top-level fn or type:

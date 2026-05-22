@@ -1532,7 +1532,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // declared generic to a specific type).
     for item in &program.items {
         if let Item::Fn(f) = item {
-            // No-shadowing law (spec §12 "There is no shadowing"): a user
+            // No-shadowing law (spec §9 "There is no shadowing"): a user
             // fn may not redefine a preluded compiler intrinsic. The name
             // is already bound globally, like the builtin types — a
             // redefinition is rejected with a clear collision diagnostic
@@ -1541,7 +1541,16 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
             // int_to_string` silently shadowed it; the prelude makes
             // intrinsics first-class globals, so the shadow is now an
             // error, consistent with the rest of the language.)
-            if is_prelude_builtin(&f.name) {
+            //
+            // Scoped to user files: `imports::resolve` appends stdlib
+            // source items into `program.items`, but intrinsics have no
+            // `.sigil` source, so a stdlib fn never legitimately bears an
+            // intrinsic name (asserted disjoint by
+            // `prelude_names_disjoint_from_stdlib_source_fns`). Guarding
+            // on file origin keeps a future stdlib-source/intrinsic name
+            // clash from emitting a nonsensical "cannot be redefined"
+            // against a stdlib file.
+            if user_redefines_prelude_builtin(f, &tc.stdlib_files) {
                 tc.errors.push(CompilerError::new(
                     Severity::Error,
                     errors::code("E0020"),
@@ -1732,6 +1741,13 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     }
     for item in &program.items {
         match item {
+            // Skip body-checking a user fn that redefines a prelude
+            // intrinsic: the pre-pass already emitted E0020 and skipped
+            // its scheme registration. Running `check_fn` would
+            // re-register the user's (wrong) scheme over the builtin's,
+            // producing confusing cascading diagnostics at OTHER call
+            // sites of the intrinsic in the same compilation.
+            Item::Fn(f) if user_redefines_prelude_builtin(f, &tc.stdlib_files) => {}
             Item::Fn(f) => tc.check_fn(f),
             Item::Import(_) | Item::Use(_) => {}
             // Plan A3 task 38 / Plan B task 48: validate variant
@@ -2634,12 +2650,19 @@ const BUILTIN_TO_MODULE_FILE: &[(&str, &str)] = &[
 ];
 
 /// Intrinsics deliberately NOT preluded. These remain `use`-gated:
-///   - The `*_validate` / `*_parse` halves are a two-call protocol the
-///     stdlib wraps into safe `Result`-returning *source* fns (which
-///     stay `use`-gated); exposing the raw halves globally invites
-///     misuse.
+///   - The `*_validate` / `*_parse` / `*_alloc` halves are a two-call
+///     protocol the stdlib wraps into safe `Result`-returning *source*
+///     fns (which stay `use`-gated); exposing the raw halves globally
+///     invites misuse.
 ///   - `sigil_ref_*` are internal Ref machinery, used through the
 ///     `std.state` API rather than directly.
+///
+/// ASYMMETRY NOTE: excluded names return `is_prelude_builtin == false`,
+/// so the no-shadowing redefinition guard does NOT protect them — a user
+/// `fn string_to_int_validate(...)` still silently last-wins-overwrites
+/// the builtin (the pre-prelude footgun). This is intentional: excluded
+/// intrinsics are second-class plumbing, not part of the user-facing
+/// prelude surface. Only the 93 preluded names are redefinition-protected.
 const PRELUDE_EXCLUDED: &[&str] = &[
     "string_to_int_validate",
     "string_to_int_parse",
@@ -2651,6 +2674,20 @@ const PRELUDE_EXCLUDED: &[&str] = &[
     "sigil_ref_deref",
     "sigil_ref_set",
 ];
+
+/// Synthetic `stdlib_files` set covering every intrinsic's conceptual
+/// module file, built once. Shared by `prelude_canonical_key` (hot,
+/// per-bare-name-resolution) and `register_builtin_file_qualified_mirrors`
+/// (setup) so both compute canonical keys against an identical set — the
+/// load-bearing invariant that a prelude-resolved name rewrites to the
+/// same key an explicit `use` produces.
+static INTRINSIC_MODULE_FILES: std::sync::LazyLock<BTreeSet<String>> =
+    std::sync::LazyLock::new(|| {
+        BUILTIN_TO_MODULE_FILE
+            .iter()
+            .map(|(_, mf)| (*mf).to_string())
+            .collect()
+    });
 
 /// Is `name` a user-facing compiler intrinsic available in the prelude
 /// (resolvable bare, no `use` line needed)? True iff it's in
@@ -2680,11 +2717,17 @@ fn prelude_canonical_key(name: &str) -> Option<String> {
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, mf)| *mf)?;
-    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
-        .iter()
-        .map(|(_, mf)| (*mf).to_string())
-        .collect();
-    Some(canonical_fn_key(module_file, name, &synthetic_stdlib_files))
+    Some(canonical_fn_key(module_file, name, &INTRINSIC_MODULE_FILES))
+}
+
+/// Does user fn `f` redefine a prelude intrinsic? True iff its name is a
+/// preluded intrinsic AND it originates from a user (non-stdlib) file.
+/// Used by both the redefinition guard (emit E0020 + skip registration)
+/// and the body-check loop (skip `check_fn` so the rejected fn's scheme
+/// never overwrites the builtin's). See the redefinition guard for why
+/// the file-origin check matters.
+fn user_redefines_prelude_builtin(f: &FnDecl, stdlib_files: &BTreeSet<String>) -> bool {
+    is_prelude_builtin(&f.name) && !stdlib_files.contains(&f.span.file)
 }
 
 /// Plan F1 — mirror every bare-key builtin fn_scheme onto its
@@ -2703,16 +2746,15 @@ fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
     // imports; we use a synthetic stdlib_files set listing every
     // module_file in our table, so the canonical key uses the
     // `std.X` form.
-    let synthetic_stdlib_files: BTreeSet<String> = BUILTIN_TO_MODULE_FILE
-        .iter()
-        .map(|(_, mf)| (*mf).to_string())
-        .collect();
+    // Shared with `prelude_canonical_key` (built once) so both compute
+    // canonical keys against an identical set.
+    let synthetic_stdlib_files = &*INTRINSIC_MODULE_FILES;
     for (name, module_file) in BUILTIN_TO_MODULE_FILE {
         let scheme = match tc.fn_schemes.get(*name).cloned() {
             Some(s) => s,
             None => continue,
         };
-        let qualified = canonical_fn_key(module_file, name, &synthetic_stdlib_files);
+        let qualified = canonical_fn_key(module_file, name, synthetic_stdlib_files);
         tc.fn_schemes.entry(qualified).or_insert(scheme);
     }
 }
@@ -10392,6 +10434,84 @@ fn main() -> Int ![IO] {\n\
         assert!(
             errs.is_empty(),
             "a local let may shadow a prelude intrinsic (local-first lookup); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn prelude_names_disjoint_from_stdlib_source_fns() {
+        // INVARIANT: no stdlib SOURCE fn shares a name with a compiler
+        // intrinsic. The redefinition guard is scoped to user files, but
+        // this disjointness is what guarantees a stdlib source fn never
+        // *needs* that scoping — and that a future intrinsic/source name
+        // clash is caught here (at the right layer) rather than as a
+        // nonsensical "cannot redefine" against a stdlib file.
+        use std::collections::BTreeSet;
+        let intrinsics: BTreeSet<&str> = BUILTIN_TO_MODULE_FILE.iter().map(|(n, _)| *n).collect();
+        let mut collisions = Vec::new();
+        for path in glob_std_sigil_files() {
+            let src = std::fs::read_to_string(&path).expect("read std file");
+            for line in src.lines() {
+                let t = line.trim_start();
+                if let Some(rest) = t.strip_prefix("fn ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if intrinsics.contains(name.as_str()) {
+                        collisions.push(format!("{}: fn {name}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            collisions.is_empty(),
+            "stdlib source fns must not collide with intrinsic names \
+             (would make the stdlib fail to compile with a bogus \
+             'cannot redefine' error): {collisions:?}"
+        );
+    }
+
+    /// Resolve `std/**/*.sigil` paths relative to the crate root for the
+    /// disjointness invariant test.
+    fn glob_std_sigil_files() -> Vec<std::path::PathBuf> {
+        // CARGO_MANIFEST_DIR is `<repo>/compiler`; std/ is a sibling.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("compiler/ has a parent")
+            .join("std");
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("sigil") {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bare_excluded_intrinsic_still_needs_use() {
+        // Excluded intrinsics (e.g. `string_to_int_validate`) are NOT in
+        // the prelude, so calling them bare must still fail to resolve
+        // (E0046) — closing the gap between "excluded from the prelude
+        // set" (unit-tested membership) and "actually unresolvable bare".
+        let src = "fn main() -> Int ![] {\n\
+  let _: Bool = string_to_int_validate(\"42\");\n\
+  0\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0046"),
+            "excluded intrinsics must not resolve bare; got {errs:?}"
         );
     }
 
