@@ -550,11 +550,7 @@ fn block_to_expr(b: Block) -> Expr {
 
 fn binop_result_type(op: BinOp, span: Span) -> TypeExpr {
     let name = match op {
-        BinOp::Add
-        | BinOp::Sub
-        | BinOp::Mul
-        | BinOp::Div
-        | BinOp::Mod => "Int",
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => "Int",
         BinOp::Eq
         | BinOp::NotEq
         | BinOp::Lt

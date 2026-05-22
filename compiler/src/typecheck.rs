@@ -6501,7 +6501,12 @@ impl Tc {
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
             Expr::UnitLit(_) => Some(Ty::Unit),
-            Expr::Binary { op, lhs, rhs, span: _ } => {
+            Expr::Binary {
+                op,
+                lhs,
+                rhs,
+                span: _,
+            } => {
                 let lt = self.check_expr(lhs, row, row_tail);
                 let rt = self.check_expr(rhs, row, row_tail);
                 self.check_binop(*op, lt, rt, lhs.span(), rhs.span())
