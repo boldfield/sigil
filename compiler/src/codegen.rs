@@ -496,11 +496,11 @@ fn compute_user_fn_abi(
             }
         }
         scc_members.insert(name.to_string());
-        let max_calls = count_max_recursive_calls_per_branch(body, &scc_members);
-        if max_calls <= 1 && !body_has_non_trivial_non_recursive_calls(body, &scc_members) {
+        let _max_calls = count_max_recursive_calls_per_branch(body, &scc_members);
+        if !body_has_non_trivial_non_recursive_calls(body, &scc_members) {
             return UserFnAbi::Cps;
         }
-        // Multi-call or non-trivial non-recursive calls: stay Sync.
+        // Non-trivial non-recursive calls: stay Sync.
     }
     UserFnAbi::Sync
 }
@@ -3640,6 +3640,12 @@ enum CpsContinuationKind {
         tail_expr: Box<crate::ast::Expr>,
         /// Role of this continuation in the chain.
         auto_cps_role: AutoCpsContRole,
+        /// Step index within the parent fn's recursive-call chain. The
+        /// continuation receives the result of recursive call
+        /// `step_index` as `args_ptr[0]` and binds it to `$rec{step_index}`.
+        /// For a single-call fn this is always 0; for multi-call chains
+        /// (fib, sum_tree) it ranges 0..N-1.
+        step_index: usize,
     },
 }
 
@@ -10348,27 +10354,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             analyze_auto_cps_body(&f.body, &scc_members, call_site_inst)
                         {
                             // Count total continuations needed across all
-                            // recursive branches. Only handle single-call
-                            // arms (one step per recursive branch). Multi-call
-                            // (e.g., fib(n-1) + fib(n-2)) is deferred.
+                            // recursive branches: one per recursive call step.
+                            // Single-call arms contribute 1 (a Final cont);
+                            // multi-call arms (fib(n-1) + fib(n-2),
+                            // sum_tree(l) + sum_tree(r)) contribute N — the
+                            // first N-1 are Intermediate, the last is Final.
                             let mut total_conts = 0usize;
-                            let mut has_multi_call = false;
                             for branch in &branches {
                                 if let AutoCpsBranchKind::Recursive { steps, .. } = branch {
-                                    if steps.len() > 1 {
-                                        has_multi_call = true;
-                                        break;
-                                    }
                                     total_conts += steps.len();
                                 }
-                            }
-                            if has_multi_call {
-                                // Multi-call arms aren't yet supported by the
-                                // auto-CPS emit. Fall through to Sync ABI.
-                                // Remove this fn from auto_promotions effect
-                                // by not allocating synth-conts (the body emit
-                                // continue guard will skip it).
-                                total_conts = 0;
                             }
 
                             if total_conts > 0 {
@@ -10416,27 +10411,60 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             .map(|p| slot_kind_for_type_expr_post_mono(&p.ty))
                                             .collect();
 
-                                        for (step_idx, _step) in steps.iter().enumerate() {
-                                            let is_last = step_idx == steps.len() - 1;
-                                            let this_func_id = cont_func_ids[cont_idx];
+                                        // Slot kind for `$rec{i}` (the result of
+                                        // recursive call `i`) = the slot kind of
+                                        // step i's callee's return type. For
+                                        // Int-returning fns (fib, sum_tree) this is
+                                        // Int; for pointer-returning fns (build →
+                                        // Tree) it must be a pointer so the GC
+                                        // bitmap tracks the slot when it's held in
+                                        // a continuation closure across the next
+                                        // recursive call.
+                                        let rec_slot_kind =
+                                            |step_i: usize| -> crate::ast::EnvSlotKind {
+                                                let callee = &steps[step_i].callee_name;
+                                                checked
+                                                    .program
+                                                    .items
+                                                    .iter()
+                                                    .find_map(|it| match it {
+                                                        crate::ast::Item::Fn(fd)
+                                                            if &fd.name == callee =>
+                                                        {
+                                                            Some(slot_kind_for_type_expr_post_mono(
+                                                                &fd.return_type,
+                                                            ))
+                                                        }
+                                                        _ => None,
+                                                    })
+                                                    .unwrap_or(crate::ast::EnvSlotKind::Int)
+                                            };
 
-                                            // Determine captures for this continuation:
-                                            // - All fn params referenced in the residual expr
-                                            // - $k_closure and $k_fn (the caller's continuation)
-                                            // - For intermediate: prior $rec results
+                                        // First pass: compute each continuation's
+                                        // capture list. Done up front so an
+                                        // Intermediate continuation's
+                                        // `next_cont_captures` is the NEXT
+                                        // continuation's ACTUAL capture list —
+                                        // packer (this cont) and reader (next cont)
+                                        // must agree on slot layout exactly, or the
+                                        // next cont reads garbage from the closure
+                                        // record (segfault / wrong result).
+                                        let mut per_step_captures: Vec<Vec<SynthContCapture>> =
+                                            Vec::with_capacity(steps.len());
+                                        for step_idx in 0..steps.len() {
                                             let mut free_vars = Vec::new();
                                             let mut seen = std::collections::BTreeSet::new();
                                             let bound = std::collections::BTreeSet::new();
-                                            // Collect free vars from residual expr.
+                                            // Free vars from residual + all subsequent
+                                            // steps' call args (an Intermediate cont
+                                            // needs these to compute the next call's
+                                            // args AND to forward to later conts).
                                             collect_free_vars_in_expr(
                                                 residual_expr,
                                                 &bound,
                                                 &mut free_vars,
                                                 &mut seen,
                                             );
-                                            // Also collect free vars from ALL subsequent
-                                            // steps' call args (the intermediate cont needs
-                                            // these to evaluate the next call's arguments).
                                             for future_step in steps.iter().skip(step_idx + 1) {
                                                 for arg in &future_step.call_args {
                                                     collect_free_vars_in_expr(
@@ -10448,9 +10476,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 }
                                             }
 
-                                            // Build captures list: user params first,
-                                            // then pre-stmt bindings, then $k_closure, $k_fn.
                                             let mut captures: Vec<SynthContCapture> = Vec::new();
+                                            // 1. Fn params referenced ahead.
                                             for (i, pname) in param_names.iter().enumerate() {
                                                 if free_vars.contains(pname) {
                                                     captures.push(SynthContCapture {
@@ -10459,8 +10486,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     });
                                                 }
                                             }
-                                            // Capture pre-stmt bindings (like $elab_t*)
-                                            // that are referenced by subsequent steps or residual.
+                                            // 2. Pre-stmt bindings (elaborated lets).
                                             if let AutoCpsBranchKind::Recursive {
                                                 pre_stmts, ..
                                             } = branch
@@ -10470,14 +10496,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         if free_vars.contains(&l.name) {
                                                             captures.push(SynthContCapture {
                                                                 name: l.name.clone(),
-                                                                // Elab bindings are typically Int
                                                                 kind: crate::ast::EnvSlotKind::Int,
                                                             });
                                                         }
                                                     }
                                                 }
                                             }
-                                            // Capture match-arm pattern bindings (e.g., `v`
+                                            // 3. Match-arm pattern bindings (e.g. `v`
                                             // from `C(v, rest) => v + sum_list(rest)`).
                                             if let Some(Some(arm_pat)) =
                                                 arm_patterns.get(branch_idx)
@@ -10494,56 +10519,60 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                     }
                                                 }
                                             }
-                                            // For intermediate conts, capture prior rec results
+                                            // 4. Prior recursive results referenced in
+                                            // the residual (cont for step_idx receives
+                                            // $rec{step_idx} as its arg; $rec{0..step_idx-1}
+                                            // come from the closure). Kind matches the
+                                            // producing call's return type.
                                             for prior_idx in 0..step_idx {
                                                 let rec_name = format!("$rec{prior_idx}");
                                                 if free_vars.contains(&rec_name) {
                                                     captures.push(SynthContCapture {
                                                         name: rec_name,
-                                                        kind: crate::ast::EnvSlotKind::Int,
+                                                        kind: rec_slot_kind(prior_idx),
                                                     });
                                                 }
                                             }
-                                            // Always capture k_closure and k_fn.
-                                            // SAFETY: `$`-prefixed names are synthetic and cannot
-                                            // collide with user identifiers — Sigil's lexer rejects
-                                            // `$` in user-written names. If a future lexer change
-                                            // relaxes this, the residual rewriting in
-                                            // `analyze_single_branch_block` would silently corrupt.
+                                            // 5. Always the caller's continuation pair,
+                                            // last. SAFETY: `$`-prefixed names are
+                                            // synthetic — Sigil's lexer rejects `$` in
+                                            // user identifiers, so no collision.
+                                            // `$k_closure` is a heap-allocated closure
+                                            // record (or null) — pointer slot, GC-traced.
+                                            // `$k_fn` is a CODE address (function pointer),
+                                            // NOT a heap pointer — kind Int so the closure
+                                            // bitmap leaves it unmarked and the precise GC
+                                            // walker doesn't treat it as a root (mirrors the
+                                            // chained-let-yield k-pair convention).
                                             captures.push(SynthContCapture {
                                                 name: "$k_closure".to_string(),
                                                 kind: crate::ast::EnvSlotKind::Closure,
                                             });
                                             captures.push(SynthContCapture {
                                                 name: "$k_fn".to_string(),
-                                                kind: crate::ast::EnvSlotKind::Closure,
+                                                kind: crate::ast::EnvSlotKind::Int,
                                             });
+                                            per_step_captures.push(captures);
+                                        }
+
+                                        // Second pass: push synth-cont entries.
+                                        for step_idx in 0..steps.len() {
+                                            let is_last = step_idx == steps.len() - 1;
+                                            let this_func_id = cont_func_ids[cont_idx];
+                                            let captures = per_step_captures[step_idx].clone();
 
                                             let role = if is_last {
                                                 AutoCpsContRole::Final
                                             } else {
                                                 let next_step = &steps[step_idx + 1];
                                                 let next_func_id = cont_func_ids[cont_idx + 1];
-                                                // Next cont captures same as this + current $rec result
-                                                let mut next_captures = captures.clone();
-                                                let rec_name = format!("$rec{step_idx}");
-                                                if !next_captures.iter().any(|c| c.name == rec_name)
-                                                {
-                                                    // Insert before the k-pair
-                                                    let insert_pos = next_captures.len() - 2;
-                                                    next_captures.insert(
-                                                        insert_pos,
-                                                        SynthContCapture {
-                                                            name: rec_name,
-                                                            kind: crate::ast::EnvSlotKind::Int,
-                                                        },
-                                                    );
-                                                }
                                                 AutoCpsContRole::Intermediate {
                                                     next_callee_name: next_step.callee_name.clone(),
                                                     next_call_args: next_step.call_args.clone(),
                                                     next_cont_func_id: next_func_id,
-                                                    next_cont_captures: next_captures,
+                                                    next_cont_captures: per_step_captures
+                                                        [step_idx + 1]
+                                                        .clone(),
                                                 }
                                             };
 
@@ -10551,9 +10580,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 func_id: this_func_id,
                                                 parent_fn_name: f.name.clone(),
                                                 kind: CpsContinuationKind::AutoCpsRecursiveCont {
-                                                    captures: captures.clone(),
+                                                    captures,
                                                     tail_expr: Box::new(residual_expr.clone()),
                                                     auto_cps_role: role,
+                                                    step_index: step_idx,
                                                 },
                                             });
 
@@ -20026,6 +20056,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         captures,
                         tail_expr,
                         auto_cps_role,
+                        step_index,
                     } => {
                         // Auto-CPS recursive continuation body emit.
                         // Entry: unpack result from args_ptr[0], load
@@ -20066,9 +20097,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             env.insert(capture.name.clone(), value);
                         }
 
-                        // Bind `$rec0` (or `$rec{N}`) to the recursive result.
-                        // The tail_expr references `$rec0` as a placeholder.
-                        env.insert("$rec0".to_string(), rec_result_widened);
+                        // Bind `$rec{step_index}` to the recursive result.
+                        // This continuation is invoked after recursive call
+                        // `step_index` returns; the residual references that
+                        // result as `$rec{step_index}`. Prior results
+                        // (`$rec0..$rec{step_index-1}`) come from captures.
+                        env.insert(format!("$rec{step_index}"), rec_result_widened);
 
                         match auto_cps_role {
                             AutoCpsContRole::Final => {
@@ -32164,13 +32198,53 @@ fn analyze_single_branch_block(
         crate::typecheck::GenericInstantiation,
     >,
 ) -> AutoCpsBranchKind {
-    // After elaboration, non-tail recursive calls appear as
-    // Stmt::Let { name, value: Expr::Call { callee ∈ SCC } }
-    // in the block stmts. The tail references the let-binding name.
+    // After elaboration, an arm body like `v + sum_tree(l) + sum_tree(r)`
+    // becomes a block of synthetic `$elab_t*` lets followed by a tail:
+    //
+    //   $elab_t0 = sum_tree(l)      // recursive
+    //   $elab_t1 = v + $elab_t0     // arithmetic depending on rec0
+    //   $elab_t2 = sum_tree(r)      // recursive
+    //   tail: $elab_t1 + $elab_t2
+    //
+    // The recursive calls are interleaved with arithmetic that depends on
+    // earlier recursive results, so we can't simply split "pre-stmts then
+    // calls then residual". Instead, inline every `$elab_t*` binding back
+    // into the tail to reconstruct a single expression, then let
+    // `extract_first_recursive_call` (via `analyze_single_branch_expr`)
+    // peel off recursive calls left-to-right. Each elaborate temp is
+    // bound once and used once (elaborate linearizes), so inlining never
+    // duplicates a recursive call.
+    //
+    // Non-`$elab_t*` lets (genuine user `let` bindings) can't be inlined
+    // blindly — fall back to the legacy split for blocks containing them.
+    let all_elab = block
+        .stmts
+        .iter()
+        .all(|s| matches!(s, crate::ast::Stmt::Let(l) if l.name.starts_with("$elab_t")));
+
+    if all_elab {
+        let mut subst: std::collections::BTreeMap<String, crate::ast::Expr> =
+            std::collections::BTreeMap::new();
+        for stmt in &block.stmts {
+            if let crate::ast::Stmt::Let(l) = stmt {
+                // Expand prior $elab refs inside this RHS before recording it,
+                // so later substitutions are fully inlined in one pass.
+                let expanded = substitute_idents_in_expr(&l.value, &subst);
+                subst.insert(l.name.clone(), expanded);
+            }
+        }
+        let tail = block.tail.clone().unwrap_or(crate::ast::Expr::UnitLit(
+            crate::errors::Span::synthetic("auto-cps"),
+        ));
+        let inlined = substitute_idents_in_expr(&tail, &subst);
+        return analyze_single_branch_expr(&inlined, scc_members, call_site_instantiations);
+    }
+
+    // Legacy path: block with genuine user lets. Recursive calls appear as
+    // `Stmt::Let { value: Expr::Call { callee ∈ SCC } }`; the tail
+    // references the binding names, renamed to `$recN`.
     let mut steps: Vec<AutoCpsRecursiveStep> = Vec::new();
     let mut rec_binding_names: Vec<String> = Vec::new();
-    // Also collect non-recursive let stmts that appear BEFORE the
-    // recursive call(s) — these need to be evaluated in the body.
     let mut pre_stmts: Vec<crate::ast::Stmt> = Vec::new();
 
     for stmt in &block.stmts {
@@ -32180,7 +32254,6 @@ fn analyze_single_branch_block(
                     if let crate::ast::Expr::Ident(name, ident_span) = callee.as_ref() {
                         if let Some(inst) = call_site_instantiations.get(ident_span) {
                             if &inst.name == name && scc_members.contains(&inst.name) {
-                                // This is a recursive call in a let stmt.
                                 steps.push(AutoCpsRecursiveStep {
                                     callee_name: inst.name.clone(),
                                     call_args: args.clone(),
@@ -32191,7 +32264,6 @@ fn analyze_single_branch_block(
                         }
                     }
                 }
-                // Non-recursive let stmt — goes into pre_stmts.
                 pre_stmts.push(stmt.clone());
             }
             _ => {
@@ -32201,8 +32273,6 @@ fn analyze_single_branch_block(
     }
 
     if steps.is_empty() {
-        // No recursive calls in stmts. Check the tail expression too
-        // (rare — elaborate normally hoists calls into lets).
         match &block.tail {
             Some(tail) => analyze_single_branch_expr(tail, scc_members, call_site_instantiations),
             None => AutoCpsBranchKind::BaseCase(crate::ast::Expr::UnitLit(
@@ -32210,14 +32280,9 @@ fn analyze_single_branch_block(
             )),
         }
     } else {
-        // Build the residual expression. The tail already references
-        // the let-binding names; we need to rename them to $rec0, $rec1, etc.
         let tail = block.tail.clone().unwrap_or(crate::ast::Expr::UnitLit(
             crate::errors::Span::synthetic("auto-cps"),
         ));
-        // Build a residual that includes:
-        // 1. Pre-stmts (evaluated before the first recursive call)
-        // 2. The tail expression with recursive let-bindings replaced by $recN
         let mut residual = tail;
         for (i, binding_name) in rec_binding_names.iter().enumerate() {
             let placeholder = format!("$rec{i}");
