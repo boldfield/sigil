@@ -6501,23 +6501,9 @@ impl Tc {
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
             Expr::UnitLit(_) => Some(Ty::Unit),
-            Expr::Binary { op, lhs, rhs, span } => {
+            Expr::Binary { op, lhs, rhs, span: _ } => {
                 let lt = self.check_expr(lhs, row, row_tail);
                 let rt = self.check_expr(rhs, row, row_tail);
-                // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
-                // elaborate to a perform-bearing form (`if rhs == 0
-                // { perform ArithError.{div,mod}_by_zero() } else {
-                // … }`); the row introduction happens here at
-                // typecheck because elaborate runs after typecheck
-                // and cannot influence the row check upstream. See
-                // `[DEVIATION Task 57] BinOp::Div and BinOp::Mod
-                // elaborate to perform-bearing form` in
-                // `PLAN_B_DEVIATIONS.md`.
-                if matches!(op, BinOp::Div | BinOp::Mod) {
-                    let opname = if matches!(op, BinOp::Div) { "/" } else { "%" };
-                    let ctx = format!("operator `{opname}` (may abort with ArithError)");
-                    self.register_effect_use("ArithError", row, row_tail, span.clone(), &ctx);
-                }
                 self.check_binop(*op, lt, rt, lhs.span(), rhs.span())
             }
             Expr::Unary { op, operand, span } => {

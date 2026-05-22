@@ -1063,30 +1063,63 @@ fn match_primitive_with_wildcard() {
     assert_eq!(code, 17, "n=2 hits wildcard → 17");
 }
 
-/// Modulo-by-zero takes the same default-handler path as division-by-
-/// zero but with a different reason string. The canonical
+/// arith-trap — a `![]` function (no ArithError on the row) may use
+/// `/`; a zero divisor traps with the preserved banner + exit 2.
+#[test]
+fn bare_div_by_zero_traps_without_row() {
+    let source = "fn main() -> Int ![] {\n\
+                  let a: Int = 10;\n\
+                  let b: Int = 0;\n\
+                  a / b\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "bare_div_by_zero");
+    assert_eq!(code, 2, "bare `/` by zero exits 2; stderr={stderr:?}");
+    assert!(
+        stderr.contains("sigil: arithmetic error: division by zero"),
+        "expected division-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — `%` traps inside an auto-CPS-promoted recursive fn
+/// (the residual-evaluator lowering path). Guards the second Div/Mod
+/// lowering site. `count_down` recurses non-tail (so it is promoted
+/// to CPS) and performs `100 % (n - n)` == `100 % 0` at the base.
+#[test]
+fn auto_cps_recursive_mod_by_zero_traps() {
+    let source = "fn count_down(n: Int) -> Int ![] {\n\
+                  if n <= 0 {\n\
+                  100 % (n - n)\n\
+                  } else {\n\
+                  1 + count_down(n - 1)\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  count_down(3)\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_mod_zero");
+    assert_eq!(code, 2, "auto-CPS `%` by zero exits 2; stderr={stderr:?}");
+    assert!(
+        stderr.contains("sigil: arithmetic error: remainder by zero"),
+        "expected remainder-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — `%` by zero traps with banner + exit 2, with NO
+/// `![ArithError]` on the row (operators no longer carry the effect).
 /// `examples/div_by_zero.sigil` covers the `/` path via
 /// [`div_by_zero_example_traps`]; this test covers the `%` path.
-///
-/// Plan B Task 57 — row updated from `![]` to `![ArithError]` per
-/// the elaborate-time-rewrite tracked-effect doctrine. User-visible
-/// behaviour (stderr banner + exit 2) preserved verbatim by the
-/// runtime-side `sigil_arith_error_mod_by_zero_arm` default arm fn.
 #[test]
 fn mod_by_zero_traps() {
-    let source = "import std.raise\n\
-               use std.raise.{ArithError};\n\
-               fn main() -> Int ![ArithError] {\n\
-               let a: Int = 10;\n\
-               let b: Int = 0;\n\
-               let r: Int = a % b;\n\
-               r\n\
-               }\n";
+    let source = "fn main() -> Int ![] {\n\
+                  let a: Int = 10;\n\
+                  let b: Int = 0;\n\
+                  a % b\n\
+                  }\n";
     let (_stdout, stderr, code) = compile_and_run(source, "mod_by_zero");
-    assert_eq!(code, 2, "mod-by-zero exits with 2");
+    assert_eq!(code, 2, "`%` by zero exits 2; stderr={stderr:?}");
     assert!(
-        stderr.contains("remainder by zero"),
-        "stderr missing mod-zero banner: {stderr:?}"
+        stderr.contains("sigil: arithmetic error: remainder by zero"),
+        "expected remainder-by-zero banner; stderr={stderr:?}"
     );
 }
 
