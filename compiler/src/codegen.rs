@@ -11946,11 +11946,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                     // Emit the branching structure (if/match).
                     // For simple if/else: two branches. For match: N branches.
-                    let tail_expr = f
-                        .body
-                        .tail
-                        .as_ref()
-                        .unwrap_or_else(|| unreachable!("auto-CPS fn must have a tail expression"));
+                    let tail_expr =
+                        f.body.tail.as_ref().unwrap_or_else(|| {
+                            unreachable!("auto-CPS fn must have a tail expression")
+                        });
 
                     // Create a continuation block that all arms jump to with
                     // a pointer_ty param (the NextStep ptr).
@@ -28723,8 +28722,9 @@ fn emit_auto_cps_branch(
 
             // Get the first step's info.
             let first_step = &steps[0];
-            let starting_idx = auto_cps_starting_idx
-                .unwrap_or_else(|| unreachable!("auto-CPS recursive branch requires synth-cont allocation"));
+            let starting_idx = auto_cps_starting_idx.unwrap_or_else(|| {
+                unreachable!("auto-CPS recursive branch requires synth-cont allocation")
+            });
             let cont_synth_idx = starting_idx + *cont_idx_offset;
             *cont_idx_offset += steps.len();
 
@@ -32231,12 +32231,9 @@ fn analyze_single_branch_expr(
     let mut steps: Vec<AutoCpsRecursiveStep> = Vec::new();
     let mut current_expr = expr.clone();
     let mut idx = 0;
-    while let Some((callee_name, call_args, residual)) = extract_first_recursive_call(
-        &current_expr,
-        scc_members,
-        call_site_instantiations,
-        idx,
-    ) {
+    while let Some((callee_name, call_args, residual)) =
+        extract_first_recursive_call(&current_expr, scc_members, call_site_instantiations, idx)
+    {
         steps.push(AutoCpsRecursiveStep {
             callee_name,
             call_args,
