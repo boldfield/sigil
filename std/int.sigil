@@ -13,28 +13,21 @@
 //
 // ## Scope
 //
-// Ships `int_add_safe` and `int_sub_safe`. Both are pure-Sigil
-// implementations that pre-check for overflow before performing the
-// operation, so they don't need `![ArithError]` on the row.
+// Ships `int_add_safe` and `int_sub_safe` (overflow-safe, returning
+// `Option[Int]`) and `checked_div` / `checked_mod` (zero-safe,
+// returning `Result[Int, String]`). All are pure (`![]`) and
+// pre-check before performing the underlying operation.
 //
-// **Deferred to a follow-up plan with a runtime primitive:**
-// `int_mul_safe`, `int_div_safe`, `int_mod_safe`. The natural
-// pre-check pattern for multiplication uses `/` to verify the
-// product survives a round-trip; the natural pre-check for division
-// uses `/` to compute the quotient. Both trip Sigil's typecheck
-// rule that any use of `/` or `%` requires `![ArithError]` on the
-// enclosing row, regardless of runtime guards. A runtime primitive
-// `sigil_int_div_checked(a, b) -> Option[Int]` (and the multiply
-// equivalent) lifts this constraint by performing the check + op
-// in one non-aborting FFI call.
+// `checked_div` / `checked_mod` test the divisor first and only run
+// `/` / `%` when it is non-zero, so they never trip the runtime
+// divide-by-zero trap. (`/` and `%` trap on a zero divisor and carry
+// no effect — see `spec/language.md` §4.2 — so no `![ArithError]`
+// row is involved.)
 //
-// Until that primitive ships, callers who need safe multiply or
-// divide can:
-//   - Use `Int64` (`int64_mul` / `int64_div`) under `![ArithError]`,
-//     pre-checking `b != 0` for division and bounding operand
-//     magnitudes for multiplication, and casting back to `Int`.
-//   - Wrap the operation in a `catch`-style helper at the call
-//     site, accepting the `![ArithError]` row.
+// **Still deferred:** `int_mul_safe`. Detecting multiplication
+// overflow without a wider accumulator needs either an `Int64`
+// round-trip or a dedicated runtime primitive; that work is
+// independent of the divide-by-zero handling and tracked separately.
 //
 // ## Range constants
 

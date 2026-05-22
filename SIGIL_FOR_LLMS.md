@@ -76,7 +76,7 @@ LLMs are pattern matchers trained on a corpus of human code. That corpus has:
 
 Sigil deliberately removes each of those:
 - **Explicit types** at every binding, parameter, and return
-- **Effect rows** — `![ArithError]` is part of the function type; you can't divide without declaring it
+- **Effect rows** — a function's effects (e.g. `![IO]`) are part of its type; you can't perform an effect without declaring it in your row
 - **Exhaustive matching** — the compiler rejects a `match` that doesn't cover every variant
 - **No operator overloading** — `+` is `+` on `Int`, and `string_concat` on strings
 - **Result and Option** — fallible operations return values, not exceptions
