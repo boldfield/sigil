@@ -27712,16 +27712,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             BinOp::Sub => self.builder.ins().isub(l, r),
             BinOp::Mul => self.builder.ins().imul(l, r),
             BinOp::Div | BinOp::Mod => {
-                let div_ref = self.builtins.arith_div_trap_ref;
-                let mod_ref = self.builtins.arith_mod_trap_ref;
-                emit_guarded_div(
-                    &mut self.builder,
-                    l,
-                    r,
-                    matches!(op, BinOp::Div),
-                    div_ref,
-                    mod_ref,
-                )
+                let is_div = matches!(op, BinOp::Div);
+                let trap_ref = if is_div {
+                    self.builtins.arith_div_trap_ref
+                } else {
+                    self.builtins.arith_mod_trap_ref
+                };
+                emit_guarded_div(&mut self.builder, l, r, is_div, trap_ref)
             }
             BinOp::SdivUnchecked => self.builder.ins().sdiv(l, r),
             BinOp::SremUnchecked => self.builder.ins().srem(l, r),
@@ -28796,7 +28793,9 @@ const TRAP_PANIC_UNREACHABLE: u8 = 0x43;
 /// `sigil_arith_{div,mod}_by_zero_trap` so the basic block has a
 /// terminator. A distinct code from `TRAP_PANIC_UNREACHABLE` makes a
 /// post-mortem trap signature unambiguously identify the arith-trap
-/// path if the runtime fn ever returns instead of exiting.
+/// path. This trap is structurally unreachable (the runtime fn exits
+/// the process); a distinct code aids post-mortem identification if
+/// the runtime fn ever incorrectly returns.
 const TRAP_ARITH_UNREACHABLE: u8 = 0x44;
 
 /// Emit a zero-guarded signed division (`is_div == true`) or
@@ -28812,10 +28811,13 @@ fn emit_guarded_div(
     l: Value,
     r: Value,
     is_div: bool,
-    div_trap_ref: FuncRef,
-    mod_trap_ref: FuncRef,
+    trap_ref: FuncRef,
 ) -> Value {
     let int_ty = builder.func.dfg.value_type(r);
+    debug_assert!(
+        int_ty.is_int(),
+        "emit_guarded_div: divisor must be an integer type, got {int_ty}"
+    );
     let zero = builder.ins().iconst(int_ty, 0);
     let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
     let trap_block = builder.create_block();
@@ -28824,7 +28826,6 @@ fn emit_guarded_div(
 
     builder.switch_to_block(trap_block);
     builder.seal_block(trap_block);
-    let trap_ref = if is_div { div_trap_ref } else { mod_trap_ref };
     builder.ins().call(trap_ref, &[]);
     builder
         .ins()
@@ -29197,22 +29198,10 @@ fn lower_auto_cps_simple_expr(
                 BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
                 BinOp::Mul => builder.ins().imul(lhs_v, rhs_v),
-                BinOp::Div => emit_guarded_div(
-                    builder,
-                    lhs_v,
-                    rhs_v,
-                    true,
-                    ctx.arith_div_trap_ref,
-                    ctx.arith_mod_trap_ref,
-                ),
-                BinOp::Mod => emit_guarded_div(
-                    builder,
-                    lhs_v,
-                    rhs_v,
-                    false,
-                    ctx.arith_div_trap_ref,
-                    ctx.arith_mod_trap_ref,
-                ),
+                BinOp::Div => emit_guarded_div(builder, lhs_v, rhs_v, true, ctx.arith_div_trap_ref),
+                BinOp::Mod => {
+                    emit_guarded_div(builder, lhs_v, rhs_v, false, ctx.arith_mod_trap_ref)
+                }
                 BinOp::Eq => {
                     let cmp = builder.ins().icmp(IntCC::Equal, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)
