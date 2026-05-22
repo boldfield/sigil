@@ -1532,6 +1532,28 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
     // declared generic to a specific type).
     for item in &program.items {
         if let Item::Fn(f) = item {
+            // No-shadowing law (spec §12 "There is no shadowing"): a user
+            // fn may not redefine a preluded compiler intrinsic. The name
+            // is already bound globally, like the builtin types — a
+            // redefinition is rejected with a clear collision diagnostic
+            // rather than silently overwriting the builtin. (Pre-prelude,
+            // the bare-name seed was last-wins and a user `fn
+            // int_to_string` silently shadowed it; the prelude makes
+            // intrinsics first-class globals, so the shadow is now an
+            // error, consistent with the rest of the language.)
+            if is_prelude_builtin(&f.name) {
+                tc.errors.push(CompilerError::new(
+                    Severity::Error,
+                    errors::code("E0020"),
+                    f.name_span.clone(),
+                    format!(
+                        "`{}` is a builtin (prelude intrinsic) and cannot be \
+                         redefined; it is already in scope everywhere without an import",
+                        f.name
+                    ),
+                ));
+                continue;
+            }
             // Task 78.5 G2.a — strip bracketed `[e]` GP entries that
             // alias the row var name (`![... | e]`); see
             // `effective_fn_generic_params` doc-comment for rationale.
@@ -4040,23 +4062,50 @@ impl Tc {
             }
             None
         } else {
-            // Bare name. Consult the current file's `use` bindings.
-            let bindings = self.file_use_bindings.get(file)?;
-            let resolved = bindings.get(name)?;
-            let canonical = canonical_fn_key(
-                &resolved.module_file,
-                &resolved.source_name,
-                &self.stdlib_files,
-            );
-            if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
-                return Some((scheme, canonical));
+            // Bare name. Consult the current file's explicit `use`
+            // bindings first — they take precedence over the prelude.
+            if let Some(resolved) = self
+                .file_use_bindings
+                .get(file)
+                .and_then(|bindings| bindings.get(name))
+            {
+                let canonical = canonical_fn_key(
+                    &resolved.module_file,
+                    &resolved.source_name,
+                    &self.stdlib_files,
+                );
+                if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                    return Some((scheme, canonical));
+                }
+                // Builtin schemes use bare-name keys only — fall back so
+                // a `use std.int.{int_to_string}` line resolves correctly.
+                // Builtin names are globally unique so this never
+                // dispatches to the wrong target.
+                if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
+                    return Some((scheme, resolved.source_name.clone()));
+                }
+                return None;
             }
-            // Builtin schemes use bare-name keys only — fall back so
-            // a `use std.int.{int_to_string}` line resolves correctly.
-            // Builtin names are globally unique so this never
-            // dispatches to the wrong target.
-            if let Some(scheme) = self.fn_schemes.get(&resolved.source_name).cloned() {
-                return Some((scheme, resolved.source_name.clone()));
+            // PRELUDE FALLBACK: no explicit `use` brought this name in,
+            // but a user-facing compiler intrinsic is implicitly in
+            // scope. Resolve it to the same canonical key an explicit
+            // `use std.X.{name}` would, so the resolved-idents rewrite
+            // and codegen dispatch are identical to the imported case
+            // (the prelude is, mechanically, an implicit `use` of every
+            // intrinsic's canonical name). Intrinsic names are globally
+            // unique, so this reopens none of the cross-module ambiguity
+            // that Plan F1's qualified-imports model closed.
+            if is_prelude_builtin(name) {
+                if let Some(canonical) = prelude_canonical_key(name) {
+                    let scheme = self
+                        .fn_schemes
+                        .get(&canonical)
+                        .or_else(|| self.fn_schemes.get(name))
+                        .cloned();
+                    if let Some(scheme) = scheme {
+                        return Some((scheme, canonical));
+                    }
+                }
             }
             None
         }
@@ -10306,6 +10355,38 @@ mod tests {
         assert_eq!(prelude_canonical_key("sigil_ref_alloc"), None);
     }
 
+    #[test]
+    fn bare_prelude_intrinsic_resolves_without_use() {
+        // No `import std.int` / `use std.int.{int_to_string}` — bare call.
+        // The prelude must resolve it; no E0046.
+        let src = "import std.io\n\
+use std.io.{IO};\n\
+fn main() -> Int ![IO] {\n\
+  perform IO.println(int_to_string(42));\n\
+  0\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0046"),
+            "bare int_to_string must resolve via the prelude; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_non_intrinsic_still_needs_use() {
+        // `string_to_int` is a stdlib SOURCE fn (not an intrinsic), so the
+        // prelude must NOT resolve it — it still requires `use` and emits
+        // E0046 + an import hint. Guards the intrinsic-vs-source line.
+        let src = "fn main() -> Int ![] {\n\
+  match string_to_int(\"42\") { _ => 0 }\n\
+}\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0046"),
+            "string_to_int is a source fn, not preluded — must still fail; got {errs:?}"
+        );
+    }
+
     fn has_code(errs: &[CompilerError], code: &str) -> bool {
         errs.iter().any(|e| e.code.as_str() == code)
     }
@@ -11148,11 +11229,12 @@ mod tests {
     }
 
     #[test]
-    fn user_can_shadow_int_to_string_builtin() {
-        // Seeded builtin is overwritten by the user's `fn
-        // int_to_string` in the pre-pass. The user's signature is
-        // what typecheck uses; arg-type checking follows the user's
-        // definition, not the builtin.
+    fn user_cannot_redefine_int_to_string_builtin() {
+        // No-shadowing law + the intrinsic prelude: `int_to_string` is a
+        // prelude builtin, in scope everywhere. A user `fn int_to_string`
+        // is a redefinition error (E0020), NOT a silent shadow. (This
+        // inverts the pre-prelude `user_can_shadow_int_to_string_builtin`
+        // behavior, where the seeded builtin was last-wins overwritten.)
         let src = "import std.io\n\
                use std.io.{IO};\n\
                fn int_to_string(s: String) -> String ![] { s }\n\
@@ -11162,9 +11244,13 @@ mod tests {
                }\n\
                ";
         let errs = pipeline(src);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0020")
+            .unwrap_or_else(|| panic!("expected E0020 for builtin redefinition; got: {errs:?}"));
         assert!(
-            errs.is_empty(),
-            "user shadow of int_to_string should typecheck clean; got: {errs:?}"
+            e.message.contains("int_to_string") && e.message.contains("builtin"),
+            "error must name the builtin collision: {e:?}"
         );
     }
 
@@ -15615,9 +15701,11 @@ mod tests {
         // a concrete fn whose `A`/`B` map to Int/String pins both
         // positions through unification. Typechecks cleanly iff
         // unification flows the concrete types through `A` + `B`.
-        let src = "fn int_to_string(n: Int) -> String ![] { \"x\" }\n\
+        // (Uses `stringify`, not `int_to_string`, since the latter is
+        // now a prelude builtin that may not be redefined.)
+        let src = "fn stringify(n: Int) -> String ![] { \"x\" }\n\
                    fn apply[A, B](f: (A) -> B ![], x: A) -> B ![] { f(x) }\n\
-                   fn main() -> Int ![] { let _: String = apply(int_to_string, 42); 0 }\n";
+                   fn main() -> Int ![] { let _: String = apply(stringify, 42); 0 }\n";
         let errs = pipeline(src);
         assert!(
             errs.is_empty(),
