@@ -554,9 +554,7 @@ fn binop_result_type(op: BinOp, span: Span) -> TypeExpr {
         | BinOp::Sub
         | BinOp::Mul
         | BinOp::Div
-        | BinOp::Mod
-        | BinOp::SdivUnchecked
-        | BinOp::SremUnchecked => "Int",
+        | BinOp::Mod => "Int",
         BinOp::Eq
         | BinOp::NotEq
         | BinOp::Lt

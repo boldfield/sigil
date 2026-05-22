@@ -27720,8 +27720,6 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 };
                 emit_guarded_div(&mut self.builder, l, r, is_div, trap_ref)
             }
-            BinOp::SdivUnchecked => self.builder.ins().sdiv(l, r),
-            BinOp::SremUnchecked => self.builder.ins().srem(l, r),
             BinOp::Eq => self.builder.ins().icmp(IntCC::Equal, l, r),
             BinOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, l, r),
             BinOp::Lt => self.builder.ins().icmp(IntCC::SignedLessThan, l, r),
@@ -28368,25 +28366,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
                 }
             }
             Expr::Binary { op, .. } => match op {
-                // Plan B Task 57 — `SdivUnchecked` / `SremUnchecked`
-                // are codegen-internal Int-returning variants
-                // produced by elaborate's `BinOp::Div` / `BinOp::Mod`
-                // rewrite. Mirror their counterparts in the I64
-                // arm; mirrors `elaborate::binop_result_type`'s
-                // parallel logic. Latent today (codegen lowers them
-                // via `sdiv`/`srem` directly, producing I64
-                // regardless of `type_of_expr`'s answer), but the
-                // two functions are parallel AST→type lookups across
-                // passes; drift here would silently corrupt a
-                // future pass that consults `type_of_expr` over a
-                // synthesized unchecked-Binary node.
-                BinOp::Add
-                | BinOp::Sub
-                | BinOp::Mul
-                | BinOp::Div
-                | BinOp::Mod
-                | BinOp::SdivUnchecked
-                | BinOp::SremUnchecked => types::I64,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => types::I64,
                 _ => types::I8, // comparison / logic → Bool
             },
             Expr::Unary { op, .. } => match op {
@@ -28757,10 +28737,10 @@ impl<'a, 'b> Lowerer<'a, 'b> {
 
 /// Cranelift trap codes. Values are in the user-trap range
 /// (`TrapCode::user`). `TRAP_ARITH_ABORT = 0x40` was retired in
-/// Plan B Task 57 — `BinOp::Div`/`Mod` no longer trap; they
-/// elaborate to `if rhs == 0 { perform ArithError.* } else {
-/// SdivUnchecked / SremUnchecked }`, with the perform path
-/// dispatching through `sigil_perform` to the top-level handler.
+/// Plan B Task 57. `BinOp::Div`/`Mod` now trap directly on a zero
+/// divisor via `emit_guarded_div`, which branches to a call into
+/// the runtime's `arith_div_trap`/`arith_mod_trap` rather than
+/// raising a Cranelift trap code.
 ///
 /// The 0x40 slot is **reserved** (Stage 6 cleanup confirmed
 /// disposition): no other trap reuses it, so a future trap-catalogue
@@ -29230,8 +29210,6 @@ fn lower_auto_cps_simple_expr(
                         .icmp(IntCC::SignedGreaterThanOrEqual, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)
                 }
-                BinOp::SdivUnchecked => builder.ins().sdiv(lhs_v, rhs_v),
-                BinOp::SremUnchecked => builder.ins().srem(lhs_v, rhs_v),
                 BinOp::And | BinOp::Or => {
                     // Logical ops on I8 booleans
                     if *op == BinOp::And {

@@ -6778,17 +6778,6 @@ impl Tc {
                 self.require_operand(op, Ty::Int, rt, rspan);
                 Some(Ty::Int)
             }
-            BinOp::SdivUnchecked | BinOp::SremUnchecked => {
-                // Plan B Task 57 — codegen-internal variants produced
-                // only by elaborate's `BinOp::Div`/`Mod` rewrite. The
-                // typechecker reaches this arm only via synthetic
-                // walks (e.g. typecheck-tests-walking-elaborated-IR),
-                // not via user source. Same operand/result types as
-                // the pre-elaborate variants.
-                self.require_operand(op, Ty::Int, lt, lspan);
-                self.require_operand(op, Ty::Int, rt, rspan);
-                Some(Ty::Int)
-            }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 self.require_operand(op, Ty::Int, lt, lspan);
                 self.require_operand(op, Ty::Int, rt, rspan);
@@ -9094,11 +9083,6 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
-        // Plan B Task 57 — codegen-internal variants surface in
-        // diagnostics only via post-elaborate IR walks; the surface
-        // syntax is the same as their pre-elaborate counterparts.
-        BinOp::SdivUnchecked => "/",
-        BinOp::SremUnchecked => "%",
     }
 }
 
