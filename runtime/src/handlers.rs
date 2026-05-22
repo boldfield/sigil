@@ -1925,26 +1925,49 @@ pub unsafe extern "C" fn sigil_arith_error_mod_by_zero_arm(
     arith_error_default_arm("remainder by zero", args_len)
 }
 
-/// Internal helper for the two `ArithError` default arm fns. Writes
-/// `"sigil: arithmetic error: <reason>\n"` to stderr and calls
+/// Shared stderr-banner + exit for every arithmetic-error trap path.
+/// Writes `"sigil: arithmetic error: <reason>\n"` to stderr and calls
 /// `std::process::exit(2)`. Never returns.
-///
-/// `args_len` is debug-asserted to be 4 (zero user args + two trailing
-/// pairs: `(k_closure, k_fn)` and the 2026-05-04 return-arm-via-args
-/// lift Stage 3b `(return_arm_closure, return_arm_fn)`). Caller
-/// (`sigil_perform`) guarantees the invariant.
-fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
-    debug_assert!(
-        args_len == 5,
-        "sigil_arith_error_*_arm: args_len must be exactly 5 (zero user args + \
-         (k_closure, k_fn) + (return_arm_closure, return_arm_fn, return_arm_fired_ptr)); got {args_len}"
-    );
+fn arith_trap_exit(reason: &str) -> ! {
     use std::io::Write;
     let mut stderr = std::io::stderr().lock();
     let _ = writeln!(stderr, "sigil: arithmetic error: {reason}");
     let _ = stderr.flush();
     drop(stderr);
     std::process::exit(2);
+}
+
+/// Internal helper for the two `ArithError` *effect* default arm fns
+/// (`sigil_arith_error_{div,mod}_by_zero_arm`). Kept for the explicit
+/// `perform ArithError.*` path, which still flows through the CPS arm
+/// fn ABI. `args_len` is debug-asserted to be 5 (zero user args +
+/// (k_closure, k_fn) + (return_arm_closure, return_arm_fn,
+/// return_arm_fired_ptr)). Caller (`sigil_perform`) guarantees it.
+fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
+    debug_assert!(
+        args_len == 5,
+        "sigil_arith_error_*_arm: args_len must be exactly 5 (zero user args + \
+         (k_closure, k_fn) + (return_arm_closure, return_arm_fn, return_arm_fired_ptr)); got {args_len}"
+    );
+    arith_trap_exit(reason)
+}
+
+/// Direct trap for `/` by zero. Called inline from codegen's
+/// `BinOp::Div` lowering (NOT through the effect system) — `/` no
+/// longer performs `ArithError`. Preserves the Plan A2 stderr banner
+/// + exit-2 behaviour verbatim so `examples/div_by_zero.sigil`'s
+/// oracle is unchanged. Never returns; codegen emits a `trap`
+/// terminator after the call.
+#[no_mangle]
+pub extern "C" fn sigil_arith_div_by_zero_trap() -> ! {
+    arith_trap_exit("division by zero")
+}
+
+/// Direct trap for `%` by zero. Parallel of
+/// `sigil_arith_div_by_zero_trap`; banner reads "remainder by zero".
+#[no_mangle]
+pub extern "C" fn sigil_arith_mod_by_zero_trap() -> ! {
+    arith_trap_exit("remainder by zero")
 }
 
 // ---------------------------------------------------------------------
