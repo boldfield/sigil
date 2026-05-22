@@ -11950,7 +11950,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         .body
                         .tail
                         .as_ref()
-                        .expect("auto-CPS fn must have a tail expression");
+                        .unwrap_or_else(|| unreachable!("auto-CPS fn must have a tail expression"));
 
                     // Create a continuation block that all arms jump to with
                     // a pointer_ty param (the NextStep ptr).
@@ -28724,7 +28724,7 @@ fn emit_auto_cps_branch(
             // Get the first step's info.
             let first_step = &steps[0];
             let starting_idx = auto_cps_starting_idx
-                .expect("auto-CPS recursive branch requires synth-cont allocation");
+                .unwrap_or_else(|| unreachable!("auto-CPS recursive branch requires synth-cont allocation"));
             let cont_synth_idx = starting_idx + *cont_idx_offset;
             *cont_idx_offset += steps.len();
 
@@ -28877,7 +28877,7 @@ fn lower_auto_cps_simple_expr(
     builder: &mut FunctionBuilder<'_>,
     expr: &crate::ast::Expr,
     env: &BTreeMap<String, Value>,
-    pointer_ty: Type,
+    _pointer_ty: Type,
 ) -> Value {
     use crate::ast::{BinOp, Expr};
     match expr {
@@ -28894,8 +28894,8 @@ fn lower_auto_cps_simple_expr(
         Expr::IntLit(n, _) => builder.ins().iconst(types::I64, *n),
         Expr::BoolLit(b, _) => builder.ins().iconst(types::I8, *b as i64),
         Expr::Binary { op, lhs, rhs, .. } => {
-            let lhs_v = lower_auto_cps_simple_expr(builder, lhs, env, pointer_ty);
-            let rhs_v = lower_auto_cps_simple_expr(builder, rhs, env, pointer_ty);
+            let lhs_v = lower_auto_cps_simple_expr(builder, lhs, env, _pointer_ty);
+            let rhs_v = lower_auto_cps_simple_expr(builder, rhs, env, _pointer_ty);
             match op {
                 BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
@@ -28943,7 +28943,7 @@ fn lower_auto_cps_simple_expr(
             }
         }
         Expr::Unary { op, operand, .. } => {
-            let v = lower_auto_cps_simple_expr(builder, operand, env, pointer_ty);
+            let v = lower_auto_cps_simple_expr(builder, operand, env, _pointer_ty);
             match op {
                 crate::ast::UnOp::Neg => builder.ins().ineg(v),
                 crate::ast::UnOp::Not => {
@@ -31772,57 +31772,6 @@ fn block_is_pure(b: &crate::ast::Block, ctors: &std::collections::BTreeSet<Strin
     }
 }
 
-/// Plan B Task 55, Phase 4e — does this fn body match the **simple
-/// yield then constant tail** shape that the first slice of lambda-
-/// lifting supports?
-///
-/// A body matches iff:
-///
-/// 1. Its statement list has exactly one stmt.
-/// 2. That stmt is a non-IO [`crate::ast::Stmt::Perform`].
-/// 3. Every arg of the perform is pure (per [`expr_is_pure`]).
-/// 4. The tail expression is a constant literal (initially:
-///    [`crate::ast::Expr::IntLit`] only — future widenings cover
-///    BoolLit / CharLit / StringLit).
-///
-/// **Why this carve-out exists.** The full Phase 4e lambda-lifting
-/// machinery needs synthetic continuation closures that capture
-/// helper's k_closure / k_fn and any user params referenced by
-/// the post-yield rest-of-body. Closure captures require a
-/// closure-convert side-table extension (the "S1" item from prior
-/// reviews), which is its own commit. This classifier identifies
-/// the strictest stmt-then-tail subset that does NOT need closure
-/// captures: the synth-cont's body is a constant literal so it
-/// captures NOTHING, and the perform's args are pure so they can
-/// be lowered synchronously at the parent fn's entry block.
-///
-/// **Synth-cont shape under this classifier.** For a body matching
-/// `perform E.op(); 42`, codegen synthesises:
-///
-/// ```text
-/// extern "C" fn synth_cont(closure_ptr, args_ptr, args_len) -> *NextStep {
-///     // closure_ptr / args_ptr / args_len ignored — Stmt::Perform
-///     // discards the perform's result, and the tail is constant.
-///     return sigil_next_step_done(42)
-/// }
-/// ```
-///
-/// Helper's body emit builds `sigil_perform(eff, op, args, len,
-/// k_closure=null, k_fn=&synth_cont)` and returns its NextStep.
-/// When the trampoline eventually dispatches the arm:
-///   - **Discard-k arm** (no `k` in arm body) returns Done(arm_value)
-///     directly — the synth-cont never runs. The handle's overall
-///     value is the arm's value. **This is the discard-k correctness
-///     fix for stmt-form perform yields**, the load-bearing piece
-///     for inverting `statement_form_non_io_perform_inside_handle_
-///     compiles_and_runs` (`42` → `99`).
-///   - **Use-k arm** (`k(value)` in arm body) builds Call(synth_cont,
-///     [value]); trampoline runs synth_cont which returns Done(42)
-///     ignoring the value. Tail-position `k(value)` arms produce
-///     the same observable behavior they would have under the
-///     synchronous Phase 4d MVP shape (the tail expression is
-///     the value).
-///
 // ── Auto-CPS analysis helpers ─────────────────────────────────────────
 //
 // These functions analyze auto-promoted fn bodies (non-tail recursive
@@ -31834,6 +31783,7 @@ fn block_is_pure(b: &crate::ast::Block, ctors: &std::collections::BTreeSet<Strin
 //   - What captures the continuation needs
 
 /// Result of analyzing one recursive arm of an auto-CPS fn body.
+///
 /// Each non-tail recursive call becomes a "step" that yields to a
 /// continuation.
 #[derive(Clone, Debug)]
@@ -32281,23 +32231,18 @@ fn analyze_single_branch_expr(
     let mut steps: Vec<AutoCpsRecursiveStep> = Vec::new();
     let mut current_expr = expr.clone();
     let mut idx = 0;
-    loop {
-        match extract_first_recursive_call(
-            &current_expr,
-            scc_members,
-            call_site_instantiations,
-            idx,
-        ) {
-            Some((callee_name, call_args, residual)) => {
-                steps.push(AutoCpsRecursiveStep {
-                    callee_name,
-                    call_args,
-                });
-                current_expr = residual;
-                idx += 1;
-            }
-            None => break,
-        }
+    while let Some((callee_name, call_args, residual)) = extract_first_recursive_call(
+        &current_expr,
+        scc_members,
+        call_site_instantiations,
+        idx,
+    ) {
+        steps.push(AutoCpsRecursiveStep {
+            callee_name,
+            call_args,
+        });
+        current_expr = residual;
+        idx += 1;
     }
     if steps.is_empty() {
         AutoCpsBranchKind::BaseCase(expr.clone())
@@ -32312,6 +32257,58 @@ fn analyze_single_branch_expr(
 
 // ── End auto-CPS analysis helpers ─────────────────────────────────────
 
+/// Plan B Task 55, Phase 4e — does this fn body match the **simple
+/// yield then constant tail** shape that the first slice of lambda-
+/// lifting supports?
+///
+/// A body matches iff:
+///
+/// 1. Its statement list has exactly one stmt.
+/// 2. That stmt is a non-IO [`crate::ast::Stmt::Perform`].
+/// 3. Every arg of the perform is pure (per [`expr_is_pure`]).
+/// 4. The tail expression is a constant literal (initially:
+///    [`crate::ast::Expr::IntLit`] only — future widenings cover
+///    BoolLit / CharLit / StringLit).
+///
+/// **Why this carve-out exists.** The full Phase 4e lambda-lifting
+/// machinery needs synthetic continuation closures that capture
+/// helper's k_closure / k_fn and any user params referenced by
+/// the post-yield rest-of-body. Closure captures require a
+/// closure-convert side-table extension (the "S1" item from prior
+/// reviews), which is its own commit. This classifier identifies
+/// the strictest stmt-then-tail subset that does NOT need closure
+/// captures: the synth-cont's body is a constant literal so it
+/// captures NOTHING, and the perform's args are pure so they can
+/// be lowered synchronously at the parent fn's entry block.
+///
+/// **Synth-cont shape under this classifier.** For a body matching
+/// `perform E.op(); 42`, codegen synthesises:
+///
+/// ```text
+/// extern "C" fn synth_cont(closure_ptr, args_ptr, args_len) -> *NextStep {
+///     // closure_ptr / args_ptr / args_len ignored — Stmt::Perform
+///     // discards the perform's result, and the tail is constant.
+///     return sigil_next_step_done(42)
+/// }
+/// ```
+///
+/// Helper's body emit builds `sigil_perform(eff, op, args, len,
+/// k_closure=null, k_fn=&synth_cont)` and returns its NextStep.
+/// When the trampoline eventually dispatches the arm:
+///
+/// - **Discard-k arm** (no `k` in arm body) returns Done(arm_value)
+///   directly — the synth-cont never runs. The handle's overall
+///   value is the arm's value. **This is the discard-k correctness
+///   fix for stmt-form perform yields**, the load-bearing piece
+///   for inverting `statement_form_non_io_perform_inside_handle_
+///   compiles_and_runs` (`42` → `99`).
+/// - **Use-k arm** (`k(value)` in arm body) builds Call(synth_cont,
+///   \[value\]); trampoline runs synth_cont which returns Done(42)
+///   ignoring the value. Tail-position `k(value)` arms produce
+///   the same observable behavior they would have under the
+///   synchronous Phase 4d MVP shape (the tail expression is
+///   the value).
+///
 /// Future Phase 4e commits widen this classifier to:
 ///
 /// 1. Tail expressions referencing user params or let-bindings —
