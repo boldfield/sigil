@@ -483,10 +483,174 @@ fn compute_user_fn_abi(
     // though their body shape doesn't match any existing classifier above.
     // The colorer already promoted them to CPS color; this ensures the ABI
     // selection agrees.
+    // RESTRICTION: only single-call-per-branch auto-promoted fns get CPS ABI.
+    // Multi-call fns (like fib with fib(n-1) + fib(n-2)) stay Sync until
+    // the intermediate continuation machinery is complete.
     if colored.auto_promotions.iter().any(|ap| ap.fn_name == name) {
-        return UserFnAbi::Cps;
+        // Quick check: count max non-tail recursive calls across all
+        // branches of the body. If any branch has > 1, stay Sync.
+        let mut scc_members = std::collections::BTreeSet::new();
+        for ap in &colored.auto_promotions {
+            if ap.fn_name == name {
+                scc_members.insert(ap.callee_name.clone());
+            }
+        }
+        scc_members.insert(name.to_string());
+        let max_calls = count_max_recursive_calls_per_branch(body, &scc_members);
+        if max_calls <= 1 && !body_has_non_trivial_non_recursive_calls(body, &scc_members) {
+            return UserFnAbi::Cps;
+        }
+        // Multi-call or non-trivial non-recursive calls: stay Sync.
     }
     UserFnAbi::Sync
+}
+
+/// Count the maximum number of non-tail recursive calls in any single
+/// branch of a function body. Used by `compute_user_fn_abi` to gate
+/// auto-CPS promotion to only single-call patterns.
+fn count_max_recursive_calls_per_branch(
+    body: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+) -> usize {
+    fn count_calls_in_expr(
+        e: &crate::ast::Expr,
+        scc: &std::collections::BTreeSet<String>,
+    ) -> usize {
+        use crate::ast::Expr;
+        match e {
+            Expr::Call { callee, args, .. } => {
+                let self_call = if let Expr::Ident(name, _) = callee.as_ref() {
+                    if scc.contains(name) { 1 } else { 0 }
+                } else {
+                    0
+                };
+                let args_calls: usize = args.iter().map(|a| count_calls_in_expr(a, scc)).sum();
+                self_call + args_calls
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                count_calls_in_expr(lhs, scc) + count_calls_in_expr(rhs, scc)
+            }
+            Expr::Unary { operand, .. } => count_calls_in_expr(operand, scc),
+            Expr::Block(b) => count_calls_in_block(b, scc),
+            _ => 0,
+        }
+    }
+    fn count_calls_in_block(
+        b: &crate::ast::Block,
+        scc: &std::collections::BTreeSet<String>,
+    ) -> usize {
+        let mut total = 0;
+        for s in &b.stmts {
+            match s {
+                crate::ast::Stmt::Let(l) => total += count_calls_in_expr(&l.value, scc),
+                crate::ast::Stmt::Expr(e) => total += count_calls_in_expr(e, scc),
+                _ => {}
+            }
+        }
+        if let Some(t) = &b.tail {
+            total += count_calls_in_expr(t, scc);
+        }
+        total
+    }
+    fn max_per_branch(
+        e: &crate::ast::Expr,
+        scc: &std::collections::BTreeSet<String>,
+    ) -> usize {
+        use crate::ast::Expr;
+        match e {
+            Expr::If { then_block, else_block, .. } => {
+                let t = count_calls_in_block(then_block, scc);
+                let el = count_calls_in_block(else_block, scc);
+                t.max(el)
+            }
+            Expr::Match { arms, .. } => {
+                arms.iter()
+                    .map(|arm| count_calls_in_expr(&arm.body, scc))
+                    .max()
+                    .unwrap_or(0)
+            }
+            Expr::Block(b) => {
+                if let Some(tail) = &b.tail {
+                    max_per_branch(tail, scc)
+                } else {
+                    count_calls_in_block(b, scc)
+                }
+            }
+            _ => count_calls_in_expr(e, scc),
+        }
+    }
+    if let Some(tail) = &body.tail {
+        max_per_branch(tail, scc_members)
+    } else {
+        0
+    }
+}
+
+/// Check whether a fn body contains non-recursive Call expressions
+/// (lambda IIFEs, closure calls, calls to non-SCC fns) that the simple
+/// auto-CPS evaluator can't handle. If true, the fn should stay Sync.
+fn body_has_non_trivial_non_recursive_calls(
+    body: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+) -> bool {
+    fn has_non_rec_call(e: &crate::ast::Expr, scc: &std::collections::BTreeSet<String>) -> bool {
+        use crate::ast::Expr;
+        match e {
+            Expr::Call { callee, args, .. } => {
+                let is_recursive = if let Expr::Ident(name, _) = callee.as_ref() {
+                    scc.contains(name)
+                } else {
+                    false
+                };
+                if !is_recursive {
+                    return true; // non-recursive call found
+                }
+                args.iter().any(|a| has_non_rec_call(a, scc))
+            }
+            Expr::Binary { lhs, rhs, .. } => {
+                has_non_rec_call(lhs, scc) || has_non_rec_call(rhs, scc)
+            }
+            Expr::Unary { operand, .. } => has_non_rec_call(operand, scc),
+            Expr::Block(b) => has_non_rec_call_in_block(b, scc),
+            Expr::If { cond, then_block, else_block, .. } => {
+                has_non_rec_call(cond, scc)
+                    || has_non_rec_call_in_block(then_block, scc)
+                    || has_non_rec_call_in_block(else_block, scc)
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                has_non_rec_call(scrutinee, scc)
+                    || arms.iter().any(|a| has_non_rec_call(&a.body, scc))
+            }
+            Expr::ClosureRecord { .. } | Expr::Lambda { .. } => true,
+            _ => false,
+        }
+    }
+    fn has_non_rec_call_in_block(
+        b: &crate::ast::Block,
+        scc: &std::collections::BTreeSet<String>,
+    ) -> bool {
+        for s in &b.stmts {
+            match s {
+                crate::ast::Stmt::Let(l) => {
+                    if has_non_rec_call(&l.value, scc) {
+                        return true;
+                    }
+                }
+                crate::ast::Stmt::Expr(e) => {
+                    if has_non_rec_call(e, scc) {
+                        return true;
+                    }
+                }
+                crate::ast::Stmt::Perform(_) => return true,
+            }
+        }
+        if let Some(t) = &b.tail {
+            has_non_rec_call(t, scc)
+        } else {
+            false
+        }
+    }
+    has_non_rec_call_in_block(body, scc_members)
 }
 
 /// Map a surface-syntax `TypeExpr` to the Cranelift IR type codegen uses
@@ -3427,6 +3591,58 @@ enum CpsContinuationKind {
         /// assertion-failure message. The assertion now reports the
         /// dynamic value type alone.
         let_binding: Option<(String, Type, EnvSlotKind)>,
+    },
+    /// **Auto-CPS recursive continuation**: synthesised continuation for
+    /// an auto-promoted non-tail recursive fn. Each non-tail recursive
+    /// call in the fn body becomes a yield point with a continuation
+    /// that receives the recursive result and computes the remaining
+    /// expression.
+    ///
+    /// For `sum_to(n) = if n <= 0 { 0 } else { n + sum_to(n-1) }`:
+    /// - The continuation captures `[n, k_closure, k_fn]`
+    /// - Receives `rec_result` from args_ptr[0]
+    /// - Computes `n + rec_result`
+    /// - Returns `NextStep::Call(k_closure, k_fn, [n + rec_result])`
+    ///
+    /// For chained calls (e.g., `sum_tree(l) + sum_tree(r)`), the first
+    /// continuation captures extra state and dispatches the second
+    /// recursive call; the final continuation computes the residual.
+    AutoCpsRecursiveCont {
+        /// Captures from the parent fn's scope that this continuation
+        /// needs. Loaded from `closure_ptr` at offsets `16 + 8*i`.
+        /// Always includes `k_closure` and `k_fn` (the caller's
+        /// continuation pair) as the last two entries.
+        captures: Vec<SynthContCapture>,
+        /// The tail expression to evaluate after all recursive calls
+        /// are resolved. The continuation's env will have:
+        /// - Each capture bound under its name
+        /// - `$rec_result` bound to `args_ptr[0]` (the recursive result)
+        /// - Any prior recursive results (for chained calls)
+        tail_expr: Box<crate::ast::Expr>,
+        /// Role of this continuation in the chain.
+        auto_cps_role: AutoCpsContRole,
+    },
+}
+
+/// Role of an auto-CPS recursive continuation.
+#[derive(Clone, Debug)]
+enum AutoCpsContRole {
+    /// Final continuation: compute tail_expr and resume caller k.
+    /// `tail_expr` references captures + `$rec_result`.
+    Final,
+    /// Intermediate continuation: receives one recursive result, then
+    /// dispatches the NEXT recursive call with a further continuation.
+    /// The `next_callee_name` is the fn to call, `next_call_args` are
+    /// the source-level arg expressions for that call, and
+    /// `next_cont_func_id` is the FuncId of the next continuation.
+    Intermediate {
+        next_callee_name: String,
+        next_call_args: Vec<crate::ast::Expr>,
+        next_cont_func_id: cranelift_module::FuncId,
+        /// Captures needed by the NEXT continuation's closure record.
+        /// This intermediate continuation allocates the next cont's
+        /// closure, packing these captures + k_closure + k_fn.
+        next_cont_captures: Vec<SynthContCapture>,
     },
 }
 
@@ -10081,6 +10297,211 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // step_0's captures + first perform's k_fn.
                         cps_continuation_synth_indices.insert(f.name.clone(), starting_idx);
                     }
+                    // Auto-CPS fns: if chain_length is None AND this fn is
+                    // auto-promoted, allocate synth-cont entries for the
+                    // recursive continuations.
+                    if chain_length.is_none()
+                        && cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name)
+                    {
+                        // Build SCC member set for this fn's auto-promotion.
+                        let mut scc_members = std::collections::BTreeSet::new();
+                        for ap in &cc.colored.auto_promotions {
+                            if ap.fn_name == f.name {
+                                scc_members.insert(ap.callee_name.clone());
+                            }
+                        }
+                        scc_members.insert(f.name.clone());
+
+                        let call_site_inst = &checked.call_site_instantiations;
+                        if let Some(branches) = analyze_auto_cps_body(
+                            &f.body,
+                            &scc_members,
+                            call_site_inst,
+                        ) {
+                            // Count total continuations needed across all
+                            // recursive branches. Only handle single-call
+                            // arms (one step per recursive branch). Multi-call
+                            // (e.g., fib(n-1) + fib(n-2)) is deferred.
+                            let mut total_conts = 0usize;
+                            let mut has_multi_call = false;
+                            for branch in &branches {
+                                if let AutoCpsBranchKind::Recursive { steps, .. } = branch {
+                                    if steps.len() > 1 {
+                                        has_multi_call = true;
+                                        break;
+                                    }
+                                    total_conts += steps.len();
+                                }
+                            }
+                            if has_multi_call {
+                                // Multi-call arms aren't yet supported by the
+                                // auto-CPS emit. Fall through to Sync ABI.
+                                // Remove this fn from auto_promotions effect
+                                // by not allocating synth-conts (the body emit
+                                // continue guard will skip it).
+                                total_conts = 0;
+                            }
+
+                            if total_conts > 0 {
+                                // Allocate FuncIds for all continuations.
+                                let synth_cont_sig = cps_signature(pointer_ty, &module);
+                                let starting_idx = cps_continuation_synth.len();
+                                let mut cont_func_ids: Vec<cranelift_module::FuncId> =
+                                    Vec::with_capacity(total_conts);
+                                for i in 0..total_conts {
+                                    let cont_name = format!(
+                                        "sigil_auto_cps_cont_{}_{}",
+                                        f.name, i
+                                    );
+                                    let cont_func_id = module
+                                        .declare_function(
+                                            &cont_name,
+                                            Linkage::Export,
+                                            &synth_cont_sig,
+                                        )
+                                        .map_err(|e| format!("declare {cont_name}: {e}"))?;
+                                    cont_func_ids.push(cont_func_id);
+                                }
+
+                                // Build CpsContinuationSynth entries.
+                                let mut cont_idx = 0;
+                                for branch in &branches {
+                                    if let AutoCpsBranchKind::Recursive {
+                                        steps,
+                                        residual_expr,
+                                        ..
+                                    } = branch
+                                    {
+                                        let param_names: Vec<String> =
+                                            f.params.iter().map(|p| p.name.clone()).collect();
+                                        let param_kinds: Vec<crate::ast::EnvSlotKind> =
+                                            f.params.iter().map(|p| slot_kind_for_type_expr_post_mono(&p.ty)).collect();
+
+                                        for (step_idx, _step) in steps.iter().enumerate() {
+                                            let is_last = step_idx == steps.len() - 1;
+                                            let this_func_id = cont_func_ids[cont_idx];
+
+                                            // Determine captures for this continuation:
+                                            // - All fn params referenced in the residual expr
+                                            // - $k_closure and $k_fn (the caller's continuation)
+                                            // - For intermediate: prior $rec results
+                                            let mut free_vars = Vec::new();
+                                            let mut seen = std::collections::BTreeSet::new();
+                                            let bound = std::collections::BTreeSet::new();
+                                            // Collect free vars from residual expr.
+                                            collect_free_vars_in_expr(
+                                                residual_expr,
+                                                &bound,
+                                                &mut free_vars,
+                                                &mut seen,
+                                            );
+                                            // Also collect free vars from ALL subsequent
+                                            // steps' call args (the intermediate cont needs
+                                            // these to evaluate the next call's arguments).
+                                            for future_step in steps.iter().skip(step_idx + 1) {
+                                                for arg in &future_step.call_args {
+                                                    collect_free_vars_in_expr(
+                                                        arg,
+                                                        &bound,
+                                                        &mut free_vars,
+                                                        &mut seen,
+                                                    );
+                                                }
+                                            }
+
+                                            // Build captures list: user params first,
+                                            // then pre-stmt bindings, then $k_closure, $k_fn.
+                                            let mut captures: Vec<SynthContCapture> = Vec::new();
+                                            for (i, pname) in param_names.iter().enumerate() {
+                                                if free_vars.contains(pname) {
+                                                    captures.push(SynthContCapture {
+                                                        name: pname.clone(),
+                                                        kind: param_kinds[i],
+                                                    });
+                                                }
+                                            }
+                                            // Capture pre-stmt bindings (like $elab_t*)
+                                            // that are referenced by subsequent steps or residual.
+                                            if let AutoCpsBranchKind::Recursive { pre_stmts, .. } = branch {
+                                                for ps in pre_stmts {
+                                                    if let crate::ast::Stmt::Let(l) = ps {
+                                                        if free_vars.contains(&l.name) {
+                                                            captures.push(SynthContCapture {
+                                                                name: l.name.clone(),
+                                                                // Elab bindings are typically Int
+                                                                kind: crate::ast::EnvSlotKind::Int,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // For intermediate conts, capture prior rec results
+                                            for prior_idx in 0..step_idx {
+                                                let rec_name = format!("$rec{prior_idx}");
+                                                if free_vars.contains(&rec_name) {
+                                                    captures.push(SynthContCapture {
+                                                        name: rec_name,
+                                                        kind: crate::ast::EnvSlotKind::Int,
+                                                    });
+                                                }
+                                            }
+                                            // Always capture k_closure and k_fn.
+                                            captures.push(SynthContCapture {
+                                                name: "$k_closure".to_string(),
+                                                kind: crate::ast::EnvSlotKind::Closure,
+                                            });
+                                            captures.push(SynthContCapture {
+                                                name: "$k_fn".to_string(),
+                                                kind: crate::ast::EnvSlotKind::Closure,
+                                            });
+
+                                            let role = if is_last {
+                                                AutoCpsContRole::Final
+                                            } else {
+                                                let next_step = &steps[step_idx + 1];
+                                                let next_func_id = cont_func_ids[cont_idx + 1];
+                                                // Next cont captures same as this + current $rec result
+                                                let mut next_captures = captures.clone();
+                                                let rec_name = format!("$rec{step_idx}");
+                                                if !next_captures.iter().any(|c| c.name == rec_name) {
+                                                    // Insert before the k-pair
+                                                    let insert_pos = next_captures.len() - 2;
+                                                    next_captures.insert(insert_pos, SynthContCapture {
+                                                        name: rec_name,
+                                                        kind: crate::ast::EnvSlotKind::Int,
+                                                    });
+                                                }
+                                                AutoCpsContRole::Intermediate {
+                                                    next_callee_name: next_step.callee_name.clone(),
+                                                    next_call_args: next_step.call_args.clone(),
+                                                    next_cont_func_id: next_func_id,
+                                                    next_cont_captures: next_captures,
+                                                }
+                                            };
+
+                                            cps_continuation_synth.push(CpsContinuationSynth {
+                                                func_id: this_func_id,
+                                                parent_fn_name: f.name.clone(),
+                                                kind: CpsContinuationKind::AutoCpsRecursiveCont {
+                                                    captures: captures.clone(),
+                                                    tail_expr: Box::new(residual_expr.clone()),
+                                                    auto_cps_role: role,
+                                                },
+                                            });
+
+                                            cont_idx += 1;
+                                        }
+                                    }
+                                }
+
+                                // Store the first cont's index for body emit lookup.
+                                cps_continuation_synth_indices.insert(
+                                    format!("__auto_cps_{}", f.name),
+                                    starting_idx,
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -11409,12 +11830,297 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                 let synth_cont_idx_opt = cps_continuation_synth_indices.get(&f.name).copied();
 
-                // Auto-CPS fns get their own emit path (Task 3). For now,
-                // skip body emit — the fn is declared with cps_signature
-                // but its body definition is deferred until the auto-CPS
-                // emit infrastructure lands. This prevents the debug_assert
-                // below from firing.
-                if cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name) {
+                // Auto-CPS body emit: if this fn was auto-promoted AND we
+                // allocated synth-conts for it, emit its CPS-transformed
+                // body directly and continue. If no synth-conts (multi-call
+                // case not yet supported), fall through to existing paths.
+                let auto_cps_key_check = format!("__auto_cps_{}", f.name);
+                if cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name)
+                    && cps_continuation_synth_indices.contains_key(&auto_cps_key_check)
+                {
+                    // Build SCC member set.
+                    let mut scc_members = std::collections::BTreeSet::new();
+                    for ap in &cc.colored.auto_promotions {
+                        if ap.fn_name == f.name {
+                            scc_members.insert(ap.callee_name.clone());
+                        }
+                    }
+                    scc_members.insert(f.name.clone());
+
+                    let call_site_inst = &checked.call_site_instantiations;
+                    let branches = analyze_auto_cps_body(
+                        &f.body,
+                        &scc_members,
+                        call_site_inst,
+                    )
+                    .unwrap_or_default();
+
+                    // Phase 1: unpack block params.
+                    let block_params: Vec<Value> = builder.block_params(block).to_vec();
+                    assert_cps_arity(&block_params, &format!("auto-CPS fn `{}`", f.name));
+                    let closure_ptr_v = block_params[0];
+                    builder.declare_value_needs_stack_map(closure_ptr_v);
+                    let args_ptr = block_params[1];
+                    let _args_len = block_params[2];
+                    let _terminal_out = block_params[3];
+
+                    // Unpack user args from args_ptr.
+                    let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                    for (i, p) in f.params.iter().enumerate() {
+                        let declared_ty = cranelift_ty_for_type_expr(&p.ty, pointer_ty);
+                        let widened = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            (i * 8) as i32,
+                        );
+                        let value = if declared_ty == types::I64 {
+                            widened
+                        } else if declared_ty.is_int() && declared_ty.bits() < 64 {
+                            builder.ins().ireduce(declared_ty, widened)
+                        } else {
+                            widened
+                        };
+                        env.insert(p.name.clone(), value);
+                    }
+
+                    // Load trailing k-pair from args_ptr.
+                    let user_arg_count = f.params.len();
+                    let k_closure_v = lower_heap_pointer_load(
+                        &mut builder,
+                        pointer_ty,
+                        args_ptr,
+                        k_closure_offset(user_arg_count),
+                    );
+                    let k_fn_v = builder.ins().load(
+                        pointer_ty,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        k_fn_offset(user_arg_count),
+                    );
+
+                    // Emit the branching structure (if/match).
+                    // For simple if/else: two branches. For match: N branches.
+                    let tail_expr = f.body.tail.as_ref().expect(
+                        "auto-CPS fn must have a tail expression",
+                    );
+
+                    // Create a continuation block that all arms jump to with
+                    // a pointer_ty param (the NextStep ptr).
+                    let cont_block = builder.create_block();
+                    builder.append_block_param(cont_block, pointer_ty);
+
+                    // Look up the synth-cont allocations for this fn.
+                    let auto_cps_key = format!("__auto_cps_{}", f.name);
+                    let auto_cps_starting_idx =
+                        cps_continuation_synth_indices.get(&auto_cps_key).copied();
+
+                    match tail_expr {
+                        crate::ast::Expr::Match {
+                            scrutinee,
+                            arms,
+                            ..
+                        } => {
+                            // Lower the scrutinee.
+                            let scrut_v = lower_auto_cps_simple_expr(
+                                &mut builder, scrutinee, &env, pointer_ty,
+                            );
+
+                            // For the common desugared-if pattern (match bool
+                            // { true => ..., false => ... }), emit brif.
+                            // For other match patterns, fall back to a chain
+                            // of test+branch blocks.
+                            if arms.len() == 2
+                                && matches!(&arms[0].pattern, crate::ast::Pattern::BoolLit(true, _))
+                                && matches!(&arms[1].pattern, crate::ast::Pattern::BoolLit(false, _))
+                            {
+                                // Desugared if/else: brif on bool scrutinee.
+                                let scrut_ty = builder.func.dfg.value_type(scrut_v);
+                                let cond_i8 = if scrut_ty == types::I8 {
+                                    scrut_v
+                                } else {
+                                    builder.ins().ireduce(types::I8, scrut_v)
+                                };
+
+                                let then_block_bb = builder.create_block();
+                                let else_block_bb = builder.create_block();
+                                builder.ins().brif(cond_i8, then_block_bb, &[], else_block_bb, &[]);
+
+                                let mut cont_idx_offset = 0usize;
+                                for (branch, arm_block) in branches
+                                    .iter()
+                                    .zip([then_block_bb, else_block_bb].iter())
+                                {
+                                    builder.switch_to_block(*arm_block);
+                                    builder.seal_block(*arm_block);
+
+                                    let ns_ptr = emit_auto_cps_branch(
+                                        &mut builder,
+                                        branch,
+                                        &env,
+                                        k_closure_v,
+                                        k_fn_v,
+                                        pointer_ty,
+                                        &f.name,
+                                        user_arg_count,
+                                        &user_fns,
+                                        &cps_continuation_synth,
+                                        auto_cps_starting_idx,
+                                        &mut cont_idx_offset,
+                                        &mut module,
+                                        next_step_call_ref,
+                                        next_step_args_ptr_ref,
+                                        &shape_table,
+                                        &per_fn_refs_ctx,
+                                    );
+                                    builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
+                                }
+                            } else {
+                                // General match: emit a chain of test blocks.
+                                // Each arm has a pattern that we test against
+                                // the scrutinee. We emit a linear chain:
+                                // test_arm_0 ��� (match: arm_0_body, no match: test_arm_1)
+                                // test_arm_1 → (match: arm_1_body, no match: test_arm_2)
+                                // ...
+                                // Wildcard/Var arms always match (unconditional jump).
+                                let mut cont_idx_offset = 0usize;
+                                let mut current_test_block = None;
+
+                                for (arm_idx, (arm, branch)) in arms.iter().zip(branches.iter()).enumerate() {
+                                    let arm_body_block = builder.create_block();
+
+                                    // If we're continuing from a previous test block,
+                                    // switch to it and emit the test.
+                                    if let Some(test_block) = current_test_block {
+                                        builder.switch_to_block(test_block);
+                                        builder.seal_block(test_block);
+                                    }
+                                    // otherwise we're still in the entry block (for arm 0)
+
+                                    let is_last = arm_idx == arms.len() - 1;
+                                    let next_test_block = if !is_last {
+                                        Some(builder.create_block())
+                                    } else {
+                                        None
+                                    };
+
+                                    // Emit pattern test.
+                                    match &arm.pattern {
+                                        crate::ast::Pattern::IntLit(n, _) => {
+                                            let lit_v = builder.ins().iconst(types::I64, *n);
+                                            let cmp = builder.ins().icmp(
+                                                IntCC::Equal, scrut_v, lit_v,
+                                            );
+                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
+                                        }
+                                        crate::ast::Pattern::BoolLit(b, _) => {
+                                            let lit_v = builder.ins().iconst(types::I8, *b as i64);
+                                            let cmp = builder.ins().icmp(
+                                                IntCC::Equal, scrut_v, lit_v,
+                                            );
+                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
+                                        }
+                                        crate::ast::Pattern::Wildcard(_)
+                                        | crate::ast::Pattern::Var(_, _) => {
+                                            // Always matches — unconditional jump.
+                                            builder.ins().jump(arm_body_block, &[]);
+                                        }
+                                        _ => {
+                                            // For other patterns (Ctor, Tuple), fall through
+                                            // unconditionally for now. TODO: proper ctor dispatch.
+                                            builder.ins().jump(arm_body_block, &[]);
+                                        }
+                                    }
+
+                                    // Emit arm body.
+                                    builder.switch_to_block(arm_body_block);
+                                    builder.seal_block(arm_body_block);
+
+                                    // For Var patterns, bind the scrutinee to the var name.
+                                    let mut arm_env = env.clone();
+                                    if let crate::ast::Pattern::Var(name, _) = &arm.pattern {
+                                        arm_env.insert(name.clone(), scrut_v);
+                                    }
+
+                                    let ns_ptr = emit_auto_cps_branch(
+                                        &mut builder,
+                                        branch,
+                                        &arm_env,
+                                        k_closure_v,
+                                        k_fn_v,
+                                        pointer_ty,
+                                        &f.name,
+                                        user_arg_count,
+                                        &user_fns,
+                                        &cps_continuation_synth,
+                                        auto_cps_starting_idx,
+                                        &mut cont_idx_offset,
+                                        &mut module,
+                                        next_step_call_ref,
+                                        next_step_args_ptr_ref,
+                                        &shape_table,
+                                        &per_fn_refs_ctx,
+                                    );
+                                    builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
+
+                                    current_test_block = next_test_block;
+                                }
+
+                                // Seal remaining test block if any (shouldn't have one
+                                // since last arm should be wildcard, but defensive).
+                                if let Some(remaining) = current_test_block {
+                                    builder.switch_to_block(remaining);
+                                    builder.seal_block(remaining);
+                                    builder.ins().trap(TrapCode::unwrap_user(0x42));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Non-match tail (shouldn't normally happen for
+                            // auto-CPS fns after elaboration, but handle).
+                            let branch = branches.first().cloned().unwrap_or(
+                                AutoCpsBranchKind::BaseCase(tail_expr.clone()),
+                            );
+                            let mut cont_idx_offset = 0usize;
+                            let ns_ptr = emit_auto_cps_branch(
+                                &mut builder,
+                                &branch,
+                                &env,
+                                k_closure_v,
+                                k_fn_v,
+                                pointer_ty,
+                                &f.name,
+                                user_arg_count,
+                                &user_fns,
+                                &cps_continuation_synth,
+                                auto_cps_starting_idx,
+                                &mut cont_idx_offset,
+                                &mut module,
+                                next_step_call_ref,
+                                next_step_args_ptr_ref,
+                                &shape_table,
+                                &per_fn_refs_ctx,
+                            );
+                            builder.ins().jump(cont_block, &[BlockArg::Value(ns_ptr)]);
+                        }
+                    }
+
+                    // Cont block: return the NextStep ptr.
+                    builder.switch_to_block(cont_block);
+                    builder.seal_block(cont_block);
+                    let next_step_result = builder.block_params(cont_block)[0];
+                    builder.ins().return_(&[next_step_result]);
+                    builder.finalize();
+
+                    define_fn_and_capture_stackmap(
+                        &mut module,
+                        &mut ctx,
+                        entry.func_id,
+                        &f.name,
+                        &mut stackmap,
+                    )?;
                     continue;
                 }
 
@@ -19165,6 +19871,291 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 emit_dispatch_to_post_arm_k(&mut lowerer.builder, widened_tail);
                             lowerer.builder.ins().return_(&[next_step]);
                             lowerer.builder.finalize();
+                        }
+                    }
+                    CpsContinuationKind::AutoCpsRecursiveCont {
+                        captures,
+                        tail_expr,
+                        auto_cps_role,
+                    } => {
+                        // Auto-CPS recursive continuation body emit.
+                        // Entry: unpack result from args_ptr[0], load
+                        // captures from closure_ptr.
+                        assert_cps_arity(&block_params, "auto-cps recursive cont");
+                        let synth_closure_ptr = block_params[0];
+                        builder.declare_value_needs_stack_map(synth_closure_ptr);
+                        let args_ptr = block_params[1];
+                        let _terminal_out = block_params[3];
+
+                        // Load the recursive result from args_ptr[0].
+                        let rec_result_widened = builder.ins().load(
+                            types::I64,
+                            MemFlags::trusted(),
+                            args_ptr,
+                            0,
+                        );
+
+                        // Load captures from closure_ptr at offsets
+                        // 16 + 8*i (past TAG_CLOSURE header at +0 and
+                        // null code_ptr at +8).
+                        let mut env: BTreeMap<String, Value> = BTreeMap::new();
+                        for (i, capture) in captures.iter().enumerate() {
+                            let offset: i32 = 16 + 8 * i as i32;
+                            let value = if capture.kind.is_pointer() {
+                                lower_heap_pointer_load(
+                                    &mut builder,
+                                    pointer_ty,
+                                    synth_closure_ptr,
+                                    offset,
+                                )
+                            } else {
+                                builder.ins().load(
+                                    types::I64,
+                                    MemFlags::trusted(),
+                                    synth_closure_ptr,
+                                    offset,
+                                )
+                            };
+                            env.insert(capture.name.clone(), value);
+                        }
+
+                        // Bind `$rec0` (or `$rec{N}`) to the recursive result.
+                        // The tail_expr references `$rec0` as a placeholder.
+                        env.insert("$rec0".to_string(), rec_result_widened);
+
+                        match auto_cps_role {
+                            AutoCpsContRole::Final => {
+                                // Load k_closure and k_fn from captures
+                                // (they are always the last two captures).
+                                let k_closure_v = env.get("$k_closure").copied().unwrap_or_else(|| {
+                                    builder.ins().iconst(pointer_ty, 0)
+                                });
+                                let k_fn_v = env.get("$k_fn").copied().unwrap_or_else(|| {
+                                    builder.ins().iconst(pointer_ty, 0)
+                                });
+
+                                // Lower the tail expression using a simple
+                                // inline evaluator (handles Binary, Ident, IntLit).
+                                let tail_value = lower_auto_cps_simple_expr(
+                                    &mut builder,
+                                    tail_expr,
+                                    &env,
+                                    pointer_ty,
+                                );
+                                let tail_ty = builder.func.dfg.value_type(tail_value);
+                                let widened_result = if tail_ty == types::I64 {
+                                    tail_value
+                                } else if tail_ty.is_int() && tail_ty.bits() < 64 {
+                                    builder.ins().uextend(types::I64, tail_value)
+                                } else {
+                                    tail_value // pointer_ty == I64 on 64-bit
+                                };
+
+                                // Build NextStep::Call(k_closure, k_fn, [widened_result])
+                                let one_v = builder.ins().iconst(types::I32, 1);
+                                let call_ns = builder.ins().call(
+                                    next_step_call_ref,
+                                    &[k_closure_v, k_fn_v, one_v],
+                                );
+                                let ns_ptr = builder.inst_results(call_ns)[0];
+                                let argp_call = builder.ins().call(
+                                    next_step_args_ptr_ref,
+                                    &[ns_ptr],
+                                );
+                                let argp_v = builder.inst_results(argp_call)[0];
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    widened_result,
+                                    argp_v,
+                                    0,
+                                );
+                                builder.ins().return_(&[ns_ptr]);
+                                builder.finalize();
+                            }
+                            AutoCpsContRole::Intermediate {
+                                next_callee_name,
+                                next_call_args,
+                                next_cont_func_id,
+                                next_cont_captures,
+                            } => {
+                                // Intermediate continuation: receives one
+                                // recursive result, builds the NEXT
+                                // continuation's closure, dispatches the
+                                // next recursive call via NextStep::Call.
+                                let next_cont_fn_ref = module.declare_func_in_func(
+                                    *next_cont_func_id,
+                                    builder.func,
+                                );
+                                let next_cont_fn_addr = builder
+                                    .ins()
+                                    .func_addr(pointer_ty, next_cont_fn_ref);
+
+                                // k_closure and k_fn are in `env` for packing into
+                                // the next continuation's closure record (via the
+                                // capture loop below). Not used directly here.
+                                let _k_closure_v = env.get("$k_closure").copied();
+                                let _k_fn_v = env.get("$k_fn").copied();
+
+                                // Allocate closure record for NEXT continuation.
+                                let next_capture_count = next_cont_captures.len();
+                                let next_total_slots = next_capture_count;
+                                let mut next_bitmap: u32 = 0;
+                                for (i, c) in next_cont_captures.iter().enumerate() {
+                                    if c.kind.is_pointer() {
+                                        next_bitmap |= 1u32 << (i + 1);
+                                    }
+                                }
+                                let next_count: u8 = 1 + next_total_slots as u8;
+                                let next_header: u64 = header_word(TAG_CLOSURE, next_count, next_bitmap);
+                                let next_payload_bytes: i64 = 8 + 8 * next_total_slots as i64;
+
+                                let next_header_v = builder.ins().iconst(types::I64, next_header as i64);
+                                let next_payload_v = builder.ins().iconst(pointer_ty, next_payload_bytes);
+                                let next_descriptor_idx = shape_table
+                                    .borrow_mut()
+                                    .alloc_descriptor_index(next_bitmap, next_count);
+                                let next_descriptor_v = builder.ins().iconst(types::I32, next_descriptor_idx as i64);
+                                let alloc_ref = module.declare_func_in_func(
+                                    per_fn_refs_ctx.builtins.alloc,
+                                    builder.func,
+                                );
+                                let next_closure_record = lower_alloc_call(
+                                    &mut builder,
+                                    alloc_ref,
+                                    &[next_header_v, next_payload_v, next_descriptor_v],
+                                );
+
+                                // Null code_ptr at +8.
+                                let null_v = builder.ins().iconst(pointer_ty, 0);
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_v,
+                                    next_closure_record,
+                                    8,
+                                );
+
+                                // Pack captures into next closure record.
+                                for (i, capture) in next_cont_captures.iter().enumerate() {
+                                    let v = env.get(&capture.name).copied().unwrap_or_else(|| {
+                                        // Capture not in env: could be k_closure/k_fn.
+                                        builder.ins().iconst(types::I64, 0)
+                                    });
+                                    let widened = widen_to_i64(
+                                        &mut builder,
+                                        v,
+                                        pointer_ty,
+                                        "auto-cps intermediate cont next-closure packing",
+                                    );
+                                    let offset: i32 = 16 + 8 * i as i32;
+                                    builder.ins().store(
+                                        MemFlags::trusted(),
+                                        widened,
+                                        next_closure_record,
+                                        offset,
+                                    );
+                                }
+
+                                // Lower args for the next recursive call.
+                                let _alloc_ref2 = module.declare_func_in_func(
+                                    per_fn_refs_ctx.builtins.alloc,
+                                    builder.func,
+                                );
+                                // For now, lower args with a simple approach:
+                                // the args are already in `env` scope (they
+                                // reference captures we loaded above).
+                                let mut arg_values: Vec<Value> = Vec::new();
+                                for arg_expr in next_call_args.iter() {
+                                    // Simple lowering for common arg patterns.
+                                    let v = lower_auto_cps_simple_expr(
+                                        &mut builder,
+                                        arg_expr,
+                                        &env,
+                                        pointer_ty,
+                                    );
+                                    arg_values.push(v);
+                                }
+
+                                // Build NextStep::Call(null, callee_fn, [args, cont_closure, cont_fn, null_ra*3])
+                                let callee_func_id = user_fns[next_callee_name].func_id;
+                                let callee_fn_ref = module.declare_func_in_func(
+                                    callee_func_id,
+                                    builder.func,
+                                );
+                                let callee_fn_addr = builder
+                                    .ins()
+                                    .func_addr(pointer_ty, callee_fn_ref);
+
+                                let user_arg_count_next = next_call_args.len();
+                                let total_arg_count_next = user_arg_count_next + 5;
+                                let arg_count_v = builder
+                                    .ins()
+                                    .iconst(types::I32, total_arg_count_next as i64);
+                                let null_closure_for_call = builder.ins().iconst(pointer_ty, 0);
+                                let call_ns = builder.ins().call(
+                                    next_step_call_ref,
+                                    &[null_closure_for_call, callee_fn_addr, arg_count_v],
+                                );
+                                let ns_ptr = builder.inst_results(call_ns)[0];
+                                let argp_call = builder.ins().call(
+                                    next_step_args_ptr_ref,
+                                    &[ns_ptr],
+                                );
+                                let argp_v = builder.inst_results(argp_call)[0];
+
+                                // Write user args.
+                                for (i, arg_v) in arg_values.iter().enumerate() {
+                                    let widened = widen_to_i64(
+                                        &mut builder,
+                                        *arg_v,
+                                        pointer_ty,
+                                        "auto-cps intermediate next-call arg widen",
+                                    );
+                                    builder.ins().store(
+                                        MemFlags::trusted(),
+                                        widened,
+                                        argp_v,
+                                        (i * 8) as i32,
+                                    );
+                                }
+
+                                // Write k-pair: (next_closure_record, next_cont_fn_addr)
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    next_closure_record,
+                                    argp_v,
+                                    k_closure_offset(user_arg_count_next),
+                                );
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    next_cont_fn_addr,
+                                    argp_v,
+                                    k_fn_offset(user_arg_count_next),
+                                );
+
+                                // Write null return-arm triple.
+                                let null_ra = builder.ins().iconst(pointer_ty, 0);
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_ra,
+                                    argp_v,
+                                    return_arm_closure_offset(user_arg_count_next),
+                                );
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_ra,
+                                    argp_v,
+                                    return_arm_fn_offset(user_arg_count_next),
+                                );
+                                builder.ins().store(
+                                    MemFlags::trusted(),
+                                    null_ra,
+                                    argp_v,
+                                    return_arm_fired_offset(user_arg_count_next),
+                                );
+
+                                builder.ins().return_(&[ns_ptr]);
+                                builder.finalize();
+                            }
                         }
                     }
                 }
@@ -27553,6 +28544,306 @@ const TRAP_HANDLE_DISCIPLINE_VIOLATION: u8 = 0x42;
 /// recognisable abort signature instead of a generic IR violation.
 const TRAP_PANIC_UNREACHABLE: u8 = 0x43;
 
+/// Emit one branch (arm) of an auto-CPS fn body. Returns the NextStep
+/// pointer for this branch.
+#[allow(clippy::too_many_arguments)]
+fn emit_auto_cps_branch(
+    builder: &mut FunctionBuilder<'_>,
+    branch: &AutoCpsBranchKind,
+    env: &BTreeMap<String, Value>,
+    k_closure_v: Value,
+    k_fn_v: Value,
+    pointer_ty: Type,
+    _fn_name: &str,
+    _user_arg_count: usize,
+    user_fns: &BTreeMap<String, UserFnEntry>,
+    cps_continuation_synth: &[CpsContinuationSynth],
+    auto_cps_starting_idx: Option<usize>,
+    cont_idx_offset: &mut usize,
+    module: &mut ObjectModule,
+    next_step_call_ref: FuncRef,
+    next_step_args_ptr_ref: FuncRef,
+    shape_table: &std::cell::RefCell<ShapeTable>,
+    per_fn_refs_ctx: &PerFnRefsCtx<'_>,
+) -> Value {
+    match branch {
+        AutoCpsBranchKind::BaseCase(expr) => {
+            // Evaluate the expression and resume caller's k.
+            let result_v = lower_auto_cps_simple_expr(builder, expr, env, pointer_ty);
+            let result_ty = builder.func.dfg.value_type(result_v);
+            let widened = if result_ty == types::I64 {
+                result_v
+            } else if result_ty.is_int() && result_ty.bits() < 64 {
+                builder.ins().uextend(types::I64, result_v)
+            } else {
+                result_v
+            };
+
+            // Build NextStep::Call(k_closure, k_fn, [widened])
+            let one_v = builder.ins().iconst(types::I32, 1);
+            let call_ns = builder
+                .ins()
+                .call(next_step_call_ref, &[k_closure_v, k_fn_v, one_v]);
+            let ns_ptr = builder.inst_results(call_ns)[0];
+            let argp_call = builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
+            let argp_v = builder.inst_results(argp_call)[0];
+            builder
+                .ins()
+                .store(MemFlags::trusted(), widened, argp_v, 0);
+            ns_ptr
+        }
+        AutoCpsBranchKind::Recursive { steps, pre_stmts, .. } => {
+            // Evaluate pre-stmts (non-recursive lets before the recursive call).
+            let mut env = env.clone();
+            for stmt in pre_stmts {
+                if let crate::ast::Stmt::Let(l) = stmt {
+                    let v = lower_auto_cps_simple_expr(builder, &l.value, &env, pointer_ty);
+                    env.insert(l.name.clone(), v);
+                }
+            }
+
+            // Get the first step's info.
+            let first_step = &steps[0];
+            let starting_idx = auto_cps_starting_idx.expect(
+                "auto-CPS recursive branch requires synth-cont allocation",
+            );
+            let cont_synth_idx = starting_idx + *cont_idx_offset;
+            *cont_idx_offset += steps.len();
+
+            // Get the continuation FuncId for the first step.
+            let cont_func_id = cps_continuation_synth[cont_synth_idx].func_id;
+            let cont_fn_ref = module.declare_func_in_func(cont_func_id, builder.func);
+            let cont_fn_addr = builder.ins().func_addr(pointer_ty, cont_fn_ref);
+
+            // Get the continuation's captures from the synth entry.
+            let captures = match &cps_continuation_synth[cont_synth_idx].kind {
+                CpsContinuationKind::AutoCpsRecursiveCont { captures, .. } => captures.clone(),
+                _ => unreachable!("auto-CPS branch must reference AutoCpsRecursiveCont"),
+            };
+
+            // Allocate continuation closure record.
+            let capture_count = captures.len();
+            let mut bitmap: u32 = 0;
+            for (i, c) in captures.iter().enumerate() {
+                if c.kind.is_pointer() {
+                    bitmap |= 1u32 << (i + 1);
+                }
+            }
+            let count: u8 = 1 + capture_count as u8;
+            let header: u64 = header_word(TAG_CLOSURE, count, bitmap);
+            let payload_bytes: i64 = 8 + 8 * capture_count as i64;
+
+            let header_v = builder.ins().iconst(types::I64, header as i64);
+            let payload_v = builder.ins().iconst(pointer_ty, payload_bytes);
+            let descriptor_idx = shape_table
+                .borrow_mut()
+                .alloc_descriptor_index(bitmap, count);
+            let descriptor_v = builder.ins().iconst(types::I32, descriptor_idx as i64);
+            let alloc_ref = module.declare_func_in_func(
+                per_fn_refs_ctx.builtins.alloc,
+                builder.func,
+            );
+            let closure_record = lower_alloc_call(
+                builder,
+                alloc_ref,
+                &[header_v, payload_v, descriptor_v],
+            );
+
+            // Null code_ptr at +8.
+            let null_v = builder.ins().iconst(pointer_ty, 0);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), null_v, closure_record, 8);
+
+            // Pack captures into closure record.
+            for (i, capture) in captures.iter().enumerate() {
+                let v = if capture.name == "$k_closure" {
+                    k_closure_v
+                } else if capture.name == "$k_fn" {
+                    k_fn_v
+                } else {
+                    env.get(&capture.name)
+                        .copied()
+                        .unwrap_or_else(|| builder.ins().iconst(types::I64, 0))
+                };
+                let widened = widen_to_i64(
+                    builder,
+                    v,
+                    pointer_ty,
+                    "auto-cps body emit closure-record packing",
+                );
+                let offset: i32 = 16 + 8 * i as i32;
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), widened, closure_record, offset);
+            }
+
+            // Lower args for the recursive call.
+            let mut arg_values: Vec<Value> = Vec::new();
+            for arg_expr in &first_step.call_args {
+                let v = lower_auto_cps_simple_expr(builder, arg_expr, &env, pointer_ty);
+                arg_values.push(v);
+            }
+
+            // Build NextStep::Call(null, callee_fn, [args, cont_closure, cont_fn, null_ra*3])
+            let callee_func_id = user_fns[&first_step.callee_name].func_id;
+            let callee_fn_ref = module.declare_func_in_func(callee_func_id, builder.func);
+            let callee_fn_addr = builder.ins().func_addr(pointer_ty, callee_fn_ref);
+
+            let callee_user_arg_count = first_step.call_args.len();
+            let total_arg_count = callee_user_arg_count + 5;
+            let arg_count_v = builder
+                .ins()
+                .iconst(types::I32, total_arg_count as i64);
+            let null_closure_for_call = builder.ins().iconst(pointer_ty, 0);
+            let call_ns = builder.ins().call(
+                next_step_call_ref,
+                &[null_closure_for_call, callee_fn_addr, arg_count_v],
+            );
+            let ns_ptr = builder.inst_results(call_ns)[0];
+            let argp_call = builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
+            let argp_v = builder.inst_results(argp_call)[0];
+
+            // Write user args.
+            for (i, arg_v) in arg_values.iter().enumerate() {
+                let widened = widen_to_i64(
+                    builder,
+                    *arg_v,
+                    pointer_ty,
+                    "auto-cps body emit recursive call arg widen",
+                );
+                builder
+                    .ins()
+                    .store(MemFlags::trusted(), widened, argp_v, (i * 8) as i32);
+            }
+
+            // Write k-pair: (cont_closure_record, cont_fn_addr)
+            builder.ins().store(
+                MemFlags::trusted(),
+                closure_record,
+                argp_v,
+                k_closure_offset(callee_user_arg_count),
+            );
+            builder.ins().store(
+                MemFlags::trusted(),
+                cont_fn_addr,
+                argp_v,
+                k_fn_offset(callee_user_arg_count),
+            );
+
+            // Write null return-arm triple.
+            let null_ra = builder.ins().iconst(pointer_ty, 0);
+            builder.ins().store(
+                MemFlags::trusted(),
+                null_ra,
+                argp_v,
+                return_arm_closure_offset(callee_user_arg_count),
+            );
+            builder.ins().store(
+                MemFlags::trusted(),
+                null_ra,
+                argp_v,
+                return_arm_fn_offset(callee_user_arg_count),
+            );
+            builder.ins().store(
+                MemFlags::trusted(),
+                null_ra,
+                argp_v,
+                return_arm_fired_offset(callee_user_arg_count),
+            );
+
+            ns_ptr
+        }
+    }
+}
+
+/// Simple expression evaluator for auto-CPS continuation bodies.
+/// Handles the common patterns that appear in recursive fn residuals:
+/// Binary(op, Ident, Ident), Ident, IntLit, and nested Binary.
+/// Does NOT handle arbitrary expressions — only the shapes that
+/// `extract_first_recursive_call` produces as residuals.
+fn lower_auto_cps_simple_expr(
+    builder: &mut FunctionBuilder<'_>,
+    expr: &crate::ast::Expr,
+    env: &BTreeMap<String, Value>,
+    pointer_ty: Type,
+) -> Value {
+    use crate::ast::{BinOp, Expr};
+    match expr {
+        Expr::Ident(name, _) => {
+            match env.get(name).copied() {
+                Some(v) => v,
+                None => {
+                    // Unknown name — emit a zero as fallback (shouldn't
+                    // happen for well-formed auto-CPS residuals).
+                    builder.ins().iconst(types::I64, 0)
+                }
+            }
+        }
+        Expr::IntLit(n, _) => builder.ins().iconst(types::I64, *n),
+        Expr::BoolLit(b, _) => builder.ins().iconst(types::I8, *b as i64),
+        Expr::Binary { op, lhs, rhs, .. } => {
+            let lhs_v = lower_auto_cps_simple_expr(builder, lhs, env, pointer_ty);
+            let rhs_v = lower_auto_cps_simple_expr(builder, rhs, env, pointer_ty);
+            match op {
+                BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
+                BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
+                BinOp::Mul => builder.ins().imul(lhs_v, rhs_v),
+                BinOp::Div => builder.ins().sdiv(lhs_v, rhs_v),
+                BinOp::Mod => builder.ins().srem(lhs_v, rhs_v),
+                BinOp::Eq => {
+                    let cmp = builder.ins().icmp(IntCC::Equal, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::NotEq => {
+                    let cmp = builder.ins().icmp(IntCC::NotEqual, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::Lt => {
+                    let cmp = builder.ins().icmp(IntCC::SignedLessThan, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::LtEq => {
+                    let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::Gt => {
+                    let cmp = builder.ins().icmp(IntCC::SignedGreaterThan, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::GtEq => {
+                    let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs_v, rhs_v);
+                    builder.ins().uextend(types::I64, cmp)
+                }
+                BinOp::SdivUnchecked => builder.ins().sdiv(lhs_v, rhs_v),
+                BinOp::SremUnchecked => builder.ins().srem(lhs_v, rhs_v),
+                BinOp::And | BinOp::Or => {
+                    // Logical ops on I8 booleans
+                    if *op == BinOp::And {
+                        builder.ins().band(lhs_v, rhs_v)
+                    } else {
+                        builder.ins().bor(lhs_v, rhs_v)
+                    }
+                }
+            }
+        }
+        Expr::Unary { op, operand, .. } => {
+            let v = lower_auto_cps_simple_expr(builder, operand, env, pointer_ty);
+            match op {
+                crate::ast::UnOp::Neg => builder.ins().ineg(v),
+                crate::ast::UnOp::Not => {
+                    let one = builder.ins().iconst(types::I8, 1);
+                    builder.ins().bxor(v, one)
+                }
+            }
+        }
+        // For any expression not handled by the simple evaluator,
+        // emit iconst(0) as a placeholder. This shouldn't be reached
+        // for well-formed auto-CPS patterns.
+        _ => builder.ins().iconst(types::I64, 0),
+    }
+}
+
 /// Widen an SSA value to I64 for closure-slot / args-buffer storage,
 /// using the standard slot encoding shared by every CPS-form packing
 /// site (perform args buffer, synth-cont closure-record captures,
@@ -30071,9 +31362,26 @@ fn is_supported_cps_user_fn_inner(
             return true;
         }
         // Auto-promoted fns (non-tail self/SCC recursion) are supported CPS
-        // callees once codegen handles their body shape.
+        // callees only if they actually get CPS ABI (single-call per branch,
+        // no non-trivial non-recursive calls).
         if colored.auto_promotions.iter().any(|ap| ap.fn_name == callee_name) {
-            return true;
+            if let Some(callee_fn) = fns_by_name.get(callee_name) {
+                let mut scc_members_callee = std::collections::BTreeSet::new();
+                for ap in &colored.auto_promotions {
+                    if ap.fn_name == callee_name {
+                        scc_members_callee.insert(ap.callee_name.clone());
+                    }
+                }
+                scc_members_callee.insert(callee_name.to_string());
+                let max_calls = count_max_recursive_calls_per_branch(
+                    &callee_fn.body, &scc_members_callee,
+                );
+                if max_calls <= 1
+                    && !body_has_non_trivial_non_recursive_calls(&callee_fn.body, &scc_members_callee)
+                {
+                    return true;
+                }
+            }
         }
         false
     })();
@@ -30380,6 +31688,491 @@ fn block_is_pure(b: &crate::ast::Block, ctors: &std::collections::BTreeSet<Strin
 ///     synchronous Phase 4d MVP shape (the tail expression is
 ///     the value).
 ///
+// ── Auto-CPS analysis helpers ─────────────────────────────────────────
+//
+// These functions analyze auto-promoted fn bodies (non-tail recursive
+// fns promoted to CPS by color analysis) to extract:
+//   - Which calls are recursive (to self or SCC members)
+//   - What arguments each recursive call uses
+//   - What the "continuation expression" is (the residual after
+//     replacing the recursive call with a placeholder)
+//   - What captures the continuation needs
+
+/// Result of analyzing one recursive arm of an auto-CPS fn body.
+/// Each non-tail recursive call becomes a "step" that yields to a
+/// continuation.
+#[derive(Clone, Debug)]
+struct AutoCpsRecursiveStep {
+    /// Name of the callee (self or SCC member).
+    callee_name: String,
+    /// The argument expressions passed to the recursive call.
+    call_args: Vec<crate::ast::Expr>,
+}
+
+/// Analysis result for one branch (arm) of an auto-CPS fn body.
+#[derive(Clone, Debug)]
+enum AutoCpsBranchKind {
+    /// Base case: no recursive calls. Evaluate the expression directly
+    /// and resume the caller's continuation with the result.
+    BaseCase(crate::ast::Expr),
+    /// Recursive case: one or more non-tail recursive calls followed
+    /// by a residual expression. Steps are in call order; the
+    /// `residual_expr` references `$rec0`, `$rec1`, etc. as
+    /// placeholders for the recursive results.
+    Recursive {
+        steps: Vec<AutoCpsRecursiveStep>,
+        /// Expression to evaluate after ALL recursive calls resolve.
+        /// References `$rec0`, `$rec1`, ... for the recursive results,
+        /// plus any captured variables from the parent scope.
+        residual_expr: crate::ast::Expr,
+        /// Non-recursive let-stmts that appear before the first
+        /// recursive call. Must be evaluated in the body emit before
+        /// computing the recursive call's args (they often compute
+        /// args like `$elab_t0 = n - 1`).
+        pre_stmts: Vec<crate::ast::Stmt>,
+    },
+}
+
+/// Walk an expression and find the first `Expr::Call` whose callee is
+/// in `scc_members`. Returns `Some((callee_name, args, residual))`
+/// where `residual` is the expression with the call replaced by
+/// `Expr::Ident("$rec{idx}", synthetic_span)`.
+///
+/// Returns `None` if no recursive call is found.
+fn extract_first_recursive_call(
+    expr: &crate::ast::Expr,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    idx: usize,
+) -> Option<(String, Vec<crate::ast::Expr>, crate::ast::Expr)> {
+    use crate::ast::Expr;
+    use crate::errors::Span;
+    let placeholder_name = format!("$rec{idx}");
+    let synth_span = Span::synthetic("auto-cps");
+
+    match expr {
+        Expr::Call {
+            callee, args, span, ..
+        } => {
+            if let Expr::Ident(name, ident_span) = callee.as_ref() {
+                // Check if this call resolves to an SCC member via the
+                // instantiations map (handles shadowing correctly).
+                if let Some(inst) = call_site_instantiations.get(ident_span) {
+                    if &inst.name == name && scc_members.contains(&inst.name) {
+                        // This IS the recursive call. Replace with placeholder.
+                        let residual = Expr::Ident(placeholder_name, synth_span);
+                        return Some((inst.name.clone(), args.clone(), residual));
+                    }
+                }
+            }
+            // The call itself isn't recursive, but maybe an arg contains one.
+            for (i, arg) in args.iter().enumerate() {
+                if let Some((callee_name, rec_args, new_arg)) =
+                    extract_first_recursive_call(arg, scc_members, call_site_instantiations, idx)
+                {
+                    let mut new_args = args.clone();
+                    new_args[i] = new_arg;
+                    let residual = Expr::Call {
+                        callee: callee.clone(),
+                        args: new_args,
+                        span: span.clone(),
+                    };
+                    return Some((callee_name, rec_args, residual));
+                }
+            }
+            None
+        }
+        Expr::Binary { op, lhs, rhs, span } => {
+            // Try LHS first.
+            if let Some((callee_name, rec_args, new_lhs)) =
+                extract_first_recursive_call(lhs, scc_members, call_site_instantiations, idx)
+            {
+                let residual = Expr::Binary {
+                    op: *op,
+                    lhs: Box::new(new_lhs),
+                    rhs: rhs.clone(),
+                    span: span.clone(),
+                };
+                return Some((callee_name, rec_args, residual));
+            }
+            // Try RHS.
+            if let Some((callee_name, rec_args, new_rhs)) =
+                extract_first_recursive_call(rhs, scc_members, call_site_instantiations, idx)
+            {
+                let residual = Expr::Binary {
+                    op: *op,
+                    lhs: lhs.clone(),
+                    rhs: Box::new(new_rhs),
+                    span: span.clone(),
+                };
+                return Some((callee_name, rec_args, residual));
+            }
+            None
+        }
+        Expr::Unary { op, operand, span } => {
+            if let Some((callee_name, rec_args, new_operand)) =
+                extract_first_recursive_call(operand, scc_members, call_site_instantiations, idx)
+            {
+                let residual = Expr::Unary {
+                    op: *op,
+                    operand: Box::new(new_operand),
+                    span: span.clone(),
+                };
+                return Some((callee_name, rec_args, residual));
+            }
+            None
+        }
+        // For constructor calls (which are also Expr::Call), handled above.
+        // Idents, literals: no recursive call possible.
+        _ => None,
+    }
+}
+
+/// Collect free variable names referenced in an expression. Used to
+/// determine what the continuation needs to capture from the parent scope.
+fn collect_free_vars_in_expr(
+    expr: &crate::ast::Expr,
+    bound: &std::collections::BTreeSet<String>,
+    free: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Ident(name, _) => {
+            if !bound.contains(name) && !seen.contains(name) {
+                seen.insert(name.clone());
+                free.push(name.clone());
+            }
+        }
+        Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_free_vars_in_expr(lhs, bound, free, seen);
+            collect_free_vars_in_expr(rhs, bound, free, seen);
+        }
+        Expr::Unary { operand, .. } => {
+            collect_free_vars_in_expr(operand, bound, free, seen);
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_free_vars_in_expr(callee, bound, free, seen);
+            for a in args {
+                collect_free_vars_in_expr(a, bound, free, seen);
+            }
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            collect_free_vars_in_expr(cond, bound, free, seen);
+            collect_free_vars_in_block(then_block, bound, free, seen);
+            collect_free_vars_in_block(else_block, bound, free, seen);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_free_vars_in_expr(scrutinee, bound, free, seen);
+            for arm in arms {
+                // Arm pattern bindings are locally bound within the arm body.
+                let mut arm_bound = bound.clone();
+                collect_pattern_bindings(&arm.pattern, &mut arm_bound);
+                collect_free_vars_in_expr(&arm.body, &arm_bound, free, seen);
+            }
+        }
+        Expr::Block(b) => {
+            collect_free_vars_in_block(b, bound, free, seen);
+        }
+        Expr::Perform(p) => {
+            for a in &p.args {
+                collect_free_vars_in_expr(a, bound, free, seen);
+            }
+        }
+        Expr::Lambda { body, params, .. } => {
+            let mut lambda_bound = bound.clone();
+            for p in params {
+                lambda_bound.insert(p.name.clone());
+            }
+            collect_free_vars_in_expr(body, &lambda_bound, free, seen);
+        }
+        Expr::ClosureRecord { env_exprs, .. } => {
+            for e in env_exprs {
+                collect_free_vars_in_expr(e, bound, free, seen);
+            }
+        }
+        // RecordLit fields, Handle sub-exprs, Tuple elements — walk children.
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                collect_free_vars_in_expr(&f.value, bound, free, seen);
+            }
+        }
+        Expr::Handle { body, .. } => {
+            collect_free_vars_in_expr(body, bound, free, seen);
+        }
+        Expr::Tuple { elems, .. } => {
+            for e in elems {
+                collect_free_vars_in_expr(e, bound, free, seen);
+            }
+        }
+    }
+}
+
+fn collect_free_vars_in_block(
+    block: &crate::ast::Block,
+    bound: &std::collections::BTreeSet<String>,
+    free: &mut Vec<String>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    let mut local_bound = bound.clone();
+    for stmt in &block.stmts {
+        match stmt {
+            crate::ast::Stmt::Let(l) => {
+                collect_free_vars_in_expr(&l.value, &local_bound, free, seen);
+                local_bound.insert(l.name.clone());
+            }
+            crate::ast::Stmt::Expr(e) => {
+                collect_free_vars_in_expr(e, &local_bound, free, seen);
+            }
+            crate::ast::Stmt::Perform(p) => {
+                for a in &p.args {
+                    collect_free_vars_in_expr(a, &local_bound, free, seen);
+                }
+            }
+        }
+    }
+    if let Some(t) = &block.tail {
+        collect_free_vars_in_expr(t, &local_bound, free, seen);
+    }
+}
+
+// Note: uses the existing `collect_pattern_bindings` fn defined earlier
+// in this file (line ~5254).
+
+/// Rename all occurrences of `old_name` to `new_name` in an expression.
+/// Used to map elaboration's synthetic let-binding names to the $recN
+/// placeholders that the continuation env will bind.
+fn rename_ident_in_expr(
+    expr: &crate::ast::Expr,
+    old_name: &str,
+    new_name: &str,
+) -> crate::ast::Expr {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Ident(name, span) => {
+            if name == old_name {
+                Expr::Ident(new_name.to_string(), span.clone())
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::Binary { op, lhs, rhs, span } => Expr::Binary {
+            op: *op,
+            lhs: Box::new(rename_ident_in_expr(lhs, old_name, new_name)),
+            rhs: Box::new(rename_ident_in_expr(rhs, old_name, new_name)),
+            span: span.clone(),
+        },
+        Expr::Unary { op, operand, span } => Expr::Unary {
+            op: *op,
+            operand: Box::new(rename_ident_in_expr(operand, old_name, new_name)),
+            span: span.clone(),
+        },
+        Expr::Call { callee, args, span } => Expr::Call {
+            callee: Box::new(rename_ident_in_expr(callee, old_name, new_name)),
+            args: args.iter().map(|a| rename_ident_in_expr(a, old_name, new_name)).collect(),
+            span: span.clone(),
+        },
+        // For other exprs (literals, etc.), no renaming needed.
+        _ => expr.clone(),
+    }
+}
+
+/// Analyze an auto-promoted fn body to determine which branches are
+/// base cases vs recursive cases. Returns a structured description
+/// of each branch.
+///
+/// The body MUST be `Expr::If { ... }` or `Expr::Match { ... }` in
+/// the tail position (the typical shape for recursive fns).
+fn analyze_auto_cps_body(
+    body: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+) -> Option<Vec<AutoCpsBranchKind>> {
+    let tail = body.tail.as_ref()?;
+    analyze_auto_cps_expr(tail, scc_members, call_site_instantiations)
+}
+
+fn analyze_auto_cps_expr(
+    expr: &crate::ast::Expr,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+) -> Option<Vec<AutoCpsBranchKind>> {
+    use crate::ast::Expr;
+    match expr {
+        Expr::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            let then_branch = analyze_single_branch_block(
+                then_block,
+                scc_members,
+                call_site_instantiations,
+            );
+            let else_branch = analyze_single_branch_block(
+                else_block,
+                scc_members,
+                call_site_instantiations,
+            );
+            Some(vec![then_branch, else_branch])
+        }
+        Expr::Match { arms, .. } => {
+            let branches: Vec<AutoCpsBranchKind> = arms
+                .iter()
+                .map(|arm| {
+                    analyze_single_branch_expr(
+                        &arm.body,
+                        scc_members,
+                        call_site_instantiations,
+                    )
+                })
+                .collect();
+            Some(branches)
+        }
+        // Single expression (no branching) — treat as a single "arm".
+        _ => {
+            let branch = analyze_single_branch_expr(
+                expr,
+                scc_members,
+                call_site_instantiations,
+            );
+            Some(vec![branch])
+        }
+    }
+}
+
+fn analyze_single_branch_block(
+    block: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+) -> AutoCpsBranchKind {
+    // After elaboration, non-tail recursive calls appear as
+    // Stmt::Let { name, value: Expr::Call { callee ∈ SCC } }
+    // in the block stmts. The tail references the let-binding name.
+    let mut steps: Vec<AutoCpsRecursiveStep> = Vec::new();
+    let mut rec_binding_names: Vec<String> = Vec::new();
+    // Also collect non-recursive let stmts that appear BEFORE the
+    // recursive call(s) — these need to be evaluated in the body.
+    let mut pre_stmts: Vec<crate::ast::Stmt> = Vec::new();
+
+    for stmt in &block.stmts {
+        match stmt {
+            crate::ast::Stmt::Let(l) => {
+                if let crate::ast::Expr::Call { callee, args, .. } = &l.value {
+                    if let crate::ast::Expr::Ident(name, ident_span) = callee.as_ref() {
+                        if let Some(inst) = call_site_instantiations.get(ident_span) {
+                            if &inst.name == name && scc_members.contains(&inst.name) {
+                                // This is a recursive call in a let stmt.
+                                steps.push(AutoCpsRecursiveStep {
+                                    callee_name: inst.name.clone(),
+                                    call_args: args.clone(),
+                                });
+                                rec_binding_names.push(l.name.clone());
+                                continue;
+                            }
+                        }
+                    }
+                }
+                // Non-recursive let stmt — goes into pre_stmts.
+                pre_stmts.push(stmt.clone());
+            }
+            _ => {
+                pre_stmts.push(stmt.clone());
+            }
+        }
+    }
+
+    if steps.is_empty() {
+        // No recursive calls in stmts. Check the tail expression too
+        // (rare — elaborate normally hoists calls into lets).
+        match &block.tail {
+            Some(tail) => analyze_single_branch_expr(tail, scc_members, call_site_instantiations),
+            None => AutoCpsBranchKind::BaseCase(crate::ast::Expr::UnitLit(
+                crate::errors::Span::synthetic("auto-cps"),
+            )),
+        }
+    } else {
+        // Build the residual expression. The tail already references
+        // the let-binding names; we need to rename them to $rec0, $rec1, etc.
+        let tail = block.tail.clone().unwrap_or(crate::ast::Expr::UnitLit(
+            crate::errors::Span::synthetic("auto-cps"),
+        ));
+        // Build a residual that includes:
+        // 1. Pre-stmts (evaluated before the first recursive call)
+        // 2. The tail expression with recursive let-bindings replaced by $recN
+        let mut residual = tail;
+        for (i, binding_name) in rec_binding_names.iter().enumerate() {
+            let placeholder = format!("$rec{i}");
+            residual = rename_ident_in_expr(&residual, binding_name, &placeholder);
+        }
+        AutoCpsBranchKind::Recursive {
+            steps,
+            residual_expr: residual,
+            pre_stmts,
+        }
+    }
+}
+
+fn analyze_single_branch_expr(
+    expr: &crate::ast::Expr,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+) -> AutoCpsBranchKind {
+    use crate::ast::Expr;
+    // Handle Block wrapping (from elaborate's if→match desugaring).
+    if let Expr::Block(b) = expr {
+        return analyze_single_branch_block(b, scc_members, call_site_instantiations);
+    }
+
+    // For bare expressions, try to extract recursive calls.
+    let mut steps: Vec<AutoCpsRecursiveStep> = Vec::new();
+    let mut current_expr = expr.clone();
+    let mut idx = 0;
+    loop {
+        match extract_first_recursive_call(
+            &current_expr,
+            scc_members,
+            call_site_instantiations,
+            idx,
+        ) {
+            Some((callee_name, call_args, residual)) => {
+                steps.push(AutoCpsRecursiveStep {
+                    callee_name,
+                    call_args,
+                });
+                current_expr = residual;
+                idx += 1;
+            }
+            None => break,
+        }
+    }
+    if steps.is_empty() {
+        AutoCpsBranchKind::BaseCase(expr.clone())
+    } else {
+        AutoCpsBranchKind::Recursive {
+            steps,
+            residual_expr: current_expr,
+            pre_stmts: Vec::new(),
+        }
+    }
+}
+
+// ── End auto-CPS analysis helpers ─────────────────────────────────────
+
 /// Future Phase 4e commits widen this classifier to:
 ///
 /// 1. Tail expressions referencing user params or let-bindings —
