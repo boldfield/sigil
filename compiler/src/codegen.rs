@@ -520,7 +520,11 @@ fn count_max_recursive_calls_per_branch(
         match e {
             Expr::Call { callee, args, .. } => {
                 let self_call = if let Expr::Ident(name, _) = callee.as_ref() {
-                    if scc.contains(name) { 1 } else { 0 }
+                    if scc.contains(name) {
+                        1
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -552,23 +556,23 @@ fn count_max_recursive_calls_per_branch(
         }
         total
     }
-    fn max_per_branch(
-        e: &crate::ast::Expr,
-        scc: &std::collections::BTreeSet<String>,
-    ) -> usize {
+    fn max_per_branch(e: &crate::ast::Expr, scc: &std::collections::BTreeSet<String>) -> usize {
         use crate::ast::Expr;
         match e {
-            Expr::If { then_block, else_block, .. } => {
+            Expr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
                 let t = count_calls_in_block(then_block, scc);
                 let el = count_calls_in_block(else_block, scc);
                 t.max(el)
             }
-            Expr::Match { arms, .. } => {
-                arms.iter()
-                    .map(|arm| count_calls_in_expr(&arm.body, scc))
-                    .max()
-                    .unwrap_or(0)
-            }
+            Expr::Match { arms, .. } => arms
+                .iter()
+                .map(|arm| count_calls_in_expr(&arm.body, scc))
+                .max()
+                .unwrap_or(0),
             Expr::Block(b) => {
                 if let Some(tail) = &b.tail {
                     max_per_branch(tail, scc)
@@ -612,12 +616,19 @@ fn body_has_non_trivial_non_recursive_calls(
             }
             Expr::Unary { operand, .. } => has_non_rec_call(operand, scc),
             Expr::Block(b) => has_non_rec_call_in_block(b, scc),
-            Expr::If { cond, then_block, else_block, .. } => {
+            Expr::If {
+                cond,
+                then_block,
+                else_block,
+                ..
+            } => {
                 has_non_rec_call(cond, scc)
                     || has_non_rec_call_in_block(then_block, scc)
                     || has_non_rec_call_in_block(else_block, scc)
             }
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
                 has_non_rec_call(scrutinee, scc)
                     || arms.iter().any(|a| has_non_rec_call(&a.body, scc))
             }
@@ -10301,7 +10312,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     // auto-promoted, allocate synth-cont entries for the
                     // recursive continuations.
                     if chain_length.is_none()
-                        && cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name)
+                        && cc
+                            .colored
+                            .auto_promotions
+                            .iter()
+                            .any(|ap| ap.fn_name == f.name)
                     {
                         // Build SCC member set for this fn's auto-promotion.
                         let mut scc_members = std::collections::BTreeSet::new();
@@ -10313,11 +10328,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         scc_members.insert(f.name.clone());
 
                         let call_site_inst = &checked.call_site_instantiations;
-                        if let Some(branches) = analyze_auto_cps_body(
-                            &f.body,
-                            &scc_members,
-                            call_site_inst,
-                        ) {
+                        if let Some(branches) =
+                            analyze_auto_cps_body(&f.body, &scc_members, call_site_inst)
+                        {
                             // Count total continuations needed across all
                             // recursive branches. Only handle single-call
                             // arms (one step per recursive branch). Multi-call
@@ -10349,10 +10362,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let mut cont_func_ids: Vec<cranelift_module::FuncId> =
                                     Vec::with_capacity(total_conts);
                                 for i in 0..total_conts {
-                                    let cont_name = format!(
-                                        "sigil_auto_cps_cont_{}_{}",
-                                        f.name, i
-                                    );
+                                    let cont_name = format!("sigil_auto_cps_cont_{}_{}", f.name, i);
                                     let cont_func_id = module
                                         .declare_function(
                                             &cont_name,
@@ -10384,8 +10394,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     {
                                         let param_names: Vec<String> =
                                             f.params.iter().map(|p| p.name.clone()).collect();
-                                        let param_kinds: Vec<crate::ast::EnvSlotKind> =
-                                            f.params.iter().map(|p| slot_kind_for_type_expr_post_mono(&p.ty)).collect();
+                                        let param_kinds: Vec<crate::ast::EnvSlotKind> = f
+                                            .params
+                                            .iter()
+                                            .map(|p| slot_kind_for_type_expr_post_mono(&p.ty))
+                                            .collect();
 
                                         for (step_idx, _step) in steps.iter().enumerate() {
                                             let is_last = step_idx == steps.len() - 1;
@@ -10432,7 +10445,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             }
                                             // Capture pre-stmt bindings (like $elab_t*)
                                             // that are referenced by subsequent steps or residual.
-                                            if let AutoCpsBranchKind::Recursive { pre_stmts, .. } = branch {
+                                            if let AutoCpsBranchKind::Recursive {
+                                                pre_stmts, ..
+                                            } = branch
+                                            {
                                                 for ps in pre_stmts {
                                                     if let crate::ast::Stmt::Let(l) = ps {
                                                         if free_vars.contains(&l.name) {
@@ -10447,7 +10463,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             }
                                             // Capture match-arm pattern bindings (e.g., `v`
                                             // from `C(v, rest) => v + sum_list(rest)`).
-                                            if let Some(Some(arm_pat)) = arm_patterns.get(branch_idx) {
+                                            if let Some(Some(arm_pat)) =
+                                                arm_patterns.get(branch_idx)
+                                            {
                                                 let pat_captures = collect_pattern_binding_captures(
                                                     arm_pat,
                                                     &ctor_index,
@@ -10488,13 +10506,17 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                 // Next cont captures same as this + current $rec result
                                                 let mut next_captures = captures.clone();
                                                 let rec_name = format!("$rec{step_idx}");
-                                                if !next_captures.iter().any(|c| c.name == rec_name) {
+                                                if !next_captures.iter().any(|c| c.name == rec_name)
+                                                {
                                                     // Insert before the k-pair
                                                     let insert_pos = next_captures.len() - 2;
-                                                    next_captures.insert(insert_pos, SynthContCapture {
-                                                        name: rec_name,
-                                                        kind: crate::ast::EnvSlotKind::Int,
-                                                    });
+                                                    next_captures.insert(
+                                                        insert_pos,
+                                                        SynthContCapture {
+                                                            name: rec_name,
+                                                            kind: crate::ast::EnvSlotKind::Int,
+                                                        },
+                                                    );
                                                 }
                                                 AutoCpsContRole::Intermediate {
                                                     next_callee_name: next_step.callee_name.clone(),
@@ -10520,10 +10542,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 }
 
                                 // Store the first cont's index for body emit lookup.
-                                cps_continuation_synth_indices.insert(
-                                    format!("__auto_cps_{}", f.name),
-                                    starting_idx,
-                                );
+                                cps_continuation_synth_indices
+                                    .insert(format!("__auto_cps_{}", f.name), starting_idx);
                             }
                         }
                     }
@@ -11860,7 +11880,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 // body directly and continue. If no synth-conts (multi-call
                 // case not yet supported), fall through to existing paths.
                 let auto_cps_key_check = format!("__auto_cps_{}", f.name);
-                if cc.colored.auto_promotions.iter().any(|ap| ap.fn_name == f.name)
+                if cc
+                    .colored
+                    .auto_promotions
+                    .iter()
+                    .any(|ap| ap.fn_name == f.name)
                     && cps_continuation_synth_indices.contains_key(&auto_cps_key_check)
                 {
                     // Build SCC member set.
@@ -11873,12 +11897,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                     scc_members.insert(f.name.clone());
 
                     let call_site_inst = &checked.call_site_instantiations;
-                    let branches = analyze_auto_cps_body(
-                        &f.body,
-                        &scc_members,
-                        call_site_inst,
-                    )
-                    .unwrap_or_default();
+                    let branches = analyze_auto_cps_body(&f.body, &scc_members, call_site_inst)
+                        .unwrap_or_default();
 
                     // Phase 1: unpack block params.
                     let block_params: Vec<Value> = builder.block_params(block).to_vec();
@@ -11926,9 +11946,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                     // Emit the branching structure (if/match).
                     // For simple if/else: two branches. For match: N branches.
-                    let tail_expr = f.body.tail.as_ref().expect(
-                        "auto-CPS fn must have a tail expression",
-                    );
+                    let tail_expr = f
+                        .body
+                        .tail
+                        .as_ref()
+                        .expect("auto-CPS fn must have a tail expression");
 
                     // Create a continuation block that all arms jump to with
                     // a pointer_ty param (the NextStep ptr).
@@ -11942,13 +11964,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                     match tail_expr {
                         crate::ast::Expr::Match {
-                            scrutinee,
-                            arms,
-                            ..
+                            scrutinee, arms, ..
                         } => {
                             // Lower the scrutinee.
                             let scrut_v = lower_auto_cps_simple_expr(
-                                &mut builder, scrutinee, &env, pointer_ty,
+                                &mut builder,
+                                scrutinee,
+                                &env,
+                                pointer_ty,
                             );
 
                             // For the common desugared-if pattern (match bool
@@ -11957,7 +11980,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             // of test+branch blocks.
                             if arms.len() == 2
                                 && matches!(&arms[0].pattern, crate::ast::Pattern::BoolLit(true, _))
-                                && matches!(&arms[1].pattern, crate::ast::Pattern::BoolLit(false, _))
+                                && matches!(
+                                    &arms[1].pattern,
+                                    crate::ast::Pattern::BoolLit(false, _)
+                                )
                             {
                                 // Desugared if/else: brif on bool scrutinee.
                                 let scrut_ty = builder.func.dfg.value_type(scrut_v);
@@ -11969,12 +11995,13 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                 let then_block_bb = builder.create_block();
                                 let else_block_bb = builder.create_block();
-                                builder.ins().brif(cond_i8, then_block_bb, &[], else_block_bb, &[]);
+                                builder
+                                    .ins()
+                                    .brif(cond_i8, then_block_bb, &[], else_block_bb, &[]);
 
                                 let mut cont_idx_offset = 0usize;
-                                for (branch, arm_block) in branches
-                                    .iter()
-                                    .zip([then_block_bb, else_block_bb].iter())
+                                for (branch, arm_block) in
+                                    branches.iter().zip([then_block_bb, else_block_bb].iter())
                                 {
                                     builder.switch_to_block(*arm_block);
                                     builder.seal_block(*arm_block);
@@ -12011,7 +12038,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 let mut cont_idx_offset = 0usize;
                                 let mut current_test_block = None;
 
-                                for (arm_idx, (arm, branch)) in arms.iter().zip(branches.iter()).enumerate() {
+                                for (arm_idx, (arm, branch)) in
+                                    arms.iter().zip(branches.iter()).enumerate()
+                                {
                                     let arm_body_block = builder.create_block();
 
                                     // If we're continuing from a previous test block,
@@ -12033,19 +12062,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     match &arm.pattern {
                                         crate::ast::Pattern::IntLit(n, _) => {
                                             let lit_v = builder.ins().iconst(types::I64, *n);
-                                            let cmp = builder.ins().icmp(
-                                                IntCC::Equal, scrut_v, lit_v,
+                                            let cmp =
+                                                builder.ins().icmp(IntCC::Equal, scrut_v, lit_v);
+                                            let fallthrough =
+                                                next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(
+                                                cmp,
+                                                arm_body_block,
+                                                &[],
+                                                fallthrough,
+                                                &[],
                                             );
-                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
-                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
                                         }
                                         crate::ast::Pattern::BoolLit(b, _) => {
                                             let lit_v = builder.ins().iconst(types::I8, *b as i64);
-                                            let cmp = builder.ins().icmp(
-                                                IntCC::Equal, scrut_v, lit_v,
+                                            let cmp =
+                                                builder.ins().icmp(IntCC::Equal, scrut_v, lit_v);
+                                            let fallthrough =
+                                                next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(
+                                                cmp,
+                                                arm_body_block,
+                                                &[],
+                                                fallthrough,
+                                                &[],
                                             );
-                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
-                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
                                         }
                                         crate::ast::Pattern::Wildcard(_)
                                         | crate::ast::Pattern::Var(_, _) => {
@@ -12069,15 +12110,23 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                         .discriminant
                                                 })
                                                 .unwrap_or(0);
-                                            let expected_v = builder.ins().iconst(
-                                                types::I64,
-                                                i64::from(expected_disc),
-                                            );
+                                            let expected_v = builder
+                                                .ins()
+                                                .iconst(types::I64, i64::from(expected_disc));
                                             let cmp = builder.ins().icmp(
-                                                IntCC::Equal, disc_v, expected_v,
+                                                IntCC::Equal,
+                                                disc_v,
+                                                expected_v,
                                             );
-                                            let fallthrough = next_test_block.unwrap_or(arm_body_block);
-                                            builder.ins().brif(cmp, arm_body_block, &[], fallthrough, &[]);
+                                            let fallthrough =
+                                                next_test_block.unwrap_or(arm_body_block);
+                                            builder.ins().brif(
+                                                cmp,
+                                                arm_body_block,
+                                                &[],
+                                                fallthrough,
+                                                &[],
+                                            );
                                         }
                                         _ => {
                                             // Other patterns (Tuple, etc.) — unconditional.
@@ -12103,7 +12152,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     } = &arm.pattern
                                     {
                                         for (field_idx, sub_pat) in patterns.iter().enumerate() {
-                                            if let crate::ast::Pattern::Var(field_name, _) = sub_pat {
+                                            if let crate::ast::Pattern::Var(field_name, _) = sub_pat
+                                            {
                                                 let offset: i32 = 16 + 8 * field_idx as i32;
                                                 let field_v = builder.ins().load(
                                                     pointer_ty,
@@ -12152,9 +12202,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         _ => {
                             // Non-match tail (shouldn't normally happen for
                             // auto-CPS fns after elaboration, but handle).
-                            let branch = branches.first().cloned().unwrap_or(
-                                AutoCpsBranchKind::BaseCase(tail_expr.clone()),
-                            );
+                            let branch = branches
+                                .first()
+                                .cloned()
+                                .unwrap_or(AutoCpsBranchKind::BaseCase(tail_expr.clone()));
                             let mut cont_idx_offset = 0usize;
                             let ns_ptr = emit_auto_cps_branch(
                                 &mut builder,
@@ -17211,7 +17262,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                                                 callee.as_ref()
                                                             {
                                                                 matches!(
-                                                                    lowerer.user_fns.get(n.as_str()).map(|e| e.abi),
+                                                                    lowerer
+                                                                        .user_fns
+                                                                        .get(n.as_str())
+                                                                        .map(|e| e.abi),
                                                                     Some(UserFnAbi::Cps)
                                                                 )
                                                             } else {
@@ -19963,12 +20017,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         let _terminal_out = block_params[3];
 
                         // Load the recursive result from args_ptr[0].
-                        let rec_result_widened = builder.ins().load(
-                            types::I64,
-                            MemFlags::trusted(),
-                            args_ptr,
-                            0,
-                        );
+                        let rec_result_widened =
+                            builder
+                                .ins()
+                                .load(types::I64, MemFlags::trusted(), args_ptr, 0);
 
                         // Load captures from closure_ptr at offsets
                         // 16 + 8*i (past TAG_CLOSURE header at +0 and
@@ -20002,12 +20054,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             AutoCpsContRole::Final => {
                                 // Load k_closure and k_fn from captures
                                 // (they are always the last two captures).
-                                let k_closure_v = env.get("$k_closure").copied().unwrap_or_else(|| {
-                                    builder.ins().iconst(pointer_ty, 0)
-                                });
-                                let k_fn_v = env.get("$k_fn").copied().unwrap_or_else(|| {
-                                    builder.ins().iconst(pointer_ty, 0)
-                                });
+                                let k_closure_v = env
+                                    .get("$k_closure")
+                                    .copied()
+                                    .unwrap_or_else(|| builder.ins().iconst(pointer_ty, 0));
+                                let k_fn_v = env
+                                    .get("$k_fn")
+                                    .copied()
+                                    .unwrap_or_else(|| builder.ins().iconst(pointer_ty, 0));
 
                                 // Lower the tail expression using a simple
                                 // inline evaluator (handles Binary, Ident, IntLit).
@@ -20028,22 +20082,16 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                 // Build NextStep::Call(k_closure, k_fn, [widened_result])
                                 let one_v = builder.ins().iconst(types::I32, 1);
-                                let call_ns = builder.ins().call(
-                                    next_step_call_ref,
-                                    &[k_closure_v, k_fn_v, one_v],
-                                );
+                                let call_ns = builder
+                                    .ins()
+                                    .call(next_step_call_ref, &[k_closure_v, k_fn_v, one_v]);
                                 let ns_ptr = builder.inst_results(call_ns)[0];
-                                let argp_call = builder.ins().call(
-                                    next_step_args_ptr_ref,
-                                    &[ns_ptr],
-                                );
+                                let argp_call =
+                                    builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
                                 let argp_v = builder.inst_results(argp_call)[0];
-                                builder.ins().store(
-                                    MemFlags::trusted(),
-                                    widened_result,
-                                    argp_v,
-                                    0,
-                                );
+                                builder
+                                    .ins()
+                                    .store(MemFlags::trusted(), widened_result, argp_v, 0);
                                 builder.ins().return_(&[ns_ptr]);
                                 builder.finalize();
                             }
@@ -20057,13 +20105,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // recursive result, builds the NEXT
                                 // continuation's closure, dispatches the
                                 // next recursive call via NextStep::Call.
-                                let next_cont_fn_ref = module.declare_func_in_func(
-                                    *next_cont_func_id,
-                                    builder.func,
-                                );
-                                let next_cont_fn_addr = builder
-                                    .ins()
-                                    .func_addr(pointer_ty, next_cont_fn_ref);
+                                let next_cont_fn_ref =
+                                    module.declare_func_in_func(*next_cont_func_id, builder.func);
+                                let next_cont_fn_addr =
+                                    builder.ins().func_addr(pointer_ty, next_cont_fn_ref);
 
                                 // k_closure and k_fn are in `env` for packing into
                                 // the next continuation's closure record (via the
@@ -20081,15 +20126,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     }
                                 }
                                 let next_count: u8 = 1 + next_total_slots as u8;
-                                let next_header: u64 = header_word(TAG_CLOSURE, next_count, next_bitmap);
+                                let next_header: u64 =
+                                    header_word(TAG_CLOSURE, next_count, next_bitmap);
                                 let next_payload_bytes: i64 = 8 + 8 * next_total_slots as i64;
 
-                                let next_header_v = builder.ins().iconst(types::I64, next_header as i64);
-                                let next_payload_v = builder.ins().iconst(pointer_ty, next_payload_bytes);
+                                let next_header_v =
+                                    builder.ins().iconst(types::I64, next_header as i64);
+                                let next_payload_v =
+                                    builder.ins().iconst(pointer_ty, next_payload_bytes);
                                 let next_descriptor_idx = shape_table
                                     .borrow_mut()
                                     .alloc_descriptor_index(next_bitmap, next_count);
-                                let next_descriptor_v = builder.ins().iconst(types::I32, next_descriptor_idx as i64);
+                                let next_descriptor_v =
+                                    builder.ins().iconst(types::I32, next_descriptor_idx as i64);
                                 let alloc_ref = module.declare_func_in_func(
                                     per_fn_refs_ctx.builtins.alloc,
                                     builder.func,
@@ -20152,13 +20201,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
 
                                 // Build NextStep::Call(null, callee_fn, [args, cont_closure, cont_fn, null_ra*3])
                                 let callee_func_id = user_fns[next_callee_name].func_id;
-                                let callee_fn_ref = module.declare_func_in_func(
-                                    callee_func_id,
-                                    builder.func,
-                                );
-                                let callee_fn_addr = builder
-                                    .ins()
-                                    .func_addr(pointer_ty, callee_fn_ref);
+                                let callee_fn_ref =
+                                    module.declare_func_in_func(callee_func_id, builder.func);
+                                let callee_fn_addr =
+                                    builder.ins().func_addr(pointer_ty, callee_fn_ref);
 
                                 let user_arg_count_next = next_call_args.len();
                                 let total_arg_count_next = user_arg_count_next + 5;
@@ -20171,10 +20217,8 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     &[null_closure_for_call, callee_fn_addr, arg_count_v],
                                 );
                                 let ns_ptr = builder.inst_results(call_ns)[0];
-                                let argp_call = builder.ins().call(
-                                    next_step_args_ptr_ref,
-                                    &[ns_ptr],
-                                );
+                                let argp_call =
+                                    builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
                                 let argp_v = builder.inst_results(argp_call)[0];
 
                                 // Write user args.
@@ -28662,12 +28706,12 @@ fn emit_auto_cps_branch(
             let ns_ptr = builder.inst_results(call_ns)[0];
             let argp_call = builder.ins().call(next_step_args_ptr_ref, &[ns_ptr]);
             let argp_v = builder.inst_results(argp_call)[0];
-            builder
-                .ins()
-                .store(MemFlags::trusted(), widened, argp_v, 0);
+            builder.ins().store(MemFlags::trusted(), widened, argp_v, 0);
             ns_ptr
         }
-        AutoCpsBranchKind::Recursive { steps, pre_stmts, .. } => {
+        AutoCpsBranchKind::Recursive {
+            steps, pre_stmts, ..
+        } => {
             // Evaluate pre-stmts (non-recursive lets before the recursive call).
             let mut env = env.clone();
             for stmt in pre_stmts {
@@ -28679,9 +28723,8 @@ fn emit_auto_cps_branch(
 
             // Get the first step's info.
             let first_step = &steps[0];
-            let starting_idx = auto_cps_starting_idx.expect(
-                "auto-CPS recursive branch requires synth-cont allocation",
-            );
+            let starting_idx = auto_cps_starting_idx
+                .expect("auto-CPS recursive branch requires synth-cont allocation");
             let cont_synth_idx = starting_idx + *cont_idx_offset;
             *cont_idx_offset += steps.len();
 
@@ -28714,15 +28757,10 @@ fn emit_auto_cps_branch(
                 .borrow_mut()
                 .alloc_descriptor_index(bitmap, count);
             let descriptor_v = builder.ins().iconst(types::I32, descriptor_idx as i64);
-            let alloc_ref = module.declare_func_in_func(
-                per_fn_refs_ctx.builtins.alloc,
-                builder.func,
-            );
-            let closure_record = lower_alloc_call(
-                builder,
-                alloc_ref,
-                &[header_v, payload_v, descriptor_v],
-            );
+            let alloc_ref =
+                module.declare_func_in_func(per_fn_refs_ctx.builtins.alloc, builder.func);
+            let closure_record =
+                lower_alloc_call(builder, alloc_ref, &[header_v, payload_v, descriptor_v]);
 
             // Null code_ptr at +8.
             let null_v = builder.ins().iconst(pointer_ty, 0);
@@ -28767,9 +28805,7 @@ fn emit_auto_cps_branch(
 
             let callee_user_arg_count = first_step.call_args.len();
             let total_arg_count = callee_user_arg_count + 5;
-            let arg_count_v = builder
-                .ins()
-                .iconst(types::I32, total_arg_count as i64);
+            let arg_count_v = builder.ins().iconst(types::I32, total_arg_count as i64);
             let null_closure_for_call = builder.ins().iconst(pointer_ty, 0);
             let call_ns = builder.ins().call(
                 next_step_call_ref,
@@ -28879,7 +28915,9 @@ fn lower_auto_cps_simple_expr(
                     builder.ins().uextend(types::I64, cmp)
                 }
                 BinOp::LtEq => {
-                    let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, lhs_v, rhs_v);
+                    let cmp = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThanOrEqual, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)
                 }
                 BinOp::Gt => {
@@ -28887,7 +28925,9 @@ fn lower_auto_cps_simple_expr(
                     builder.ins().uextend(types::I64, cmp)
                 }
                 BinOp::GtEq => {
-                    let cmp = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, lhs_v, rhs_v);
+                    let cmp = builder
+                        .ins()
+                        .icmp(IntCC::SignedGreaterThanOrEqual, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)
                 }
                 BinOp::SdivUnchecked => builder.ins().sdiv(lhs_v, rhs_v),
@@ -31430,7 +31470,10 @@ fn is_supported_cps_user_fn_inner(
                 // that call CPS-colored-but-Sync-ABI fns.
                 if let Some(inner_fn) = fns_by_name.get(inner_name) {
                     let has_effects = block_contains_perform(&inner_fn.body);
-                    let is_auto = colored.auto_promotions.iter().any(|ap| ap.fn_name == inner_name);
+                    let is_auto = colored
+                        .auto_promotions
+                        .iter()
+                        .any(|ap| ap.fn_name == inner_name);
                     return has_effects || is_auto;
                 }
                 return true;
@@ -31450,7 +31493,11 @@ fn is_supported_cps_user_fn_inner(
         // Auto-promoted fns (non-tail self/SCC recursion) are supported CPS
         // callees only if they actually get CPS ABI (single-call per branch,
         // no non-trivial non-recursive calls).
-        if colored.auto_promotions.iter().any(|ap| ap.fn_name == callee_name) {
+        if colored
+            .auto_promotions
+            .iter()
+            .any(|ap| ap.fn_name == callee_name)
+        {
             if let Some(callee_fn) = fns_by_name.get(callee_name) {
                 let mut scc_members_callee = std::collections::BTreeSet::new();
                 for ap in &colored.auto_promotions {
@@ -31459,11 +31506,13 @@ fn is_supported_cps_user_fn_inner(
                     }
                 }
                 scc_members_callee.insert(callee_name.to_string());
-                let max_calls = count_max_recursive_calls_per_branch(
-                    &callee_fn.body, &scc_members_callee,
-                );
+                let max_calls =
+                    count_max_recursive_calls_per_branch(&callee_fn.body, &scc_members_callee);
                 if max_calls <= 1
-                    && !body_has_non_trivial_non_recursive_calls(&callee_fn.body, &scc_members_callee)
+                    && !body_has_non_trivial_non_recursive_calls(
+                        &callee_fn.body,
+                        &scc_members_callee,
+                    )
                 {
                     return true;
                 }
@@ -31828,7 +31877,10 @@ enum AutoCpsBranchKind {
 fn extract_first_recursive_call(
     expr: &crate::ast::Expr,
     scc_members: &std::collections::BTreeSet<String>,
-    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
     idx: usize,
 ) -> Option<(String, Vec<crate::ast::Expr>, crate::ast::Expr)> {
     use crate::ast::Expr;
@@ -32069,7 +32121,10 @@ fn rename_ident_in_expr(
         },
         Expr::Call { callee, args, span } => Expr::Call {
             callee: Box::new(rename_ident_in_expr(callee, old_name, new_name)),
-            args: args.iter().map(|a| rename_ident_in_expr(a, old_name, new_name)).collect(),
+            args: args
+                .iter()
+                .map(|a| rename_ident_in_expr(a, old_name, new_name))
+                .collect(),
             span: span.clone(),
         },
         // For other exprs (literals, etc.), no renaming needed.
@@ -32086,7 +32141,10 @@ fn rename_ident_in_expr(
 fn analyze_auto_cps_body(
     body: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
-    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
 ) -> Option<Vec<AutoCpsBranchKind>> {
     let tail = body.tail.as_ref()?;
     analyze_auto_cps_expr(tail, scc_members, call_site_instantiations)
@@ -32095,7 +32153,10 @@ fn analyze_auto_cps_body(
 fn analyze_auto_cps_expr(
     expr: &crate::ast::Expr,
     scc_members: &std::collections::BTreeSet<String>,
-    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
 ) -> Option<Vec<AutoCpsBranchKind>> {
     use crate::ast::Expr;
     match expr {
@@ -32104,38 +32165,24 @@ fn analyze_auto_cps_expr(
             else_block,
             ..
         } => {
-            let then_branch = analyze_single_branch_block(
-                then_block,
-                scc_members,
-                call_site_instantiations,
-            );
-            let else_branch = analyze_single_branch_block(
-                else_block,
-                scc_members,
-                call_site_instantiations,
-            );
+            let then_branch =
+                analyze_single_branch_block(then_block, scc_members, call_site_instantiations);
+            let else_branch =
+                analyze_single_branch_block(else_block, scc_members, call_site_instantiations);
             Some(vec![then_branch, else_branch])
         }
         Expr::Match { arms, .. } => {
             let branches: Vec<AutoCpsBranchKind> = arms
                 .iter()
                 .map(|arm| {
-                    analyze_single_branch_expr(
-                        &arm.body,
-                        scc_members,
-                        call_site_instantiations,
-                    )
+                    analyze_single_branch_expr(&arm.body, scc_members, call_site_instantiations)
                 })
                 .collect();
             Some(branches)
         }
         // Single expression (no branching) — treat as a single "arm".
         _ => {
-            let branch = analyze_single_branch_expr(
-                expr,
-                scc_members,
-                call_site_instantiations,
-            );
+            let branch = analyze_single_branch_expr(expr, scc_members, call_site_instantiations);
             Some(vec![branch])
         }
     }
@@ -32144,7 +32191,10 @@ fn analyze_auto_cps_expr(
 fn analyze_single_branch_block(
     block: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
-    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
 ) -> AutoCpsBranchKind {
     // After elaboration, non-tail recursive calls appear as
     // Stmt::Let { name, value: Expr::Call { callee ∈ SCC } }
@@ -32216,7 +32266,10 @@ fn analyze_single_branch_block(
 fn analyze_single_branch_expr(
     expr: &crate::ast::Expr,
     scc_members: &std::collections::BTreeSet<String>,
-    call_site_instantiations: &std::collections::BTreeMap<crate::errors::Span, crate::typecheck::GenericInstantiation>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
 ) -> AutoCpsBranchKind {
     use crate::ast::Expr;
     // Handle Block wrapping (from elaborate's if→match desugaring).
@@ -35547,7 +35600,10 @@ mod tests {
         let colored = ColoredProgram {
             mono,
             colors: vec![("sum_to".to_string(), Color::Cps)],
-            reasons: vec![("sum_to".to_string(), "auto-promoted: non-tail self-call".to_string())],
+            reasons: vec![(
+                "sum_to".to_string(),
+                "auto-promoted: non-tail self-call".to_string(),
+            )],
             auto_promotions: vec![AutoPromotion {
                 fn_name: "sum_to".to_string(),
                 fn_decl_span: span.clone(),
