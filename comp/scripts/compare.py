@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -79,6 +80,7 @@ CONTEXTS_DIR = COMP_DIR / "contexts"
 EVAL_SCRIPTS_DIR = COMP_DIR / "scripts"
 LOG_DIR = COMP_DIR / "log"
 SPEC_PATH = REPO_ROOT / "spec" / "language.md"
+SIGIL_CONTEXT_PATH = CONTEXTS_DIR / "sigil.md"
 
 DEFAULT_LANGUAGES = ["sigil"]
 FULL_LANGUAGES = ["sigil", "python", "go", "rust"]
@@ -110,6 +112,39 @@ class Prompt:
 _HEADING_RE = re.compile(r"^## ([A-Z]\d+) — (.+)$")
 _PROMPT_FIELD_RE = re.compile(r"^\*\*Prompt:\*\*\s*(.*)$")
 _NOTES_RE = re.compile(r"^\*\*Notes:\*\*\s*(.*)$")
+
+
+def compute_corpus_version() -> dict[str, str]:
+    """Return {git_sha, teaching_hash} identifying the teaching-material
+    state at the time of a run. teaching_hash is SHA-256 over the
+    concatenation of comp/contexts/sigil.md and spec/language.md; lets
+    the dashboard refuse to mix runs across versions that change either."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT, capture_output=True, text=True, check=False,
+        )
+        git_sha = proc.stdout.strip() if proc.returncode == 0 else "unknown"
+    except (FileNotFoundError, OSError):
+        git_sha = "unknown"
+    try:
+        body = SIGIL_CONTEXT_PATH.read_bytes() + SPEC_PATH.read_bytes()
+        teaching_hash = hashlib.sha256(body).hexdigest()
+    except FileNotFoundError:
+        teaching_hash = "unknown"
+    return {"git_sha": git_sha, "teaching_hash": teaching_hash}
+
+
+def resolve_runs(*, tier: Optional[str], explicit_runs: Optional[int]) -> int:
+    """Map tier → runs. Explicit --runs always wins. Tier defaults:
+    baseline=10, iteration=5. No tier and no --runs → 1 (single-cell ad-hoc)."""
+    if explicit_runs is not None:
+        return explicit_runs
+    if tier == "baseline":
+        return 10
+    if tier == "iteration":
+        return 5
+    return 1
 
 
 def parse_prompts(path: pathlib.Path) -> list[Prompt]:
@@ -689,7 +724,13 @@ def _attempt_to_json(a: Optional[AttemptResult]) -> Optional[dict]:
     }
 
 
-def write_jsonl(results: list[CellResult], path: pathlib.Path) -> None:
+def write_jsonl(
+    results: list[CellResult],
+    path: pathlib.Path,
+    *,
+    tier: Optional[str],
+    corpus_version: dict[str, str],
+) -> None:
     with path.open("w") as f:
         for r in results:
             f.write(json.dumps({
@@ -697,6 +738,8 @@ def write_jsonl(results: list[CellResult], path: pathlib.Path) -> None:
                 "language": r.language,
                 "model": r.model,
                 "run_idx": r.run_idx,
+                "tier": tier,
+                "corpus_version": corpus_version,
                 "first_attempt": _attempt_to_json(r.first_attempt),
                 "edit_attempt": _attempt_to_json(r.edit_attempt),
                 "final_pass": r.final_pass,
@@ -888,6 +931,7 @@ def _build_run_slug(
     all_langs: bool,
     runs: int,
     no_edit_loop: bool,
+    tier: Optional[str],
 ) -> str:
     """Compose a short slug describing the distinctive flags of this run.
 
@@ -896,6 +940,8 @@ def _build_run_slug(
     Returns empty string when nothing is distinctive — the timestamp alone
     is enough to uniquely identify a default-bank run."""
     parts: list[str] = []
+    if tier:
+        parts.append(tier)
     if filter_expr:
         # Strip regex metacharacters so the filename stays readable; cap length.
         sanitized = re.sub(r"[^A-Za-z0-9_-]+", "", filter_expr)[:32]
@@ -905,7 +951,11 @@ def _build_run_slug(
         parts.append("cross")
     if full:
         parts.append("full")
-    if runs > 1:
+    tier_default = resolve_runs(tier=tier, explicit_runs=None) if tier else 1
+    if runs > 1 and runs != tier_default:
+        # Include r<N> when runs diverges from the tier default (or there's
+        # no tier). Omit it when the tier already implies the count, to
+        # avoid redundant baseline-r10 slugs.
         parts.append(f"r{runs}")
     if no_edit_loop:
         parts.append("noedit")
@@ -958,9 +1008,10 @@ def main() -> int:
     parser.add_argument(
         "--runs",
         type=int,
-        default=1,
+        default=None,
         help="Number of independent runs per (prompt, lang, model). >1 enables "
-             "K/N aggregation (default: 1)",
+             "K/N aggregation. Default depends on --tier (baseline=10, iteration=5, "
+             "else 1).",
     )
     parser.add_argument(
         "--no-edit-loop",
@@ -968,11 +1019,28 @@ def main() -> int:
         help="Disable the after-one-edit retry on first failure",
     )
     parser.add_argument(
+        "--tier",
+        default=None,
+        choices=["baseline", "iteration"],
+        help="Tiered run preset. baseline=10 runs/cell (authoritative measurement); "
+             "iteration=5 runs/cell (cheap spot-check). Explicit --runs N overrides.",
+    )
+    parser.add_argument(
         "--results-dir",
         default=str(LOG_DIR),
         help=f"Directory for JSONL trace + comparison-log.md (default: {LOG_DIR})",
     )
     args = parser.parse_args()
+    args.runs = resolve_runs(tier=args.tier, explicit_runs=args.runs)
+    if args.tier and resolve_runs(tier=args.tier, explicit_runs=None) != args.runs:
+        tier_default = resolve_runs(tier=args.tier, explicit_runs=None)
+        print(
+            f"compare.py: warning: --tier {args.tier} normally implies "
+            f"--runs {tier_default}, but --runs {args.runs} was passed; the "
+            f"tier label in the trace will be {args.tier!r} despite the "
+            f"non-standard run count.",
+            file=sys.stderr,
+        )
 
     if shutil.which("claude") is None:
         print(
@@ -1053,6 +1121,7 @@ def main() -> int:
             for p in prompts
             for run_idx in range(args.runs)]
     results: list[CellResult] = []
+    corpus_version = compute_corpus_version()
 
     started = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
@@ -1101,12 +1170,14 @@ def main() -> int:
         all_langs=args.all_langs,
         runs=args.runs,
         no_edit_loop=args.no_edit_loop,
+        tier=args.tier,
     )
     stem = f"comparison-log-{timestamp}" + (f"-{run_slug}" if run_slug else "")
-    jsonl_path = results_dir / f"comparison-results-{timestamp}.jsonl"
+    slug_suffix = f"-{run_slug}" if run_slug else ""
+    jsonl_path = results_dir / f"comparison-results-{timestamp}{slug_suffix}.jsonl"
     md_latest_path = results_dir / "comparison-log.md"
     md_run_path = results_dir / f"{stem}.md"
-    write_jsonl(results, jsonl_path)
+    write_jsonl(results, jsonl_path, tier=args.tier, corpus_version=corpus_version)
     render_markdown_report(results, prompts, languages, models, args.runs, md_latest_path, jsonl_path)
     # Per-run report is a byte-identical copy of the latest pointer —
     # one render, one copy. Cheaper and guarantees the two files agree.
