@@ -40,6 +40,8 @@
 
 import std.option
 use std.option.{None, Option, Some};
+import std.result
+use std.result.{Err, Ok, Result};
 
 // `int_max()` returns `2^62 - 1`, the largest representable `Int`.
 fn int_max() -> Int ![] {
@@ -91,5 +93,28 @@ fn int_sub_safe(a: Int, b: Int) -> Option[Int] ![] {
     }
   } else {
     int_add_safe(a, -b)
+  }
+}
+
+// `checked_div(a, b)` returns `Ok(a / b)` for a nonzero divisor and
+// `Err("division by zero")` when `b == 0`, instead of trapping. Pure
+// (`![]`) — the `/` in the `Ok` arm only runs when `b != 0`, so it
+// never trips the runtime div-by-zero trap. Use this when a zero
+// divisor is a recoverable condition rather than a program bug.
+fn checked_div(a: Int, b: Int) -> Result[Int, String] ![] {
+  if b == 0 {
+    Err("division by zero")
+  } else {
+    Ok(a / b)
+  }
+}
+
+// `checked_mod(a, b)` is the `%` parallel of `checked_div`: `Ok(a % b)`
+// for a nonzero divisor, `Err("remainder by zero")` when `b == 0`.
+fn checked_mod(a: Int, b: Int) -> Result[Int, String] ![] {
+  if b == 0 {
+    Err("remainder by zero")
+  } else {
+    Ok(a % b)
   }
 }

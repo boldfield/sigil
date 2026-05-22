@@ -18014,6 +18014,54 @@ fn std_int_sub_safe_at_int_min_special_case() {
     );
 }
 
+/// arith-trap — checked_div returns Err on a zero divisor (no trap).
+#[test]
+fn checked_div_returns_err_on_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_div, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn main() -> Int ![IO] {\n\
+                  match checked_div(10, 0) {\n\
+                  Ok(v) => perform IO.println(int_to_string(v)),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_div_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "division by zero\n", "stderr={stderr:?}");
+}
+
+/// arith-trap — checked_div returns Ok(quotient) for a nonzero divisor;
+/// checked_mod returns Ok(remainder).
+#[test]
+fn checked_div_and_mod_return_ok() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_div, checked_mod, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn show(r: Result[Int, String]) -> Int ![IO] {\n\
+                  match r {\n\
+                  Ok(v) => perform IO.println(int_to_string(v)),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  show(checked_div(17, 5));\n\
+                  show(checked_mod(17, 5));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_div_mod_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n2\n", "stderr={stderr:?}");
+}
+
 // ===== Plan C addendum (Tier 2) — `std.string` source-level helpers =====
 //
 // `string_split` / `string_replace` are pure-Sigil helpers added to
