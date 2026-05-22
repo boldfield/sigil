@@ -1955,7 +1955,7 @@ fn arith_error_default_arm(reason: &str, args_len: u32) -> ! {
 /// Direct trap for `/` by zero. Called inline from codegen's
 /// `BinOp::Div` lowering (NOT through the effect system) — `/` no
 /// longer performs `ArithError`. Preserves the Plan A2 stderr banner
-/// + exit-2 behaviour verbatim so `examples/div_by_zero.sigil`'s
+/// and exit-2 behaviour verbatim so `examples/div_by_zero.sigil`'s
 /// oracle is unchanged. Never returns; codegen emits a `trap`
 /// terminator after the call.
 #[no_mangle]
