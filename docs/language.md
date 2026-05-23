@@ -87,9 +87,11 @@ fn main() -> Int ![IO] {
 effects. The compiler rejects any function with an `![]` row that
 contains `perform` or that calls a function with a non-empty row.
 
-`int_to_string(n: Int) -> String ![]` is a builtin (§13.2). String
-literals use `"..."` with C-style backslash escapes (`\\`, `\"`,
-`\n`, `\t`).
+`int_to_string(n: Int) -> String ![]` is a compiler intrinsic in the
+prelude (§13.2) — it is in scope everywhere, no `import` / `use`
+needed (the example above imports it explicitly, which still works but
+is redundant). String literals use `"..."` with C-style backslash
+escapes (`\\`, `\"`, `\n`, `\t`).
 
 ### E3 — Recursion and exhaustive `match`
 
@@ -126,20 +128,18 @@ order; the first matching arm wins.
 import std.int
 import std.io
 import std.option
-import std.raise
 use std.int.{int_to_string};
 use std.io.{IO};
 use std.option.{None, Option, Some};
-use std.raise.{ArithError};
 
-fn safe_div(num: Int, den: Int) -> Option[Int] ![ArithError] {
+fn safe_div(num: Int, den: Int) -> Option[Int] ![] {
   match den {
     0 => None,
     _ => Some(num / den),
   }
 }
 
-fn main() -> Int ![IO, ArithError] {
+fn main() -> Int ![IO] {
   match safe_div(10, 0) {
     Some(v) => perform IO.println(int_to_string(v)),
     None => perform IO.println("zero divisor"),
@@ -779,7 +779,9 @@ return `Int`. Its effect row may only contain effects discharged by
 the top-level shim:
 
 - `IO` — `print`, `println`, `read_line` arms (`std.io`)
-- `ArithError` — div-by-zero / mod-by-zero default handlers
+- `ArithError` — explicit `perform ArithError.*` only (the `/` and
+  `%` operators trap directly and do not perform it); default
+  handler exits 2
 - `Mem` — marker effect (no shim handler; allowed for type-level
   gating)
 - `Env` — `args`, `var`, `vars` (`std.env`)
@@ -984,14 +986,10 @@ see §3.2.1 for the doubled-row form.
 > **Operator effects to remember.** Several built-in operators carry
 > non-empty effect rows that propagate to their enclosing function:
 >
-> - **`/` and `%`** carry `![ArithError]` (may abort on zero divisor).
->   Any function whose body contains `/` or `%` MUST include
->   `ArithError` in its declared effect row, even when the divisor
->   is a non-zero literal — the requirement is structural, not
->   flow-sensitive. Trying to substitute one for the other (e.g.,
->   `n - (n / d) * d` instead of `n % d`) does NOT eliminate the
->   row requirement. See §4.2 for the full operator table and
->   discharge guidance.
+> - **`/` and `%`** trap (abort + exit 2) on a zero divisor and
+>   carry NO effect — a dividing function needs nothing on its row.
+>   For recoverable division use `checked_div` / `checked_mod`
+>   (`std.int`), which return `Result[Int, String]`. See §4.2.
 > - **`perform Effect.op(...)`** carries `![Effect]` (the effect
 >   you're performing). Helper functions that perform effects need
 >   the effect in their declared row.
@@ -1045,51 +1043,45 @@ suggested fix.
 | Category | Operators | Type |
 |----------|-----------|------|
 | Arithmetic | `+`, `-`, `*` | `(Int, Int) -> Int ![]` |
-| Arithmetic (may abort) | `/`, `%` | `(Int, Int) -> Int ![ArithError]` |
+| Arithmetic (traps on zero) | `/`, `%` | `(Int, Int) -> Int ![]` |
 | Comparison | `==`, `!=`, `<`, `<=`, `>`, `>=` | `(Int, Int) -> Bool ![]` |
 | Logic | `&&`, `\|\|`, `!` | `(Bool, Bool) -> Bool ![]` |
 | String compare | `string_compare(a, b)` (from `std.ordering`) | `(String, String) -> Ordering ![]` |
 
-> **Effect-row gotcha — `/` and `%` carry `ArithError`.** The
-> division and modulo operators perform `ArithError.div_by_zero` /
-> `ArithError.mod_by_zero` on zero divisors, so any function whose
-> body contains `/` or `%` MUST include `ArithError` in its declared
-> effect row. This is purely structural — even when the divisor is
-> a non-zero literal, the typechecker requires the row entry. A
-> `fn main() -> Int ![IO]` that contains `n % 2` fires E0042
-> ("`operator '%' (may abort with ArithError)` requires `ArithError`
-> in the enclosing function's effect row"); the row must be
-> `![ArithError, IO]`.
+> **`/` and `%` trap on a zero divisor — they carry no effect.**
+> Division and modulo abort the process on a zero divisor: the
+> runtime writes `sigil: arithmetic error: division by zero`
+> (resp. `remainder by zero`) to stderr and exits with status 2.
+> This is a *trap*, like an out-of-bounds array access or `panic` —
+> not an effect. A function that divides needs NO `ArithError` (or
+> any other) entry on its row; `fn main() -> Int ![]` may contain
+> `n % 2` and compiles.
 >
-> The top-level `main` shim installs default handlers that print
-> to stderr and exit 2 on uncaught `ArithError`. To recover in
-> source, install your own `handle` arm covering BOTH
-> `ArithError.div_by_zero` AND `ArithError.mod_by_zero` (E0142
-> requires exhaustive arm coverage per effect).
->
-> **If you're tempted to dodge the row by rewriting `n % d` as
-> `n - (n / d) * d`, STOP and declare the row instead.** That
-> workaround substitutes one may-abort op (`%`) for another (`/`),
-> so the row requirement doesn't go away — your function STILL
-> needs `![ArithError]`. Don't write the dodge; just declare the
-> row. The canonical pattern is:
+> A trap cannot be intercepted by a `handle` arm. When a zero
+> divisor is a recoverable condition rather than a programming bug,
+> use `checked_div` / `checked_mod` from `std.int`, which pre-check
+> the divisor and return `Result[Int, String]`:
 >
 > ```sigil
-> fn helper(n: Int, d: Int) -> Int ![ArithError] {
->   n % d
-> }
-> fn main() -> Int ![ArithError, IO] {
->   perform IO.println(int_to_string(helper(10, 3)));
+> import std.int
+> use std.int.{checked_div};
+> use std.result.{Err, Ok, Result};
+> fn main() -> Int ![] {
+>   let r: Result[Int, String] = checked_div(10, 0);  // Err("division by zero")
 >   0
 > }
 > ```
 >
-> If a particular use case truly cannot tolerate `ArithError` in the
-> row (e.g., a pure-row library helper meant to compose with discharging
-> contexts), use a different ALGORITHM — not a different operator.
-> Examples: comparing magnitudes via subtraction for parity, or
-> recursive predecessor walks instead of integer division. Substituting
-> one may-abort operator for another is never the right path.
+> The `ArithError` effect still exists and can be performed and
+> handled explicitly (`perform ArithError.div_by_zero()` inside a
+> `![ArithError]` row), but the `/` and `%` operators no longer
+> perform it.
+>
+> **What about `INT_MIN / -1`?** Not a concern in Sigil. `Int` is
+> 63-bit signed (range `[-2^62, 2^62 - 1]`), so the smallest `Int`
+> divided by `-1` is `2^62`, which fits in the backing i64 and never
+> trips the hardware overflow trap. Zero divisor is the only arith
+> trap.
 
 #### §4.3 — Match patterns
 
@@ -1635,8 +1627,8 @@ but binds **no symbols** — by itself it lets you write
 bare namespace, so `Some(7)` and `map(opt, f)` work without a
 prefix.
 
-This is **strict by design** — Plan F1 (2026-05-14) removed the
-old auto-prelude. The only globally-available names are:
+Imports are **strict by design** — Plan F1 (2026-05-14) removed the
+old auto-prelude of stdlib *types*. The globally-available names are:
 
 - **Primitive type names:** `Int`, `Bool`, `String`, `Char`,
   `Byte`, `Float`, `Int64`, `Unit`.
@@ -1649,15 +1641,53 @@ old auto-prelude. The only globally-available names are:
   the constructors are file-gated to that one source by E0148,
   but the type name is in scope everywhere for type-annotation
   purposes).
+- **Compiler intrinsic functions (the prelude)** — the primitive
+  operations the compiler emits directly (no `.sigil` source).
+  Because Sigil has no operator overloading, these *are* the
+  language's primitive operations: `int_to_string(n)`,
+  `float_add(a, b)`, `char_to_int(c)`, `array_get(xs, i)`,
+  `string_concat(a, b)`, `panic(msg)`, and so on. Their names are
+  globally unique, so calling them bare is unambiguous and needs no
+  `import` / `use`. §13.2 lists the module-less primitives, and the
+  per-module tables in §13 list the rest (e.g. `std.float`'s
+  `float_add`) — all of which are intrinsics callable bare.
 
-The authoritative list is registered in
-`typecheck::builtin_types()` and the matching `builtin_fn_env_*`
-helpers — the bullets above mirror that registration.
+The compiler maintains the authoritative registrations of the builtin
+type names and the intrinsic-function surface; the bullets above
+mirror them.
 
-Every other name — including `Option`, `Result`, `Some`, `None`,
-`Ok`, `Err`, `List`, `Cons`, `Nil`, and any stdlib fn like `map`,
-`int_to_string`, `string_concat`, `read_dir`, etc. — must come
-from an `import` + `use` line, or be qualified at the call site.
+**Intrinsics vs. stdlib source.** The prelude covers compiler
+intrinsics only. Stdlib *source* functions — written in `.sigil`,
+living in modules, and able to share names across modules (`map` in
+`std.list` vs `std.option`) — are NOT in the prelude. Every such name
+— `Option`, `Result`, `Some`, `None`, `Ok`, `Err`, `List`, `Cons`,
+`Nil`, and source fns like `map`, `unwrap_or`, `read_dir`, the safe
+`string_to_int`/`string_to_float` parse wrappers, etc. — must come
+from an `import` + `use` line, or be qualified at the call site. The
+line is exactly intrinsic-vs-source: a name with one possible meaning
+is global; a name you pick a module for needs the `use`.
+
+**The prelude obeys the no-shadowing rule** (see §9's "There is no
+shadowing"):
+
+- A top-level `fn` redefining a prelude intrinsic name is a
+  redefinition error (E0020) — you can no more redefine
+  `int_to_string` than the type `Int`.
+- A local `let` / parameter *may* shadow a prelude intrinsic within
+  its scope, exactly as a local may shadow a top-level `fn` of the
+  same name (local-first lookup). This is not a violation of the
+  no-shadowing rule, which forbids only re-binding the *same* name in
+  the *same* scope (`let x = 1; let x = 2;`).
+- A redundant explicit `use std.int.{int_to_string};` still compiles:
+  it binds the name to the *same* intrinsic the prelude provides, so
+  it is not shadowing — just redundant. Pre-prelude code that imports
+  intrinsics keeps compiling unchanged.
+
+Two intrinsic categories are intentionally NOT preluded and still
+require a `use`: the low-level `*_validate` / `*_parse` / `*_alloc`
+parsing-and-allocation halves (use the safe `Result`-returning wrappers
+in `std.string`, `std.float`, and `std.byte_array` instead) and the
+internal `Ref` cell ops (use the `std.state` API).
 
 **Module aliases.** `import` accepts an `as` alias for shorter
 qualified-call paths:
@@ -1708,12 +1738,13 @@ still opts the names in (`use std.io.{IO};`, etc.).
 
 Several other modules — `std.int`, `std.float`, `std.array`,
 `std.mut_array`, `std.byte_array`, `std.mut_byte_array` — are
-**mixed**: they ship some compiler-builtin entries (registered
-via `BUILTIN_TO_MODULE_FILE`) alongside source-level fn
-declarations. From the user's perspective the two categories are
-indistinguishable — both come into scope via the same `import` +
-`use` pair. The distinction matters only to the compiler's name
-registration machinery.
+**mixed**: they ship some compiler-intrinsic entries alongside
+source-level fn declarations. The two categories now differ from the
+user's perspective: the intrinsic entries are in the prelude (callable
+bare, no `import` / `use`), while the source-level fns require a `use`
+like any other stdlib symbol. Importing the module and `use`-ing a
+name always works for both; the intrinsics simply also work without
+it.
 
 **Resolver semantics.** Three resolution paths cover every Ident
 that names a top-level fn or type:
@@ -1971,6 +2002,29 @@ correct by default; the program now works at arbitrary depth.
 Surfacing the transformation lets the author opt for the
 tail-recursive rewrite only when the per-call overhead matters.
 
+**Coverage.** Auto-promotion handles arbitrary non-tail recursive
+shapes via chained continuations:
+
+- **Single call per branch** — `sum_to(n) = n + sum_to(n - 1)`,
+  `sum_list(c) = v + sum_list(rest)`.
+- **Multiple calls per branch** — `fib(n) = fib(n - 1) + fib(n - 2)`,
+  `sum_tree(t) = v + sum_tree(l) + sum_tree(r)`. Each call becomes a
+  yield point with its own continuation; intermediate continuations
+  thread captured state forward to the next call.
+- **Pointer-returning recursion** — `build(d) = Node(1, build(d-1),
+  build(d-1))`, `build_list(n) = Cons(n, build_list(n-1))`. The
+  reconstructed value (a heap record) flows through the continuation
+  chain; the GC roots the in-flight chain across collections.
+- **Mutual recursion** — `f → g → f` where every leg has a non-tail
+  call; each SCC member is promoted.
+
+The one shape that stays Sync: a recursive arm containing a **genuine
+non-recursive function call** (a real `foo(x)` call, as opposed to a
+constructor application or a recursive call), since the residual
+evaluator can only lower arithmetic, comparisons, identifiers, and
+constructor applications. Such a function keeps the Sync calling
+convention and remains depth-bounded by the host stack.
+
 ### §13 — Stdlib reference
 
 Each module is documented in its own `std/<name>.sigil` source
@@ -2063,7 +2117,11 @@ reason and have walked through the asymmetry above.
 
 #### §13.2 — Builtin primitives (not in stdlib modules)
 
-These functions are available without any `import`:
+These functions are compiler intrinsics in the prelude — available
+without any `import` (see §10's prelude rules). This table covers the
+primitives with no conceptual stdlib module; the numeric/char/string/
+array intrinsics live under their conceptual module in §13's tables
+and are equally prelude-callable.
 
 | Function | Type | Description |
 |----------|------|-------------|
