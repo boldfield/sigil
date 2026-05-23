@@ -152,7 +152,7 @@ Run: `comp/log/comparison-results-20260510T171113.jsonl` (2026-05-10T17:11, 3 ru
 | `claude-opus-4-7` | **3/3** | **3/3** |
 | `claude-sonnet-4-6` | 2/3 | **3/3** |
 
-The one sonnet first-pass miss was an unrelated `let half = list_length(xs) / 2;` E0042 — Sigil's effect-row strictness requires `ArithError` on integer division; the edit-loop fixed it.
+The one sonnet first-pass miss was an unrelated `let half = list_length(xs) / 2;` E0042 — fixed in one edit-loop turn. (That rule has since been removed: `/` and `%` now trap on a zero divisor and carry no effect, so the same code compiles first-pass today; see `spec/language.md` §4.2.)
 
 ### 3.2 H01–H03, H05 — not yet executed
 
