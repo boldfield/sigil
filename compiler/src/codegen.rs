@@ -27714,13 +27714,16 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             BinOp::Sub => self.builder.ins().isub(l, r),
             BinOp::Mul => self.builder.ins().imul(l, r),
             BinOp::Div | BinOp::Mod => {
-                let is_div = matches!(op, BinOp::Div);
-                let trap_ref = if is_div {
-                    self.builtins.arith_div_trap_ref
+                let op_kind = if matches!(op, BinOp::Div) {
+                    GuardedDivOp::Div {
+                        zero_trap: self.builtins.arith_div_trap_ref,
+                    }
                 } else {
-                    self.builtins.arith_mod_trap_ref
+                    GuardedDivOp::Mod {
+                        zero_trap: self.builtins.arith_mod_trap_ref,
+                    }
                 };
-                emit_guarded_div(&mut self.builder, l, r, is_div, trap_ref)
+                emit_guarded_div(&mut self.builder, l, r, op_kind)
             }
             BinOp::Eq => self.builder.ins().icmp(IntCC::Equal, l, r),
             BinOp::NotEq => self.builder.ins().icmp(IntCC::NotEqual, l, r),
@@ -28780,25 +28783,42 @@ const TRAP_PANIC_UNREACHABLE: u8 = 0x43;
 /// the runtime fn ever incorrectly returns.
 const TRAP_ARITH_UNREACHABLE: u8 = 0x44;
 
-/// Emit a zero-guarded signed division (`is_div == true`) or
-/// remainder (`is_div == false`). On a zero divisor, branches to a
-/// cold block that calls the (noreturn) runtime trap and emits a
-/// `trap` terminator; otherwise computes `sdiv`/`srem` in a fresh
-/// block. Returns the quotient/remainder Value in the now-current
-/// (ok) block. Shared by `Lowerer::emit_binop` and the auto-CPS
-/// residual evaluator so the guard semantics can't drift between
-/// the two paths.
+/// Pairs a div/mod op with its zero-trap FuncRef so callers can't pass a
+/// mismatched (op, trap) pair. Constructed at the call site from the
+/// per-fn `Builtins` trap refs.
+enum GuardedDivOp {
+    Div { zero_trap: FuncRef },
+    Mod { zero_trap: FuncRef },
+}
+
+/// Emit a zero-guarded signed division or remainder. On a zero divisor,
+/// branches to a cold block that calls the (noreturn) runtime trap and
+/// emits a `trap` terminator; otherwise computes `sdiv`/`srem` in a
+/// fresh ok block and returns its Value (current block on return is
+/// the ok block). Shared by `Lowerer::emit_binop` and the auto-CPS
+/// residual evaluator so the guard semantics can't drift between the
+/// two paths.
+///
+/// **No `INT_MIN / -1` overflow guard is needed.** Cranelift's `sdiv`
+/// raises an IntegerOverflow trap only when the quotient overflows
+/// i64 (i.e., `i64::MIN / -1`). Sigil's `Int` is 63-bit signed (range
+/// `[-2^62, 2^62 - 1]` per `std/int.sigil`'s `int_min()`/`int_max()`),
+/// so the smallest Int divided by -1 is `-2^62 / -1 = 2^62`, which is
+/// representable in i64 and does not trip the overflow trap. The
+/// `int_min_div_neg_one_returns_two_to_the_62` e2e test pins this
+/// invariant; if Sigil ever widens `Int` to full i64, this guard
+/// requirement returns and the test will surface it.
 fn emit_guarded_div(
     builder: &mut FunctionBuilder<'_>,
     l: Value,
     r: Value,
-    is_div: bool,
-    trap_ref: FuncRef,
+    op: GuardedDivOp,
 ) -> Value {
     let int_ty = builder.func.dfg.value_type(r);
-    debug_assert!(
-        int_ty.is_int(),
-        "emit_guarded_div: divisor must be an integer type, got {int_ty}"
+    debug_assert_eq!(
+        int_ty,
+        types::I64,
+        "emit_guarded_div: divisor must be I64 (Sigil Int), got {int_ty}"
     );
     let zero = builder.ins().iconst(int_ty, 0);
     let is_zero = builder.ins().icmp(IntCC::Equal, r, zero);
@@ -28808,17 +28828,19 @@ fn emit_guarded_div(
 
     builder.switch_to_block(trap_block);
     builder.seal_block(trap_block);
-    builder.ins().call(trap_ref, &[]);
+    let zero_trap = match op {
+        GuardedDivOp::Div { zero_trap } | GuardedDivOp::Mod { zero_trap } => zero_trap,
+    };
+    builder.ins().call(zero_trap, &[]);
     builder
         .ins()
         .trap(TrapCode::unwrap_user(TRAP_ARITH_UNREACHABLE));
 
     builder.switch_to_block(ok_block);
     builder.seal_block(ok_block);
-    if is_div {
-        builder.ins().sdiv(l, r)
-    } else {
-        builder.ins().srem(l, r)
+    match op {
+        GuardedDivOp::Div { .. } => builder.ins().sdiv(l, r),
+        GuardedDivOp::Mod { .. } => builder.ins().srem(l, r),
     }
 }
 
@@ -29180,10 +29202,22 @@ fn lower_auto_cps_simple_expr(
                 BinOp::Add => builder.ins().iadd(lhs_v, rhs_v),
                 BinOp::Sub => builder.ins().isub(lhs_v, rhs_v),
                 BinOp::Mul => builder.ins().imul(lhs_v, rhs_v),
-                BinOp::Div => emit_guarded_div(builder, lhs_v, rhs_v, true, ctx.arith_div_trap_ref),
-                BinOp::Mod => {
-                    emit_guarded_div(builder, lhs_v, rhs_v, false, ctx.arith_mod_trap_ref)
-                }
+                BinOp::Div => emit_guarded_div(
+                    builder,
+                    lhs_v,
+                    rhs_v,
+                    GuardedDivOp::Div {
+                        zero_trap: ctx.arith_div_trap_ref,
+                    },
+                ),
+                BinOp::Mod => emit_guarded_div(
+                    builder,
+                    lhs_v,
+                    rhs_v,
+                    GuardedDivOp::Mod {
+                        zero_trap: ctx.arith_mod_trap_ref,
+                    },
+                ),
                 BinOp::Eq => {
                     let cmp = builder.ins().icmp(IntCC::Equal, lhs_v, rhs_v);
                     builder.ins().uextend(types::I64, cmp)

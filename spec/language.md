@@ -1062,6 +1062,12 @@ suggested fix.
 > handled explicitly (`perform ArithError.div_by_zero()` inside a
 > `![ArithError]` row), but the `/` and `%` operators no longer
 > perform it.
+>
+> **What about `INT_MIN / -1`?** Not a concern in Sigil. `Int` is
+> 63-bit signed (range `[-2^62, 2^62 - 1]`), so the smallest `Int`
+> divided by `-1` is `2^62`, which fits in the backing i64 and never
+> trips the hardware overflow trap. Zero divisor is the only arith
+> trap.
 
 #### §4.3 — Match patterns
 

@@ -1123,6 +1123,123 @@ fn mod_by_zero_traps() {
     );
 }
 
+/// arith-trap invariant — Sigil's 63-bit Int never produces `i64::MIN`,
+/// so `int_min() / -1 = 2^62 = 4611686018427387904` computes cleanly
+/// (no IntegerOverflow trap from Cranelift's `sdiv`). Pins the
+/// rationale in `emit_guarded_div`'s "No INT_MIN / -1 overflow guard"
+/// comment; if `Int` is ever widened to full i64, this test surfaces
+/// the regression.
+#[test]
+fn int_min_div_neg_one_returns_two_to_the_62() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_min, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn main() -> Int ![IO] {\n\
+                  let lo: Int = int_min();\n\
+                  let neg_one: Int = 0 - 1;\n\
+                  let q: Int = lo / neg_one;\n\
+                  perform IO.println(int_to_string(q));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "int_min_div_neg_one");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4611686018427387904\n", "stderr={stderr:?}");
+}
+
+/// arith-trap invariant — companion to the div case: `int_min() % -1`
+/// equals 0 and computes cleanly (no overflow trap on `srem`).
+#[test]
+fn int_min_mod_neg_one_returns_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_min, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn main() -> Int ![IO] {\n\
+                  let lo: Int = int_min();\n\
+                  let neg_one: Int = 0 - 1;\n\
+                  let r: Int = lo % neg_one;\n\
+                  perform IO.println(int_to_string(r));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "int_min_mod_neg_one");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// arith-trap — the kept `ArithError` effect machinery still works
+/// when used explicitly. An unhandled `perform ArithError.div_by_zero()`
+/// from an `![ArithError]` fn dispatches through `sigil_perform` to
+/// the default `sigil_arith_error_div_by_zero_arm` and exits 2 with
+/// the same banner the trap path produces. Pins the kept default
+/// frame against silent rot.
+#[test]
+fn explicit_perform_arith_error_div_lands_on_default_arm() {
+    let source = "import std.raise\n\
+                  use std.raise.{ArithError};\n\
+                  fn main() -> Int ![ArithError] {\n\
+                  perform ArithError.div_by_zero()\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "explicit_perform_arith_error_div");
+    assert_eq!(
+        code, 2,
+        "explicit perform should land on default arm + exit 2; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("sigil: arithmetic error: division by zero"),
+        "expected division-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — a user-installed `handle ... with { ArithError.* => ... }`
+/// intercepts an explicit `perform ArithError.div_by_zero()` and
+/// recovers, proving the handler-recovery path on explicit performs
+/// still works after the arith-trap change. Both arms are registered
+/// per the partial-handler-aborts v1 contract. Recovery value is 42
+/// (a small int that round-trips cleanly through POSIX's 8-bit exit
+/// code truncation).
+#[test]
+fn explicit_handle_intercepts_perform_arith_error_div() {
+    let source = "import std.raise\n\
+                  use std.raise.{ArithError};\n\
+                  fn try_div() -> Int ![ArithError] {\n\
+                  perform ArithError.div_by_zero()\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  handle try_div() with {\n\
+                  ArithError.div_by_zero(k) => 42,\n\
+                  ArithError.mod_by_zero(k) => 42,\n\
+                  }\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "explicit_handle_arith_error_div");
+    assert_eq!(
+        code, 42,
+        "handler should recover with 42; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — checked_mod returns Err on a zero divisor (no trap).
+/// Symmetric coverage with `checked_div_returns_err_on_zero`.
+#[test]
+fn checked_mod_returns_err_on_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_mod};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn main() -> Int ![IO] {\n\
+                  match checked_mod(10, 0) {\n\
+                  Ok(_) => perform IO.println(\"unexpected\"),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_mod_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "remainder by zero\n", "stderr={stderr:?}");
+}
+
 /// arith-trap — `examples/div_recover.sigil` recovers from a zero
 /// divisor via `checked_div` (std.int), which returns
 /// `Result[Int, String]`. Handler-based recovery on `/` is no longer
