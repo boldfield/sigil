@@ -20339,6 +20339,89 @@ fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
     );
 }
 
+/// Category C #1 — minimal repro: pure `let` in a match-arm body, referenced
+/// from a second `perform` in the same arm. Before the fix this panicked
+/// with "codegen: unknown ident `name`" because BranchedCpsLeaf::PerformChain
+/// captures did not include arm-body inner_tail_prefix_lets.
+#[test]
+fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  fn print_names(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  let name: String = \"x\";\n\
+                  perform IO.print(\" \");\n\
+                  perform IO.print(name);\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { print_names(false) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_minimal");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, " x", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #2 — pure-fn RHS (mirrors H02's `let is_valid: Bool =
+/// validate_json_number(input)` shape). Confirms the fix evaluates the
+/// pure-fn-call RHS exactly once (no double-allocation / no re-firing of
+/// side-effectful pure calls).
+#[test]
+fn branch_chain_pure_let_with_fn_rhs_runs_once() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn double(n: Int) -> Int ![] { n + n }\n\
+                  fn print_doubled(n: Int) -> Int ![IO] {\n\
+                  match n {\n\
+                  0 => 0,\n\
+                  _ => {\n\
+                  let d: Int = double(n);\n\
+                  perform IO.print(int_to_string(d));\n\
+                  perform IO.print(\":\");\n\
+                  perform IO.print(int_to_string(d));\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { print_doubled(3) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_fn_rhs");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // d = 6; expect "6:6" — proves d was evaluated and reused, not lost.
+    assert_eq!(stdout, "6:6", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #3 — Cons-arm shape (mirrors H04's `Cons(head, tail) => { let
+/// name = entry_name(head); ... print twice ... }`). Confirms the fix works
+/// when the pure-let RHS depends on an arm-bound pattern variable.
+#[test]
+fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn first_char(s: String) -> String ![] { s }\n\
+                  fn show(xs: List[String]) -> Int ![IO] {\n\
+                  match xs {\n\
+                  Nil => 0,\n\
+                  Cons(head, _) => {\n\
+                  let label: String = first_char(head);\n\
+                  perform IO.print(\"[\");\n\
+                  perform IO.print(label);\n\
+                  perform IO.print(\"]\");\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { show(Cons(\"hi\", Nil)) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_cons_arm_pure_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[hi]", "stdout; stderr={stderr:?}");
+}
+
 /// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression
 /// gate. Nests two `handle` expressions whose body fns each have
 /// distinct return arms. The TLS approach masked outer with inner via
