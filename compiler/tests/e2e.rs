@@ -20344,8 +20344,12 @@ fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
 /// with "codegen: unknown ident `name`" because BranchedCpsLeaf::PerformChain
 /// captures did not include arm-body inner_tail_prefix_lets.
 ///
-/// Diagnostic version: wrap in trace `before`/`after` printlns so CI shows
-/// whether the chain runs at all and where execution stops.
+/// Uses `IO.println` (not `IO.print`) because Rust's stdout is line-buffered
+/// — bytes written without a trailing newline stay buffered and the sigil
+/// binary's C-main exit path doesn't invoke Rust's atexit flush, so a final
+/// `IO.print`-only program produces empty captured stdout. The newline
+/// forces a per-line flush. The semantic test (pre-yield let reachable from
+/// a later perform) is independent of the newline.
 #[test]
 fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
     let source = "import std.io\n\
@@ -20361,24 +20365,17 @@ fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
                   },\n\
                   }\n\
                   }\n\
-                  fn main() -> Int ![IO] {\n\
-                  perform IO.println(\"before\");\n\
-                  let _r: Int = print_names(false);\n\
-                  perform IO.println(\"after\");\n\
-                  0\n\
-                  }\n";
+                  fn main() -> Int ![IO] { print_names(false) }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_minimal");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(
-        stdout, "before\nfirst\nx\nafter\n",
-        "stdout; stderr={stderr:?}"
-    );
+    assert_eq!(stdout, "first\nx\n", "stdout; stderr={stderr:?}");
 }
 
 /// Category C #2 — pure-fn RHS (mirrors H02's `let is_valid: Bool =
 /// validate_json_number(input)` shape). Confirms the fix evaluates the
 /// pure-fn-call RHS exactly once (no double-allocation / no re-firing of
-/// side-effectful pure calls).
+/// side-effectful pure calls). Uses `IO.println` for the same buffering
+/// reason as the minimal repro above.
 #[test]
 fn branch_chain_pure_let_with_fn_rhs_runs_once() {
     let source = "import std.int\n\
@@ -20391,9 +20388,9 @@ fn branch_chain_pure_let_with_fn_rhs_runs_once() {
                   0 => 0,\n\
                   _ => {\n\
                   let d: Int = double(n);\n\
-                  perform IO.print(int_to_string(d));\n\
-                  perform IO.print(\":\");\n\
-                  perform IO.print(int_to_string(d));\n\
+                  perform IO.println(int_to_string(d));\n\
+                  perform IO.println(\":\");\n\
+                  perform IO.println(int_to_string(d));\n\
                   0\n\
                   },\n\
                   }\n\
@@ -20401,13 +20398,14 @@ fn branch_chain_pure_let_with_fn_rhs_runs_once() {
                   fn main() -> Int ![IO] { print_doubled(3) }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_fn_rhs");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // d = 6; expect "6:6" — proves d was evaluated and reused, not lost.
-    assert_eq!(stdout, "6:6", "stdout; stderr={stderr:?}");
+    // d = 6; expect "6\n:\n6\n" — proves d was evaluated and reused, not lost.
+    assert_eq!(stdout, "6\n:\n6\n", "stdout; stderr={stderr:?}");
 }
 
 /// Category C #3 — Cons-arm shape (mirrors H04's `Cons(head, tail) => { let
 /// name = entry_name(head); ... print twice ... }`). Confirms the fix works
-/// when the pure-let RHS depends on an arm-bound pattern variable.
+/// when the pure-let RHS depends on an arm-bound pattern variable. Uses
+/// `IO.println` for the same buffering reason as the minimal repro above.
 #[test]
 fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
     let source = "import std.io\n\
@@ -20420,9 +20418,9 @@ fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
                   Nil => 0,\n\
                   Cons(head, _) => {\n\
                   let label: String = first_char(head);\n\
-                  perform IO.print(\"[\");\n\
-                  perform IO.print(label);\n\
-                  perform IO.print(\"]\");\n\
+                  perform IO.println(\"[\");\n\
+                  perform IO.println(label);\n\
+                  perform IO.println(\"]\");\n\
                   0\n\
                   },\n\
                   }\n\
@@ -20430,7 +20428,7 @@ fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
                   fn main() -> Int ![IO] { show(Cons(\"hi\", Nil)) }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_cons_arm_pure_let");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "[hi]", "stdout; stderr={stderr:?}");
+    assert_eq!(stdout, "[\nhi\n]\n", "stdout; stderr={stderr:?}");
 }
 
 /// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression
