@@ -141,8 +141,8 @@ fn range(start: Int, end: Int) -> List[Int] ![] {
 // - Splitting uses the tortoise-and-hare pattern (`__split`): a
 //   slow pointer advances by 1 each step while a fast pointer
 //   advances by 2; when fast reaches the end, slow sits at the
-//   midpoint. This avoids the `n / 2` division that would force
-//   `ArithError` onto the effect row.
+//   midpoint. This finds the split point in a single pass, without
+//   first walking the list to measure its length and dividing.
 // - The merge step is tail-recursive (TCO'd per Plan C Task TCO):
 //   `__merge_rev` accumulates the merged list in reverse, then
 //   `reverse` flips it back at the end. Merge stack depth is

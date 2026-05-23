@@ -6046,14 +6046,12 @@ impl Tc {
     }
 
     /// Plan B Task 57 — verify that the surrounding fn's effect row
-    /// declares `effect_name`. Used by both `check_perform` (for
-    /// every `perform` site) and the `Expr::Binary` arm of
-    /// `check_expr` (for `BinOp::Div`/`Mod` sites, which lower to
-    /// `perform ArithError.{div,mod}_by_zero()` at elaborate-time).
-    /// The deviation entry `[DEVIATION Task 57] BinOp::Div and
-    /// BinOp::Mod elaborate to perform-bearing form` documents why
-    /// the row introduction happens at typecheck rather than waiting
-    /// for elaborate's rewrite.
+    /// declares `effect_name`. Used by `check_perform` (for every
+    /// `perform` site). (`BinOp::Div`/`Mod` previously also called
+    /// in via an elaborate-time perform rewrite; that wiring was
+    /// removed by the arith-trap change — operators now trap
+    /// directly and carry no effect — so this fn is reached only
+    /// from explicit `perform` sites today.)
     ///
     /// Emits E0042 with a context-specific message when missing;
     /// returns whether the row contains `effect_name` for callers
@@ -6501,23 +6499,14 @@ impl Tc {
             Expr::BoolLit(_, _) => Some(Ty::Bool),
             Expr::CharLit(_, _) => Some(Ty::Char),
             Expr::UnitLit(_) => Some(Ty::Unit),
-            Expr::Binary { op, lhs, rhs, span } => {
+            Expr::Binary {
+                op,
+                lhs,
+                rhs,
+                span: _,
+            } => {
                 let lt = self.check_expr(lhs, row, row_tail);
                 let rt = self.check_expr(rhs, row, row_tail);
-                // Plan B Task 57 — `BinOp::Div` and `BinOp::Mod`
-                // elaborate to a perform-bearing form (`if rhs == 0
-                // { perform ArithError.{div,mod}_by_zero() } else {
-                // … }`); the row introduction happens here at
-                // typecheck because elaborate runs after typecheck
-                // and cannot influence the row check upstream. See
-                // `[DEVIATION Task 57] BinOp::Div and BinOp::Mod
-                // elaborate to perform-bearing form` in
-                // `PLAN_B_DEVIATIONS.md`.
-                if matches!(op, BinOp::Div | BinOp::Mod) {
-                    let opname = if matches!(op, BinOp::Div) { "/" } else { "%" };
-                    let ctx = format!("operator `{opname}` (may abort with ArithError)");
-                    self.register_effect_use("ArithError", row, row_tail, span.clone(), &ctx);
-                }
                 self.check_binop(*op, lt, rt, lhs.span(), rhs.span())
             }
             Expr::Unary { op, operand, span } => {
@@ -6788,17 +6777,6 @@ impl Tc {
     ) -> Option<Ty> {
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                self.require_operand(op, Ty::Int, lt, lspan);
-                self.require_operand(op, Ty::Int, rt, rspan);
-                Some(Ty::Int)
-            }
-            BinOp::SdivUnchecked | BinOp::SremUnchecked => {
-                // Plan B Task 57 — codegen-internal variants produced
-                // only by elaborate's `BinOp::Div`/`Mod` rewrite. The
-                // typechecker reaches this arm only via synthetic
-                // walks (e.g. typecheck-tests-walking-elaborated-IR),
-                // not via user source. Same operand/result types as
-                // the pre-elaborate variants.
                 self.require_operand(op, Ty::Int, lt, lspan);
                 self.require_operand(op, Ty::Int, rt, rspan);
                 Some(Ty::Int)
@@ -9108,11 +9086,6 @@ fn binop_symbol(op: BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
-        // Plan B Task 57 — codegen-internal variants surface in
-        // diagnostics only via post-elaborate IR walks; the surface
-        // syntax is the same as their pre-elaborate counterparts.
-        BinOp::SdivUnchecked => "/",
-        BinOp::SremUnchecked => "%",
     }
 }
 

@@ -1,55 +1,32 @@
 // examples/div_recover.sigil
 //
-// Plan B Task 57 — demonstrates algebraic recovery from a div-by-
-// zero via a user-installed `ArithError` handler. The inner fn
-// `safe_divide` does division (so its row carries `![ArithError]`);
-// the outer `main` wraps the call in `handle ... with { ... }`,
-// discharging the effect with a recovery value of 999. The outer
-// fn's row is `![IO]` only — `ArithError` is fully discharged
-// inside the handle expression.
+// arith-trap — recovering from a zero divisor without trapping.
 //
-// Pre-Task-57 this program would have aborted at the divide site
-// via the `sigil_panic_arith_error` runtime fn. Post-Task-57 the
-// perform-bearing form lets user handlers intercept and recover.
+// `/` and `%` trap (clean stderr + exit 2) on a zero divisor and do
+// NOT introduce an effect, so a zero divisor cannot be intercepted
+// with a `handle ... with { ArithError.* }` arm. When a zero divisor
+// is a recoverable condition rather than a bug, use `checked_div` /
+// `checked_mod` (std.int), which return `Result[Int, String]`.
 //
-// **v1 contract — partial handlers abort at runtime.** `effect
-// ArithError` declares **two ops** (`div_by_zero` for `/` and
-// `mod_by_zero` for `%`). User handlers MUST register both arms,
-// even when the handled expression only triggers one — under the
-// Phase 4f latent op_id/arm_count constraint (pinned by `#[ignore]`
-// 'd e2e `partial_handler_of_multi_op_effect_aborts_at_runtime_-
-// pending_resolution`), a handle with only one of the two arms
-// runtime-aborts when the unhandled op fires. The example below
-// registers BOTH arms; the `mod_by_zero(k) => 999` arm is
-// unreachable in this program (the body only does `/`), but its
-// presence keeps the `arm_count` matched to the effect's declared
-// op count. The constraint will close in a future post-Phase-4f
-// task (option 1: convention fix sizing arm_count to the effect's
-// declared op count automatically; option 2: typecheck E0142
-// exhaustiveness rejection).
-//
-// Invariant: stdout reads `999\n` and the program exits 0.
-//
-// See `[DEVIATION Task 57] BinOp::Div and BinOp::Mod elaborate to
-// perform-bearing form` and `[DEVIATION Task 57] ArithError op
-// return type — Int (v1 simplification) instead of Never` in
-// `boldfield/designs/PLAN_B_DEVIATIONS.md`.
+// `safe_divide` returns the quotient on success and a fallback of
+// 999 on a zero divisor. Invariant: stdout reads `999\n`, exit 0.
 
 import std.int
 import std.io
-import std.raise
-use std.int.{int_to_string};
+import std.result
+use std.int.{checked_div, int_to_string};
 use std.io.{IO};
-use std.raise.{ArithError};
-fn safe_divide(a: Int, b: Int) -> Int ![ArithError] {
-  a / b
+use std.result.{Err, Ok, Result};
+
+fn safe_divide(a: Int, b: Int) -> Int ![] {
+  match checked_div(a, b) {
+    Ok(q) => q,
+    Err(_) => 999,
+  }
 }
 
 fn main() -> Int ![IO] {
-  let recovered: Int = handle safe_divide(10, 0) with {
-    ArithError.div_by_zero(k) => 999,
-    ArithError.mod_by_zero(k) => 999,
-  };
+  let recovered: Int = safe_divide(10, 0);
   perform IO.println(int_to_string(recovered));
   0
 }

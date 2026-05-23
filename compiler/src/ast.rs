@@ -674,19 +674,6 @@ pub enum BinOp {
     GtEq,
     And,
     Or,
-    /// Plan B Task 57 — codegen-internal `sdiv` without zero check;
-    /// produced only by elaborate's `BinOp::Div` rewrite when the
-    /// divisor is statically guaranteed non-zero on this branch (the
-    /// `else` arm of the `if rhs == 0 { perform … } else { __unchecked
-    /// }` rewrite). Never produced by parser; surface syntax has no
-    /// way to express it. Codegen emits a plain `sdiv` for this
-    /// variant. See `[DEVIATION Task 57] BinOp::Div and BinOp::Mod
-    /// elaborate to perform-bearing form` in `PLAN_B_DEVIATIONS.md`.
-    SdivUnchecked,
-    /// Plan B Task 57 — codegen-internal `srem` without zero check;
-    /// the `Mod` parallel of `SdivUnchecked`. Same elaborate-time
-    /// rewrite shape, same codegen treatment (plain `srem`).
-    SremUnchecked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

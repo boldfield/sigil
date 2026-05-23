@@ -1063,47 +1063,190 @@ fn match_primitive_with_wildcard() {
     assert_eq!(code, 17, "n=2 hits wildcard → 17");
 }
 
-/// Modulo-by-zero takes the same default-handler path as division-by-
-/// zero but with a different reason string. The canonical
-/// `examples/div_by_zero.sigil` covers the `/` path via
-/// [`div_by_zero_example_traps`]; this test covers the `%` path.
-///
-/// Plan B Task 57 — row updated from `![]` to `![ArithError]` per
-/// the elaborate-time-rewrite tracked-effect doctrine. User-visible
-/// behaviour (stderr banner + exit 2) preserved verbatim by the
-/// runtime-side `sigil_arith_error_mod_by_zero_arm` default arm fn.
+/// arith-trap — a `![]` function (no ArithError on the row) may use
+/// `/`; a zero divisor traps with the preserved banner + exit 2.
 #[test]
-fn mod_by_zero_traps() {
-    let source = "import std.raise\n\
-               use std.raise.{ArithError};\n\
-               fn main() -> Int ![ArithError] {\n\
-               let a: Int = 10;\n\
-               let b: Int = 0;\n\
-               let r: Int = a % b;\n\
-               r\n\
-               }\n";
-    let (_stdout, stderr, code) = compile_and_run(source, "mod_by_zero");
-    assert_eq!(code, 2, "mod-by-zero exits with 2");
+fn bare_div_by_zero_traps_without_row() {
+    let source = "fn main() -> Int ![] {\n\
+                  let a: Int = 10;\n\
+                  let b: Int = 0;\n\
+                  a / b\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "bare_div_by_zero");
+    assert_eq!(code, 2, "bare `/` by zero exits 2; stderr={stderr:?}");
     assert!(
-        stderr.contains("remainder by zero"),
-        "stderr missing mod-zero banner: {stderr:?}"
+        stderr.contains("sigil: arithmetic error: division by zero"),
+        "expected division-by-zero banner; stderr={stderr:?}"
     );
 }
 
-/// Plan B Task 57 — `examples/div_recover.sigil` exercises algebraic
-/// recovery from a div-by-zero via a user-installed `ArithError`
-/// handler. Confirms that:
-///
-/// - typecheck accepts `![ArithError]` on the inner fn doing
-///   division, and `![IO]` on the outer fn whose handle expression
-///   discharges `ArithError`;
-/// - elaborate's `BinOp::Div` rewrite produces a perform-bearing
-///   form that flows through `sigil_perform`;
-/// - the user's `ArithError.div_by_zero(k) => 999` handler frame
-///   intercepts the perform before the top-level shim's default
-///   (the frame walk is inward-first);
-/// - the recovery value `999` flows back to the outer fn's handle
-///   expression, and the program prints `999` then exits 0.
+/// arith-trap — `%` traps inside an auto-CPS-promoted recursive fn
+/// (the residual-evaluator lowering path). Guards the second Div/Mod
+/// lowering site. `count_down` recurses non-tail (so it is promoted
+/// to CPS) and performs `100 % (n - n)` == `100 % 0` at the base.
+#[test]
+fn auto_cps_recursive_mod_by_zero_traps() {
+    let source = "fn count_down(n: Int) -> Int ![] {\n\
+                  if n <= 0 {\n\
+                  100 % (n - n)\n\
+                  } else {\n\
+                  1 + count_down(n - 1)\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  count_down(3)\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_mod_zero");
+    assert_eq!(code, 2, "auto-CPS `%` by zero exits 2; stderr={stderr:?}");
+    assert!(
+        stderr.contains("sigil: arithmetic error: remainder by zero"),
+        "expected remainder-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — `%` by zero traps with banner + exit 2, with NO
+/// `![ArithError]` on the row (operators no longer carry the effect).
+/// `examples/div_by_zero.sigil` covers the `/` path via
+/// [`div_by_zero_example_traps`]; this test covers the `%` path.
+#[test]
+fn mod_by_zero_traps() {
+    let source = "fn main() -> Int ![] {\n\
+                  let a: Int = 10;\n\
+                  let b: Int = 0;\n\
+                  a % b\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "mod_by_zero");
+    assert_eq!(code, 2, "`%` by zero exits 2; stderr={stderr:?}");
+    assert!(
+        stderr.contains("sigil: arithmetic error: remainder by zero"),
+        "expected remainder-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap invariant — Sigil's 63-bit Int never produces `i64::MIN`,
+/// so `int_min() / -1 = 2^62 = 4611686018427387904` computes cleanly
+/// (no IntegerOverflow trap from Cranelift's `sdiv`). Pins the
+/// rationale in `emit_guarded_div`'s "No INT_MIN / -1 overflow guard"
+/// comment; if `Int` is ever widened to full i64, this test surfaces
+/// the regression.
+#[test]
+fn int_min_div_neg_one_returns_two_to_the_62() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_min, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn main() -> Int ![IO] {\n\
+                  let lo: Int = int_min();\n\
+                  let neg_one: Int = 0 - 1;\n\
+                  let q: Int = lo / neg_one;\n\
+                  perform IO.println(int_to_string(q));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "int_min_div_neg_one");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "4611686018427387904\n", "stderr={stderr:?}");
+}
+
+/// arith-trap invariant — companion to the div case: `int_min() % -1`
+/// equals 0 and computes cleanly (no overflow trap on `srem`).
+#[test]
+fn int_min_mod_neg_one_returns_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_min, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn main() -> Int ![IO] {\n\
+                  let lo: Int = int_min();\n\
+                  let neg_one: Int = 0 - 1;\n\
+                  let r: Int = lo % neg_one;\n\
+                  perform IO.println(int_to_string(r));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "int_min_mod_neg_one");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "0\n", "stderr={stderr:?}");
+}
+
+/// arith-trap — the kept `ArithError` effect machinery still works
+/// when used explicitly. An unhandled `perform ArithError.div_by_zero()`
+/// from an `![ArithError]` fn dispatches through `sigil_perform` to
+/// the default `sigil_arith_error_div_by_zero_arm` and exits 2 with
+/// the same banner the trap path produces. Pins the kept default
+/// frame against silent rot.
+#[test]
+fn explicit_perform_arith_error_div_lands_on_default_arm() {
+    let source = "import std.raise\n\
+                  use std.raise.{ArithError};\n\
+                  fn main() -> Int ![ArithError] {\n\
+                  perform ArithError.div_by_zero()\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "explicit_perform_arith_error_div");
+    assert_eq!(
+        code, 2,
+        "explicit perform should land on default arm + exit 2; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("sigil: arithmetic error: division by zero"),
+        "expected division-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — a user-installed `handle ... with { ArithError.* => ... }`
+/// intercepts an explicit `perform ArithError.div_by_zero()` and
+/// recovers, proving the handler-recovery path on explicit performs
+/// still works after the arith-trap change. Both arms are registered
+/// per the partial-handler-aborts v1 contract. Recovery value is 42
+/// (a small int that round-trips cleanly through POSIX's 8-bit exit
+/// code truncation).
+#[test]
+fn explicit_handle_intercepts_perform_arith_error_div() {
+    let source = "import std.raise\n\
+                  use std.raise.{ArithError};\n\
+                  fn try_div() -> Int ![ArithError] {\n\
+                  perform ArithError.div_by_zero()\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  handle try_div() with {\n\
+                  ArithError.div_by_zero(k) => 42,\n\
+                  ArithError.mod_by_zero(k) => 42,\n\
+                  }\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "explicit_handle_arith_error_div");
+    assert_eq!(
+        code, 42,
+        "handler should recover with 42; stderr={stderr:?}"
+    );
+}
+
+/// arith-trap — checked_mod returns Err on a zero divisor (no trap).
+/// Symmetric coverage with `checked_div_returns_err_on_zero`.
+#[test]
+fn checked_mod_returns_err_on_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_mod};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn main() -> Int ![IO] {\n\
+                  match checked_mod(10, 0) {\n\
+                  Ok(_) => perform IO.println(\"unexpected\"),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_mod_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "remainder by zero\n", "stderr={stderr:?}");
+}
+
+/// arith-trap — `examples/div_recover.sigil` recovers from a zero
+/// divisor via `checked_div` (std.int), which returns
+/// `Result[Int, String]`. Handler-based recovery on `/` is no longer
+/// possible (the operator traps and cannot be intercepted by a
+/// `handle` arm). The example matches `Err(_) => 999`, so:
+/// - stdout reads `999\n`
+/// - exit code is 0 (no trap fires — the divisor is checked first)
 #[test]
 fn div_recover_example_returns_999() {
     let root = workspace_root();
@@ -17979,6 +18122,54 @@ fn std_int_sub_safe_at_int_min_special_case() {
         stdout, "zero-none\n4611686018427387903\n",
         "stderr={stderr:?}"
     );
+}
+
+/// arith-trap — checked_div returns Err on a zero divisor (no trap).
+#[test]
+fn checked_div_returns_err_on_zero() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_div, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn main() -> Int ![IO] {\n\
+                  match checked_div(10, 0) {\n\
+                  Ok(v) => perform IO.println(int_to_string(v)),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_div_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "division by zero\n", "stderr={stderr:?}");
+}
+
+/// arith-trap — checked_div returns Ok(quotient) for a nonzero divisor;
+/// checked_mod returns Ok(remainder).
+#[test]
+fn checked_div_and_mod_return_ok() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  import std.result\n\
+                  use std.int.{checked_div, checked_mod, int_to_string};\n\
+                  use std.io.{IO};\n\
+                  use std.result.{Err, Ok, Result};\n\
+                  fn show(r: Result[Int, String]) -> Int ![IO] {\n\
+                  match r {\n\
+                  Ok(v) => perform IO.println(int_to_string(v)),\n\
+                  Err(msg) => perform IO.println(msg),\n\
+                  };\n\
+                  0\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  show(checked_div(17, 5));\n\
+                  show(checked_mod(17, 5));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "checked_div_mod_ok");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3\n2\n", "stderr={stderr:?}");
 }
 
 // ===== Plan C addendum (Tier 2) — `std.string` source-level helpers =====

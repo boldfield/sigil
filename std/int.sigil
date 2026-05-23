@@ -13,33 +13,28 @@
 //
 // ## Scope
 //
-// Ships `int_add_safe` and `int_sub_safe`. Both are pure-Sigil
-// implementations that pre-check for overflow before performing the
-// operation, so they don't need `![ArithError]` on the row.
+// Ships `int_add_safe` and `int_sub_safe` (overflow-safe, returning
+// `Option[Int]`) and `checked_div` / `checked_mod` (zero-safe,
+// returning `Result[Int, String]`). All are pure (`![]`) and
+// pre-check before performing the underlying operation.
 //
-// **Deferred to a follow-up plan with a runtime primitive:**
-// `int_mul_safe`, `int_div_safe`, `int_mod_safe`. The natural
-// pre-check pattern for multiplication uses `/` to verify the
-// product survives a round-trip; the natural pre-check for division
-// uses `/` to compute the quotient. Both trip Sigil's typecheck
-// rule that any use of `/` or `%` requires `![ArithError]` on the
-// enclosing row, regardless of runtime guards. A runtime primitive
-// `sigil_int_div_checked(a, b) -> Option[Int]` (and the multiply
-// equivalent) lifts this constraint by performing the check + op
-// in one non-aborting FFI call.
+// `checked_div` / `checked_mod` test the divisor first and only run
+// `/` / `%` when it is non-zero, so they never trip the runtime
+// divide-by-zero trap. (`/` and `%` trap on a zero divisor and carry
+// no effect — see `spec/language.md` §4.2 — so no `![ArithError]`
+// row is involved.)
 //
-// Until that primitive ships, callers who need safe multiply or
-// divide can:
-//   - Use `Int64` (`int64_mul` / `int64_div`) under `![ArithError]`,
-//     pre-checking `b != 0` for division and bounding operand
-//     magnitudes for multiplication, and casting back to `Int`.
-//   - Wrap the operation in a `catch`-style helper at the call
-//     site, accepting the `![ArithError]` row.
+// **Still deferred:** `int_mul_safe`. Detecting multiplication
+// overflow without a wider accumulator needs either an `Int64`
+// round-trip or a dedicated runtime primitive; that work is
+// independent of the divide-by-zero handling and tracked separately.
 //
 // ## Range constants
 
 import std.option
 use std.option.{None, Option, Some};
+import std.result
+use std.result.{Err, Ok, Result};
 
 // `int_max()` returns `2^62 - 1`, the largest representable `Int`.
 fn int_max() -> Int ![] {
@@ -91,5 +86,28 @@ fn int_sub_safe(a: Int, b: Int) -> Option[Int] ![] {
     }
   } else {
     int_add_safe(a, -b)
+  }
+}
+
+// `checked_div(a, b)` returns `Ok(a / b)` for a nonzero divisor and
+// `Err("division by zero")` when `b == 0`, instead of trapping. Pure
+// (`![]`) — the `/` in the `Ok` arm only runs when `b != 0`, so it
+// never trips the runtime div-by-zero trap. Use this when a zero
+// divisor is a recoverable condition rather than a program bug.
+fn checked_div(a: Int, b: Int) -> Result[Int, String] ![] {
+  if b == 0 {
+    Err("division by zero")
+  } else {
+    Ok(a / b)
+  }
+}
+
+// `checked_mod(a, b)` is the `%` parallel of `checked_div`: `Ok(a % b)`
+// for a nonzero divisor, `Err("remainder by zero")` when `b == 0`.
+fn checked_mod(a: Int, b: Int) -> Result[Int, String] ![] {
+  if b == 0 {
+    Err("remainder by zero")
+  } else {
+    Ok(a % b)
   }
 }
