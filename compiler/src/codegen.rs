@@ -3868,6 +3868,17 @@ fn collect_branch_chain_allocs(
                 let mut branch_binding_names: Vec<String> = Vec::new();
                 let mut branch_binding_tys: Vec<Type> = Vec::new();
                 let mut branch_binding_kinds: Vec<EnvSlotKind> = Vec::new();
+                // Pure lets BEFORE the first yield: evaluable in the
+                // outer body env, so they get promoted to captures
+                // (below) and loaded from synth_closure_ptr at every
+                // Middle/Final step entry. Middle steps need them to
+                // lower perform-arg references; Final step reads them
+                // from env (no re-evaluation).
+                let mut pre_yield_pure_lets: Vec<TailPrefixLet> = Vec::new();
+                // Pure lets AFTER the first yield: RHS may depend on
+                // earlier perform results, so they CAN'T be captured
+                // at outer alloc time. Evaluated at the Final step
+                // (with prior_bindings already loaded).
                 let mut inner_tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
                 let mut seen_yield = false;
 
@@ -3883,24 +3894,16 @@ fn collect_branch_chain_allocs(
                                 seen_yield = true;
                             }
                             _ => {
+                                let entry = TailPrefixLet {
+                                    name: l.name.clone(),
+                                    ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
+                                    kind: slot_kind_for_type_expr_post_mono(&l.ty),
+                                    value: l.value.clone(),
+                                };
                                 if seen_yield {
-                                    inner_tail_prefix_lets.push(TailPrefixLet {
-                                        name: l.name.clone(),
-                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
-                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
-                                        value: l.value.clone(),
-                                    });
-                                }
-                                // Pure lets before first yield: also
-                                // treated as inner_tail_prefix_lets for
-                                // the branch chain's final step.
-                                if !seen_yield {
-                                    inner_tail_prefix_lets.push(TailPrefixLet {
-                                        name: l.name.clone(),
-                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
-                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
-                                        value: l.value.clone(),
-                                    });
+                                    inner_tail_prefix_lets.push(entry);
+                                } else {
+                                    pre_yield_pure_lets.push(entry);
                                 }
                             }
                         }
@@ -3922,6 +3925,19 @@ fn collect_branch_chain_allocs(
                 }
                 for ab in &arm_bindings {
                     branch_captures.push(ab.clone());
+                }
+                // Pre-yield pure lets join captures: the outer body
+                // emit already evaluates them into env before the
+                // capture-store loop runs, so they're available for
+                // storage into branch_closure. Without this, Middle
+                // step bodies would panic on env.get(name) == None
+                // when lowering perform-arg references in later
+                // steps (the "codegen: unknown ident" ICE class).
+                for pre_let in &pre_yield_pure_lets {
+                    branch_captures.push(SynthContCapture {
+                        name: pre_let.name.clone(),
+                        kind: pre_let.kind,
+                    });
                 }
 
                 let branch_yield_count = branch_steps.len();
