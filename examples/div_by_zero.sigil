@@ -1,16 +1,12 @@
 // examples/div_by_zero.sigil
 //
-// Test-only Stage 2 program (plan A2 task 26): triggers the runtime
-// division-by-zero default handler. Running this program writes
-// `sigil: arithmetic error: division by zero` to stderr and exits
-// with status 2.
-//
 // arith-trap — `/` by zero traps directly: the runtime fn
 // `sigil_arith_div_by_zero_trap` writes
 // `sigil: arithmetic error: division by zero` to stderr and exits 2.
 // `/` no longer performs an effect, so the row is `![]`. This file
-// exists so the e2e suite can assert the trap fires; it is excluded
-// from smoke.sh as a success-path example.
+// exists so the e2e suite can assert the trap fires; smoke.sh's
+// example allowlist intentionally omits programs expected to abort,
+// so this one is not listed there.
 
 fn main() -> Int ![] {
   let a: Int = 10;

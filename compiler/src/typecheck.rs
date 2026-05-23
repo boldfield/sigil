@@ -6046,14 +6046,12 @@ impl Tc {
     }
 
     /// Plan B Task 57 — verify that the surrounding fn's effect row
-    /// declares `effect_name`. Used by both `check_perform` (for
-    /// every `perform` site) and the `Expr::Binary` arm of
-    /// `check_expr` (for `BinOp::Div`/`Mod` sites, which lower to
-    /// `perform ArithError.{div,mod}_by_zero()` at elaborate-time).
-    /// The deviation entry `[DEVIATION Task 57] BinOp::Div and
-    /// BinOp::Mod elaborate to perform-bearing form` documents why
-    /// the row introduction happens at typecheck rather than waiting
-    /// for elaborate's rewrite.
+    /// declares `effect_name`. Used by `check_perform` (for every
+    /// `perform` site). (`BinOp::Div`/`Mod` previously also called
+    /// in via an elaborate-time perform rewrite; that wiring was
+    /// removed by the arith-trap change — operators now trap
+    /// directly and carry no effect — so this fn is reached only
+    /// from explicit `perform` sites today.)
     ///
     /// Emits E0042 with a context-specific message when missing;
     /// returns whether the row contains `effect_name` for callers

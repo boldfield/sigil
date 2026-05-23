@@ -21,7 +21,7 @@ use std.result.{Err, Ok, Result};
 fn safe_divide(a: Int, b: Int) -> Int ![] {
   match checked_div(a, b) {
     Ok(q) => q,
-    Err(msg) => 999,
+    Err(_) => 999,
   }
 }
 

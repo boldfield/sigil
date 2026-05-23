@@ -1,22 +1,35 @@
-//! Arithmetic runtime primitives — plan A2 task 25, Plan B Task 57.
+//! Arithmetic runtime primitives — plan A2 task 25, Plan B Task 57,
+//! arith-trap change.
 //!
-//! Plan A2's `sigil_panic_arith_error` was retired in Plan B Task 57.
-//! Codegen no longer emits a branch to a panic-by-stderr-message
-//! function on `sdiv` / `srem` sites with a zero divisor; instead,
-//! `BinOp::Div` / `BinOp::Mod` elaborate to a perform-bearing form
-//! (`if rhs == 0 { perform ArithError.{div,mod}_by_zero() } else
-//! { … }`), and the perform routes through `sigil_perform` to the
-//! top-level ArithError handler installed by the `main` shim. The
-//! default arm fns (`sigil_arith_error_div_by_zero_arm` /
-//! `sigil_arith_error_mod_by_zero_arm` in `runtime/src/handlers.rs`)
-//! preserve Plan A2's exact stderr banner + exit-2 user-visible
-//! behavior; user programs that wrap arithmetic in
-//! `handle ... with { ArithError.div_by_zero(k) => ... }` can now
-//! recover from div-by-zero rather than aborting. See
-//! `[DEVIATION Task 57] BinOp::Div and BinOp::Mod elaborate to
+//! Divide-by-zero history:
+//!
+//! - Plan A2 emitted a direct panic-by-stderr-message call from
+//!   codegen on `sdiv` / `srem` sites (`sigil_panic_arith_error`).
+//! - Plan B Task 57 retired that and routed `BinOp::Div`/`Mod`
+//!   through the effect system: elaborate rewrote each site to a
+//!   perform-bearing form whose perform dispatched through
+//!   `sigil_perform` to the top-level ArithError handler installed
+//!   by the `main` shim; the default arm fns
+//!   (`sigil_arith_error_{div,mod}_by_zero_arm` in `handlers.rs`)
+//!   produced the stderr banner + exit 2.
+//! - The arith-trap change (current) reverts the routing: codegen
+//!   lowers `BinOp::Div`/`Mod` directly to a zero-check that calls
+//!   the new runtime traps `sigil_arith_{div,mod}_by_zero_trap`
+//!   (also in `handlers.rs`), reusing the same stderr banner and
+//!   exit code via the shared `arith_trap_exit` helper. Operators
+//!   no longer perform `ArithError` and carry no effect on the
+//!   row. The `ArithError` effect, the CPS arm fns, and the
+//!   default handler frame are intentionally retained — they
+//!   remain reachable via *explicit* user `perform ArithError.*`
+//!   calls and user-installed `handle ... with { ArithError.* }`
+//!   arms (those still recover via the CPS path). A trap on a `/`
+//!   or `%` cannot be intercepted by a handler.
+//!
+//! See `[DEVIATION Task 57] BinOp::Div and BinOp::Mod elaborate to
 //! perform-bearing form` and `[DEVIATION Task 57] Top-level handler
 //! installation in main shim` in
-//! `boldfield/designs/PLAN_B_DEVIATIONS.md`.
+//! `boldfield/designs/PLAN_B_DEVIATIONS.md` for the historical
+//! design, and `spec/language.md` §4.2 for the current rule.
 //!
 //! Surface this module still owns:
 //!

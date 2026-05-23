@@ -10739,10 +10739,11 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // abbreviated forms. Keep the two independent.
     // Plan B Stage 6 cleanup — `sigil_arith_msg_div_zero` /
     // `sigil_arith_msg_mod_zero` C-string declarations removed.
-    // Task 57's BinOp::Div/Mod elaborate-time rewrite to
-    // `perform ArithError.{div,mod}_by_zero()` makes the codegen-side
-    // C-strings unreachable; the user-visible stderr banner now lives
-    // in runtime-side `sigil_arith_error_{div,mod}_by_zero_arm`.
+    // The arith-trap change wires BinOp::Div/Mod directly to the
+    // runtime traps `sigil_arith_{div,mod}_by_zero_trap` (called
+    // inline from `emit_guarded_div`); the user-visible stderr
+    // banner lives in runtime-side `arith_trap_exit`. The
+    // codegen-side C-string declarations have no caller.
 
     // --- define every user fn (original + synthetic $lambda_N) ----------
     //
@@ -13632,11 +13633,12 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
     // popped under LIFO). User code's `perform IO.println(...)`
     // walks down the handler stack looking for a matching frame;
     // an unwrapped print finds IO at the top, identical to Slice 1
-    // behavior. ArithError is below IO; only `BinOp::Div`/`Mod`
-    // sites' elaborate-rewritten `perform ArithError.{div,mod}_-
-    // by_zero()` traverse past IO to reach it. User-installed
-    // handlers via `handle ... with { ... }` push deeper frames on
-    // top of these defaults and override them.
+    // behavior. ArithError sits below IO; reachable only via
+    // explicit user `perform ArithError.*` (`/` and `%` trap
+    // directly now, not via the effect system — see
+    // `emit_guarded_div`). User-installed handlers via
+    // `handle ... with { ... }` push deeper frames on top of these
+    // defaults and override them.
     //
     // Effect_ids 0 (ArithError) and 1 (IO) are reserved-low-id per
     // `[DEVIATION Task 57] Builtin-effect injection`. ArithError
