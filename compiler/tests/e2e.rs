@@ -20343,6 +20343,9 @@ fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
 /// from a second `perform` in the same arm. Before the fix this panicked
 /// with "codegen: unknown ident `name`" because BranchedCpsLeaf::PerformChain
 /// captures did not include arm-body inner_tail_prefix_lets.
+///
+/// Diagnostic version: wrap in trace `before`/`after` printlns so CI shows
+/// whether the chain runs at all and where execution stops.
 #[test]
 fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
     let source = "import std.io\n\
@@ -20352,16 +20355,24 @@ fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
                   true => 0,\n\
                   false => {\n\
                   let name: String = \"x\";\n\
-                  perform IO.print(\" \");\n\
-                  perform IO.print(name);\n\
+                  perform IO.println(\"first\");\n\
+                  perform IO.println(name);\n\
                   0\n\
                   },\n\
                   }\n\
                   }\n\
-                  fn main() -> Int ![IO] { print_names(false) }\n";
+                  fn main() -> Int ![IO] {\n\
+                  perform IO.println(\"before\");\n\
+                  let _r: Int = print_names(false);\n\
+                  perform IO.println(\"after\");\n\
+                  0\n\
+                  }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_minimal");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, " x", "stdout; stderr={stderr:?}");
+    assert_eq!(
+        stdout, "before\nfirst\nx\nafter\n",
+        "stdout; stderr={stderr:?}"
+    );
 }
 
 /// Category C #2 — pure-fn RHS (mirrors H02's `let is_valid: Bool =
