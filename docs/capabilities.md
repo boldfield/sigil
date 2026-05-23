@@ -102,32 +102,41 @@ Run: `comp/log/comparison-results-20260510T004245.jsonl` (2026-05-10T00:42).
 | C09 | 9/10 | 10/10 | 10/10 | 10/10 | **10/10** | **10/10** |
 | C10 | 10/10 | 10/10 | 10/10 | 10/10 | **10/10** | 8/10 |
 
-### 2.2 C01–C20 Sigil expansion (3 runs per cell, includes haiku)
+### 2.2 C01–C20 Sigil — cells under 100% first-pass (v1.1.0 baseline, 10 runs per cell)
 
-Run: `comp/log/comparison-results-20260510T102107.jsonl` (2026-05-10T10:21).
+Run: `comp/log/comparison-results-20260523T004621-baseline-full.jsonl` (v1.1.0 baseline, 2026-05-23). Dashboard: `comp/log/dashboard-20260523T004700-baseline.md`. All cells not listed below are 10/10 first-pass.
 
-**First-pass / Final-pass:**
+| Cell | First-pass | Final-pass |
+|---|---|---|
+| C05 / haiku | 4/10 | 9/10 |
+| C06 / haiku | 8/10 | 8/10 |
+| C09 / haiku | 9/10 | 9/10 |
+| C09 / sonnet | 5/10 | 10/10 |
+| C10 / haiku | 6/10 | 7/10 |
+| C11 / haiku | 3/10 | 8/10 |
+| C11 / sonnet | 9/10 | 10/10 |
+| C12 / haiku | 9/10 | 10/10 |
+| C14 / haiku | 9/10 | 9/10 |
+| C15 / sonnet | 8/10 | 10/10 |
+| C17 / haiku | 9/10 | 10/10 |
+| C18 / opus | 8/10 | 10/10 |
+| C19 / sonnet | 9/10 | 10/10 |
+| C20 / haiku | 8/10 | 8/10 |
+| C20 / sonnet | 9/10 | 9/10 |
 
-| Prompt | haiku-4-5 | opus-4-7 | sonnet-4-6 |
-|---|---|---|---|
-| C11 map missing-key lookup | 0/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C12 parse invalid integer | 0/3 → 0/3 | 0/3 → 0/3 | 0/3 → 0/3 |
-| C13 find first matching | 3/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C14 index out of bounds | 0/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C15 integer/float average | 2/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C16 div by zero | 0/3 → 0/3 | 1/3 → 3/3 | 0/3 → 3/3 |
-| C17 reverse a string | 1/3 → 2/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C18 Roman → Int | 1/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C19 balanced brackets | 3/3 → 3/3 | 3/3 → 3/3 | 3/3 → 3/3 |
-| C20 postfix evaluator | 0/3 → 0/3 | 0/3 → 1/3 | 0/3 → 2/3 |
+C12 (parse invalid integer) — previously 0/3 on every cell under the 3-runs-per-cell sample — is now 10/10 on sonnet and opus and 9/10 on haiku first-pass. The intrinsic prelude (#191) and arith-trap (#192) changes together moved C-tier from "concentrated misses on a few prompts" to "near-saturation."
 
-### 2.3 Sigil aggregate across all C* runs
+### 2.3 Sigil aggregate across all C* + H* runs (v1.1.0 baseline)
+
+10 runs/cell × 25 prompts (C01–C20 + H01–H05) = 250 runs per model. Same source as §2.2.
 
 | Model | Runs | First-pass | Final-pass |
 |---|---|---|---|
-| `claude-opus-4-7` | 160 | **141 (88.1%)** | **154 (96.2%)** |
-| `claude-sonnet-4-6` | 160 | 103 (64.4%) | **153 (95.6%)** |
-| `claude-haiku-4-5` | 60 | 25 (41.7%) | 47 (78.3%) |
+| `claude-opus-4-7` | 250 | **245 (98.0%)** | **249 (99.6%)** |
+| `claude-sonnet-4-6` | 250 | **225 (90.0%)** | **239 (95.6%)** |
+| `claude-haiku-4-5` | 250 | **205 (82.0%)** | **232 (92.8%)** |
+
+Headline deltas vs the pre-v1.1.0 surface (2026-05-10 run, smaller sample): opus first-pass +9.9pp, sonnet +25.6pp, haiku +40.3pp. The sonnet/haiku jumps are driven by two structural changes: the intrinsic prelude (#191) eliminated the bare-`int_to_string` cluster, and arith-trap (#192) eliminated the `effect-row-missing-arith` cluster (38.6% of pre-1.1 failures, now zero).
 
 ### 2.4 Failure modes (Sigil, C* runs)
 
@@ -143,20 +152,23 @@ Sigil failure breakdown: compile=134  stdout=1  total=135
 
 Source: `comp/prompts.md`. H-tier prompts target subtle correctness traps (stable sort tie-breaking, JSON number grammar, two-pass scoring, etc.).
 
-### 3.1 H04 — Stable sort with tie-breaking
+### 3.1 H-tier first-pass / final-pass (v1.1.0 baseline, 10 runs per cell)
 
-Run: `comp/log/comparison-results-20260510T171113.jsonl` (2026-05-10T17:11, 3 runs/cell). Run **after** PR #142 (codegen ICE fix in `outer match-arm bindings through Nested branch descent`); pre-PR-#142 the natural sonnet-authored program ICE'd in codegen.
+Source: same baseline run as §2.2/§2.3.
 
-| Model | First-pass | Final-pass |
-|---|---|---|
-| `claude-opus-4-7` | **3/3** | **3/3** |
-| `claude-sonnet-4-6` | 2/3 | **3/3** |
+| Prompt | haiku-4-5 | sonnet-4-6 | opus-4-7 |
+|---|---|---|---|
+| H01 | 0/10 → 7/10 | 2/10 → 2/10 | 7/10 → 9/10 |
+| H02 | 5/10 → 8/10 | 10/10 → 10/10 | 10/10 → 10/10 |
+| H03 | 9/10 → 10/10 | 6/10 → 10/10 | 10/10 → 10/10 |
+| H04 | 6/10 → 9/10 | 7/10 → 8/10 | 10/10 → 10/10 |
+| H05 | 10/10 → 10/10 | 10/10 → 10/10 | 10/10 → 10/10 |
 
-The one sonnet first-pass miss was an unrelated `let half = list_length(xs) / 2;` E0042 — fixed in one edit-loop turn. (That rule has since been removed: `/` and `%` now trap on a zero divisor and carry no effect, so the same code compiles first-pass today; see `spec/language.md` §4.2.)
+### 3.2 Notes on individual prompts
 
-### 3.2 H01–H03, H05 — not yet executed
-
-Prompts exist in `comp/prompts.md` but were not in the data window. H05 (floor division, round toward negative infinity) was deferred as incompatible with Sigil's 63-bit `Int` (i64 overflow at the prompt's edge cases).
+- **H05 (floor division)** was previously deferred as incompatible with Sigil's 63-bit `Int` (i64 overflow at the prompt's edge cases). The arith-trap change (#192) removed the elaborate-time perform rewrite for `/` and `%`; under the new direct-trap lowering the prompt is tractable for all three models — **10/10 first-pass and 10/10 final-pass across haiku, sonnet, and opus**.
+- **H04 (stable sort with tie-breaking)** went from "PR #142 was needed to fix a codegen ICE that surfaced on the natural sonnet-authored program" to 10/10 on opus, 7/10→8/10 on sonnet, 6/10→9/10 on haiku.
+- **H01** is currently the hardest H-tier — sonnet sits at 2/10 first/final-pass and is the next obvious investigation target.
 
 ---
 
@@ -165,10 +177,11 @@ Prompts exist in `comp/prompts.md` but were not in the data window. H05 (floor d
 | Corpus | Sigil first-pass | Sigil final-pass | Failure shape |
 |---|---|---|---|
 | P01–P62 spec (1,240 runs) | 93.5% | 99.9% | 100% compile-time |
-| C01–C20 cross-lang (380 Sigil runs) | 70.8% | 93.2% | 99.3% compile-time |
-| H04 cross-lang (6 Sigil runs) | 5/6 | 6/6 | edit-loop fix was effect-row, not codegen |
+| C01–C20 + H01–H05 v1.1.0 baseline (750 Sigil runs across haiku + sonnet + opus, 10/cell) | 90.0% | 96.0% | ~99% compile-time |
 
-**Across all 1,626 Sigil runs in this report: ~85.4% first-pass, ~98.8% final-pass.** Failure shape is concentrated at compile time by design — Sigil's explicit types, mandatory effect rows, exhaustive matching, and lack of operator overloading move the error surface forward from runtime to typecheck.
+**Across the 1,990 Sigil runs in this report (1,240 spec + 750 v1.1.0 corpus): ~92.2% first-pass, ~98.4% final-pass.** Failure shape is concentrated at compile time by design — Sigil's explicit types, mandatory effect rows, exhaustive matching, and lack of operator overloading move the error surface forward from runtime to typecheck.
+
+The v1.1.0 surface (post arith-trap, intrinsic prelude, auto-CPS, qualified imports) moves opus close to corpus saturation (98.0% first-pass) and lifts haiku above 82% first-pass — a working LLM-authorship target for the smaller and faster model tier.
 
 ---
 
