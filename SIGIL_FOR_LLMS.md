@@ -62,7 +62,7 @@ Sigil's `list_sort` from `std.list` is documented as stable. The LLM has to use 
 | Opus | 3/3 | 3/3 |
 | Sonnet | 2/3 | 3/3 |
 
-6/6. The one Sonnet first-pass miss was an unrelated `ArithError` annotation on integer division — Sigil's effect-row strictness, caught at compile time, fixed in one edit-loop turn.
+6/6. The one Sonnet first-pass miss was an unrelated `![ArithError]` annotation on integer division — fixed in one edit-loop turn. (That rule has since been removed: `/` and `%` now trap on a zero divisor and carry no effect, so the same code compiles first-pass today.)
 
 ---
 
@@ -92,7 +92,7 @@ There are real gaps, documented honestly in [CAPABILITIES.md](./CAPABILITIES.md)
 - **P20 multi-shot Choose**: the hardest single construct. 1 final-pass miss across 1,240 runs.
 - **C12 parse invalid integer**: persistent 0/9 final-pass. Sigil's `Result[Int, ParseError]` API differs enough from `int(s)` that the LLM keeps reaching for the wrong shape.
 - **C20 postfix evaluator**: 1/3 — 2/3 final-pass. Stack-discipline programs are hard for LLMs in any language; Sigil's amplifies the difficulty by requiring explicit error handling on each pop.
-- **Sonnet vs. Opus on C-tier**: Sonnet first-pass is materially lower (64.4% vs. 88.1% on C* prompts). Sonnet under-utilizes the stdlib and writes division without `ArithError` annotation. Edit-loop closes most of the gap; opus is the safer authoring partner today.
+- **Sonnet vs. Opus on C-tier**: Sonnet first-pass is materially lower (64.4% vs. 88.1% on C* prompts), driven by stdlib under-utilization. (Division without `![ArithError]` was a contributor at the time of the run but is no longer a compile error — `/` and `%` now trap and need no row — so a re-run today would close part of this gap automatically; the broader stdlib-utilization deficit persists.) Edit-loop closes most of the gap; opus is the safer authoring partner today.
 
 These gaps are inputs to the next iteration of the spec and stdlib. The validation-prompt corpus + cross-language harness + H-tier corpus aren't just demos — they're a feedback loop that turns LLM friction into language design data.
 
