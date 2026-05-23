@@ -174,18 +174,27 @@ jobs:
             --clobber
 
   # Regenerate the published docs/ tree from canonical sources and
-  # commit back to main. This replaces the per-commit
+  # open a PR against main. This replaces the per-commit
   # `check-docs-sync` CI gate: between tags we accept that
   # `docs/*.md` may lag the canonical source, and let the release cut
-  # be the sync point. Skipped on workflow_dispatch (used for
-  # retroactively building old tags — rewriting docs/ on top of an old
-  # build would be a footgun) and on tags landing without a push event.
+  # be the sync point.
+  #
+  # PR (not direct push) because main has a "Changes must be made
+  # through a pull request" repo rule that the github-actions[bot]
+  # token can't bypass. Best-effort `--auto --squash` lets the merge
+  # land hands-off when the repo allows it; otherwise the PR sits
+  # open for manual merge (as PR #193 did for v1.1.0).
+  #
+  # Skipped on workflow_dispatch (used for retroactively building
+  # old tags — rewriting docs/ on top of an old build would be a
+  # footgun) and on tags landing without a push event.
   sync-docs:
     name: sync docs/ to main
     runs-on: ubuntu-24.04
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -196,7 +205,9 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - name: run sync-docs
         run: ./scripts/sync-docs.sh
-      - name: commit & push if changed
+      - name: open sync PR if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if git diff --quiet docs/; then
@@ -204,8 +215,29 @@ jobs:
             exit 0
           fi
           TAG="${GITHUB_REF#refs/tags/}"
+          BRANCH="docs-sync-${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
           git add docs/
           git commit -m "Sync docs/ for ${TAG}"
-          git push origin main
+          # Regular push first; on rerun of the same tag (workflow_-
+          # dispatch is excluded, but defensively for re-pushed tags)
+          # the branch already exists, so fall back to force.
+          git push origin "$BRANCH" || git push --force origin "$BRANCH"
+          # Reuse an existing PR for this branch if present (rerun
+          # case); otherwise open one.
+          if gh pr view "$BRANCH" --json number >/dev/null 2>&1; then
+            echo "PR for $BRANCH already exists — refreshed by push"
+          else
+            gh pr create \
+              --title "Sync docs/ for ${TAG}" \
+              --body "Automated sync of docs/ from canonical sources (spec/language.md, CAPABILITIES.md, SIGIL_FOR_LLMS.md) triggered by tag ${TAG}. Merge to publish to sigillang.ai." \
+              --base main \
+              --head "$BRANCH"
+          fi
+          # Best-effort auto-merge. Succeeds if the repo allows
+          # auto-merge; falls through cleanly if not (the PR is open
+          # for manual merge).
+          gh pr merge "$BRANCH" --auto --squash --delete-branch || \
+            echo "auto-merge unavailable or PR has unmet requirements — open for manual merge"
