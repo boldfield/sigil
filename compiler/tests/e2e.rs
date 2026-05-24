@@ -20386,8 +20386,10 @@ fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
 /// `is_supported` check rejects (the arm body would no longer classify
 /// as PerformChain), so the test would no longer exercise this code
 /// path. Single-evaluation is guaranteed structurally by the codegen:
-/// `pre_yield_pure_lets` are lowered ONCE in the outer body emit
-/// (codegen.rs:17839-17850) and reused via captures; the FINAL step's
+/// `pre_yield_pure_lets` are lowered ONCE by the `for stmt in
+/// leaf_stmts` loop at codegen.rs:17856-17867 (a single
+/// `lower_expr(&l.value)` + `env.insert(l.name, v)` per stmt, breaking
+/// at the first perform) and reused via captures; the FINAL step's
 /// `tail_prefix_lets` only contains post-yield lets, so it doesn't
 /// re-evaluate pre-yield RHSs.
 #[test]
@@ -20455,7 +20457,12 @@ fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
 /// split-fix promotes to captures). This pins the OTHER arm of the
 /// split: a pure let bound AFTER all yields, its RHS evaluated at the
 /// FINAL step's `inner_tail_prefix_lets` loop, its value referenced
-/// from the FINAL step's tail (Pure leaf).
+/// from the FINAL step's tail (Pure leaf). The assertion observes
+/// `x` directly via the chain's return value — `show` returns `x`
+/// and `main` prints it, so any miscomputation in the FINAL step's
+/// post-yield-let evaluation (uninitialized stack, wrong env slot,
+/// sign-extension bug, ICE on the tail's `Ident("x")` lookup) trips
+/// the assertion.
 ///
 /// Scope caveat: this test deliberately does NOT reference the
 /// post-yield let from an EARLIER perform-arg in the chain. That
@@ -20468,7 +20475,9 @@ fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
 /// it surfaces in the baseline campaign, it's a follow-up plan.
 #[test]
 fn branch_chain_post_yield_pure_let_evaluated_by_final_step() {
-    let source = "import std.io\n\
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
                   use std.io.{IO};\n\
                   fn show(b: Bool) -> Int ![IO] {\n\
                   match b {\n\
@@ -20482,16 +20491,64 @@ fn branch_chain_post_yield_pure_let_evaluated_by_final_step() {
                   }\n\
                   }\n\
                   fn main() -> Int ![IO] {\n\
-                  let _r: Int = show(false);\n\
-                  perform IO.println(\"done\");\n\
+                  let r: Int = show(false);\n\
+                  perform IO.println(int_to_string(r));\n\
                   0\n\
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_post_yield_let");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // FINAL step evaluates `let x = 5` from inner_tail_prefix_lets, then
-    // lowers tail `x` reading from env; main observes the chain's perforns
-    // and the post-chain `done` println.
-    assert_eq!(stdout, "a\nb\ndone\n", "stdout; stderr={stderr:?}");
+    // "a\nb\n" from the chain's perforns, "5\n" from main printing the
+    // value FINAL flowed through caller_k_pair. Any wrong value for `x`
+    // surfaces directly in the third line.
+    assert_eq!(stdout, "a\nb\n5\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #5 — mixed pre/post-yield lets in the same arm. The PR's
+/// load-bearing change is the SPLIT between `pre_yield_pure_lets`
+/// (promoted to `branch_captures`, visible to every step via
+/// synth_closure_ptr) and `inner_tail_prefix_lets` (left on the FINAL
+/// step's role, evaluated locally there). Tests #1-#3 exercise only
+/// pre-yield; test #4 exercises only post-yield. This one exercises
+/// BOTH in a single arm — the only configuration that catches a
+/// split bug where the bags cross, e.g. an off-by-one when
+/// `seen_yield` flips, a FINAL emit accidentally evaluating
+/// pre-yield names, or a capture-store loop picking up post-yield
+/// names.
+///
+/// Shape: `pre` is used in a Middle perform-arg (proves capture
+/// path); `post` is used in the FINAL tail (proves
+/// inner_tail_prefix_lets path); `pre + post` in the tail proves
+/// both values are live in the FINAL step's env at the same time.
+#[test]
+fn branch_chain_pre_and_post_yield_lets_in_same_arm() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn show(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  let pre: Int = 1;\n\
+                  perform IO.println(int_to_string(pre));\n\
+                  perform IO.println(\"mid\");\n\
+                  let post: Int = 2;\n\
+                  pre + post\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  let r: Int = show(false);\n\
+                  perform IO.println(int_to_string(r));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_mixed_pre_post");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // pre=1 promoted to captures and read in P0's `int_to_string(pre)`
+    // arg (via outer body emit's pre-yield-let env-insert). post=2
+    // evaluated by FINAL's inner_tail_prefix_lets loop. Tail `pre +
+    // post` = 3, flowed through caller_k_pair to main.
+    assert_eq!(stdout, "1\nmid\n3\n", "stdout; stderr={stderr:?}");
 }
 
 /// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression

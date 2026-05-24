@@ -3788,17 +3788,17 @@ enum ChainStepRole {
 /// or CpsCall) before its inner leaf. The emit uses this to route
 /// the branch's first yield through a branch-chain synth-cont.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct BranchChainAlloc {
-    /// FuncIds for each step in the branch chain.
+    /// FuncIds for each step in the branch chain. Read at the
+    /// branch-chain emit site to set `next_step_func_id` / target the
+    /// trampoline's `NextStep::Call`.
     step_func_ids: Vec<cranelift_module::FuncId>,
-    /// Per-step yield kind.
+    /// Per-step yield kind. Read for `bc.steps[0]` to start the chain
+    /// (the first perform's effect / args).
     steps: Vec<ChainedNextStep>,
-    /// Per-step binding info.
-    binding_names: Vec<String>,
-    binding_tys: Vec<Type>,
-    binding_kinds: Vec<EnvSlotKind>,
-    /// Captures needed by all branch steps.
+    /// Captures needed by all branch steps. Read for slot count,
+    /// bitmap derivation, and capture-store loop at the
+    /// branch_closure allocation.
     captures: Vec<SynthContCapture>,
 }
 
@@ -4011,9 +4011,6 @@ fn collect_branch_chain_allocs(
                 allocs.push(BranchChainAlloc {
                     step_func_ids: branch_func_ids,
                     steps: branch_steps,
-                    binding_names: branch_binding_names,
-                    binding_tys: branch_binding_tys,
-                    binding_kinds: branch_binding_kinds,
                     captures: branch_captures,
                 });
             }
