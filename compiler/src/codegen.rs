@@ -3798,8 +3798,6 @@ struct BranchChainAlloc {
     binding_names: Vec<String>,
     binding_tys: Vec<Type>,
     binding_kinds: Vec<EnvSlotKind>,
-    /// Pure lets after the last yield, before the inner tail.
-    inner_tail_prefix_lets: Vec<TailPrefixLet>,
     /// Captures needed by all branch steps.
     captures: Vec<SynthContCapture>,
 }
@@ -3941,6 +3939,13 @@ fn collect_branch_chain_allocs(
                 }
 
                 let branch_yield_count = branch_steps.len();
+                // Upstream invariant: `classify_branched_cps_tail_branch`
+                // only returns `BranchedCpsLeaf::PerformChain` when
+                // `has_branch_perform == true` (i.e. at least one
+                // `Stmt::Let { value: Expr::Perform(_) }` in the arm body),
+                // so this loop is guaranteed to have produced >= 1 entry.
+                // Zero-yield arm bodies classify as `Pure` / `CpsCall` /
+                // `Perform` / `Nested` upstream and never reach this arm.
                 assert!(
                     branch_yield_count > 0,
                     "PerformChain leaf with 0 yields in branch chain alloc"
@@ -4009,7 +4014,6 @@ fn collect_branch_chain_allocs(
                     binding_names: branch_binding_names,
                     binding_tys: branch_binding_tys,
                     binding_kinds: branch_binding_kinds,
-                    inner_tail_prefix_lets,
                     captures: branch_captures,
                 });
             }

@@ -20372,12 +20372,26 @@ fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
 }
 
 /// Category C #2 — pure-fn RHS (mirrors H02's `let is_valid: Bool =
-/// validate_json_number(input)` shape). Confirms the fix evaluates the
-/// pure-fn-call RHS exactly once (no double-allocation / no re-firing of
-/// side-effectful pure calls). Uses `IO.println` for the same buffering
-/// reason as the minimal repro above.
+/// validate_json_number(input)` shape). Confirms the captured pure-let
+/// value reaches every step in the chain. Uses `IO.println` for the same
+/// buffering reason as the minimal repro above.
+///
+/// Note on name: an earlier version of this test was named
+/// `..._runs_once` and claimed to prove single-evaluation of `double(n)`.
+/// The assertion `stdout == "6\n:\n6\n"` does not actually distinguish
+/// single-eval from double-eval because `double(n) = n + n` is pure and
+/// idempotent — both eval counts return 6. A true single-eval probe
+/// would require a side-effecting RHS, but adding `![IO]` to `double`
+/// makes it a CPS-color user fn that the `classify_branched_cps_tail_branch`
+/// `is_supported` check rejects (the arm body would no longer classify
+/// as PerformChain), so the test would no longer exercise this code
+/// path. Single-evaluation is guaranteed structurally by the codegen:
+/// `pre_yield_pure_lets` are lowered ONCE in the outer body emit
+/// (codegen.rs:17839-17850) and reused via captures; the FINAL step's
+/// `tail_prefix_lets` only contains post-yield lets, so it doesn't
+/// re-evaluate pre-yield RHSs.
 #[test]
-fn branch_chain_pure_let_with_fn_rhs_runs_once() {
+fn branch_chain_pure_let_with_fn_rhs_value_propagates() {
     let source = "import std.int\n\
                   import std.io\n\
                   use std.int.{int_to_string};\n\
@@ -20398,7 +20412,7 @@ fn branch_chain_pure_let_with_fn_rhs_runs_once() {
                   fn main() -> Int ![IO] { print_doubled(3) }\n";
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_fn_rhs");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    // d = 6; expect "6\n:\n6\n" — proves d was evaluated and reused, not lost.
+    // d = 6, captured into branch_captures, observed in both perform args.
     assert_eq!(stdout, "6\n:\n6\n", "stdout; stderr={stderr:?}");
 }
 
@@ -20406,18 +20420,23 @@ fn branch_chain_pure_let_with_fn_rhs_runs_once() {
 /// name = entry_name(head); ... print twice ... }`). Confirms the fix works
 /// when the pure-let RHS depends on an arm-bound pattern variable. Uses
 /// `IO.println` for the same buffering reason as the minimal repro above.
+///
+/// `take_label` is an identity helper (returns its String arg unchanged);
+/// its purpose is to make the let RHS a `Call` with `arm-binding-as-arg`
+/// shape so the test exercises pre-yield RHSs that depend on an arm
+/// pattern binding, not a String literal.
 #[test]
 fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
     let source = "import std.io\n\
                   import std.list\n\
                   use std.io.{IO};\n\
                   use std.list.{Cons, List, Nil};\n\
-                  fn first_char(s: String) -> String ![] { s }\n\
+                  fn take_label(s: String) -> String ![] { s }\n\
                   fn show(xs: List[String]) -> Int ![IO] {\n\
                   match xs {\n\
                   Nil => 0,\n\
                   Cons(head, _) => {\n\
-                  let label: String = first_char(head);\n\
+                  let label: String = take_label(head);\n\
                   perform IO.println(\"[\");\n\
                   perform IO.println(label);\n\
                   perform IO.println(\"]\");\n\
@@ -20429,6 +20448,50 @@ fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
     let (stdout, stderr, code) = compile_and_run(source, "branch_chain_cons_arm_pure_let");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
     assert_eq!(stdout, "[\nhi\n]\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #4 — post-yield pure let evaluated by the FINAL step.
+/// Companion to tests #1-#3 (which exercise the pre-yield path the
+/// split-fix promotes to captures). This pins the OTHER arm of the
+/// split: a pure let bound AFTER all yields, its RHS evaluated at the
+/// FINAL step's `inner_tail_prefix_lets` loop, its value referenced
+/// from the FINAL step's tail (Pure leaf).
+///
+/// Scope caveat: this test deliberately does NOT reference the
+/// post-yield let from an EARLIER perform-arg in the chain. That
+/// shape (Middle step lowering a perform-arg that names a post-yield
+/// pure let) is a separate codegen bug — the post-yield let isn't in
+/// any earlier Middle step's env (its RHS may depend on later
+/// perform-result `prior_bindings` that don't exist yet at the
+/// Middle step) and lowering would trip the same "unknown ident" ICE
+/// this PR closes for the pre-yield case. Out of scope here; if/when
+/// it surfaces in the baseline campaign, it's a follow-up plan.
+#[test]
+fn branch_chain_post_yield_pure_let_evaluated_by_final_step() {
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  fn show(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  perform IO.println(\"a\");\n\
+                  perform IO.println(\"b\");\n\
+                  let x: Int = 5;\n\
+                  x\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  let _r: Int = show(false);\n\
+                  perform IO.println(\"done\");\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_post_yield_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // FINAL step evaluates `let x = 5` from inner_tail_prefix_lets, then
+    // lowers tail `x` reading from env; main observes the chain's perforns
+    // and the post-chain `done` println.
+    assert_eq!(stdout, "a\nb\ndone\n", "stdout; stderr={stderr:?}");
 }
 
 /// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression
