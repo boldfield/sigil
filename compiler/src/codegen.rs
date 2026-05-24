@@ -3788,19 +3788,17 @@ enum ChainStepRole {
 /// or CpsCall) before its inner leaf. The emit uses this to route
 /// the branch's first yield through a branch-chain synth-cont.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct BranchChainAlloc {
-    /// FuncIds for each step in the branch chain.
+    /// FuncIds for each step in the branch chain. Read at the
+    /// branch-chain emit site to set `next_step_func_id` / target the
+    /// trampoline's `NextStep::Call`.
     step_func_ids: Vec<cranelift_module::FuncId>,
-    /// Per-step yield kind.
+    /// Per-step yield kind. Read for `bc.steps[0]` to start the chain
+    /// (the first perform's effect / args).
     steps: Vec<ChainedNextStep>,
-    /// Per-step binding info.
-    binding_names: Vec<String>,
-    binding_tys: Vec<Type>,
-    binding_kinds: Vec<EnvSlotKind>,
-    /// Pure lets after the last yield, before the inner tail.
-    inner_tail_prefix_lets: Vec<TailPrefixLet>,
-    /// Captures needed by all branch steps.
+    /// Captures needed by all branch steps. Read for slot count,
+    /// bitmap derivation, and capture-store loop at the
+    /// branch_closure allocation.
     captures: Vec<SynthContCapture>,
 }
 
@@ -3868,6 +3866,17 @@ fn collect_branch_chain_allocs(
                 let mut branch_binding_names: Vec<String> = Vec::new();
                 let mut branch_binding_tys: Vec<Type> = Vec::new();
                 let mut branch_binding_kinds: Vec<EnvSlotKind> = Vec::new();
+                // Pure lets BEFORE the first yield: evaluable in the
+                // outer body env, so they get promoted to captures
+                // (below) and loaded from synth_closure_ptr at every
+                // Middle/Final step entry. Middle steps need them to
+                // lower perform-arg references; Final step reads them
+                // from env (no re-evaluation).
+                let mut pre_yield_pure_lets: Vec<TailPrefixLet> = Vec::new();
+                // Pure lets AFTER the first yield: RHS may depend on
+                // earlier perform results, so they CAN'T be captured
+                // at outer alloc time. Evaluated at the Final step
+                // (with prior_bindings already loaded).
                 let mut inner_tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
                 let mut seen_yield = false;
 
@@ -3883,24 +3892,16 @@ fn collect_branch_chain_allocs(
                                 seen_yield = true;
                             }
                             _ => {
+                                let entry = TailPrefixLet {
+                                    name: l.name.clone(),
+                                    ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
+                                    kind: slot_kind_for_type_expr_post_mono(&l.ty),
+                                    value: l.value.clone(),
+                                };
                                 if seen_yield {
-                                    inner_tail_prefix_lets.push(TailPrefixLet {
-                                        name: l.name.clone(),
-                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
-                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
-                                        value: l.value.clone(),
-                                    });
-                                }
-                                // Pure lets before first yield: also
-                                // treated as inner_tail_prefix_lets for
-                                // the branch chain's final step.
-                                if !seen_yield {
-                                    inner_tail_prefix_lets.push(TailPrefixLet {
-                                        name: l.name.clone(),
-                                        ty: cranelift_ty_for_type_expr(&l.ty, pointer_ty),
-                                        kind: slot_kind_for_type_expr_post_mono(&l.ty),
-                                        value: l.value.clone(),
-                                    });
+                                    inner_tail_prefix_lets.push(entry);
+                                } else {
+                                    pre_yield_pure_lets.push(entry);
                                 }
                             }
                         }
@@ -3923,8 +3924,28 @@ fn collect_branch_chain_allocs(
                 for ab in &arm_bindings {
                     branch_captures.push(ab.clone());
                 }
+                // Pre-yield pure lets join captures: the outer body
+                // emit already evaluates them into env before the
+                // capture-store loop runs, so they're available for
+                // storage into branch_closure. Without this, Middle
+                // step bodies would panic on env.get(name) == None
+                // when lowering perform-arg references in later
+                // steps (the "codegen: unknown ident" ICE class).
+                for pre_let in &pre_yield_pure_lets {
+                    branch_captures.push(SynthContCapture {
+                        name: pre_let.name.clone(),
+                        kind: pre_let.kind,
+                    });
+                }
 
                 let branch_yield_count = branch_steps.len();
+                // Upstream invariant: `classify_branched_cps_tail_branch`
+                // only returns `BranchedCpsLeaf::PerformChain` when
+                // `has_branch_perform == true` (i.e. at least one
+                // `Stmt::Let { value: Expr::Perform(_) }` in the arm body),
+                // so this loop is guaranteed to have produced >= 1 entry.
+                // Zero-yield arm bodies classify as `Pure` / `CpsCall` /
+                // `Perform` / `Nested` upstream and never reach this arm.
                 assert!(
                     branch_yield_count > 0,
                     "PerformChain leaf with 0 yields in branch chain alloc"
@@ -3990,10 +4011,6 @@ fn collect_branch_chain_allocs(
                 allocs.push(BranchChainAlloc {
                     step_func_ids: branch_func_ids,
                     steps: branch_steps,
-                    binding_names: branch_binding_names,
-                    binding_tys: branch_binding_tys,
-                    binding_kinds: branch_binding_kinds,
-                    inner_tail_prefix_lets,
                     captures: branch_captures,
                 });
             }

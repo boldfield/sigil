@@ -20339,6 +20339,218 @@ fn pattern_c_outer_arm_binding_visible_through_two_nested_levels() {
     );
 }
 
+/// Category C #1 — minimal repro: pure `let` in a match-arm body, referenced
+/// from a second `perform` in the same arm. Before the fix this panicked
+/// with "codegen: unknown ident `name`" because BranchedCpsLeaf::PerformChain
+/// captures did not include arm-body inner_tail_prefix_lets.
+///
+/// Uses `IO.println` (not `IO.print`) because Rust's stdout is line-buffered
+/// — bytes written without a trailing newline stay buffered and the sigil
+/// binary's C-main exit path doesn't invoke Rust's atexit flush, so a final
+/// `IO.print`-only program produces empty captured stdout. The newline
+/// forces a per-line flush. The semantic test (pre-yield let reachable from
+/// a later perform) is independent of the newline.
+#[test]
+fn branch_chain_pure_let_referenced_by_later_perform_minimal() {
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  fn print_names(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  let name: String = \"x\";\n\
+                  perform IO.println(\"first\");\n\
+                  perform IO.println(name);\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { print_names(false) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_minimal");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "first\nx\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #2 — pure-fn RHS (mirrors H02's `let is_valid: Bool =
+/// validate_json_number(input)` shape). Confirms the captured pure-let
+/// value reaches every step in the chain. Uses `IO.println` for the same
+/// buffering reason as the minimal repro above.
+///
+/// Note on name: an earlier version of this test was named
+/// `..._runs_once` and claimed to prove single-evaluation of `double(n)`.
+/// The assertion `stdout == "6\n:\n6\n"` does not actually distinguish
+/// single-eval from double-eval because `double(n) = n + n` is pure and
+/// idempotent — both eval counts return 6. A true single-eval probe
+/// would require a side-effecting RHS, but adding `![IO]` to `double`
+/// makes it a CPS-color user fn that the `classify_branched_cps_tail_branch`
+/// `is_supported` check rejects (the arm body would no longer classify
+/// as PerformChain), so the test would no longer exercise this code
+/// path. Single-evaluation is guaranteed structurally by the codegen:
+/// `pre_yield_pure_lets` are lowered ONCE by the `for stmt in
+/// leaf_stmts` loop at codegen.rs:17856-17867 (a single
+/// `lower_expr(&l.value)` + `env.insert(l.name, v)` per stmt, breaking
+/// at the first perform) and reused via captures; the FINAL step's
+/// `tail_prefix_lets` only contains post-yield lets, so it doesn't
+/// re-evaluate pre-yield RHSs.
+#[test]
+fn branch_chain_pure_let_with_fn_rhs_value_propagates() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn double(n: Int) -> Int ![] { n + n }\n\
+                  fn print_doubled(n: Int) -> Int ![IO] {\n\
+                  match n {\n\
+                  0 => 0,\n\
+                  _ => {\n\
+                  let d: Int = double(n);\n\
+                  perform IO.println(int_to_string(d));\n\
+                  perform IO.println(\":\");\n\
+                  perform IO.println(int_to_string(d));\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { print_doubled(3) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_pure_let_fn_rhs");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // d = 6, captured into branch_captures, observed in both perform args.
+    assert_eq!(stdout, "6\n:\n6\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #3 — Cons-arm shape (mirrors H04's `Cons(head, tail) => { let
+/// name = entry_name(head); ... print twice ... }`). Confirms the fix works
+/// when the pure-let RHS depends on an arm-bound pattern variable. Uses
+/// `IO.println` for the same buffering reason as the minimal repro above.
+///
+/// `take_label` is an identity helper (returns its String arg unchanged);
+/// its purpose is to make the let RHS a `Call` with `arm-binding-as-arg`
+/// shape so the test exercises pre-yield RHSs that depend on an arm
+/// pattern binding, not a String literal.
+#[test]
+fn branch_chain_pure_let_in_cons_arm_uses_arm_binding() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn take_label(s: String) -> String ![] { s }\n\
+                  fn show(xs: List[String]) -> Int ![IO] {\n\
+                  match xs {\n\
+                  Nil => 0,\n\
+                  Cons(head, _) => {\n\
+                  let label: String = take_label(head);\n\
+                  perform IO.println(\"[\");\n\
+                  perform IO.println(label);\n\
+                  perform IO.println(\"]\");\n\
+                  0\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] { show(Cons(\"hi\", Nil)) }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_cons_arm_pure_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[\nhi\n]\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #4 — post-yield pure let evaluated by the FINAL step.
+/// Companion to tests #1-#3 (which exercise the pre-yield path the
+/// split-fix promotes to captures). This pins the OTHER arm of the
+/// split: a pure let bound AFTER all yields, its RHS evaluated at the
+/// FINAL step's `inner_tail_prefix_lets` loop, its value referenced
+/// from the FINAL step's tail (Pure leaf). The assertion observes
+/// `x` directly via the chain's return value — `show` returns `x`
+/// and `main` prints it, so any miscomputation in the FINAL step's
+/// post-yield-let evaluation (uninitialized stack, wrong env slot,
+/// sign-extension bug, ICE on the tail's `Ident("x")` lookup) trips
+/// the assertion.
+///
+/// Scope caveat: this test deliberately does NOT reference the
+/// post-yield let from an EARLIER perform-arg in the chain. That
+/// shape (Middle step lowering a perform-arg that names a post-yield
+/// pure let) is a separate codegen bug — the post-yield let isn't in
+/// any earlier Middle step's env (its RHS may depend on later
+/// perform-result `prior_bindings` that don't exist yet at the
+/// Middle step) and lowering would trip the same "unknown ident" ICE
+/// this PR closes for the pre-yield case. Out of scope here; if/when
+/// it surfaces in the baseline campaign, it's a follow-up plan.
+#[test]
+fn branch_chain_post_yield_pure_let_evaluated_by_final_step() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn show(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  perform IO.println(\"a\");\n\
+                  perform IO.println(\"b\");\n\
+                  let x: Int = 5;\n\
+                  x\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  let r: Int = show(false);\n\
+                  perform IO.println(int_to_string(r));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_post_yield_let");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // "a\nb\n" from the chain's perforns, "5\n" from main printing the
+    // value FINAL flowed through caller_k_pair. Any wrong value for `x`
+    // surfaces directly in the third line.
+    assert_eq!(stdout, "a\nb\n5\n", "stdout; stderr={stderr:?}");
+}
+
+/// Category C #5 — mixed pre/post-yield lets in the same arm. The PR's
+/// load-bearing change is the SPLIT between `pre_yield_pure_lets`
+/// (promoted to `branch_captures`, visible to every step via
+/// synth_closure_ptr) and `inner_tail_prefix_lets` (left on the FINAL
+/// step's role, evaluated locally there). Tests #1-#3 exercise only
+/// pre-yield; test #4 exercises only post-yield. This one exercises
+/// BOTH in a single arm — the only configuration that catches a
+/// split bug where the bags cross, e.g. an off-by-one when
+/// `seen_yield` flips, a FINAL emit accidentally evaluating
+/// pre-yield names, or a capture-store loop picking up post-yield
+/// names.
+///
+/// Shape: `pre` is used in a Middle perform-arg (proves capture
+/// path); `post` is used in the FINAL tail (proves
+/// inner_tail_prefix_lets path); `pre + post` in the tail proves
+/// both values are live in the FINAL step's env at the same time.
+#[test]
+fn branch_chain_pre_and_post_yield_lets_in_same_arm() {
+    let source = "import std.int\n\
+                  import std.io\n\
+                  use std.int.{int_to_string};\n\
+                  use std.io.{IO};\n\
+                  fn show(b: Bool) -> Int ![IO] {\n\
+                  match b {\n\
+                  true => 0,\n\
+                  false => {\n\
+                  let pre: Int = 1;\n\
+                  perform IO.println(int_to_string(pre));\n\
+                  perform IO.println(\"mid\");\n\
+                  let post: Int = 2;\n\
+                  pre + post\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                  let r: Int = show(false);\n\
+                  perform IO.println(int_to_string(r));\n\
+                  0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "branch_chain_mixed_pre_post");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    // pre=1 promoted to captures and read in P0's `int_to_string(pre)`
+    // arg (via outer body emit's pre-yield-let env-insert). post=2
+    // evaluated by FINAL's inner_tail_prefix_lets loop. Tail `pre +
+    // post` = 3, flowed through caller_k_pair to main.
+    assert_eq!(stdout, "1\nmid\n3\n", "stdout; stderr={stderr:?}");
+}
+
 /// 2026-05-04 return-arm-via-args lift Stage 5 — re-entrancy regression
 /// gate. Nests two `handle` expressions whose body fns each have
 /// distinct return arms. The TLS approach masked outer with inner via
