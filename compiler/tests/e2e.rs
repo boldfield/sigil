@@ -269,14 +269,15 @@ fn compile_and_run_capturing_compile_stderr(
     (compile_stderr, stdout, stderr, code)
 }
 
-/// Stable prefix of the auto-CPS fallback diagnostic note. Mirrors
-/// `compiler::codegen::AUTO_CPS_FALLBACK_NOTE_PREFIX`; kept in sync by
-/// convention (a rename of the user-visible text breaks both this
-/// constant and any test asserting on the absence of the note). The
-/// emission site formats `<prefix> `<fn_name>` at <file>:<line>:<col>
-/// has body shape unsupported by auto-CPS lowering; falling back to
-/// Sync ABI ...`.
-const AUTO_CPS_FALLBACK_NOTE_PREFIX: &str = "[sigil] note: auto-promoted fn";
+/// Stable substring anchors for the auto-CPS fallback diagnostic.
+/// Iter-7 routed the note through the standard `DiagnosticEmitter`
+/// (W0002, info severity) instead of raw `eprintln!`, so the user-
+/// visible text now flows through the pipeline's structured-format
+/// machinery (`--format` choice; default JSON Lines). Tests anchor
+/// on the W-code and on the load-bearing message substring; both
+/// must be present together to consider the diagnostic fired.
+const W0002_CODE_ANCHOR: &str = "\"code\":\"W0002\"";
+const W0002_MESSAGE_ANCHOR: &str = "has body shape unsupported by auto-CPS lowering";
 
 /// Compile `source` (no extra env vars) and return `(compile_stderr,
 /// success)` without running the resulting binary. See
@@ -1237,18 +1238,14 @@ fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
         compile_and_run_capturing_compile_stderr(source, "auto_cps_collatz_nested_if");
     assert_eq!(code, 111, "Collatz(27) = 111 steps; stderr={run_stderr:?}");
     assert!(
-        compile_stderr.contains("auto-promoted fn `collatz_steps`"),
-        "expected fallback note proving the gate's fallback path \
-         actually fired; compile_stderr={compile_stderr:?}"
+        compile_stderr.contains(W0002_CODE_ANCHOR)
+            && compile_stderr.contains("fn `collatz_steps`")
+            && compile_stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected W0002 fallback diagnostic naming collatz_steps; \
+         compile_stderr={compile_stderr:?}"
     );
 }
 
-/// Category A — rec call inside a handler op arm body. Without
-/// walking `Handle.op_arms` in `expr_contains_recursive_call`, this
-/// shape would slip past the auto-CPS gate (analyzer classifies the
-/// arm as `BaseCase(Handle { ... })`, the recursive call hides in
-/// the op arm), trip the Phase 4e `unreachable!` at emit time. PR
-/// review issue R1#1 / R2#1.
 /// Category A — rec call inside a handler op arm body, with the
 /// fn's outer effect row purely-discharged so auto-promotion fires.
 ///
@@ -1299,21 +1296,27 @@ fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
         "loop_n recurses through handler arm and returns 0; stderr={run_stderr:?}"
     );
     assert!(
-        compile_stderr.contains("auto-promoted fn `loop_n`"),
-        "expected fallback note proving the Handle walker caught the \
-         buried rec call (PR review R1#1 / R2#1); without the walker \
-         fix loop_n would commit to Cps and the body emit would ICE. \
-         compile_stderr={compile_stderr:?}"
+        compile_stderr.contains(W0002_CODE_ANCHOR)
+            && compile_stderr.contains("fn `loop_n`")
+            && compile_stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected W0002 fallback diagnostic naming loop_n, proving the \
+         Handle walker caught the buried rec call (PR review R1#1 / \
+         R2#1); without the walker fix loop_n would commit to Cps and \
+         the body emit would ICE. compile_stderr={compile_stderr:?}"
     );
 }
 
 /// Diagnostic — when the auto-CPS gate falls back to Sync for a body
-/// it can't lower, the compiler emits a `[sigil] note: ...` line on
-/// stderr exactly once per source fn (the gate dedups across the two
-/// `compute_user_fn_abi` call sites — per-fn ABI selection +
-/// `p20_silent_miscompile_check`). The note includes the fn name,
-/// source location, and a suppression hint. PR review issues R1#3,
-/// R3.2 (rev1 — assert exactly-once not "at least once").
+/// it can't lower, the compiler emits a `W0002` info diagnostic
+/// exactly once per source fn. Dedup spans the two
+/// `compute_user_fn_abi_with_span` call sites (per-fn ABI selection
+/// and `p20_silent_miscompile_check`). The diagnostic includes the
+/// fn name, source location (via the standard `DiagnosticEmitter`
+/// span fields), and a hint.
+///
+/// PR review issues: R1#3 (add diagnostic at all), R3.2 (rev1)
+/// (assert exactly-once not "at least once"), R4 rev1 #1 (route
+/// through the W-code infrastructure not raw eprintln).
 #[test]
 fn auto_cps_fallback_emits_diagnostic_note_exactly_once() {
     let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
@@ -1328,27 +1331,31 @@ fn auto_cps_fallback_emits_diagnostic_note_exactly_once() {
                   fn main() -> Int ![] { collatz_steps(1) }\n";
     let (stderr, success) = compile_capturing_compile_stderr(source, "auto_cps_fallback_diag");
     assert!(success, "compile must succeed; stderr={stderr:?}");
-    let count = stderr.matches("auto-promoted fn `collatz_steps`").count();
+    let count = stderr.matches(W0002_CODE_ANCHOR).count();
     assert_eq!(
         count, 1,
-        "fallback note must fire exactly once per source fn (dedup \
-         across the per-fn-ABI loop + p20_silent_miscompile_check \
-         call sites); got {count}: stderr={stderr:?}"
+        "W0002 must fire exactly once per source fn (dedup across the \
+         per-fn-ABI loop + p20_silent_miscompile_check call sites); \
+         got {count} occurrences: stderr={stderr:?}"
     );
     assert!(
-        stderr.contains(AUTO_CPS_FALLBACK_NOTE_PREFIX),
-        "expected note prefix `{AUTO_CPS_FALLBACK_NOTE_PREFIX}`; \
+        stderr.contains("fn `collatz_steps`"),
+        "expected diagnostic message to name collatz_steps; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected the load-bearing message substring \
+         (`{W0002_MESSAGE_ANCHOR}`); stderr={stderr:?}"
+    );
+    // Source location is part of the structured diagnostic (PR review
+    // R3.5 rev1): users should be able to jump to the fn without
+    // grepping. The JSON line carries it in the file/line/column
+    // fields — anchor on the `.sigil"` substring (the file field
+    // ends in `.sigil` for a sigil source, followed by `"`).
+    assert!(
+        stderr.contains(".sigil\""),
+        "expected source-location field in W0002 diagnostic; \
          stderr={stderr:?}"
-    );
-    assert!(
-        stderr.contains("falling back to Sync ABI"),
-        "expected explanatory body; stderr={stderr:?}"
-    );
-    // Source location is part of the note (PR review R3.5 rev1):
-    // users should be able to jump to the fn without grepping.
-    assert!(
-        stderr.contains(".sigil:"),
-        "expected source-location anchor in note; stderr={stderr:?}"
     );
 }
 
@@ -1370,23 +1377,28 @@ fn auto_cps_decomposable_body_stays_on_cps_no_fallback_note() {
     assert!(success, "compile must succeed; stderr={stderr:?}");
     // Two complementary assertions (PR review R3.5 rev2 — avoid
     // coupling the test solely to one phrasing of the note text):
-    //   1) The shared prefix constant doesn't appear at all for
-    //      sum_to — covers any future rename of the note text that
-    //      keeps the prefix stable.
-    //   2) Belt-and-braces: no mention of `sum_to` adjacent to the
-    //      `falling back to Sync ABI` substring, in case the prefix
-    //      is widened to cover other diagnostic classes.
+    //   1) No W0002 diagnostic anywhere — sum_to is the only fn that
+    //      could plausibly fall back (main doesn't go through the
+    //      gate), so W0002 absence is decisive.
+    //   2) Belt-and-braces: no line mentions sum_to AND the load-
+    //      bearing message substring together — guards against a
+    //      future W-code rename that keeps the message intact.
+    //
+    // Note: W0001 (auto-promotion to CPS) IS expected to fire for
+    // sum_to (non-tail recursive Native fn), so a generic
+    // `stderr.contains("sum_to")` would be true via W0001. The W0002
+    // anchor is what isolates the fallback-specific signal.
     assert!(
-        !stderr.contains("auto-promoted fn `sum_to`"),
-        "sum_to has a Cps-lowerable body; gate must not emit a \
-         fallback note for it. stderr={stderr:?}"
+        !stderr.contains(W0002_CODE_ANCHOR),
+        "sum_to has a Cps-lowerable body; gate must not emit W0002 \
+         (no fallback diagnostic expected). stderr={stderr:?}"
     );
-    let lines_mentioning_sum_to = stderr
+    let lines_mentioning_sum_to_fallback = stderr
         .lines()
-        .filter(|l| l.contains("sum_to") && l.contains("falling back to Sync ABI"))
+        .filter(|l| l.contains("sum_to") && l.contains(W0002_MESSAGE_ANCHOR))
         .count();
     assert_eq!(
-        lines_mentioning_sum_to, 0,
+        lines_mentioning_sum_to_fallback, 0,
         "no fallback line should mention sum_to; stderr={stderr:?}"
     );
 }
@@ -1415,27 +1427,26 @@ fn auto_cps_fallback_note_suppressed_by_quiet_env_var() {
     );
     assert!(success, "compile must succeed; stderr={stderr:?}");
     assert!(
-        !stderr.contains(AUTO_CPS_FALLBACK_NOTE_PREFIX),
-        "SIGIL_QUIET_AUTO_CPS_FALLBACK=1 must suppress the note; \
-         stderr={stderr:?}"
+        !stderr.contains(W0002_CODE_ANCHOR),
+        "SIGIL_QUIET_AUTO_CPS_FALLBACK=1 must suppress all W0002 \
+         emissions; stderr={stderr:?}"
     );
 }
 
-/// Category A — rec call inside a `Cons(...)` ctor arg, with a nested
-/// match in the outer arm. Originally one of the 10 v1.1.0 baseline
-/// ICE-class failures. Note: `consume` reaches Sync ABI via the
-/// pre-existing `body_has_non_trivial_non_recursive_calls` branch
-/// (the `int_eq` call inside `consume` is a non-SCC, non-ctor call
-/// so the earlier gate rejects the fn before my auto-CPS-lowerability
-/// gate runs). Consequence: no `[sigil] note: ...` diagnostic fires
-/// here — the note is only emitted from inside the
-/// `auto_cps_body_is_lowerable` branch of `compute_user_fn_abi`. PR
-/// review R3.1 (rev2) suggested asserting the note for all three
-/// fallback tests; that's correct for collatz_steps and loop_n
-/// (which DO route through the new gate), but not for consume — so
-/// we keep the runtime-only assertion and document the path here.
+/// Category A baseline reconciliation — `consume` was one of the 10
+/// v1.1.0 baseline ICE-class failures. With this PR it compiles +
+/// runs cleanly, BUT it reaches Sync ABI via the pre-existing
+/// `body_has_non_trivial_non_recursive_calls` branch (the
+/// `int_eq(idx, 0)` call inside `consume` is a non-SCC, non-ctor
+/// call, so that earlier gate rejects the fn before the new
+/// `auto_cps_body_is_lowerable` gate runs). Consequence: no W0002
+/// diagnostic fires for consume — the W0002 emission happens only
+/// from inside the new lowerability gate. So this test is a
+/// regression test for the prior-Sync path (proves consume still
+/// compiles + runs), not coverage for the new gate. Renamed (PR
+/// review R4 rev1 #5) to reflect what's actually pinned.
 #[test]
-fn auto_cps_recursive_call_in_ctor_arg_falls_back_to_sync_cleanly() {
+fn auto_cps_consume_with_buried_recursion_stays_sync_via_pre_existing_gate() {
     let source = "import std.list\n\
                   use std.list.{Cons, List, Nil};\n\
                   fn int_eq(a: Int, b: Int) -> Bool ![] { a == b }\n\
@@ -1460,10 +1471,17 @@ fn auto_cps_recursive_call_in_ctor_arg_falls_back_to_sync_cleanly() {
         code, 1,
         "consume returns a non-empty list; stderr={run_stderr:?}"
     );
-    assert!(
-        !compile_stderr.contains("auto-promoted fn `consume`"),
-        "consume falls back via body_has_non_trivial_non_recursive_calls, \
-         not via the new lowerability gate — no fallback note expected. \
+    // Anchor on the W-code: consume does not fire W0002 because the
+    // pre-existing `body_has_non_trivial_non_recursive_calls` branch
+    // routes it to Sync before the new lowerability gate runs.
+    let consume_w0002 = compile_stderr
+        .lines()
+        .filter(|l| l.contains(W0002_CODE_ANCHOR) && l.contains("fn `consume`"))
+        .count();
+    assert_eq!(
+        consume_w0002, 0,
+        "consume falls back via the pre-existing gate, not the new \
+         lowerability gate — no W0002 expected for consume. \
          compile_stderr={compile_stderr:?}"
     );
 }

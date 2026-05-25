@@ -223,9 +223,9 @@ flags:
 environment variables (compile-time):
     SIGIL_QUIET_AUTO_CPS_FALLBACK
                              If set to any non-empty value, suppresses the
-                             `[sigil] note: auto-promoted fn ... falling back to
-                             Sync ABI ...` diagnostic emitted when the auto-CPS
+                             `W0002` info diagnostic emitted when the auto-CPS
                              gate routes a body shape it can't lower to Sync ABI.
+                             Run `sigil explain W0002` for the full diagnostic.
                              Use in batch builds that want clean stderr; the
                              demotion still happens, you just don't see the note.
     SIGIL_RUNTIME_LIB        Override the path to the runtime static library

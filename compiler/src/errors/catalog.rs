@@ -1332,6 +1332,54 @@ pub const CATALOG: &[ErrorEntry] = &[
                         if n <= 0 { acc } else { sum_to_acc(n - 1, acc + n) }\n\
                       }",
     },
+    ErrorEntry {
+        code: "W0002",
+        short: "auto-CPS body shape unsupported; falling back to Sync ABI",
+        long: "The auto-CPS gate (`compute_user_fn_abi`) selects between Sync and \
+               CPS ABI for fns that the colorer auto-promoted to CPS because of \
+               non-tail self/SCC recursion (see `W0001`). The CPS lowering path \
+               accepts a narrow set of body shapes (simple tail perform; yield-\
+               then-pure-tail; chained let-yield; branched-cps-tail with zero \
+               chain length). If a body doesn't decompose into per-branch \
+               recursive steps that the synth-continuation allocator can lower, \
+               the gate falls back to Sync ABI — which is **correct** (the fn \
+               still runs identically) but **not stack-safe**: the auto-promotion \
+               was specifically intended to give this fn unbounded recursion \
+               depth, and Sync ABI uses the host OS stack.\n\n\
+               Body shapes that currently fall back:\n\
+               - Match arm bodies containing nested `if`/`match` whose own arms \
+                 end in a recursive call (e.g., Collatz with `_ => if ... then \
+                 1 + recurse(n/2) else 1 + recurse(n*3+1)`).\n\
+               - Recursive calls buried inside handler op-arm bodies.\n\
+               - Other shapes the analyzer's peeler doesn't recurse into.\n\n\
+               This diagnostic surfaces the demotion so the author can either \
+               restructure the body into a shape the auto-CPS analyzer accepts, \
+               or accept the stack-fragility for shallow-recursion use cases. \
+               The substantive auto-CPS extension that natively handles these \
+               shapes is a separate work item; until then, the Sync fallback \
+               replaces the alternative — a `codegen Phase 4e: CPS-ABI invariant \
+               broken` ICE — which is strictly worse than the diagnostic.\n\n\
+               Suppression: set `SIGIL_QUIET_AUTO_CPS_FALLBACK` to any non-empty \
+               value to silence the note. The demotion still happens; only the \
+               diagnostic is suppressed.",
+        fix_example: "// Original — nested-if arm body, falls back to Sync:\n\
+                      fn collatz_steps(n: Int) -> Int ![] {\n  \
+                        match n {\n    \
+                          1 => 0,\n    \
+                          _ => {\n      \
+                            if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n      \
+                            else          { 1 + collatz_steps(n * 3 + 1) }\n    \
+                          },\n  \
+                        }\n\
+                      }\n\n\
+                      // Lift the nested if to the outer match — auto-CPS\n\
+                      // analyzer accepts the branched-tail shape natively:\n\
+                      fn collatz_steps(n: Int) -> Int ![] {\n  \
+                        if n == 1 { 0 }\n  \
+                        else if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n  \
+                        else { 1 + collatz_steps(n * 3 + 1) }\n\
+                      }",
+    },
 ];
 
 #[cfg(test)]
@@ -1375,6 +1423,19 @@ mod tests {
         let entry = lookup("W0001").expect("W0001 should be in CATALOG");
         assert!(entry.short.contains("auto-promoted"));
         assert!(entry.long.contains("non-tail"));
+    }
+
+    #[test]
+    fn w0002_is_registered() {
+        // Pin that W0002 (auto-CPS fallback to Sync) is reachable via
+        // `ErrorCode::new` — pipeline.rs::auto_cps_fallback_diagnostics
+        // constructs the CompilerError via this code, and a missing
+        // entry would silently downgrade to an empty Vec (the codegen
+        // collector would still run, but no diagnostics would emit).
+        assert!(ErrorCode::new("W0002").is_some());
+        let entry = lookup("W0002").expect("W0002 should be in CATALOG");
+        assert!(entry.short.contains("auto-CPS"));
+        assert!(entry.long.contains("falls back"));
     }
 
     #[test]

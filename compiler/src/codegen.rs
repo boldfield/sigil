@@ -186,66 +186,86 @@ enum UserFnAbi {
 /// observable behavior for the `compute_user_fn_abi_sync_when_
 /// color_native_short_circuits_regardless_of_body_shape` test
 /// pinning.
-/// Prefix of the diagnostic note emitted when `compute_user_fn_abi`'s
-/// auto-CPS gate falls back to `UserFnAbi::Sync`. Extracted as a const
-/// so the emission site, suppression-test assertions, and any future
-/// callers stay in lockstep — a rename of the user-visible text breaks
-/// only this one definition.
-pub(crate) const AUTO_CPS_FALLBACK_NOTE_PREFIX: &str = "[sigil] note: auto-promoted fn";
-
-/// Cached read of `SIGIL_QUIET_AUTO_CPS_FALLBACK` — set (to any non-
-/// empty value) suppresses the auto-CPS-fallback diagnostic note. The
-/// env-var lookup is per-process; `compute_user_fn_abi` runs on every
-/// Cps-colored user fn from two call sites (per-fn ABI selection
-/// loop + `p20_silent_miscompile_check`), so caching avoids 2N
-/// redundant `getenv` calls for an N-fn program.
-fn auto_cps_fallback_quiet() -> bool {
-    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *QUIET.get_or_init(|| match std::env::var_os("SIGIL_QUIET_AUTO_CPS_FALLBACK") {
-        Some(v) => !v.is_empty(),
-        None => false,
-    })
+/// A single auto-CPS gate fallback event recorded during codegen.
+/// `compute_user_fn_abi_with_span`'s auto-promotion clause records
+/// one of these per source fn whose body it routes to Sync (because
+/// the auto-CPS analyzer can't decompose the body into per-branch
+/// recursive steps). `pipeline::auto_cps_fallback_diagnostics` drains
+/// the collector after `emit_object` and converts each event into a
+/// `W0002` `CompilerError`, emitted via the standard
+/// `DiagnosticEmitter` alongside `W0001` auto-promotion notes.
+#[derive(Clone, Debug)]
+pub struct AutoCpsFallbackEvent {
+    pub name: String,
+    pub name_span: crate::errors::Span,
 }
 
-/// Emit the "auto-promoted fn fell back to Sync" diagnostic note to
-/// stderr, with per-process dedup keyed by fn name. `compute_user_fn_abi`
-/// is invoked from two production sites (per-fn ABI selection loop +
-/// `p20_silent_miscompile_check`) and would otherwise produce the note
-/// twice for every fallback fn. Dedup also makes the note robust to a
-/// future per-mono-instance ABI selection loop (each source fn would
-/// still emit exactly one note).
+/// Per-process collector for auto-CPS fallback events. Keyed by fn
+/// name so each call from `compute_user_fn_abi_with_span` for the
+/// same fn produces at most one event regardless of how many
+/// production callers invoke the gate (per-fn ABI selection loop +
+/// `p20_silent_miscompile_check`).
 ///
-/// `name_span` is the fn's `name_span` from its `FnDecl`; included in
-/// the note so users can jump to the source location instead of
-/// grepping. Tests / non-source-driven callers can pass
-/// `crate::errors::Span::synthetic("compute_user_fn_abi")`.
-fn emit_auto_cps_fallback_note(name: &str, name_span: &crate::errors::Span) {
-    if auto_cps_fallback_quiet() {
-        return;
-    }
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
-        std::sync::OnceLock::new();
+/// Caveat (PR review R4 rev1 #2): the `name` parameter is the
+/// post-monomorphization mangled name. For a generic fn instantiated
+/// as multiple mono-instances, each mangled name dedups separately
+/// — N mono-instances of the same source fn produce N events. In
+/// practice the body shape is identical across mono-instances of a
+/// generic, so the N events all have the same message at the same
+/// source location, which is informative (one note per
+/// instantiation). The cleaner "dedup by source name" requires
+/// demangling, which would tie this collector to the monomorphizer's
+/// naming scheme — not worth the coupling.
+fn auto_cps_fallback_collector(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, AutoCpsFallbackEvent>> {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, AutoCpsFallbackEvent>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Drain the auto-CPS fallback collector. Called once per pipeline
+/// run from `pipeline::auto_cps_fallback_diagnostics` after
+/// `codegen::emit_object` returns. Returns events in fn-name order.
+/// The collector is per-process; in unit-test builds the same
+/// process runs many tests, so consecutive tests that exercise the
+/// gate will see only the first emission. e2e tests launch a fresh
+/// sigil subprocess per test, so the collector is naturally reset
+/// per test.
+pub fn take_auto_cps_fallback_events() -> Vec<AutoCpsFallbackEvent> {
     // `unwrap_or_else(|p| p.into_inner())` recovers from a poisoned
     // mutex: a prior thread panicked while holding it, but the inner
-    // data (a `BTreeSet<String>` of fn names) is just diagnostic
-    // dedup state — at worst we miss a dedup and the user sees one
-    // extra note. Better than crashing the compiler.
-    let mut seen = SEEN
-        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+    // data is just diagnostic state — at worst we lose a few queued
+    // events. Better than crashing the compiler.
+    let mut guard = auto_cps_fallback_collector()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !seen.insert(name.to_string()) {
-        return;
-    }
-    eprintln!(
-        "{prefix} `{name}` at {file}:{line}:{column} has body shape unsupported \
-         by auto-CPS lowering; falling back to Sync ABI (may stack-overflow \
-         on deep recursion). Set SIGIL_QUIET_AUTO_CPS_FALLBACK to suppress.",
-        prefix = AUTO_CPS_FALLBACK_NOTE_PREFIX,
-        file = name_span.file,
-        line = name_span.line,
-        column = name_span.column,
-    );
+    std::mem::take(&mut *guard).into_values().collect()
+}
+
+/// Record an auto-CPS fallback event for later structured diagnostic
+/// emission. Per-process dedup keyed by fn name so each (mangled-)fn
+/// name produces exactly one event regardless of how many times
+/// `compute_user_fn_abi_with_span` is called for it — both production
+/// callers (per-fn ABI selection loop + `p20_silent_miscompile_check`)
+/// flow through here without producing duplicates.
+///
+/// The `SIGIL_QUIET_AUTO_CPS_FALLBACK` suppression knob is checked
+/// once per pipeline run by `pipeline::auto_cps_fallback_diagnostics`
+/// at drain time — not here — so the collector remains correct for
+/// in-process inspection (e.g., the
+/// `expr_contains_recursive_call_detects_call_inside_handle_op_arm`
+/// unit test could read it via `take_auto_cps_fallback_events` if
+/// needed) even under suppression.
+fn record_auto_cps_fallback(name: &str, name_span: &crate::errors::Span) {
+    let mut seen = auto_cps_fallback_collector()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.entry(name.to_string())
+        .or_insert_with(|| AutoCpsFallbackEvent {
+            name: name.to_string(),
+            name_span: name_span.clone(),
+        });
 }
 
 /// Thin wrapper around `compute_user_fn_abi_with_span` used by unit
@@ -607,17 +627,21 @@ fn compute_user_fn_abi_with_span(
                 return UserFnAbi::Cps;
             }
             // Body shape not lowerable by auto-CPS: fall through to
-            // Sync after emitting a visible diagnostic. Without this,
-            // the demotion is silent — users would not discover their
-            // pure-recursive fn is stack-fragile until they hit the
-            // limit at runtime on adversarial input. The helper dedups
-            // across the multiple `compute_user_fn_abi` call sites
-            // (per-fn ABI selection loop + `p20_silent_miscompile_check`)
-            // so each source fn produces exactly one note per process.
-            // Suppressible by setting `SIGIL_QUIET_AUTO_CPS_FALLBACK`
-            // to any non-empty value for batch builds that want clean
-            // stderr.
-            emit_auto_cps_fallback_note(name, name_span);
+            // Sync after recording an event for the pipeline to emit
+            // as a `W0002` info diagnostic. Without this, the demotion
+            // is silent — users would not discover their pure-recursive
+            // fn is stack-fragile until they hit the limit at runtime
+            // on adversarial input. `record_auto_cps_fallback` dedups
+            // across both `compute_user_fn_abi_with_span` call sites
+            // (per-fn ABI selection loop +
+            // `p20_silent_miscompile_check`) so each (mangled-)fn name
+            // produces exactly one event per process.
+            // `pipeline::auto_cps_fallback_diagnostics` checks
+            // `SIGIL_QUIET_AUTO_CPS_FALLBACK` at drain time and
+            // suppresses emission (the collector still holds the
+            // events; only the diagnostic output is silenced) so
+            // batch builds that want clean stderr can opt out.
+            record_auto_cps_fallback(name, name_span);
         }
         // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
@@ -39270,15 +39294,24 @@ mod tests {
     }
 
     /// Pins `expr_contains_recursive_call`'s Handle-arm walking
-    /// (PR #199 R1#1 / R2#1). The Handle walker is correct
-    /// defensive coverage but currently unreachable under the
-    /// auto-promotion gate (the colorer marks any fn containing a
-    /// Handle's perform as Cps, disqualifying it from
-    /// auto-promotion). A direct unit test here pins the walker's
-    /// correctness independent of that structural unreachability:
-    /// if a future colorer change makes Handle-containing fns
-    /// auto-promotable, the walker must already be ready to
-    /// detect the rec call inside the op arm.
+    /// (PR #199 R1#1 / R2#1; corrected by R4 rev2 R4.1). The walker
+    /// IS load-bearing for currently-reachable code — see the
+    /// production-side comment in `codegen.rs`'s `Expr::Handle` arm
+    /// for the reachability analysis: a fn with `![]` outer row and
+    /// `handle <wrapped> with { ... arm => recurse(...) }` body stays
+    /// `LocalColor::Native` (the colorer's perform-finder at
+    /// color.rs:616-632 skips the wrapped body and only walks the
+    /// arm bodies, but the arm body here is a Call not a perform),
+    /// gets auto-promoted via non-tail self-recursion, and the gate
+    /// runs.
+    ///
+    /// End-to-end coverage lives in
+    /// `auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly`
+    /// (e2e). This unit test pins the walker directly so a future
+    /// regression that changes the e2e test's specific source shape
+    /// (or breaks the colorer-keeps-loop_n-Native invariant) doesn't
+    /// also silently break the walker's behaviour — the unit test
+    /// would fail first.
     ///
     /// Construction strategy: build a synthetic
     /// `BTreeMap<Span, GenericInstantiation>` that maps a
