@@ -32690,6 +32690,20 @@ fn expr_contains_recursive_call(
         Expr::RecordLit { fields, .. } => fields
             .iter()
             .any(|f| expr_contains_recursive_call(&f.value, scc_members, call_site_instantiations)),
+        // Handle walks `body` + `return_arm.body` + each
+        // `op_arms[i].body`. The op-arm walk is currently
+        // unreachable under the auto-promotion gate (color.rs:269-272
+        // skips auto-promotion for any fn that isn't `LocalColor::-
+        // Native` at decision time, and a Handle's contained
+        // perform makes the fn Cps before that point — see
+        // color.rs:1000-1006 "The fn is already CPS-colored if it
+        // contains any handle, so recursive calls inside an op arm
+        // don't drive the promotion regardless"). Kept as defensive
+        // coverage for a future colorer change that makes Handle-
+        // containing fns auto-promotable; the
+        // `expr_contains_recursive_call_detects_call_inside_handle_-
+        // op_arm` unit test pins correctness independent of that
+        // reachability. PR #199 R1#1 / R2#1.
         Expr::Handle {
             body,
             return_arm,
@@ -39250,5 +39264,120 @@ mod tests {
         assert_eq!(args.len(), 2, "args slice should preserve length");
         assert!(matches!(args[0], Expr::IntLit(1, _)));
         assert!(matches!(args[1], Expr::Ident(ref n, _) if n == "xs"));
+    }
+
+    /// Pins `expr_contains_recursive_call`'s Handle-arm walking
+    /// (PR #199 R1#1 / R2#1). The Handle walker is correct
+    /// defensive coverage but currently unreachable under the
+    /// auto-promotion gate (the colorer marks any fn containing a
+    /// Handle's perform as Cps, disqualifying it from
+    /// auto-promotion). A direct unit test here pins the walker's
+    /// correctness independent of that structural unreachability:
+    /// if a future colorer change makes Handle-containing fns
+    /// auto-promotable, the walker must already be ready to
+    /// detect the rec call inside the op arm.
+    ///
+    /// Construction strategy: build a synthetic
+    /// `BTreeMap<Span, GenericInstantiation>` that maps a
+    /// chosen ident_span to the rec callee's name, then assemble
+    /// an `Expr::Handle` whose op-arm body is a `Call` to that
+    /// ident. `scc_members = {"recurse_target"}`.
+    #[test]
+    fn expr_contains_recursive_call_detects_call_inside_handle_op_arm() {
+        use crate::ast::{Expr, HandleArmParam, HandleOpArm, PerformExpr};
+        use crate::errors::Span;
+        use crate::typecheck::GenericInstantiation;
+
+        let span = Span::synthetic("handle_walker_test");
+        let ident_span = Span::synthetic("handle_walker_test_ident");
+
+        let mut call_site_instantiations: std::collections::BTreeMap<Span, GenericInstantiation> =
+            std::collections::BTreeMap::new();
+        call_site_instantiations.insert(
+            ident_span.clone(),
+            GenericInstantiation {
+                name: "recurse_target".to_string(),
+                type_args: Vec::new(),
+            },
+        );
+
+        let mut scc_members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        scc_members.insert("recurse_target".to_string());
+
+        // op-arm body: `recurse_target()` — a Call whose callee
+        // ident-span maps to `recurse_target` in scc_members.
+        let rec_call = Expr::Call {
+            callee: Box::new(Expr::Ident("recurse_target".to_string(), ident_span)),
+            args: Vec::new(),
+            span: span.clone(),
+        };
+
+        // Handle whose op-arm body is the rec call. The Handle's
+        // own body is a `perform`; without walking op_arms, the
+        // walker would only see the perform and return false.
+        let handle_with_rec_call_in_op_arm = Expr::Handle {
+            body: Box::new(Expr::Perform(PerformExpr {
+                effect: "Step".to_string(),
+                op: "tick".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            return_arm: None,
+            op_arms: vec![HandleOpArm {
+                effect: "Step".to_string(),
+                effect_span: span.clone(),
+                op: "tick".to_string(),
+                op_span: span.clone(),
+                params: Vec::<HandleArmParam>::new(),
+                k_name: "k".to_string(),
+                k_span: span.clone(),
+                body: rec_call,
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+
+        assert!(
+            expr_contains_recursive_call(
+                &handle_with_rec_call_in_op_arm,
+                &scc_members,
+                &call_site_instantiations,
+            ),
+            "Handle walker must descend into op_arms[i].body and find \
+             the rec call to `recurse_target`; this is the PR review \
+             R1#1 / R2#1 fix"
+        );
+
+        // Negative control: same Handle shape but op-arm body is
+        // a plain literal (no rec call). Walker must return false.
+        let handle_without_rec_call = Expr::Handle {
+            body: Box::new(Expr::Perform(PerformExpr {
+                effect: "Step".to_string(),
+                op: "tick".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            return_arm: None,
+            op_arms: vec![HandleOpArm {
+                effect: "Step".to_string(),
+                effect_span: span.clone(),
+                op: "tick".to_string(),
+                op_span: span.clone(),
+                params: Vec::<HandleArmParam>::new(),
+                k_name: "k".to_string(),
+                k_span: span.clone(),
+                body: Expr::IntLit(0, span.clone()),
+                span: span.clone(),
+            }],
+            span,
+        };
+        assert!(
+            !expr_contains_recursive_call(
+                &handle_without_rec_call,
+                &scc_members,
+                &call_site_instantiations,
+            ),
+            "Handle without rec call in op_arm must not be flagged"
+        );
     }
 }

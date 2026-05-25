@@ -1249,10 +1249,40 @@ fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
 /// arm as `BaseCase(Handle { ... })`, the recursive call hides in
 /// the op arm), trip the Phase 4e `unreachable!` at emit time. PR
 /// review issue R1#1 / R2#1.
+/// Structural invariant — a recursive fn whose body contains a
+/// `Handle` expression with a rec call buried inside an op arm
+/// CANNOT reach the auto-CPS gate (and thus its `expr_contains_-
+/// recursive_call` Handle-walker arm) under the current colorer:
+///
+///   - `compiler/src/color.rs:269-272` skips auto-promotion for any
+///     fn that didn't start as `LocalColor::Native(...)`.
+///   - A fn containing a `perform` site (line ~477) or a Handle's
+///     internal perform is classified as `LocalColor::Cps` BEFORE
+///     auto-promotion runs.
+///   - Therefore: any fn that has a Handle in its body is already
+///     Cps via the contained perform, and `auto_promotions` never
+///     contains it — `compute_user_fn_abi`'s auto-promotion clause
+///     never runs, and `auto_cps_body_is_lowerable` (the call site
+///     of the Handle-walker check) never fires.
+///
+/// The Handle walker fix in `expr_contains_recursive_call` is
+/// therefore CORRECT defensive coverage but currently UNREACHABLE.
+/// A direct unit test exists in `codegen::tests` that exercises the
+/// walker on a synthetic Handle to pin its correctness independent
+/// of this structural unreachability.
+///
+/// This e2e test pins the structural invariant itself: a fn with a
+/// Handle compiles + runs cleanly under whatever ABI the standard
+/// pipeline assigns it, AND the auto-CPS fallback diagnostic does
+/// NOT mention loop_n (proving the auto-promotion path is unreached).
+/// If a future colorer change makes Handle-containing fns
+/// auto-promotable, this test will start failing because the note
+/// will then fire — surfacing the change so the Handle-walker code
+/// path can be re-verified end-to-end.
 #[test]
-fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
+fn auto_cps_handle_containing_fn_is_not_auto_promoted_invariant() {
     let source = "effect Step { tick: () -> Int }\n\
-                  fn loop_n(n: Int) -> Int ![Step] {\n\
+                  fn loop_n(n: Int) -> Int ![] {\n\
                   if n == 0 { 0 }\n\
                   else {\n\
                   handle perform Step.tick() with {\n\
@@ -1260,25 +1290,21 @@ fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
                   }\n\
                   }\n\
                   }\n\
-                  fn main() -> Int ![] {\n\
-                  handle loop_n(3) with {\n\
-                  Step.tick(k) => k(0),\n\
-                  }\n\
-                  }\n";
-    // Strengthened per PR review R3.1 (rev2): also assert the
-    // fallback note for loop_n. This is the test that proves the
-    // Handle walker fix is load-bearing — without walking
-    // op_arms, loop_n would slip past the gate to Cps and ICE.
+                  fn main() -> Int ![] { loop_n(3) }\n";
     let (compile_stderr, _stdout, run_stderr, code) =
-        compile_and_run_capturing_compile_stderr(source, "auto_cps_rec_in_handle_arm");
+        compile_and_run_capturing_compile_stderr(source, "auto_cps_handle_invariant");
     assert_eq!(
         code, 0,
         "loop_n recurses through handler arm and returns 0; stderr={run_stderr:?}"
     );
     assert!(
-        compile_stderr.contains("auto-promoted fn `loop_n`"),
-        "expected fallback note proving the Handle walker caught the \
-         buried rec call; compile_stderr={compile_stderr:?}"
+        !compile_stderr.contains("auto-promoted fn `loop_n`"),
+        "Invariant: loop_n contains a Handle, so the colorer marks \
+         it Cps via the contained perform before auto-promotion can \
+         run — no fallback note should fire. If this assertion \
+         starts failing, the colorer changed and the e2e coverage \
+         of the Handle-walker code path needs revisiting. \
+         compile_stderr={compile_stderr:?}"
     );
 }
 
