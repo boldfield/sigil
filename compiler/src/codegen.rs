@@ -32454,12 +32454,19 @@ fn analyze_auto_cps_body(
 }
 
 /// Auto-CPS gate validator: returns true iff every branch produced by
-/// `analyze_auto_cps_body` is structurally lowerable (BaseCase, or
-/// Recursive with non-empty steps). Returns false when the analyzer
-/// returns `None` (no tail expression) or when any branch is a
-/// `Recursive` with an empty `steps` list — shapes the synth-cont
-/// allocator can't decompose, which would otherwise trip the
-/// Phase 4e "CPS-ABI invariant broken" unreachable! at body emit.
+/// `analyze_auto_cps_body` is structurally lowerable. Returns false in
+/// any of these cases:
+///   - The analyzer returns `None` (no tail expression).
+///   - A branch is `Recursive` with an empty `steps` list.
+///   - A branch is `BaseCase(expr)` but `expr` still contains a
+///     recursive call into `scc_members` buried inside an
+///     `Expr::If` / `Expr::Match` / `Expr::Block` shape that
+///     `extract_first_recursive_call` doesn't recurse into. The
+///     analyzer classifies such branches as `BaseCase` (its peeler
+///     gives up at If/Match), but the call is still there at emit
+///     time — and the synth-cont allocator counted zero recursive
+///     branches for it, so dispatch trips the Phase 4e "CPS-ABI
+///     invariant broken" unreachable!.
 ///
 /// Used by `compute_user_fn_abi`'s auto-promotion clause to route
 /// such fns to `UserFnAbi::Sync` instead of `UserFnAbi::Cps`. Sync
@@ -32477,10 +32484,132 @@ fn auto_cps_body_is_lowerable(
     match analyze_auto_cps_body(body, scc_members, call_site_instantiations) {
         None => false,
         Some(branches) => branches.iter().all(|b| match b {
-            AutoCpsBranchKind::BaseCase(_) => true,
+            AutoCpsBranchKind::BaseCase(e) => {
+                !expr_contains_recursive_call(e, scc_members, call_site_instantiations)
+            }
             AutoCpsBranchKind::Recursive { steps, .. } => !steps.is_empty(),
         }),
     }
+}
+
+/// Walk `expr` and return true if any subexpression is a recursive
+/// call into `scc_members` (matched via `call_site_instantiations`).
+///
+/// Companion to `auto_cps_body_is_lowerable`: catches the case where
+/// `analyze_single_branch_expr` returns `BaseCase(expr)` because its
+/// `extract_first_recursive_call` peeler doesn't recurse into
+/// `Expr::If` / `Expr::Match` / `Expr::Block` etc., but `expr` still
+/// holds a recursive call that the body emitter can't decompose.
+fn expr_contains_recursive_call(
+    expr: &crate::ast::Expr,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(name, ident_span) = callee.as_ref() {
+                if let Some(inst) = call_site_instantiations.get(ident_span) {
+                    if &inst.name == name && scc_members.contains(&inst.name) {
+                        return true;
+                    }
+                }
+            }
+            expr_contains_recursive_call(callee, scc_members, call_site_instantiations)
+                || args
+                    .iter()
+                    .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations))
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_recursive_call(lhs, scc_members, call_site_instantiations)
+                || expr_contains_recursive_call(rhs, scc_members, call_site_instantiations)
+        }
+        Expr::Unary { operand, .. } => {
+            expr_contains_recursive_call(operand, scc_members, call_site_instantiations)
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_contains_recursive_call(cond, scc_members, call_site_instantiations)
+                || block_contains_recursive_call(then_block, scc_members, call_site_instantiations)
+                || block_contains_recursive_call(else_block, scc_members, call_site_instantiations)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if expr_contains_recursive_call(scrutinee, scc_members, call_site_instantiations) {
+                return true;
+            }
+            arms.iter().any(|arm| {
+                expr_contains_recursive_call(&arm.body, scc_members, call_site_instantiations)
+            })
+        }
+        Expr::Block(b) => block_contains_recursive_call(b, scc_members, call_site_instantiations),
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations)),
+        Expr::Lambda { body, .. } => {
+            expr_contains_recursive_call(body, scc_members, call_site_instantiations)
+        }
+        Expr::ClosureRecord { env_exprs, .. } => env_exprs
+            .iter()
+            .any(|e| expr_contains_recursive_call(e, scc_members, call_site_instantiations)),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .any(|f| expr_contains_recursive_call(&f.value, scc_members, call_site_instantiations)),
+        Expr::Handle { body, .. } => {
+            expr_contains_recursive_call(body, scc_members, call_site_instantiations)
+        }
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .any(|e| expr_contains_recursive_call(e, scc_members, call_site_instantiations)),
+        Expr::Ident(_, _)
+        | Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
+        | Expr::ClosureEnvLoad { .. } => false,
+    }
+}
+
+fn block_contains_recursive_call(
+    block: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    for stmt in &block.stmts {
+        let hit = match stmt {
+            crate::ast::Stmt::Let(l) => {
+                expr_contains_recursive_call(&l.value, scc_members, call_site_instantiations)
+            }
+            crate::ast::Stmt::Expr(e) => {
+                expr_contains_recursive_call(e, scc_members, call_site_instantiations)
+            }
+            crate::ast::Stmt::Perform(p) => p
+                .args
+                .iter()
+                .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations)),
+        };
+        if hit {
+            return true;
+        }
+    }
+    if let Some(tail) = &block.tail {
+        return expr_contains_recursive_call(tail, scc_members, call_site_instantiations);
+    }
+    false
 }
 
 fn analyze_auto_cps_expr(
