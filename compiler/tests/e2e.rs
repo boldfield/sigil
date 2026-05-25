@@ -1104,6 +1104,57 @@ fn auto_cps_recursive_mod_by_zero_traps() {
     );
 }
 
+/// Category A — Collatz with nested-if arm body that contains the
+/// recursive call inside `1 + ...`. Before the fix this panicked with
+/// "codegen Phase 4e: CPS-ABI fn `collatz_steps` body is not a simple
+/// tail perform ..." because the auto-promotion gate committed to
+/// CPS-ABI without checking that the body's branch structure
+/// decomposes cleanly. The defensive fix routes this fn to Sync ABI
+/// (correct, just stack-unsafe at adversarial depth — same as
+/// pre-auto-promotion behavior).
+#[test]
+fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
+    let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
+                  match n {\n\
+                  1 => 0,\n\
+                  _ => {\n\
+                  if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n\
+                  else          { 1 + collatz_steps(n * 3 + 1) }\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { collatz_steps(27) }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_collatz_nested_if");
+    assert_eq!(code, 111, "Collatz(27) = 111 steps; stderr={stderr:?}");
+}
+
+/// Category A — rec call inside a `Cons(...)` ctor arg, with a nested
+/// match in the outer arm. Same panic class. Defensive fix routes to
+/// Sync ABI.
+#[test]
+fn auto_cps_recursive_call_in_ctor_arg_falls_back_to_sync_cleanly() {
+    let source = "import std.list\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn int_eq(a: Int, b: Int) -> Bool ![] { a == b }\n\
+                  fn consume(avail: List[Bool], idx: Int) -> List[Bool] ![] {\n\
+                  match avail {\n\
+                  Nil => Nil,\n\
+                  Cons(v, rest_v) => match int_eq(idx, 0) {\n\
+                  true  => Cons(false, rest_v),\n\
+                  false => Cons(v, consume(rest_v, idx - 1)),\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  match consume(Cons(true, Cons(true, Cons(true, Nil))), 1) {\n\
+                  Nil => 0,\n\
+                  Cons(_, _) => 1,\n\
+                  }\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_rec_in_ctor_arg");
+    assert_eq!(code, 1, "consume returns a non-empty list; stderr={stderr:?}");
+}
+
 /// arith-trap — `%` by zero traps with banner + exit 2, with NO
 /// `![ArithError]` on the row (operators no longer carry the effect).
 /// `examples/div_by_zero.sigil` covers the `/` path via
