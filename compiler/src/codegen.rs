@@ -186,8 +186,92 @@ enum UserFnAbi {
 /// observable behavior for the `compute_user_fn_abi_sync_when_
 /// color_native_short_circuits_regardless_of_body_shape` test
 /// pinning.
+/// Prefix of the diagnostic note emitted when `compute_user_fn_abi`'s
+/// auto-CPS gate falls back to `UserFnAbi::Sync`. Extracted as a const
+/// so the emission site, suppression-test assertions, and any future
+/// callers stay in lockstep — a rename of the user-visible text breaks
+/// only this one definition.
+pub(crate) const AUTO_CPS_FALLBACK_NOTE_PREFIX: &str = "[sigil] note: auto-promoted fn";
+
+/// Cached read of `SIGIL_QUIET_AUTO_CPS_FALLBACK` — set (to any non-
+/// empty value) suppresses the auto-CPS-fallback diagnostic note. The
+/// env-var lookup is per-process; `compute_user_fn_abi` runs on every
+/// Cps-colored user fn from two call sites (per-fn ABI selection
+/// loop + `p20_silent_miscompile_check`), so caching avoids 2N
+/// redundant `getenv` calls for an N-fn program.
+fn auto_cps_fallback_quiet() -> bool {
+    static QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *QUIET.get_or_init(|| match std::env::var_os("SIGIL_QUIET_AUTO_CPS_FALLBACK") {
+        Some(v) => !v.is_empty(),
+        None => false,
+    })
+}
+
+/// Emit the "auto-promoted fn fell back to Sync" diagnostic note to
+/// stderr, with per-process dedup keyed by fn name. `compute_user_fn_abi`
+/// is invoked from two production sites (per-fn ABI selection loop +
+/// `p20_silent_miscompile_check`) and would otherwise produce the note
+/// twice for every fallback fn. Dedup also makes the note robust to a
+/// future per-mono-instance ABI selection loop (each source fn would
+/// still emit exactly one note).
+///
+/// `name_span` is the fn's `name_span` from its `FnDecl`; included in
+/// the note so users can jump to the source location instead of
+/// grepping. Tests / non-source-driven callers can pass
+/// `crate::errors::Span::synthetic("compute_user_fn_abi")`.
+fn emit_auto_cps_fallback_note(name: &str, name_span: &crate::errors::Span) {
+    if auto_cps_fallback_quiet() {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
+        std::sync::OnceLock::new();
+    // `unwrap_or_else(|p| p.into_inner())` recovers from a poisoned
+    // mutex: a prior thread panicked while holding it, but the inner
+    // data (a `BTreeSet<String>` of fn names) is just diagnostic
+    // dedup state — at worst we miss a dedup and the user sees one
+    // extra note. Better than crashing the compiler.
+    let mut seen = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::BTreeSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.insert(name.to_string()) {
+        return;
+    }
+    eprintln!(
+        "{prefix} `{name}` at {file}:{line}:{column} has body shape unsupported \
+         by auto-CPS lowering; falling back to Sync ABI (may stack-overflow \
+         on deep recursion). Set SIGIL_QUIET_AUTO_CPS_FALLBACK to suppress.",
+        prefix = AUTO_CPS_FALLBACK_NOTE_PREFIX,
+        file = name_span.file,
+        line = name_span.line,
+        column = name_span.column,
+    );
+}
+
+/// Thin wrapper around `compute_user_fn_abi_with_span` used by unit
+/// tests that don't have a source-fn `name_span` in scope. Synthesises
+/// a stub span — diagnostics emitted from this path show a synthetic
+/// location, but unit tests don't observe stderr anyway. The 2
+/// production callers (per-fn ABI selection loop +
+/// `p20_silent_miscompile_check`) call `compute_user_fn_abi_with_span`
+/// directly with the real `FnDecl::name_span` so users see the actual
+/// source location. Cfg-gated to test builds so production builds
+/// don't drag in the unused wrapper.
+#[cfg(test)]
 fn compute_user_fn_abi(
     name: &str,
+    body: &crate::ast::Block,
+    helper_params: &[crate::ast::Param],
+    colored: &ColoredProgram,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
+) -> UserFnAbi {
+    let synth = crate::errors::Span::synthetic("compute_user_fn_abi");
+    compute_user_fn_abi_with_span(name, &synth, body, helper_params, colored, fns_by_name)
+}
+
+fn compute_user_fn_abi_with_span(
+    name: &str,
+    name_span: &crate::errors::Span,
     body: &crate::ast::Block,
     helper_params: &[crate::ast::Param],
     colored: &ColoredProgram,
@@ -506,18 +590,18 @@ fn compute_user_fn_abi(
             // ("codegen Phase 4e: CPS-ABI fn `X` body is not …
             // invariant broken"). Validate the decomposition here and
             // route to Sync ABI otherwise. Sync is correct for these
-            // pure-recursive fns; the stack-safety win from PR #190 is
-            // *not* re-applied to this fn (it may stack-overflow on
-            // deep recursion under adversarial input). The native
-            // extension that handles these shapes under Cps ABI is
-            // tracked as plan P4 (`auto-cps-nested-branch-support`).
+            // pure-recursive fns; the stack-safety win that PR #190
+            // added under Cps ABI is *not* re-applied to this fn (it
+            // may stack-overflow on deep recursion under adversarial
+            // input).
             //
             // TODO(perf): `analyze_auto_cps_body` runs twice per
             // auto-promotable fn — once here, once at body emit. For
             // large recursive fns the duplicate walk is wasted work
-            // (typecheck still dominates, so not blocking). A future
-            // refactor can thread the analyzed result through
-            // `compute_user_fn_abi`'s return or memoize per-fn.
+            // (typecheck still dominates, so not blocking). The next
+            // major auto-CPS refactor will rework this region — a
+            // memoization or threaded-result rewrite belongs in that
+            // patch. See the v2 auto-CPS plan for the tracked work.
             let call_site_inst = &colored.mono.anf.checked.call_site_instantiations;
             if auto_cps_body_is_lowerable(body, &scc_members, call_site_inst) {
                 return UserFnAbi::Cps;
@@ -526,17 +610,14 @@ fn compute_user_fn_abi(
             // Sync after emitting a visible diagnostic. Without this,
             // the demotion is silent — users would not discover their
             // pure-recursive fn is stack-fragile until they hit the
-            // limit at runtime on adversarial input. Suppressible via
-            // `SIGIL_QUIET_AUTO_CPS_FALLBACK=1` for batch builds that
-            // want clean stderr.
-            if std::env::var_os("SIGIL_QUIET_AUTO_CPS_FALLBACK").is_none() {
-                eprintln!(
-                    "[sigil] note: auto-promoted fn `{name}` has body shape unsupported \
-                     by auto-CPS lowering; falling back to Sync ABI (may stack-overflow \
-                     on deep recursion). Tracked by plan P4 \
-                     `auto-cps-nested-branch-support`."
-                );
-            }
+            // limit at runtime on adversarial input. The helper dedups
+            // across the multiple `compute_user_fn_abi` call sites
+            // (per-fn ABI selection loop + `p20_silent_miscompile_check`)
+            // so each source fn produces exactly one note per process.
+            // Suppressible by setting `SIGIL_QUIET_AUTO_CPS_FALLBACK`
+            // to any non-empty value for batch builds that want clean
+            // stderr.
+            emit_auto_cps_fallback_note(name, name_span);
         }
         // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
@@ -9918,8 +9999,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let normalized_body =
                 normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
             let body_for_abi = normalized_body.as_ref().unwrap_or(body_after_perform_norm);
-            let abi =
-                compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
+            let abi = compute_user_fn_abi_with_span(
+                &f.name,
+                &f.name_span,
+                body_for_abi,
+                &f.params,
+                &cc.colored,
+                &fns_by_name,
+            );
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     // Plan D Task 111b — Sync ABI:
@@ -30882,7 +30969,14 @@ fn p20_silent_miscompile_check(
         let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
         let normalized = normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
         let body_for_abi = normalized.as_ref().unwrap_or(body_after_perform_norm);
-        let abi = compute_user_fn_abi(&f.name, body_for_abi, &f.params, colored, fns_by_name);
+        let abi = compute_user_fn_abi_with_span(
+            &f.name,
+            &f.name_span,
+            body_for_abi,
+            &f.params,
+            colored,
+            fns_by_name,
+        );
         if abi != UserFnAbi::Sync {
             continue;
         }
