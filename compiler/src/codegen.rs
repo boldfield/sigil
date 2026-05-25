@@ -32691,19 +32691,22 @@ fn expr_contains_recursive_call(
             .iter()
             .any(|f| expr_contains_recursive_call(&f.value, scc_members, call_site_instantiations)),
         // Handle walks `body` + `return_arm.body` + each
-        // `op_arms[i].body`. The op-arm walk is currently
-        // unreachable under the auto-promotion gate (color.rs:269-272
-        // skips auto-promotion for any fn that isn't `LocalColor::-
-        // Native` at decision time, and a Handle's contained
-        // perform makes the fn Cps before that point — see
-        // color.rs:1000-1006 "The fn is already CPS-colored if it
-        // contains any handle, so recursive calls inside an op arm
-        // don't drive the promotion regardless"). Kept as defensive
-        // coverage for a future colorer change that makes Handle-
-        // containing fns auto-promotable; the
-        // `expr_contains_recursive_call_detects_call_inside_handle_-
-        // op_arm` unit test pins correctness independent of that
-        // reachability. PR #199 R1#1 / R2#1.
+        // `op_arms[i].body`. This is LOAD-BEARING for currently-
+        // reachable code: a fn whose body contains
+        // `handle <wrapped> with { ... arm => recurse(...) }` and
+        // whose outer effect row discharges to `![]` IS eligible
+        // for auto-promotion. The colorer's perform-finder
+        // (color.rs:616-632) skips the wrapped body (handlers
+        // discharge the body's row from the parent fn's color
+        // perspective), so a fn with `handle perform E.op() with
+        // { ... }` and `![]` outer row stays `LocalColor::Native`
+        // — auto-promotion fires if the body has non-tail
+        // self/SCC recursion. The `auto_cps_recursive_call_in_-
+        // handle_op_arm_falls_back_to_sync_cleanly` e2e test pins
+        // this end-to-end; the `expr_contains_recursive_call_-
+        // detects_call_inside_handle_op_arm` unit test pins the
+        // walker directly with a synthetic Handle. PR #199 R1#1 /
+        // R2#1.
         Expr::Handle {
             body,
             return_arm,

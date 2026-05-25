@@ -1249,38 +1249,39 @@ fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
 /// arm as `BaseCase(Handle { ... })`, the recursive call hides in
 /// the op arm), trip the Phase 4e `unreachable!` at emit time. PR
 /// review issue R1#1 / R2#1.
-/// Structural invariant — a recursive fn whose body contains a
-/// `Handle` expression with a rec call buried inside an op arm
-/// CANNOT reach the auto-CPS gate (and thus its `expr_contains_-
-/// recursive_call` Handle-walker arm) under the current colorer:
+/// Category A — rec call inside a handler op arm body, with the
+/// fn's outer effect row purely-discharged so auto-promotion fires.
 ///
-///   - `compiler/src/color.rs:269-272` skips auto-promotion for any
-///     fn that didn't start as `LocalColor::Native(...)`.
-///   - A fn containing a `perform` site (line ~477) or a Handle's
-///     internal perform is classified as `LocalColor::Cps` BEFORE
-///     auto-promotion runs.
-///   - Therefore: any fn that has a Handle in its body is already
-///     Cps via the contained perform, and `auto_promotions` never
-///     contains it — `compute_user_fn_abi`'s auto-promotion clause
-///     never runs, and `auto_cps_body_is_lowerable` (the call site
-///     of the Handle-walker check) never fires.
+/// CRITICAL setup:
+///   - The fn's outer row MUST be `![]`. With `![Step]` the colorer
+///     marks the fn Cps via the effect (color.rs:466) before
+///     auto-promotion runs (color.rs:269-272 requires
+///     `LocalColor::Native`), so the gate never runs and this test
+///     would silently not exercise the Handle walker (the original
+///     iter 4 mistake — surfaced by the diagnostic-note assertion).
+///   - The Handle's body `perform Step.tick()` does NOT taint
+///     loop_n's color, because `find_any_perform_in_expr`'s Handle
+///     arm (color.rs:616-632) explicitly skips the wrapped body
+///     (handlers discharge their wrapped body's row). The arm
+///     bodies ARE walked for perform, but here the op arm body is
+///     `loop_n(n - 1)` (a Call, no perform). So loop_n stays Native
+///     and gets auto-promoted via its non-tail self-recursion at
+///     the `loop_n(n - 1)` site inside the op arm.
+///   - The recursive call lives inside `Handle.op_arms[0].body`.
+///     The auto-CPS branch analyzer's peeler doesn't recurse into
+///     Handle, so the arm classifies as `BaseCase(Handle{...})`.
+///     The Handle-walker check in `expr_contains_recursive_call`
+///     (PR review R1#1 / R2#1) is what detects the buried rec
+///     call and routes loop_n to Sync ABI.
 ///
-/// The Handle walker fix in `expr_contains_recursive_call` is
-/// therefore CORRECT defensive coverage but currently UNREACHABLE.
-/// A direct unit test exists in `codegen::tests` that exercises the
-/// walker on a synthetic Handle to pin its correctness independent
-/// of this structural unreachability.
-///
-/// This e2e test pins the structural invariant itself: a fn with a
-/// Handle compiles + runs cleanly under whatever ABI the standard
-/// pipeline assigns it, AND the auto-CPS fallback diagnostic does
-/// NOT mention loop_n (proving the auto-promotion path is unreached).
-/// If a future colorer change makes Handle-containing fns
-/// auto-promotable, this test will start failing because the note
-/// will then fire — surfacing the change so the Handle-walker code
-/// path can be re-verified end-to-end.
+/// What this test pins end-to-end:
+///   1. loop_n compiles + runs (exit 0).
+///   2. The auto-CPS fallback diagnostic fires for loop_n, proving
+///      the Handle-walker code path actually ran. Without walking
+///      `op_arms[i].body`, the walker would return false, the
+///      gate would commit to Cps, and the body emit would ICE.
 #[test]
-fn auto_cps_handle_containing_fn_is_not_auto_promoted_invariant() {
+fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
     let source = "effect Step { tick: () -> Int }\n\
                   fn loop_n(n: Int) -> Int ![] {\n\
                   if n == 0 { 0 }\n\
@@ -1292,18 +1293,16 @@ fn auto_cps_handle_containing_fn_is_not_auto_promoted_invariant() {
                   }\n\
                   fn main() -> Int ![] { loop_n(3) }\n";
     let (compile_stderr, _stdout, run_stderr, code) =
-        compile_and_run_capturing_compile_stderr(source, "auto_cps_handle_invariant");
+        compile_and_run_capturing_compile_stderr(source, "auto_cps_rec_in_handle_arm");
     assert_eq!(
         code, 0,
         "loop_n recurses through handler arm and returns 0; stderr={run_stderr:?}"
     );
     assert!(
-        !compile_stderr.contains("auto-promoted fn `loop_n`"),
-        "Invariant: loop_n contains a Handle, so the colorer marks \
-         it Cps via the contained perform before auto-promotion can \
-         run — no fallback note should fire. If this assertion \
-         starts failing, the colorer changed and the e2e coverage \
-         of the Handle-walker code path needs revisiting. \
+        compile_stderr.contains("auto-promoted fn `loop_n`"),
+        "expected fallback note proving the Handle walker caught the \
+         buried rec call (PR review R1#1 / R2#1); without the walker \
+         fix loop_n would commit to Cps and the body emit would ICE. \
          compile_stderr={compile_stderr:?}"
     );
 }
