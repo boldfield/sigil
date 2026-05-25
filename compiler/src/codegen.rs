@@ -506,13 +506,37 @@ fn compute_user_fn_abi(
             // ("codegen Phase 4e: CPS-ABI fn `X` body is not …
             // invariant broken"). Validate the decomposition here and
             // route to Sync ABI otherwise. Sync is correct for these
-            // pure-recursive fns — just stack-unsafe on adversarial
-            // depth (same as pre-PR-#190 behaviour).
+            // pure-recursive fns; the stack-safety win from PR #190 is
+            // *not* re-applied to this fn (it may stack-overflow on
+            // deep recursion under adversarial input). The native
+            // extension that handles these shapes under Cps ABI is
+            // tracked as plan P4 (`auto-cps-nested-branch-support`).
+            //
+            // TODO(perf): `analyze_auto_cps_body` runs twice per
+            // auto-promotable fn — once here, once at body emit. For
+            // large recursive fns the duplicate walk is wasted work
+            // (typecheck still dominates, so not blocking). A future
+            // refactor can thread the analyzed result through
+            // `compute_user_fn_abi`'s return or memoize per-fn.
             let call_site_inst = &colored.mono.anf.checked.call_site_instantiations;
             if auto_cps_body_is_lowerable(body, &scc_members, call_site_inst) {
                 return UserFnAbi::Cps;
             }
-            // Body shape not lowerable by auto-CPS: fall through to Sync.
+            // Body shape not lowerable by auto-CPS: fall through to
+            // Sync after emitting a visible diagnostic. Without this,
+            // the demotion is silent — users would not discover their
+            // pure-recursive fn is stack-fragile until they hit the
+            // limit at runtime on adversarial input. Suppressible via
+            // `SIGIL_QUIET_AUTO_CPS_FALLBACK=1` for batch builds that
+            // want clean stderr.
+            if std::env::var_os("SIGIL_QUIET_AUTO_CPS_FALLBACK").is_none() {
+                eprintln!(
+                    "[sigil] note: auto-promoted fn `{name}` has body shape unsupported \
+                     by auto-CPS lowering; falling back to Sync ABI (may stack-overflow \
+                     on deep recursion). Tracked by plan P4 \
+                     `auto-cps-nested-branch-support`."
+                );
+            }
         }
         // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
@@ -32470,9 +32494,12 @@ fn analyze_auto_cps_body(
 ///
 /// Used by `compute_user_fn_abi`'s auto-promotion clause to route
 /// such fns to `UserFnAbi::Sync` instead of `UserFnAbi::Cps`. Sync
-/// ABI on an auto-promoted (pure-recursive) fn is correct — it just
-/// exposes the underlying stack-unsafety on adversarial input depth
-/// (matches pre-PR-#190 behaviour; strictly better than an ICE).
+/// ABI on an auto-promoted (pure-recursive) fn is correct; the stack-
+/// safety win that PR #190 added under Cps ABI is *not* re-applied
+/// here, so deep recursion under adversarial input may stack-overflow.
+/// The native extension that handles these shapes under Cps ABI is
+/// tracked as plan P4 (`auto-cps-nested-branch-support`); shipping
+/// Sync fallback is strictly better than the ICE this gate replaces.
 fn auto_cps_body_is_lowerable(
     body: &crate::ast::Block,
     scc_members: &std::collections::BTreeSet<String>,
@@ -32555,6 +32582,11 @@ fn expr_contains_recursive_call(
             .args
             .iter()
             .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations)),
+        // Lambdas are closure-converted to `Expr::ClosureRecord` before
+        // `compute_user_fn_abi` runs (closure conversion lives upstream
+        // of codegen). Recursing here is defensive coverage in case
+        // pass order changes or a future pass re-introduces lambdas at
+        // this stage.
         Expr::Lambda { body, .. } => {
             expr_contains_recursive_call(body, scc_members, call_site_instantiations)
         }
@@ -32564,8 +32596,23 @@ fn expr_contains_recursive_call(
         Expr::RecordLit { fields, .. } => fields
             .iter()
             .any(|f| expr_contains_recursive_call(&f.value, scc_members, call_site_instantiations)),
-        Expr::Handle { body, .. } => {
-            expr_contains_recursive_call(body, scc_members, call_site_instantiations)
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            if expr_contains_recursive_call(body, scc_members, call_site_instantiations) {
+                return true;
+            }
+            if let Some(ra) = return_arm {
+                if expr_contains_recursive_call(&ra.body, scc_members, call_site_instantiations) {
+                    return true;
+                }
+            }
+            op_arms.iter().any(|arm| {
+                expr_contains_recursive_call(&arm.body, scc_members, call_site_instantiations)
+            })
         }
         Expr::Tuple { elems, .. } => elems
             .iter()

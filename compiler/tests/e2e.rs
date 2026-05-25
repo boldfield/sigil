@@ -221,6 +221,39 @@ fn compile_and_run_with_env(
     out
 }
 
+/// Compile `source` and return `(compile_stderr, success)` — does NOT
+/// run the resulting binary. Used by auto-CPS-fallback diagnostic
+/// tests to assert on the compiler's stderr (the `[sigil] note: ...`
+/// line emitted from `compute_user_fn_abi`'s auto-promotion clause
+/// when a body shape can't be lowered by auto-CPS). The
+/// positive-path `compile_and_run` helper discards compile stderr on
+/// success, so a separate helper is needed to observe the note.
+fn compile_capturing_compile_stderr(source: &str, test_name: &str) -> (String, bool) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    (
+        String::from_utf8_lossy(&compile.stderr).into_owned(),
+        compile.status.success(),
+    )
+}
+
 /// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
 /// e2e tests that pin specific compile-failure E-codes.
 ///
@@ -1126,6 +1159,84 @@ fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
                   fn main() -> Int ![] { collatz_steps(27) }\n";
     let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_collatz_nested_if");
     assert_eq!(code, 111, "Collatz(27) = 111 steps; stderr={stderr:?}");
+}
+
+/// Category A — rec call inside a handler op arm body. Without
+/// walking `Handle.op_arms` in `expr_contains_recursive_call`, this
+/// shape would slip past the auto-CPS gate (analyzer classifies the
+/// arm as `BaseCase(Handle { ... })`, the recursive call hides in
+/// the op arm), trip the Phase 4e `unreachable!` at emit time. PR
+/// review issue R1#1 / R2#1.
+#[test]
+fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
+    let source = "effect Step { tick: () -> Int }\n\
+                  fn loop_n(n: Int) -> Int ![Step] {\n\
+                  if n == 0 { 0 }\n\
+                  else {\n\
+                  handle perform Step.tick() with {\n\
+                  Step.tick(k) => loop_n(n - 1),\n\
+                  }\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  handle loop_n(3) with {\n\
+                  Step.tick(k) => k(0),\n\
+                  }\n\
+                  }\n";
+    let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_rec_in_handle_arm");
+    assert_eq!(
+        code, 0,
+        "loop_n recurses through handler arm and returns 0; stderr={stderr:?}"
+    );
+}
+
+/// Diagnostic — when the auto-CPS gate falls back to Sync for a body
+/// it can't lower, the compiler emits a `[sigil] note: ...` line on
+/// stderr so users discover the demotion before runtime stack
+/// overflow. PR review issue R1#3.
+#[test]
+fn auto_cps_fallback_emits_diagnostic_note() {
+    let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
+                  match n {\n\
+                  1 => 0,\n\
+                  _ => {\n\
+                  if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n\
+                  else          { 1 + collatz_steps(n * 3 + 1) }\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { collatz_steps(1) }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "auto_cps_fallback_diag");
+    assert!(success, "compile must succeed; stderr={stderr:?}");
+    assert!(
+        stderr.contains("auto-promoted fn `collatz_steps`")
+            && stderr.contains("falling back to Sync ABI"),
+        "expected auto-CPS fallback diagnostic mentioning collatz_steps; \
+         stderr={stderr:?}"
+    );
+}
+
+/// Negative gate test — pure-recursive fns with body shapes the
+/// auto-CPS analyzer DOES decompose cleanly (here: `sum_to` with the
+/// canonical `if base { 0 } else { n + recurse(n - 1) }` shape) must
+/// stay on Cps ABI. The defensive gate must not demote them to Sync,
+/// otherwise the stack-safety win from PR #190 silently regresses.
+/// We check the absence of the fallback diagnostic note (which the
+/// gate emits on every demotion). PR review issue R2#5.
+#[test]
+fn auto_cps_decomposable_body_stays_on_cps_no_fallback_note() {
+    let source = "fn sum_to(n: Int) -> Int ![] {\n\
+                  if n == 0 { 0 }\n\
+                  else { n + sum_to(n - 1) }\n\
+                  }\n\
+                  fn main() -> Int ![] { sum_to(5) }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "auto_cps_sum_to_stays_cps");
+    assert!(success, "compile must succeed; stderr={stderr:?}");
+    assert!(
+        !stderr.contains("auto-promoted fn `sum_to`"),
+        "sum_to has a Cps-lowerable body; gate must not emit a \
+         fallback note for it. stderr={stderr:?}"
+    );
 }
 
 /// Category A — rec call inside a `Cons(...)` ctor arg, with a nested
