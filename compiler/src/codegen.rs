@@ -497,7 +497,22 @@ fn compute_user_fn_abi(
         }
         scc_members.insert(name.to_string());
         if !body_has_non_trivial_non_recursive_calls(body, &scc_members, &ctors) {
-            return UserFnAbi::Cps;
+            // Defensive gate: the auto-CPS body emitter has a narrow
+            // set of accepted body shapes (simple tail perform; yield-
+            // then-X; chain_length=0 branched-cps-tail). If
+            // `analyze_auto_cps_body` can't decompose this body into
+            // per-branch recursive steps with non-empty `steps`, the
+            // body-emit's exhaustiveness `unreachable!` will fire
+            // ("codegen Phase 4e: CPS-ABI fn `X` body is not …
+            // invariant broken"). Validate the decomposition here and
+            // route to Sync ABI otherwise. Sync is correct for these
+            // pure-recursive fns — just stack-unsafe on adversarial
+            // depth (same as pre-PR-#190 behaviour).
+            let call_site_inst = &colored.mono.anf.checked.call_site_instantiations;
+            if auto_cps_body_is_lowerable(body, &scc_members, call_site_inst) {
+                return UserFnAbi::Cps;
+            }
+            // Body shape not lowerable by auto-CPS: fall through to Sync.
         }
         // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
@@ -32436,6 +32451,36 @@ fn analyze_auto_cps_body(
 ) -> Option<Vec<AutoCpsBranchKind>> {
     let tail = body.tail.as_ref()?;
     analyze_auto_cps_expr(tail, scc_members, call_site_instantiations)
+}
+
+/// Auto-CPS gate validator: returns true iff every branch produced by
+/// `analyze_auto_cps_body` is structurally lowerable (BaseCase, or
+/// Recursive with non-empty steps). Returns false when the analyzer
+/// returns `None` (no tail expression) or when any branch is a
+/// `Recursive` with an empty `steps` list — shapes the synth-cont
+/// allocator can't decompose, which would otherwise trip the
+/// Phase 4e "CPS-ABI invariant broken" unreachable! at body emit.
+///
+/// Used by `compute_user_fn_abi`'s auto-promotion clause to route
+/// such fns to `UserFnAbi::Sync` instead of `UserFnAbi::Cps`. Sync
+/// ABI on an auto-promoted (pure-recursive) fn is correct — it just
+/// exposes the underlying stack-unsafety on adversarial input depth
+/// (matches pre-PR-#190 behaviour; strictly better than an ICE).
+fn auto_cps_body_is_lowerable(
+    body: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    match analyze_auto_cps_body(body, scc_members, call_site_instantiations) {
+        None => false,
+        Some(branches) => branches.iter().all(|b| match b {
+            AutoCpsBranchKind::BaseCase(_) => true,
+            AutoCpsBranchKind::Recursive { steps, .. } => !steps.is_empty(),
+        }),
+    }
 }
 
 fn analyze_auto_cps_expr(

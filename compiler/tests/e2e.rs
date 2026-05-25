@@ -1152,7 +1152,10 @@ fn auto_cps_recursive_call_in_ctor_arg_falls_back_to_sync_cleanly() {
                   }\n\
                   }\n";
     let (_stdout, stderr, code) = compile_and_run(source, "auto_cps_rec_in_ctor_arg");
-    assert_eq!(code, 1, "consume returns a non-empty list; stderr={stderr:?}");
+    assert_eq!(
+        code, 1,
+        "consume returns a non-empty list; stderr={stderr:?}"
+    );
 }
 
 /// arith-trap — `%` by zero traps with banner + exit 2, with NO
