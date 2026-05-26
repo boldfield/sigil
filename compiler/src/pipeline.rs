@@ -100,6 +100,7 @@ pub fn compile(
         eprintln!("sigil: codegen failed: {e}");
         return Err(1);
     }
+    all_errs.extend(auto_cps_fallback_diagnostics());
     if let Err(e) = link::link(&obj_path, std::path::Path::new(output)) {
         eprintln!("sigil: link failed: {e}");
         return Err(1);
@@ -161,6 +162,49 @@ fn auto_promotion_diagnostics(colored: &color::ColoredProgram) -> Vec<CompilerEr
                 "rewrite as tail-recursive (accumulator pattern) or as an iterative loop \
                  to recover Sync performance; the CPS trampoline gives this function \
                  unbounded recursion depth at ~5-10× per-call overhead",
+            )
+        })
+        .collect()
+}
+
+/// Drain `codegen`'s auto-CPS fallback collector and convert each
+/// event into a `W0002` info diagnostic. Mirrors
+/// `auto_promotion_diagnostics`' shape so both advisories flow
+/// through the same `DiagnosticEmitter` pipeline and respond to the
+/// caller's `--format` choice (JSON Lines vs human).
+///
+/// Suppression: setting `SIGIL_QUIET_AUTO_CPS_FALLBACK` to any
+/// non-empty value drops all collected events on the floor (returns
+/// an empty Vec). The events are still drained from the collector
+/// so the next pipeline run starts fresh.
+fn auto_cps_fallback_diagnostics() -> Vec<CompilerError> {
+    let events = codegen::take_auto_cps_fallback_events();
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let quiet = matches!(
+        std::env::var_os("SIGIL_QUIET_AUTO_CPS_FALLBACK"),
+        Some(v) if !v.is_empty()
+    );
+    if quiet {
+        return Vec::new();
+    }
+    let code = match errors::ErrorCode::new("W0002") {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    events
+        .into_iter()
+        .map(|ev| {
+            let msg = format!(
+                "fn `{}` has body shape unsupported by auto-CPS lowering; falling back to Sync ABI",
+                ev.name,
+            );
+            CompilerError::info(code, ev.name_span, msg).with_hint(
+                "restructure the recursive call to be in the outer match/if (run \
+                 `sigil explain W0002` for accepted shapes); or accept Sync ABI's \
+                 stack-fragility on deep recursion. Set SIGIL_QUIET_AUTO_CPS_FALLBACK \
+                 to silence this note in batch builds.",
             )
         })
         .collect()

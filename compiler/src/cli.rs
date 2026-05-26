@@ -219,6 +219,17 @@ flags:
                              (`<text_offset_hex>\\t<size_hex>\\t<demangled_name>`),
                              sorted by ascending text offset. Consumed by the
                              runtime profiler (SIGIL_CPU_PROFILE / SIGIL_ALLOC_PROFILE).
+
+environment variables (compile-time):
+    SIGIL_QUIET_AUTO_CPS_FALLBACK
+                             If set to any non-empty value, suppresses the
+                             `W0002` info diagnostic emitted when the auto-CPS
+                             gate routes a body shape it can't lower to Sync ABI.
+                             Run `sigil explain W0002` for the full diagnostic.
+                             Use in batch builds that want clean stderr; the
+                             demotion still happens, you just don't see the note.
+    SIGIL_RUNTIME_LIB        Override the path to the runtime static library
+                             linked into compiled binaries (default: bundled).
 ";
 
 #[cfg(test)]

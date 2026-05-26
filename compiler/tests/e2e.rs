@@ -221,6 +221,111 @@ fn compile_and_run_with_env(
     out
 }
 
+/// Like `compile_and_run` but ALSO returns the compile-step stderr
+/// (4-tuple: `(compile_stderr, stdout, run_stderr, exit_code)`). The
+/// positive-path `compile_and_run` helper asserts compile success and
+/// throws away `compile.stderr` — auto-CPS fallback tests need to
+/// observe the `[sigil] note: ...` line on a successful compile to
+/// prove the gate's fallback path actually ran (PR review R3.1: a
+/// runtime-only assertion on the same source could pass for unrelated
+/// reasons — e.g., a future colorer change that drops the
+/// auto-promotion entirely).
+fn compile_and_run_capturing_compile_stderr(
+    source: &str,
+    test_name: &str,
+) -> (String, String, String, i32) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let compile = Command::new(&sigil_bin)
+        .arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root)
+        .output()
+        .expect("failed to invoke sigil compiler");
+    let compile_stderr = String::from_utf8_lossy(&compile.stderr).into_owned();
+    assert!(
+        compile.status.success(),
+        "compile failed for {test_name}: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        compile_stderr,
+    );
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to execute compiled binary");
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    (compile_stderr, stdout, stderr, code)
+}
+
+/// Stable substring anchors for the auto-CPS fallback diagnostic.
+/// Iter-7 routed the note through the standard `DiagnosticEmitter`
+/// (W0002, info severity) instead of raw `eprintln!`, so the user-
+/// visible text now flows through the pipeline's structured-format
+/// machinery (`--format` choice; default JSON Lines). Tests anchor
+/// on the W-code and on the load-bearing message substring; both
+/// must be present together to consider the diagnostic fired.
+const W0002_CODE_ANCHOR: &str = "\"code\":\"W0002\"";
+const W0002_MESSAGE_ANCHOR: &str = "has body shape unsupported by auto-CPS lowering";
+
+/// Compile `source` (no extra env vars) and return `(compile_stderr,
+/// success)` without running the resulting binary. See
+/// `compile_capturing_compile_stderr_with_env` for the env-aware form.
+fn compile_capturing_compile_stderr(source: &str, test_name: &str) -> (String, bool) {
+    compile_capturing_compile_stderr_with_env(source, test_name, &[])
+}
+
+/// Compile `source` and return `(compile_stderr, success)` — does NOT
+/// run the resulting binary. `env_vars` are set on the COMPILE child
+/// process (distinct from `compile_and_run_with_env` which sets them
+/// on the runtime child). Used by auto-CPS-fallback diagnostic tests
+/// to assert on the compiler's stderr — the `[sigil] note: ...` line
+/// emitted from `compute_user_fn_abi`'s auto-promotion clause when a
+/// body shape can't be lowered by auto-CPS — and to verify the
+/// `SIGIL_QUIET_AUTO_CPS_FALLBACK` suppression knob.
+fn compile_capturing_compile_stderr_with_env(
+    source: &str,
+    test_name: &str,
+    env_vars: &[(&str, &str)],
+) -> (String, bool) {
+    let src_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_{}_{}.sigil",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::write(&src_path, source).expect("write source");
+    let root = workspace_root();
+    let sigil_bin = sigil_binary();
+    let bin_path =
+        std::env::temp_dir().join(format!("sigil_e2e_{}_{}", test_name, std::process::id()));
+    let mut cmd = Command::new(&sigil_bin);
+    cmd.arg(&src_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .current_dir(&root);
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+    let compile = cmd.output().expect("failed to invoke sigil compiler");
+    let _ = std::fs::remove_file(&src_path);
+    let _ = std::fs::remove_file(&bin_path);
+    (
+        String::from_utf8_lossy(&compile.stderr).into_owned(),
+        compile.status.success(),
+    )
+}
+
 /// Plan B' Stage 6.8 R5 finding 1 — discipline helper for negative
 /// e2e tests that pin specific compile-failure E-codes.
 ///
@@ -1101,6 +1206,283 @@ fn auto_cps_recursive_mod_by_zero_traps() {
     assert!(
         stderr.contains("sigil: arithmetic error: remainder by zero"),
         "expected remainder-by-zero banner; stderr={stderr:?}"
+    );
+}
+
+/// Category A — Collatz with nested-if arm body that contains the
+/// recursive call inside `1 + ...`. Before the fix this panicked with
+/// "codegen Phase 4e: CPS-ABI fn `collatz_steps` body is not a simple
+/// tail perform ..." because the auto-promotion gate committed to
+/// CPS-ABI without checking that the body's branch structure
+/// decomposes cleanly. The defensive fix routes this fn to Sync ABI
+/// (correct, just stack-unsafe at adversarial depth — same as
+/// pre-auto-promotion behavior).
+#[test]
+fn auto_cps_collatz_nested_if_arm_falls_back_to_sync_cleanly() {
+    let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
+                  match n {\n\
+                  1 => 0,\n\
+                  _ => {\n\
+                  if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n\
+                  else          { 1 + collatz_steps(n * 3 + 1) }\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { collatz_steps(27) }\n";
+    // Strengthened per PR review R3.1 (rev2): also assert the
+    // fallback diagnostic note fired. Without this, a future change
+    // that drops `collatz_steps` from `auto_promotions` entirely
+    // would silently pass this test for unrelated reasons — the
+    // exit code would still be 111 under any plain Sync compilation.
+    let (compile_stderr, _stdout, run_stderr, code) =
+        compile_and_run_capturing_compile_stderr(source, "auto_cps_collatz_nested_if");
+    assert_eq!(code, 111, "Collatz(27) = 111 steps; stderr={run_stderr:?}");
+    assert!(
+        compile_stderr.contains(W0002_CODE_ANCHOR)
+            && compile_stderr.contains("fn `collatz_steps`")
+            && compile_stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected W0002 fallback diagnostic naming collatz_steps; \
+         compile_stderr={compile_stderr:?}"
+    );
+}
+
+/// Category A — rec call inside a handler op arm body, with the
+/// fn's outer effect row purely-discharged so auto-promotion fires.
+///
+/// CRITICAL setup:
+///   - The fn's outer row MUST be `![]`. With `![Step]` the colorer
+///     marks the fn Cps via the effect (color.rs:466) before
+///     auto-promotion runs (color.rs:269-272 requires
+///     `LocalColor::Native`), so the gate never runs and this test
+///     would silently not exercise the Handle walker (the original
+///     iter 4 mistake — surfaced by the diagnostic-note assertion).
+///   - The Handle's body `perform Step.tick()` does NOT taint
+///     loop_n's color, because `find_any_perform_in_expr`'s Handle
+///     arm (color.rs:616-632) explicitly skips the wrapped body
+///     (handlers discharge their wrapped body's row). The arm
+///     bodies ARE walked for perform, but here the op arm body is
+///     `loop_n(n - 1)` (a Call, no perform). So loop_n stays Native
+///     and gets auto-promoted via its non-tail self-recursion at
+///     the `loop_n(n - 1)` site inside the op arm.
+///   - The recursive call lives inside `Handle.op_arms[0].body`.
+///     The auto-CPS branch analyzer's peeler doesn't recurse into
+///     Handle, so the arm classifies as `BaseCase(Handle{...})`.
+///     The Handle-walker check in `expr_contains_recursive_call`
+///     (PR review R1#1 / R2#1) is what detects the buried rec
+///     call and routes loop_n to Sync ABI.
+///
+/// What this test pins end-to-end:
+///   1. loop_n compiles + runs (exit 0).
+///   2. The auto-CPS fallback diagnostic fires for loop_n, proving
+///      the Handle-walker code path actually ran. Without walking
+///      `op_arms[i].body`, the walker would return false, the
+///      gate would commit to Cps, and the body emit would ICE.
+#[test]
+fn auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly() {
+    let source = "effect Step { tick: () -> Int }\n\
+                  fn loop_n(n: Int) -> Int ![] {\n\
+                  if n == 0 { 0 }\n\
+                  else {\n\
+                  handle perform Step.tick() with {\n\
+                  Step.tick(k) => loop_n(n - 1),\n\
+                  }\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { loop_n(3) }\n";
+    let (compile_stderr, _stdout, run_stderr, code) =
+        compile_and_run_capturing_compile_stderr(source, "auto_cps_rec_in_handle_arm");
+    assert_eq!(
+        code, 0,
+        "loop_n recurses through handler arm and returns 0; stderr={run_stderr:?}"
+    );
+    assert!(
+        compile_stderr.contains(W0002_CODE_ANCHOR)
+            && compile_stderr.contains("fn `loop_n`")
+            && compile_stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected W0002 fallback diagnostic naming loop_n, proving the \
+         Handle walker caught the buried rec call (PR review R1#1 / \
+         R2#1); without the walker fix loop_n would commit to Cps and \
+         the body emit would ICE. compile_stderr={compile_stderr:?}"
+    );
+}
+
+/// Diagnostic — when the auto-CPS gate falls back to Sync for a body
+/// it can't lower, the compiler emits a `W0002` info diagnostic
+/// exactly once per source fn. Dedup spans the two
+/// `compute_user_fn_abi_with_span` call sites (per-fn ABI selection
+/// and `p20_silent_miscompile_check`). The diagnostic includes the
+/// fn name, source location (via the standard `DiagnosticEmitter`
+/// span fields), and a hint.
+///
+/// PR review issues: R1#3 (add diagnostic at all), R3.2 (rev1)
+/// (assert exactly-once not "at least once"), R4 rev1 #1 (route
+/// through the W-code infrastructure not raw eprintln).
+#[test]
+fn auto_cps_fallback_emits_diagnostic_note_exactly_once() {
+    let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
+                  match n {\n\
+                  1 => 0,\n\
+                  _ => {\n\
+                  if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n\
+                  else          { 1 + collatz_steps(n * 3 + 1) }\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { collatz_steps(1) }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "auto_cps_fallback_diag");
+    assert!(success, "compile must succeed; stderr={stderr:?}");
+    let count = stderr.matches(W0002_CODE_ANCHOR).count();
+    assert_eq!(
+        count, 1,
+        "W0002 must fire exactly once per source fn (dedup across the \
+         per-fn-ABI loop + p20_silent_miscompile_check call sites); \
+         got {count} occurrences: stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("fn `collatz_steps`"),
+        "expected diagnostic message to name collatz_steps; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains(W0002_MESSAGE_ANCHOR),
+        "expected the load-bearing message substring \
+         (`{W0002_MESSAGE_ANCHOR}`); stderr={stderr:?}"
+    );
+    // Source location is part of the structured diagnostic (PR review
+    // R3.5 rev1): users should be able to jump to the fn without
+    // grepping. The JSON line carries it in the file/line/column
+    // fields — anchor on the `.sigil"` substring (the file field
+    // ends in `.sigil` for a sigil source, followed by `"`).
+    assert!(
+        stderr.contains(".sigil\""),
+        "expected source-location field in W0002 diagnostic; \
+         stderr={stderr:?}"
+    );
+}
+
+/// Negative gate test — pure-recursive fns with body shapes the
+/// auto-CPS analyzer DOES decompose cleanly (here: `sum_to` with the
+/// canonical `if base { 0 } else { n + recurse(n - 1) }` shape) must
+/// stay on Cps ABI. The defensive gate must not demote them to Sync,
+/// otherwise the stack-safety win from PR #190 silently regresses.
+/// We check the absence of the fallback diagnostic note (which the
+/// gate emits on every demotion). PR review issue R2#5.
+#[test]
+fn auto_cps_decomposable_body_stays_on_cps_no_fallback_note() {
+    let source = "fn sum_to(n: Int) -> Int ![] {\n\
+                  if n == 0 { 0 }\n\
+                  else { n + sum_to(n - 1) }\n\
+                  }\n\
+                  fn main() -> Int ![] { sum_to(5) }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "auto_cps_sum_to_stays_cps");
+    assert!(success, "compile must succeed; stderr={stderr:?}");
+    // Two complementary assertions (PR review R3.5 rev2 — avoid
+    // coupling the test solely to one phrasing of the note text):
+    //   1) No W0002 diagnostic anywhere — sum_to is the only fn that
+    //      could plausibly fall back (main doesn't go through the
+    //      gate), so W0002 absence is decisive.
+    //   2) Belt-and-braces: no line mentions sum_to AND the load-
+    //      bearing message substring together — guards against a
+    //      future W-code rename that keeps the message intact.
+    //
+    // Note: W0001 (auto-promotion to CPS) IS expected to fire for
+    // sum_to (non-tail recursive Native fn), so a generic
+    // `stderr.contains("sum_to")` would be true via W0001. The W0002
+    // anchor is what isolates the fallback-specific signal.
+    assert!(
+        !stderr.contains(W0002_CODE_ANCHOR),
+        "sum_to has a Cps-lowerable body; gate must not emit W0002 \
+         (no fallback diagnostic expected). stderr={stderr:?}"
+    );
+    let lines_mentioning_sum_to_fallback = stderr
+        .lines()
+        .filter(|l| l.contains("sum_to") && l.contains(W0002_MESSAGE_ANCHOR))
+        .count();
+    assert_eq!(
+        lines_mentioning_sum_to_fallback, 0,
+        "no fallback line should mention sum_to; stderr={stderr:?}"
+    );
+}
+
+/// `SIGIL_QUIET_AUTO_CPS_FALLBACK` is a published suppression knob
+/// for batch builds. Setting it to any non-empty value must suppress
+/// the auto-CPS fallback note on stderr. PR review R3.2 (rev2). The
+/// env var is part of this PR's new public surface; without a test,
+/// a future refactor could silently drop the suppression check.
+#[test]
+fn auto_cps_fallback_note_suppressed_by_quiet_env_var() {
+    let source = "fn collatz_steps(n: Int) -> Int ![] {\n\
+                  match n {\n\
+                  1 => 0,\n\
+                  _ => {\n\
+                  if n % 2 == 0 { 1 + collatz_steps(n / 2) }\n\
+                  else          { 1 + collatz_steps(n * 3 + 1) }\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] { collatz_steps(1) }\n";
+    let (stderr, success) = compile_capturing_compile_stderr_with_env(
+        source,
+        "auto_cps_fallback_quiet",
+        &[("SIGIL_QUIET_AUTO_CPS_FALLBACK", "1")],
+    );
+    assert!(success, "compile must succeed; stderr={stderr:?}");
+    assert!(
+        !stderr.contains(W0002_CODE_ANCHOR),
+        "SIGIL_QUIET_AUTO_CPS_FALLBACK=1 must suppress all W0002 \
+         emissions; stderr={stderr:?}"
+    );
+}
+
+/// Category A baseline reconciliation — `consume` was one of the 10
+/// v1.1.0 baseline ICE-class failures. With this PR it compiles +
+/// runs cleanly, BUT it reaches Sync ABI via the pre-existing
+/// `body_has_non_trivial_non_recursive_calls` branch (the
+/// `int_eq(idx, 0)` call inside `consume` is a non-SCC, non-ctor
+/// call, so that earlier gate rejects the fn before the new
+/// `auto_cps_body_is_lowerable` gate runs). Consequence: no W0002
+/// diagnostic fires for consume — the W0002 emission happens only
+/// from inside the new lowerability gate. So this test is a
+/// regression test for the prior-Sync path (proves consume still
+/// compiles + runs), not coverage for the new gate. Renamed (PR
+/// review R4 rev1 #5) to reflect what's actually pinned.
+#[test]
+fn auto_cps_consume_with_buried_recursion_stays_sync_via_pre_existing_gate() {
+    let source = "import std.list\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn int_eq(a: Int, b: Int) -> Bool ![] { a == b }\n\
+                  fn consume(avail: List[Bool], idx: Int) -> List[Bool] ![] {\n\
+                  match avail {\n\
+                  Nil => Nil,\n\
+                  Cons(v, rest_v) => match int_eq(idx, 0) {\n\
+                  true  => Cons(false, rest_v),\n\
+                  false => Cons(v, consume(rest_v, idx - 1)),\n\
+                  },\n\
+                  }\n\
+                  }\n\
+                  fn main() -> Int ![] {\n\
+                  match consume(Cons(true, Cons(true, Cons(true, Nil))), 1) {\n\
+                  Nil => 0,\n\
+                  Cons(_, _) => 1,\n\
+                  }\n\
+                  }\n";
+    let (compile_stderr, _stdout, run_stderr, code) =
+        compile_and_run_capturing_compile_stderr(source, "auto_cps_rec_in_ctor_arg");
+    assert_eq!(
+        code, 1,
+        "consume returns a non-empty list; stderr={run_stderr:?}"
+    );
+    // Anchor on the W-code: consume does not fire W0002 because the
+    // pre-existing `body_has_non_trivial_non_recursive_calls` branch
+    // routes it to Sync before the new lowerability gate runs.
+    let consume_w0002 = compile_stderr
+        .lines()
+        .filter(|l| l.contains(W0002_CODE_ANCHOR) && l.contains("fn `consume`"))
+        .count();
+    assert_eq!(
+        consume_w0002, 0,
+        "consume falls back via the pre-existing gate, not the new \
+         lowerability gate — no W0002 expected for consume. \
+         compile_stderr={compile_stderr:?}"
     );
 }
 

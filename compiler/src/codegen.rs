@@ -186,8 +186,112 @@ enum UserFnAbi {
 /// observable behavior for the `compute_user_fn_abi_sync_when_
 /// color_native_short_circuits_regardless_of_body_shape` test
 /// pinning.
+/// A single auto-CPS gate fallback event recorded during codegen.
+/// `compute_user_fn_abi_with_span`'s auto-promotion clause records
+/// one of these per source fn whose body it routes to Sync (because
+/// the auto-CPS analyzer can't decompose the body into per-branch
+/// recursive steps). `pipeline::auto_cps_fallback_diagnostics` drains
+/// the collector after `emit_object` and converts each event into a
+/// `W0002` `CompilerError`, emitted via the standard
+/// `DiagnosticEmitter` alongside `W0001` auto-promotion notes.
+#[derive(Clone, Debug)]
+pub struct AutoCpsFallbackEvent {
+    pub name: String,
+    pub name_span: crate::errors::Span,
+}
+
+/// Per-process collector for auto-CPS fallback events. Keyed by fn
+/// name so each call from `compute_user_fn_abi_with_span` for the
+/// same fn produces at most one event regardless of how many
+/// production callers invoke the gate (per-fn ABI selection loop +
+/// `p20_silent_miscompile_check`).
+///
+/// Caveat (PR review R4 rev1 #2): the `name` parameter is the
+/// post-monomorphization mangled name. For a generic fn instantiated
+/// as multiple mono-instances, each mangled name dedups separately
+/// — N mono-instances of the same source fn produce N events. In
+/// practice the body shape is identical across mono-instances of a
+/// generic, so the N events all have the same message at the same
+/// source location, which is informative (one note per
+/// instantiation). The cleaner "dedup by source name" requires
+/// demangling, which would tie this collector to the monomorphizer's
+/// naming scheme — not worth the coupling.
+fn auto_cps_fallback_collector(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, AutoCpsFallbackEvent>> {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, AutoCpsFallbackEvent>>,
+    > = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+/// Drain the auto-CPS fallback collector. Called once per pipeline
+/// run from `pipeline::auto_cps_fallback_diagnostics` after
+/// `codegen::emit_object` returns. Returns events in fn-name order.
+/// The collector is per-process; in unit-test builds the same
+/// process runs many tests, so consecutive tests that exercise the
+/// gate will see only the first emission. e2e tests launch a fresh
+/// sigil subprocess per test, so the collector is naturally reset
+/// per test.
+pub fn take_auto_cps_fallback_events() -> Vec<AutoCpsFallbackEvent> {
+    // `unwrap_or_else(|p| p.into_inner())` recovers from a poisoned
+    // mutex: a prior thread panicked while holding it, but the inner
+    // data is just diagnostic state — at worst we lose a few queued
+    // events. Better than crashing the compiler.
+    let mut guard = auto_cps_fallback_collector()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::mem::take(&mut *guard).into_values().collect()
+}
+
+/// Record an auto-CPS fallback event for later structured diagnostic
+/// emission. Per-process dedup keyed by fn name so each (mangled-)fn
+/// name produces exactly one event regardless of how many times
+/// `compute_user_fn_abi_with_span` is called for it — both production
+/// callers (per-fn ABI selection loop + `p20_silent_miscompile_check`)
+/// flow through here without producing duplicates.
+///
+/// The `SIGIL_QUIET_AUTO_CPS_FALLBACK` suppression knob is checked
+/// once per pipeline run by `pipeline::auto_cps_fallback_diagnostics`
+/// at drain time — not here — so the collector remains correct for
+/// in-process inspection (e.g., the
+/// `expr_contains_recursive_call_detects_call_inside_handle_op_arm`
+/// unit test could read it via `take_auto_cps_fallback_events` if
+/// needed) even under suppression.
+fn record_auto_cps_fallback(name: &str, name_span: &crate::errors::Span) {
+    let mut seen = auto_cps_fallback_collector()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.entry(name.to_string())
+        .or_insert_with(|| AutoCpsFallbackEvent {
+            name: name.to_string(),
+            name_span: name_span.clone(),
+        });
+}
+
+/// Thin wrapper around `compute_user_fn_abi_with_span` used by unit
+/// tests that don't have a source-fn `name_span` in scope. Synthesises
+/// a stub span — diagnostics emitted from this path show a synthetic
+/// location, but unit tests don't observe stderr anyway. The 2
+/// production callers (per-fn ABI selection loop +
+/// `p20_silent_miscompile_check`) call `compute_user_fn_abi_with_span`
+/// directly with the real `FnDecl::name_span` so users see the actual
+/// source location. Cfg-gated to test builds so production builds
+/// don't drag in the unused wrapper.
+#[cfg(test)]
 fn compute_user_fn_abi(
     name: &str,
+    body: &crate::ast::Block,
+    helper_params: &[crate::ast::Param],
+    colored: &ColoredProgram,
+    fns_by_name: &std::collections::BTreeMap<&str, &crate::ast::FnDecl>,
+) -> UserFnAbi {
+    let synth = crate::errors::Span::synthetic("compute_user_fn_abi");
+    compute_user_fn_abi_with_span(name, &synth, body, helper_params, colored, fns_by_name)
+}
+
+fn compute_user_fn_abi_with_span(
+    name: &str,
+    name_span: &crate::errors::Span,
     body: &crate::ast::Block,
     helper_params: &[crate::ast::Param],
     colored: &ColoredProgram,
@@ -497,7 +601,47 @@ fn compute_user_fn_abi(
         }
         scc_members.insert(name.to_string());
         if !body_has_non_trivial_non_recursive_calls(body, &scc_members, &ctors) {
-            return UserFnAbi::Cps;
+            // Defensive gate: the auto-CPS body emitter has a narrow
+            // set of accepted body shapes (simple tail perform; yield-
+            // then-X; chain_length=0 branched-cps-tail). If
+            // `analyze_auto_cps_body` can't decompose this body into
+            // per-branch recursive steps with non-empty `steps`, the
+            // body-emit's exhaustiveness `unreachable!` will fire
+            // ("codegen Phase 4e: CPS-ABI fn `X` body is not …
+            // invariant broken"). Validate the decomposition here and
+            // route to Sync ABI otherwise. Sync is correct for these
+            // pure-recursive fns; the stack-safety win that PR #190
+            // added under Cps ABI is *not* re-applied to this fn (it
+            // may stack-overflow on deep recursion under adversarial
+            // input).
+            //
+            // TODO(perf): `analyze_auto_cps_body` runs twice per
+            // auto-promotable fn — once here, once at body emit. For
+            // large recursive fns the duplicate walk is wasted work
+            // (typecheck still dominates, so not blocking). The next
+            // major auto-CPS refactor will rework this region — a
+            // memoization or threaded-result rewrite belongs in that
+            // patch. See the v2 auto-CPS plan for the tracked work.
+            let call_site_inst = &colored.mono.anf.checked.call_site_instantiations;
+            if auto_cps_body_is_lowerable(body, &scc_members, call_site_inst) {
+                return UserFnAbi::Cps;
+            }
+            // Body shape not lowerable by auto-CPS: fall through to
+            // Sync after recording an event for the pipeline to emit
+            // as a `W0002` info diagnostic. Without this, the demotion
+            // is silent — users would not discover their pure-recursive
+            // fn is stack-fragile until they hit the limit at runtime
+            // on adversarial input. `record_auto_cps_fallback` dedups
+            // across both `compute_user_fn_abi_with_span` call sites
+            // (per-fn ABI selection loop +
+            // `p20_silent_miscompile_check`) so each (mangled-)fn name
+            // produces exactly one event per process.
+            // `pipeline::auto_cps_fallback_diagnostics` checks
+            // `SIGIL_QUIET_AUTO_CPS_FALLBACK` at drain time and
+            // suppresses emission (the collector still holds the
+            // events; only the diagnostic output is silenced) so
+            // batch builds that want clean stderr can opt out.
+            record_auto_cps_fallback(name, name_span);
         }
         // Genuine non-recursive fn calls in recursive arms: stay Sync.
     }
@@ -9879,8 +10023,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             let normalized_body =
                 normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
             let body_for_abi = normalized_body.as_ref().unwrap_or(body_after_perform_norm);
-            let abi =
-                compute_user_fn_abi(&f.name, body_for_abi, &f.params, &cc.colored, &fns_by_name);
+            let abi = compute_user_fn_abi_with_span(
+                &f.name,
+                &f.name_span,
+                body_for_abi,
+                &f.params,
+                &cc.colored,
+                &fns_by_name,
+            );
             let (sig, param_tys, ret_ty) = match abi {
                 UserFnAbi::Sync => {
                     // Plan D Task 111b — Sync ABI:
@@ -30843,7 +30993,14 @@ fn p20_silent_miscompile_check(
         let body_after_perform_norm = perform_norm.as_ref().unwrap_or(body_after_lift);
         let normalized = normalize_tail_perform_body(body_after_perform_norm, &f.return_type);
         let body_for_abi = normalized.as_ref().unwrap_or(body_after_perform_norm);
-        let abi = compute_user_fn_abi(&f.name, body_for_abi, &f.params, colored, fns_by_name);
+        let abi = compute_user_fn_abi_with_span(
+            &f.name,
+            &f.name_span,
+            body_for_abi,
+            &f.params,
+            colored,
+            fns_by_name,
+        );
         if abi != UserFnAbi::Sync {
             continue;
         }
@@ -32436,6 +32593,205 @@ fn analyze_auto_cps_body(
 ) -> Option<Vec<AutoCpsBranchKind>> {
     let tail = body.tail.as_ref()?;
     analyze_auto_cps_expr(tail, scc_members, call_site_instantiations)
+}
+
+/// Auto-CPS gate validator: returns true iff every branch produced by
+/// `analyze_auto_cps_body` is structurally lowerable. Returns false in
+/// any of these cases:
+///   - The analyzer returns `None` (no tail expression).
+///   - A branch is `Recursive` with an empty `steps` list.
+///   - A branch is `BaseCase(expr)` but `expr` still contains a
+///     recursive call into `scc_members` buried inside an
+///     `Expr::If` / `Expr::Match` / `Expr::Block` shape that
+///     `extract_first_recursive_call` doesn't recurse into. The
+///     analyzer classifies such branches as `BaseCase` (its peeler
+///     gives up at If/Match), but the call is still there at emit
+///     time — and the synth-cont allocator counted zero recursive
+///     branches for it, so dispatch trips the Phase 4e "CPS-ABI
+///     invariant broken" unreachable!.
+///
+/// Used by `compute_user_fn_abi`'s auto-promotion clause to route
+/// such fns to `UserFnAbi::Sync` instead of `UserFnAbi::Cps`. Sync
+/// ABI on an auto-promoted (pure-recursive) fn is correct; the stack-
+/// safety win that PR #190 added under Cps ABI is *not* re-applied
+/// here, so deep recursion under adversarial input may stack-overflow.
+/// The native extension that handles these shapes under Cps ABI is
+/// tracked as plan P4 (`auto-cps-nested-branch-support`); shipping
+/// Sync fallback is strictly better than the ICE this gate replaces.
+fn auto_cps_body_is_lowerable(
+    body: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    match analyze_auto_cps_body(body, scc_members, call_site_instantiations) {
+        None => false,
+        Some(branches) => branches.iter().all(|b| match b {
+            AutoCpsBranchKind::BaseCase(e) => {
+                !expr_contains_recursive_call(e, scc_members, call_site_instantiations)
+            }
+            AutoCpsBranchKind::Recursive { steps, .. } => !steps.is_empty(),
+        }),
+    }
+}
+
+/// Walk `expr` and return true if any subexpression is a recursive
+/// call into `scc_members` (matched via `call_site_instantiations`).
+///
+/// Companion to `auto_cps_body_is_lowerable`: catches the case where
+/// `analyze_single_branch_expr` returns `BaseCase(expr)` because its
+/// `extract_first_recursive_call` peeler doesn't recurse into
+/// `Expr::If` / `Expr::Match` / `Expr::Block` etc., but `expr` still
+/// holds a recursive call that the body emitter can't decompose.
+fn expr_contains_recursive_call(
+    expr: &crate::ast::Expr,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    use crate::ast::Expr;
+    match expr {
+        Expr::Call { callee, args, .. } => {
+            if let Expr::Ident(name, ident_span) = callee.as_ref() {
+                if let Some(inst) = call_site_instantiations.get(ident_span) {
+                    if &inst.name == name && scc_members.contains(&inst.name) {
+                        return true;
+                    }
+                }
+            }
+            expr_contains_recursive_call(callee, scc_members, call_site_instantiations)
+                || args
+                    .iter()
+                    .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations))
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_contains_recursive_call(lhs, scc_members, call_site_instantiations)
+                || expr_contains_recursive_call(rhs, scc_members, call_site_instantiations)
+        }
+        Expr::Unary { operand, .. } => {
+            expr_contains_recursive_call(operand, scc_members, call_site_instantiations)
+        }
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            expr_contains_recursive_call(cond, scc_members, call_site_instantiations)
+                || block_contains_recursive_call(then_block, scc_members, call_site_instantiations)
+                || block_contains_recursive_call(else_block, scc_members, call_site_instantiations)
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            if expr_contains_recursive_call(scrutinee, scc_members, call_site_instantiations) {
+                return true;
+            }
+            arms.iter().any(|arm| {
+                expr_contains_recursive_call(&arm.body, scc_members, call_site_instantiations)
+            })
+        }
+        Expr::Block(b) => block_contains_recursive_call(b, scc_members, call_site_instantiations),
+        Expr::Perform(p) => p
+            .args
+            .iter()
+            .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations)),
+        // Lambdas are closure-converted to `Expr::ClosureRecord` before
+        // `compute_user_fn_abi` runs (closure conversion lives upstream
+        // of codegen). Recursing here is defensive coverage in case
+        // pass order changes or a future pass re-introduces lambdas at
+        // this stage.
+        Expr::Lambda { body, .. } => {
+            expr_contains_recursive_call(body, scc_members, call_site_instantiations)
+        }
+        Expr::ClosureRecord { env_exprs, .. } => env_exprs
+            .iter()
+            .any(|e| expr_contains_recursive_call(e, scc_members, call_site_instantiations)),
+        Expr::RecordLit { fields, .. } => fields
+            .iter()
+            .any(|f| expr_contains_recursive_call(&f.value, scc_members, call_site_instantiations)),
+        // Handle walks `body` + `return_arm.body` + each
+        // `op_arms[i].body`. This is LOAD-BEARING for currently-
+        // reachable code: a fn whose body contains
+        // `handle <wrapped> with { ... arm => recurse(...) }` and
+        // whose outer effect row discharges to `![]` IS eligible
+        // for auto-promotion. The colorer's perform-finder
+        // (color.rs:616-632) skips the wrapped body (handlers
+        // discharge the body's row from the parent fn's color
+        // perspective), so a fn with `handle perform E.op() with
+        // { ... }` and `![]` outer row stays `LocalColor::Native`
+        // — auto-promotion fires if the body has non-tail
+        // self/SCC recursion. The `auto_cps_recursive_call_in_-
+        // handle_op_arm_falls_back_to_sync_cleanly` e2e test pins
+        // this end-to-end; the `expr_contains_recursive_call_-
+        // detects_call_inside_handle_op_arm` unit test pins the
+        // walker directly with a synthetic Handle. PR #199 R1#1 /
+        // R2#1.
+        Expr::Handle {
+            body,
+            return_arm,
+            op_arms,
+            ..
+        } => {
+            if expr_contains_recursive_call(body, scc_members, call_site_instantiations) {
+                return true;
+            }
+            if let Some(ra) = return_arm {
+                if expr_contains_recursive_call(&ra.body, scc_members, call_site_instantiations) {
+                    return true;
+                }
+            }
+            op_arms.iter().any(|arm| {
+                expr_contains_recursive_call(&arm.body, scc_members, call_site_instantiations)
+            })
+        }
+        Expr::Tuple { elems, .. } => elems
+            .iter()
+            .any(|e| expr_contains_recursive_call(e, scc_members, call_site_instantiations)),
+        Expr::Ident(_, _)
+        | Expr::IntLit(_, _)
+        | Expr::FloatLit(_, _)
+        | Expr::StringLit(_, _)
+        | Expr::BoolLit(_, _)
+        | Expr::CharLit(_, _)
+        | Expr::UnitLit(_)
+        | Expr::ClosureEnvLoad { .. } => false,
+    }
+}
+
+fn block_contains_recursive_call(
+    block: &crate::ast::Block,
+    scc_members: &std::collections::BTreeSet<String>,
+    call_site_instantiations: &std::collections::BTreeMap<
+        crate::errors::Span,
+        crate::typecheck::GenericInstantiation,
+    >,
+) -> bool {
+    for stmt in &block.stmts {
+        let hit = match stmt {
+            crate::ast::Stmt::Let(l) => {
+                expr_contains_recursive_call(&l.value, scc_members, call_site_instantiations)
+            }
+            crate::ast::Stmt::Expr(e) => {
+                expr_contains_recursive_call(e, scc_members, call_site_instantiations)
+            }
+            crate::ast::Stmt::Perform(p) => p
+                .args
+                .iter()
+                .any(|a| expr_contains_recursive_call(a, scc_members, call_site_instantiations)),
+        };
+        if hit {
+            return true;
+        }
+    }
+    if let Some(tail) = &block.tail {
+        return expr_contains_recursive_call(tail, scc_members, call_site_instantiations);
+    }
+    false
 }
 
 fn analyze_auto_cps_expr(
@@ -38935,5 +39291,129 @@ mod tests {
         assert_eq!(args.len(), 2, "args slice should preserve length");
         assert!(matches!(args[0], Expr::IntLit(1, _)));
         assert!(matches!(args[1], Expr::Ident(ref n, _) if n == "xs"));
+    }
+
+    /// Pins `expr_contains_recursive_call`'s Handle-arm walking
+    /// (PR #199 R1#1 / R2#1; corrected by R4 rev2 R4.1). The walker
+    /// IS load-bearing for currently-reachable code — see the
+    /// production-side comment in `codegen.rs`'s `Expr::Handle` arm
+    /// for the reachability analysis: a fn with `![]` outer row and
+    /// `handle <wrapped> with { ... arm => recurse(...) }` body stays
+    /// `LocalColor::Native` (the colorer's perform-finder at
+    /// color.rs:616-632 skips the wrapped body and only walks the
+    /// arm bodies, but the arm body here is a Call not a perform),
+    /// gets auto-promoted via non-tail self-recursion, and the gate
+    /// runs.
+    ///
+    /// End-to-end coverage lives in
+    /// `auto_cps_recursive_call_in_handle_op_arm_falls_back_to_sync_cleanly`
+    /// (e2e). This unit test pins the walker directly so a future
+    /// regression that changes the e2e test's specific source shape
+    /// (or breaks the colorer-keeps-loop_n-Native invariant) doesn't
+    /// also silently break the walker's behaviour — the unit test
+    /// would fail first.
+    ///
+    /// Construction strategy: build a synthetic
+    /// `BTreeMap<Span, GenericInstantiation>` that maps a
+    /// chosen ident_span to the rec callee's name, then assemble
+    /// an `Expr::Handle` whose op-arm body is a `Call` to that
+    /// ident. `scc_members = {"recurse_target"}`.
+    #[test]
+    fn expr_contains_recursive_call_detects_call_inside_handle_op_arm() {
+        use crate::ast::{Expr, HandleArmParam, HandleOpArm, PerformExpr};
+        use crate::errors::Span;
+        use crate::typecheck::GenericInstantiation;
+
+        let span = Span::synthetic("handle_walker_test");
+        let ident_span = Span::synthetic("handle_walker_test_ident");
+
+        let mut call_site_instantiations: std::collections::BTreeMap<Span, GenericInstantiation> =
+            std::collections::BTreeMap::new();
+        call_site_instantiations.insert(
+            ident_span.clone(),
+            GenericInstantiation {
+                name: "recurse_target".to_string(),
+                type_args: Vec::new(),
+            },
+        );
+
+        let mut scc_members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        scc_members.insert("recurse_target".to_string());
+
+        // op-arm body: `recurse_target()` — a Call whose callee
+        // ident-span maps to `recurse_target` in scc_members.
+        let rec_call = Expr::Call {
+            callee: Box::new(Expr::Ident("recurse_target".to_string(), ident_span)),
+            args: Vec::new(),
+            span: span.clone(),
+        };
+
+        // Handle whose op-arm body is the rec call. The Handle's
+        // own body is a `perform`; without walking op_arms, the
+        // walker would only see the perform and return false.
+        let handle_with_rec_call_in_op_arm = Expr::Handle {
+            body: Box::new(Expr::Perform(PerformExpr {
+                effect: "Step".to_string(),
+                op: "tick".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            return_arm: None,
+            op_arms: vec![HandleOpArm {
+                effect: "Step".to_string(),
+                effect_span: span.clone(),
+                op: "tick".to_string(),
+                op_span: span.clone(),
+                params: Vec::<HandleArmParam>::new(),
+                k_name: "k".to_string(),
+                k_span: span.clone(),
+                body: rec_call,
+                span: span.clone(),
+            }],
+            span: span.clone(),
+        };
+
+        assert!(
+            expr_contains_recursive_call(
+                &handle_with_rec_call_in_op_arm,
+                &scc_members,
+                &call_site_instantiations,
+            ),
+            "Handle walker must descend into op_arms[i].body and find \
+             the rec call to `recurse_target`; this is the PR review \
+             R1#1 / R2#1 fix"
+        );
+
+        // Negative control: same Handle shape but op-arm body is
+        // a plain literal (no rec call). Walker must return false.
+        let handle_without_rec_call = Expr::Handle {
+            body: Box::new(Expr::Perform(PerformExpr {
+                effect: "Step".to_string(),
+                op: "tick".to_string(),
+                args: Vec::new(),
+                span: span.clone(),
+            })),
+            return_arm: None,
+            op_arms: vec![HandleOpArm {
+                effect: "Step".to_string(),
+                effect_span: span.clone(),
+                op: "tick".to_string(),
+                op_span: span.clone(),
+                params: Vec::<HandleArmParam>::new(),
+                k_name: "k".to_string(),
+                k_span: span.clone(),
+                body: Expr::IntLit(0, span.clone()),
+                span: span.clone(),
+            }],
+            span,
+        };
+        assert!(
+            !expr_contains_recursive_call(
+                &handle_without_rec_call,
+                &scc_members,
+                &call_site_instantiations,
+            ),
+            "Handle without rec call in op_arm must not be flagged"
+        );
     }
 }
