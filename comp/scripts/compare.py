@@ -69,7 +69,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from typing import Optional
 
@@ -89,6 +92,17 @@ FULL_MODELS = ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"]
 DEFAULT_MAX_CONCURRENCY = 4
 DEFAULT_REQUEST_TIMEOUT_S = 180
 DEFAULT_EVAL_TIMEOUT_S = 60
+
+# Ollama-backed models are addressed via the `ollama:<model_tag>`
+# prefix in `--models` (e.g. `ollama:qwen2.5-coder:7b`). The endpoint
+# is configured via `--ollama-host` or the `OLLAMA_HOST` env var. A
+# `:11434` port-less HTTPS URL is the typical nginx-fronted shape;
+# the trailing slash is stripped at use.
+OLLAMA_MODEL_PREFIX = "ollama:"
+# 7B Q4 on a Jetson Orin Nano (~10-30 tok/s) commonly takes 30s-2min
+# per response on the Sigil corpus's prompt/response sizes. The
+# Claude-side timeout (180s) is too tight; 600s gives 5-10× headroom.
+DEFAULT_OLLAMA_REQUEST_TIMEOUT_S = 600
 
 # Token in `comp/contexts/sigil.md` that gets substituted with the
 # contents of `spec/language.md` at session-prep time. Other languages
@@ -488,6 +502,207 @@ def call_claude_cli(
 
 
 # ---------------------------------------------------------------------------
+# Ollama HTTP client (OpenAI-compat /v1/chat/completions)
+# ---------------------------------------------------------------------------
+#
+# Why a separate path from Claude Code:
+#   - Ollama has no server-side session persistence. Each request is
+#     stateless. We synthesise a `session_id` (uuid4) at first turn
+#     and keep the message history client-side in
+#     `_OLLAMA_SESSIONS`, then send the full history on resume.
+#   - No subscription/auth in Sigil's typical Ollama deployment
+#     (nginx-fronted local endpoint); no env-scrubbing dance.
+#   - Latency is ~10-100× Claude's: 30s-2min vs ~1-5s on a small
+#     prompt. Hence `DEFAULT_OLLAMA_REQUEST_TIMEOUT_S = 600` instead
+#     of 180 used for Claude.
+#
+# Retry shape mirrors `call_claude_cli`: 3 attempts, 2s/4s backoffs,
+# only on network-transient errors (timeout, connection refused,
+# 5xx). 4xx (bad request) and JSON parse failures bubble up as hard
+# errors.
+
+_OLLAMA_HOST: Optional[str] = None
+_OLLAMA_SESSIONS_LOCK = threading.Lock()
+_OLLAMA_SESSIONS: dict[str, list[dict]] = {}
+
+
+class _OllamaTransientError(RuntimeError):
+    """Ollama transient failure: connection refused, timeout, 5xx.
+    Caller's retry loop catches this and re-attempts."""
+
+
+def _set_ollama_host(host: Optional[str]) -> None:
+    """Configure the module-level Ollama endpoint. Called once at
+    `main()` time from the CLI flag or `OLLAMA_HOST` env var. Trailing
+    slash stripped so callers can concatenate `/v1/...` cleanly."""
+    global _OLLAMA_HOST
+    if host is None:
+        _OLLAMA_HOST = None
+        return
+    _OLLAMA_HOST = host.rstrip("/")
+
+
+def _call_ollama_once(
+    *,
+    model: str,
+    messages: list[dict],
+    timeout_s: int,
+) -> str:
+    """One POST to `${OLLAMA_HOST}/v1/chat/completions`. Returns the
+    assistant content string. Raises `_OllamaTransientError` on
+    timeout/connection/5xx; raises `RuntimeError` on hard failures
+    (4xx, malformed JSON, missing fields)."""
+    if _OLLAMA_HOST is None:
+        raise RuntimeError(
+            "Ollama host not configured; pass --ollama-host or set "
+            "OLLAMA_HOST"
+        )
+    url = f"{_OLLAMA_HOST}/v1/chat/completions"
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "stream": False,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        if 500 <= e.code < 600:
+            raise _OllamaTransientError(
+                f"ollama HTTP {e.code} at {url}: {e.reason}"
+            ) from e
+        raise RuntimeError(
+            f"ollama HTTP {e.code} at {url}: {e.reason}"
+        ) from e
+    except urllib.error.URLError as e:
+        # Network-level: DNS failure, connection refused, TLS handshake
+        # failure, timeout. All transient — backoff + retry.
+        raise _OllamaTransientError(
+            f"ollama URL error at {url}: {e.reason}"
+        ) from e
+    except TimeoutError as e:
+        raise _OllamaTransientError(
+            f"ollama request timed out after {timeout_s}s at {url}"
+        ) from e
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"ollama returned non-JSON from {url}: {body[:500]!r}"
+        ) from e
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(
+            f"ollama response missing choices[0].message.content at "
+            f"{url}: {body[:500]!r}"
+        ) from e
+
+
+def call_ollama(
+    *,
+    model: str,
+    user_message: str,
+    system: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    timeout_s: int = DEFAULT_OLLAMA_REQUEST_TIMEOUT_S,
+) -> tuple[str, str]:
+    """Mirror of `call_claude_cli` for Ollama. Returns
+    `(response_text, session_id)`. On a first turn (`system` set) we
+    mint a uuid4 session id and stash the [system, user, assistant]
+    triple in `_OLLAMA_SESSIONS`. On resume, we look up the existing
+    history, append [user, assistant], and POST the full message
+    list (Ollama has no server-side state)."""
+    if (system is None) == (resume_session_id is None):
+        raise ValueError(
+            "call_ollama: pass exactly one of `system` (new session) "
+            "or `resume_session_id` (continuation)"
+        )
+
+    if system is not None:
+        session_id = str(uuid.uuid4())
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_message},
+        ]
+    else:
+        with _OLLAMA_SESSIONS_LOCK:
+            history = _OLLAMA_SESSIONS.get(resume_session_id)
+        if history is None:
+            raise RuntimeError(
+                f"call_ollama: resume_session_id {resume_session_id!r} "
+                f"not found in client-side history (was the first turn "
+                f"this process, same run?)"
+            )
+        session_id = resume_session_id
+        messages = history + [{"role": "user", "content": user_message}]
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(CLI_RETRY_ATTEMPTS):
+        if attempt > 0:
+            time.sleep(CLI_RETRY_BACKOFFS_S[attempt - 1])
+        try:
+            content = _call_ollama_once(
+                model=model, messages=messages, timeout_s=timeout_s,
+            )
+        except _OllamaTransientError as e:
+            last_exc = e
+            continue
+
+        # Success: store the updated history (system+user+assistant for
+        # new sessions; old_history+user+assistant for resumes) so a
+        # subsequent edit-loop turn against this session_id sees the
+        # full context.
+        updated = messages + [{"role": "assistant", "content": content}]
+        with _OLLAMA_SESSIONS_LOCK:
+            _OLLAMA_SESSIONS[session_id] = updated
+        return content, session_id
+
+    raise RuntimeError(
+        f"ollama failed after {CLI_RETRY_ATTEMPTS} attempts: {last_exc}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Model dispatcher — picks Claude vs Ollama based on `model` prefix
+# ---------------------------------------------------------------------------
+
+
+def call_model(
+    *,
+    model: str,
+    user_message: str,
+    system: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+) -> tuple[str, str]:
+    """Dispatch a model call to the right provider. Models with the
+    `ollama:` prefix go to the local Ollama endpoint; everything else
+    goes through Claude Code's headless CLI. Per-provider timeouts
+    are applied automatically (Claude 180s, Ollama 600s)."""
+    if model.startswith(OLLAMA_MODEL_PREFIX):
+        ollama_model = model[len(OLLAMA_MODEL_PREFIX):]
+        return call_ollama(
+            model=ollama_model,
+            user_message=user_message,
+            system=system,
+            resume_session_id=resume_session_id,
+        )
+    return call_claude_cli(
+        model=model,
+        user_message=user_message,
+        system=system,
+        resume_session_id=resume_session_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Program extraction (per-language)
 # ---------------------------------------------------------------------------
 
@@ -663,20 +878,23 @@ def run_one_cell(
             first_attempt=None, edit_attempt=None, final_pass=False,
             error=f"system-prompt load failed: {e}",
         )
-    # `call_claude_cli` pins a fresh `--session-id <uuid4>` per
-    # attempt internally and returns the actually-used id so the
-    # edit-loop turn can resume against the exact same uuid. We don't
-    # pre-generate here — rotation per retry attempt is the wrapper's
-    # job, not the caller's.
+    # `call_model` dispatches to Claude Code's headless CLI or the
+    # Ollama HTTP adapter based on the `model` prefix
+    # (`ollama:<tag>` → Ollama; everything else → Claude). For
+    # Claude, the wrapper pins a fresh `--session-id <uuid4>` per
+    # attempt internally and returns the actually-used id; for
+    # Ollama, the wrapper mints a uuid4 and stashes the message
+    # history client-side. Either way the edit-loop turn resumes
+    # against the same id.
     try:
-        first_response, session_id = call_claude_cli(
+        first_response, session_id = call_model(
             model=model, system=system, user_message=prompt.prompt_text,
         )
     except Exception as e:
         return CellResult(
             prompt_id=prompt.id, language=language, model=model, run_idx=run_idx,
             first_attempt=None, edit_attempt=None, final_pass=False,
-            error=f"claude -p (first turn) failed: {e}",
+            error=f"model call (first turn) failed: {e}",
         )
     first_attempt = _execute_attempt(prompt.id, language, first_response)
     first_passed = first_attempt.eval is not None and first_attempt.eval.passed
@@ -688,14 +906,14 @@ def run_one_cell(
         )
     followup = _build_edit_followup(first_attempt, language)
     try:
-        edit_response, _ = call_claude_cli(
+        edit_response, _ = call_model(
             model=model, user_message=followup, resume_session_id=session_id,
         )
     except Exception as e:
         return CellResult(
             prompt_id=prompt.id, language=language, model=model, run_idx=run_idx,
             first_attempt=first_attempt, edit_attempt=None, final_pass=False,
-            error=f"claude -p (edit-loop turn) failed: {e}",
+            error=f"model call (edit-loop turn) failed: {e}",
         )
     edit_attempt = _execute_attempt(prompt.id, language, edit_response)
     edit_passed = edit_attempt.eval is not None and edit_attempt.eval.passed
@@ -984,7 +1202,18 @@ def main() -> int:
         default=None,
         help=f"Comma-separated model IDs. Default for iteration: "
              f"{','.join(DEFAULT_MODELS)}. Pass --full to use "
-             f"{','.join(FULL_MODELS)} instead.",
+             f"{','.join(FULL_MODELS)} instead. Ollama-hosted models "
+             f"use the `ollama:<model_tag>` prefix (e.g. "
+             f"`ollama:qwen2.5-coder:7b`); set --ollama-host or "
+             f"OLLAMA_HOST to point at the server.",
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=os.environ.get("OLLAMA_HOST"),
+        help="Base URL of the Ollama endpoint (e.g. "
+             "https://ollama.summercamp.eastharbor.casa). Required "
+             "when --models contains any `ollama:<tag>` entries. "
+             "Defaults to the OLLAMA_HOST env var.",
     )
     parser.add_argument(
         "--full",
@@ -1042,14 +1271,6 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    if shutil.which("claude") is None:
-        print(
-            "compare.py: `claude` binary not on PATH. Install Claude Code "
-            "and authenticate via `claude /login` or "
-            "`claude setup-token` + export CLAUDE_CODE_OAUTH_TOKEN.",
-            file=sys.stderr,
-        )
-        return 2
     if not PROMPTS_PATH.exists():
         print(f"compare.py: prompts missing at {PROMPTS_PATH}", file=sys.stderr)
         return 2
@@ -1084,6 +1305,38 @@ def main() -> int:
         langs_spec = args.langs
     else:
         langs_spec = ",".join(DEFAULT_LANGUAGES)
+
+    models_for_prereq_check = [s.strip() for s in models_spec.split(",") if s.strip()]
+    has_claude_model = any(
+        not m.startswith(OLLAMA_MODEL_PREFIX) for m in models_for_prereq_check
+    )
+    has_ollama_model = any(
+        m.startswith(OLLAMA_MODEL_PREFIX) for m in models_for_prereq_check
+    )
+    # Claude binary check only fires when at least one non-ollama
+    # model is requested — Ollama-only runs don't need claude on PATH.
+    if has_claude_model and shutil.which("claude") is None:
+        print(
+            "compare.py: `claude` binary not on PATH. Install Claude Code "
+            "and authenticate via `claude /login` or "
+            "`claude setup-token` + export CLAUDE_CODE_OAUTH_TOKEN. "
+            "(Alternatively, restrict --models to `ollama:*` entries to "
+            "skip the Claude path entirely.)",
+            file=sys.stderr,
+        )
+        return 2
+    # Ollama host check only fires when at least one ollama: model is
+    # requested. Configures the module-level endpoint for `call_ollama`.
+    if has_ollama_model:
+        if not args.ollama_host:
+            print(
+                "compare.py: --models contains `ollama:*` entries but no "
+                "--ollama-host or OLLAMA_HOST is set. Pass the endpoint "
+                "(e.g. --ollama-host https://your-ollama-host).",
+                file=sys.stderr,
+            )
+            return 2
+        _set_ollama_host(args.ollama_host)
 
     languages = [s.strip() for s in langs_spec.split(",") if s.strip()]
     models = [s.strip() for s in models_spec.split(",") if s.strip()]
