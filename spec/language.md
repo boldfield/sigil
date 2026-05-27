@@ -2286,3 +2286,162 @@ pprof -alloc_space /tmp/alloc.pb        # bytes-allocated heatmap
 - Continuous / streaming profiles.
 - GC heap-snapshot profile.
 - Effect-aware per-handler-frame attribution.
+
+---
+
+## Appendix — Idiomatic patterns
+
+Sigil's surface differs from common languages (Python, JS, Go, Rust)
+in five places where authors most often trip up:
+
+| If you'd write (other languages)        | In Sigil, write                              |
+|-----------------------------------------|----------------------------------------------|
+| `for i in 1..=n: total += i` / `while`  | recursive helper with an accumulator param   |
+| `var x = 0; x += y`                     | nothing mutates — bind a new `let` each step |
+| `if a: ... elif b: ... else: ...`       | nested `if`/`else`, OR `match` on conditions |
+| `return value`                          | last expression of the block IS the value    |
+| `print(x)` where `x: Int`               | `perform IO.println(int_to_string(x))`       |
+| `class Color: RED, GREEN, BLUE`         | `type Color = \| Red \| Green \| Blue`       |
+| `try/except` or null sentinels          | return `Option[T]` or `Result[T, E]` + match |
+
+The next five examples are the canonical translations. Each compiles
+and runs as-is; together they cover the surface syntax most prompts
+need (imports, `use` lines, `fn main() -> Int ![<row>]`, recursion,
+exhaustive `match`, sum types, and the stdlib `Option` type).
+
+### A — Iteration → recursion with an accumulator
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `current` walks from 1 to n; `acc` accumulates the running sum.
+// No mutable variable — each recursive call rebinds `current` and `acc`.
+fn count_up_step(n: Int, current: Int, acc: Int) -> Int ![] {
+  if current > n {
+    acc
+  } else {
+    count_up_step(n, current + 1, acc + current)
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(count_up_step(10, 1, 0)));
+  0
+}
+```
+
+### B — Multi-way branching with `match` (Sigil has no `else if`)
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `match` on a tuple of conditions is the canonical replacement for
+// `if/elif/else` chains. Each arm pattern picks the first matching
+// shape; `_` is the wildcard. The arm bodies are expressions, not
+// statements — every branch produces the same type.
+fn classify(n: Int) -> String ![] {
+  match (n < 0, n == 0) {
+    (true, _)  => "negative",
+    (_, true)  => "zero",
+    (_, _)     => int_to_string(n),
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(classify(0 - 4));
+  perform IO.println(classify(0));
+  perform IO.println(classify(7));
+  0
+}
+```
+
+### C — Pure helpers + IO main (composing effect rows)
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `double` performs no effects, so its row is `![]`. `print_doubled`
+// uses `IO`, so its row is `![IO]`. `main` calls `print_doubled` and
+// inherits `![IO]`. Effect rows are mandatory and must exactly match
+// the effects actually performed in the body.
+fn double(n: Int) -> Int ![] { n + n }
+
+fn print_doubled(n: Int) -> Int ![IO] {
+  perform IO.println(int_to_string(double(n)));
+  0
+}
+
+fn main() -> Int ![IO] {
+  print_doubled(21)
+}
+```
+
+### D — User-defined sum types with exhaustive `match`
+
+```sigil
+import std.io
+use std.io.{IO};
+
+// Sum types replace enum-like classes / constant tags. Variants
+// after `|` can be nullary (no payload) or carry positional fields.
+// `match` on a sum type is checked for exhaustiveness — leaving an
+// arm out is a compile error (E0066).
+type Mood = | Happy | Sad | Neutral
+
+fn greet(m: Mood) -> String ![] {
+  match m {
+    Happy   => "yay",
+    Sad     => "ouch",
+    Neutral => "ok",
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(greet(Happy));
+  0
+}
+```
+
+### E — `Option[T]` for fallible operations (instead of sentinels or exceptions)
+
+```sigil
+import std.int
+import std.io
+import std.option
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.option.{None, Option, Some};
+
+// Fallible operations return `Option[T]` (no value) or `Result[T, E]`
+// (typed error). Callers `match` on the result; there is no
+// try/except, no null, no sentinel.
+fn nonzero(n: Int) -> Option[Int] ![] {
+  if n == 0 { None } else { Some(n) }
+}
+
+fn main() -> Int ![IO] {
+  match nonzero(7) {
+    Some(v) => perform IO.println(int_to_string(v)),
+    None    => perform IO.println("zero"),
+  };
+  0
+}
+```
+
+### Surface-syntax reminders the five idioms collectively demonstrate
+
+- Files begin with `import std.foo` lines, then optional `use std.foo.{Name1, Name2};` lines that bring those names into local scope.
+- `fn name(arg: T, ...) -> Ret ![<row>] { body }` — `Ret` and the effect row are mandatory; the row contains exactly the effects performed.
+- The body is an expression; multi-statement bodies use a block `{ stmt; stmt; tail }` whose **last expression is the block's value** — there is no `return` keyword.
+- `match` arms are separated by commas; the last arm has a trailing comma.
+- `IO.println` takes `String`. Convert with `int_to_string`, `bool_to_string`, `char_to_string`, etc., before passing.
+- `/` and `%` trap on a zero divisor and carry NO effect (see §4.2); use `checked_div` / `checked_mod` from `std.int` for the recoverable form.
