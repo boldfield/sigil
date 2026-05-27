@@ -573,7 +573,17 @@ def _call_ollama_once(
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        if 500 <= e.code < 600:
+        # 5xx and 404 are both treated as transient.
+        # - 5xx: usual upstream error (timeout, crash, OOM).
+        # - 404: empirically seen on multi-backend Ollama deployments
+        #   where nginx round-robins across N ollama instances and
+        #   model load state is per-instance — some backends 404 a
+        #   model that's available on others. Same payload + same URL
+        #   alternating 200/404/200/404 is the signature.
+        # Hard failures (auth, malformed payload, etc.) stay as
+        # RuntimeError so they bubble up immediately rather than
+        # burning the retry budget.
+        if 500 <= e.code < 600 or e.code == 404:
             raise _OllamaTransientError(
                 f"ollama HTTP {e.code} at {url}: {e.reason}"
             ) from e
