@@ -573,7 +573,17 @@ def _call_ollama_once(
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
-        if 500 <= e.code < 600:
+        # 5xx and 404 are both treated as transient.
+        # - 5xx: usual upstream error (timeout, crash, OOM).
+        # - 404: empirically seen on multi-backend Ollama deployments
+        #   where nginx round-robins across N ollama instances and
+        #   model load state is per-instance — some backends 404 a
+        #   model that's available on others. Same payload + same URL
+        #   alternating 200/404/200/404 is the signature.
+        # Hard failures (auth, malformed payload, etc.) stay as
+        # RuntimeError so they bubble up immediately rather than
+        # burning the retry budget.
+        if 500 <= e.code < 600 or e.code == 404:
             raise _OllamaTransientError(
                 f"ollama HTTP {e.code} at {url}: {e.reason}"
             ) from e
@@ -942,6 +952,26 @@ def _attempt_to_json(a: Optional[AttemptResult]) -> Optional[dict]:
     }
 
 
+def _cell_to_jsonl_record(
+    r: CellResult, tier: Optional[str], corpus_version: dict[str, str],
+) -> dict:
+    """The on-disk JSONL record shape for one cell. Shared by
+    `write_jsonl` (batch finalize) and `_JsonlTraceWriter` (incremental
+    in-loop append) so the two paths can't drift in schema."""
+    return {
+        "prompt_id": r.prompt_id,
+        "language": r.language,
+        "model": r.model,
+        "run_idx": r.run_idx,
+        "tier": tier,
+        "corpus_version": corpus_version,
+        "first_attempt": _attempt_to_json(r.first_attempt),
+        "edit_attempt": _attempt_to_json(r.edit_attempt),
+        "final_pass": r.final_pass,
+        "error": r.error,
+    }
+
+
 def write_jsonl(
     results: list[CellResult],
     path: pathlib.Path,
@@ -951,18 +981,65 @@ def write_jsonl(
 ) -> None:
     with path.open("w") as f:
         for r in results:
-            f.write(json.dumps({
-                "prompt_id": r.prompt_id,
-                "language": r.language,
-                "model": r.model,
-                "run_idx": r.run_idx,
-                "tier": tier,
-                "corpus_version": corpus_version,
-                "first_attempt": _attempt_to_json(r.first_attempt),
-                "edit_attempt": _attempt_to_json(r.edit_attempt),
-                "final_pass": r.final_pass,
-                "error": r.error,
-            }) + "\n")
+            f.write(json.dumps(_cell_to_jsonl_record(r, tier, corpus_version)) + "\n")
+
+
+class _JsonlTraceWriter:
+    """Append-mode JSONL writer with per-line flush. Used by `main()`
+    to persist results incrementally so a multi-hour or multi-day run
+    that gets killed (SIGTERM, OOM, network outage from a remote
+    Ollama, etc.) keeps the cells it already finished on disk —
+    rather than discarding everything because the batch write at the
+    end never ran. compare.py was previously buffer-in-memory-and-
+    write-at-end: a baseline run killed at 8% lost 8% of compute.
+    Worth a per-line flush — the I/O cost is trivial vs the LLM call
+    cost (~minutes per cell on a Jetson) but the resilience win is
+    load-bearing.
+
+    Only ever called from the single main thread inside the
+    `as_completed` loop (futures resolve on workers, results pull on
+    the main thread), so no lock is needed. The file handle is opened
+    in truncate mode at construction; if a previous run wrote to the
+    same path, it gets overwritten — same behavior as the legacy
+    batch `write_jsonl` path."""
+
+    def __init__(
+        self,
+        path: pathlib.Path,
+        *,
+        tier: Optional[str],
+        corpus_version: dict[str, str],
+    ) -> None:
+        self.path = path
+        self._tier = tier
+        self._corpus_version = corpus_version
+        # `open(..., "w")` truncates; same behavior as `write_jsonl`'s
+        # `path.open("w")`. Append-mode would be wrong here: a
+        # previously-aborted run's trace at the same path would be
+        # concatenated to this run's, producing duplicate cells the
+        # dashboard couldn't disambiguate. The shared `_build_run_slug`
+        # output includes a timestamp so paths normally don't collide
+        # across runs anyway, but the truncate-on-construct is the
+        # safety belt.
+        self._fh = path.open("w", encoding="utf-8")
+
+    def write(self, r: CellResult) -> None:
+        line = json.dumps(_cell_to_jsonl_record(r, self._tier, self._corpus_version))
+        self._fh.write(line + "\n")
+        # `flush()` pushes Python's buffers to the OS; the OS will
+        # write to disk on its own. On SIGTERM the kernel closes the
+        # fd cleanly, so cells already flushed are durable. We do NOT
+        # `os.fsync` — that would force a sync after every cell and
+        # cost more than the resilience win pays for. The crash mode
+        # we care about (process killed, OS still running) is fully
+        # covered by `flush()`.
+        self._fh.flush()
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
 
 
 def render_markdown_report(
@@ -1376,44 +1453,12 @@ def main() -> int:
     results: list[CellResult] = []
     corpus_version = compute_corpus_version()
 
-    started = time.time()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
-        future_to_key = {
-            pool.submit(
-                run_one_cell,
-                prompt=p, language=lang, model=m, run_idx=run_idx,
-                spec_text=spec_text, edit_loop=edit_loop,
-            ): (p.id, lang, m, run_idx)
-            for p, lang, m, run_idx in work
-        }
-        completed = 0
-        for fut in concurrent.futures.as_completed(future_to_key):
-            pid, lang, model, run_idx = future_to_key[fut]
-            try:
-                result = fut.result()
-            except Exception as e:
-                result = CellResult(
-                    prompt_id=pid, language=lang, model=model, run_idx=run_idx,
-                    first_attempt=None, edit_attempt=None,
-                    final_pass=False, error=f"unhandled: {e}",
-                )
-            results.append(result)
-            completed += 1
-            mark = "✅" if result.final_pass else "❌"
-            extra = ""
-            if result.first_attempt and result.first_attempt.eval and result.first_attempt.eval.passed:
-                extra = " (first try)"
-            elif result.final_pass:
-                extra = " (after edit)"
-            elif result.error:
-                extra = f" (error: {result.error[:60]})"
-            run_label = f" run={run_idx}" if args.runs > 1 else ""
-            print(f"  [{completed:>3}/{len(work)}] {mark} {pid} × {lang} × {model}{run_label}{extra}",
-                  file=sys.stderr)
-
-    elapsed = time.time() - started
-    print(f"compare.py: completed {len(results)} runs in {elapsed:.1f}s", file=sys.stderr)
-
+    # Compute the JSONL trace path BEFORE the loop so we can stream
+    # results to disk incrementally. Previously this was computed
+    # after the loop and the whole batch was written at the end —
+    # a multi-day run killed mid-flight lost every cell it had
+    # already finished. Now each cell's record is flushed as soon as
+    # it completes; killing the run preserves the partial trace.
     results_dir = pathlib.Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%dT%H%M%S")
@@ -1430,7 +1475,54 @@ def main() -> int:
     jsonl_path = results_dir / f"comparison-results-{timestamp}{slug_suffix}.jsonl"
     md_latest_path = results_dir / "comparison-log.md"
     md_run_path = results_dir / f"{stem}.md"
-    write_jsonl(results, jsonl_path, tier=args.tier, corpus_version=corpus_version)
+    print(f"compare.py: trace (live) -> {jsonl_path}", file=sys.stderr)
+
+    trace_writer = _JsonlTraceWriter(
+        jsonl_path, tier=args.tier, corpus_version=corpus_version,
+    )
+    started = time.time()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrency) as pool:
+            future_to_key = {
+                pool.submit(
+                    run_one_cell,
+                    prompt=p, language=lang, model=m, run_idx=run_idx,
+                    spec_text=spec_text, edit_loop=edit_loop,
+                ): (p.id, lang, m, run_idx)
+                for p, lang, m, run_idx in work
+            }
+            completed = 0
+            for fut in concurrent.futures.as_completed(future_to_key):
+                pid, lang, model, run_idx = future_to_key[fut]
+                try:
+                    result = fut.result()
+                except Exception as e:
+                    result = CellResult(
+                        prompt_id=pid, language=lang, model=model, run_idx=run_idx,
+                        first_attempt=None, edit_attempt=None,
+                        final_pass=False, error=f"unhandled: {e}",
+                    )
+                results.append(result)
+                trace_writer.write(result)  # incremental persist (per-cell flush)
+                completed += 1
+                mark = "✅" if result.final_pass else "❌"
+                extra = ""
+                if result.first_attempt and result.first_attempt.eval and result.first_attempt.eval.passed:
+                    extra = " (first try)"
+                elif result.final_pass:
+                    extra = " (after edit)"
+                elif result.error:
+                    extra = f" (error: {result.error[:60]})"
+                run_label = f" run={run_idx}" if args.runs > 1 else ""
+                print(f"  [{completed:>3}/{len(work)}] {mark} {pid} × {lang} × {model}{run_label}{extra}",
+                      file=sys.stderr)
+    finally:
+        trace_writer.close()
+
+    elapsed = time.time() - started
+    print(f"compare.py: completed {len(results)} runs in {elapsed:.1f}s", file=sys.stderr)
+    # The JSONL trace is already on disk (incremental flushes during
+    # the loop). Render the markdown report from in-memory results.
     render_markdown_report(results, prompts, languages, models, args.runs, md_latest_path, jsonl_path)
     # Per-run report is a byte-identical copy of the latest pointer —
     # one render, one copy. Cheaper and guarantees the two files agree.
