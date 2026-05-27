@@ -150,6 +150,76 @@ impl<'a> Parser<'a> {
         ));
     }
 
+    /// Same as `err` but attaches a `hint:` line to the diagnostic.
+    /// Used at parse sites where a known foreign-language footgun
+    /// (e.g. `return`, `var`, `for`, `else if`) shows up in a place
+    /// Sigil's grammar cannot accept — so we can point the author at
+    /// the Sigil equivalent rather than make them re-read the spec
+    /// to figure out what went wrong. Hints reference the
+    /// `spec/language.md` Appendix — Idiomatic Patterns so the
+    /// author can jump straight to the canonical translation.
+    fn err_with_hint(&mut self, span: Span, message: impl Into<String>, hint: impl Into<String>) {
+        self.errors.push(
+            CompilerError::new(Severity::Error, errors::code("E0010"), span, message)
+                .with_hint(hint),
+        );
+    }
+
+    /// Check whether the given token is a footgun from another
+    /// language and return a hint pointing at the Sigil idiom that
+    /// replaces it, or `None` if not. Used at parse sites that bail
+    /// on an unexpected token; the caller passes the offending token
+    /// and gets a hint string suitable for `err_with_hint`.
+    ///
+    /// Two paths:
+    ///   - Some foreign keywords (`return`) are pre-reserved as Sigil
+    ///     `TokenKind` variants. The lexer emits them as keyword
+    ///     tokens; the parser bails when they appear in a position
+    ///     with no rule for them.
+    ///   - Most foreign keywords (`var`, `for`, `while`, etc.) are
+    ///     NOT reserved in Sigil — they tokenize as `Ident(text)`
+    ///     and the parser fails at the surrounding punctuation. We
+    ///     pattern-match on the ident text here.
+    fn foreign_keyword_hint(token: &Token) -> Option<&'static str> {
+        match &token.kind {
+            TokenKind::Return => Some(
+                "Sigil has no `return` keyword — the last expression of a block IS the \
+                 block's value. See `spec/language.md` Appendix idiom A.",
+            ),
+            TokenKind::Ident(name) => match name.as_str() {
+                "var" | "mut" => Some(
+                    "Sigil has no `var` / `mut` — all bindings are immutable (`let`). \
+                     For accumulator-style state, pass it as a parameter to a recursive \
+                     helper. See `spec/language.md` Appendix idiom A.",
+                ),
+                "for" | "while" | "loop" => Some(
+                    "Sigil has no `for` / `while` / `loop` keyword — iteration uses \
+                     recursion. See `spec/language.md` Appendix idiom A for the canonical \
+                     translation.",
+                ),
+                "def" | "function" | "func" => Some(
+                    "Sigil declares functions with `fn name(arg: T, ...) -> Ret ![<row>] \
+                     { body }`. The effect row `![<row>]` is mandatory.",
+                ),
+                "const" | "final" | "static" => Some(
+                    "Sigil has no `const` / `final` / `static` — top-level `let` is \
+                     immutable by construction; module-level bindings just live at \
+                     module scope.",
+                ),
+                "lambda" => Some(
+                    "Sigil lambdas use `fn (x: T, ...) -> U ![<row>] => body` (the body \
+                     is an expression, not a block).",
+                ),
+                "null" | "nil" | "undefined" => Some(
+                    "Sigil has no null / nil / undefined — model absence with `Option[T]` \
+                     and `match` on `Some(v)` / `None`. See `spec/language.md` Appendix idiom E.",
+                ),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn expect(&mut self, kind: &TokenKind, what: &str) -> Option<Token> {
         if std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind) {
             Some(self.advance())
@@ -224,11 +294,12 @@ impl<'a> Parser<'a> {
                     None => self.synchronise_to_semi_or_brace(),
                 },
                 _ => {
-                    let span = self.peek().span.clone();
-                    self.err(
-                        span,
-                        "expected `import`, `use`, `fn`, `type`, or `effect` at top level",
-                    );
+                    let tok = self.peek().clone();
+                    let msg = "expected `import`, `use`, `fn`, `type`, or `effect` at top level";
+                    match Self::foreign_keyword_hint(&tok) {
+                        Some(hint) => self.err_with_hint(tok.span, msg, hint),
+                        None => self.err(tok.span, msg),
+                    }
                     self.synchronise_to_semi_or_brace();
                 }
             }
@@ -1038,6 +1109,28 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => {
+                    // Pre-empt the common footgun where the author writes a
+                    // foreign-language statement keyword (`var x = ...`,
+                    // `for i in xs`, `while cond`, etc.) at statement
+                    // position. These tokenize as `Ident(text)` so the
+                    // expression parser starts down the wrong path; the
+                    // surrounding parse_block then bails on the NEXT token
+                    // with a generic "expected `}` closing block" that
+                    // doesn't say what the actual problem is. Detect here
+                    // before parse_expr so the hint points at the Sigil
+                    // idiom.
+                    let here = self.peek().clone();
+                    if let Some(hint) = Self::foreign_keyword_hint(&here) {
+                        if matches!(here.kind, TokenKind::Ident(_)) {
+                            self.err_with_hint(
+                                here.span,
+                                "expected a statement (`let`, `perform`, or expression)",
+                                hint,
+                            );
+                            self.synchronise_to_semi_or_brace();
+                            continue;
+                        }
+                    }
                     let expr = self.parse_expr()?;
                     if matches!(self.peek().kind, TokenKind::Semi) {
                         self.advance();
@@ -1380,7 +1473,11 @@ impl<'a> Parser<'a> {
             // this addition.
             TokenKind::LBrace => self.parse_block().map(|b| Expr::Block(Box::new(b))),
             _ => {
-                self.err(tok.span.clone(), "expected an expression");
+                let msg = "expected an expression";
+                match Self::foreign_keyword_hint(&tok) {
+                    Some(hint) => self.err_with_hint(tok.span.clone(), msg, hint),
+                    None => self.err(tok.span.clone(), msg),
+                }
                 None
             }
         }
@@ -1688,6 +1785,21 @@ impl<'a> Parser<'a> {
             &TokenKind::Else,
             "`else` (every `if` requires an `else` branch)",
         )?;
+        // `else if` is a common footgun from other languages. Sigil
+        // doesn't have an else-if chain — either nest `if`/`else` or
+        // use `match`. Detect explicitly so the parser can emit a
+        // hint that points at the spec idiom, rather than bailing
+        // inside `parse_block` with a generic "expected `{`".
+        if matches!(self.peek().kind, TokenKind::If) {
+            let if_span = self.peek().span.clone();
+            self.err_with_hint(
+                if_span,
+                "expected `{` opening `else` block",
+                "Sigil has no `else if` chain — use nested `if`/`else` or `match` on a \
+                 tuple of conditions. See `spec/language.md` Appendix idiom B.",
+            );
+            return None;
+        }
         let else_block = self.parse_block()?;
         Some(Expr::If {
             cond: Box::new(cond),
