@@ -2437,7 +2437,97 @@ fn main() -> Int ![IO] {
 }
 ```
 
-### Surface-syntax reminders the five idioms collectively demonstrate
+### F — List recursion via `match Cons(head, tail)` with an accumulator
+
+```sigil
+import std.int
+import std.io
+import std.list
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{Cons, List, Nil};
+
+// Walk a `List` by matching on `Nil` / `Cons(head, tail)`. The
+// tail-recursive form (accumulator parameter, recursive call at the
+// tail) is the canonical pattern for any per-element fold: count,
+// sum, search, transform, reduce. Every list traversal in Sigil
+// follows this shape.
+fn count_pos_step(xs: List[Int], acc: Int) -> Int ![] {
+  match xs {
+    Nil => acc,
+    Cons(head, tail) => if head > 0 {
+      count_pos_step(tail, acc + 1)
+    } else {
+      count_pos_step(tail, acc)
+    },
+  }
+}
+
+fn count_pos(xs: List[Int]) -> Int ![] {
+  count_pos_step(xs, 0)
+}
+
+fn main() -> Int ![IO] {
+  let xs: List[Int] = Cons(0 - 1, Cons(2, Cons(0, Cons(5, Nil))));
+  perform IO.println(int_to_string(count_pos(xs)));
+  0
+}
+```
+
+### G — Higher-order stdlib (`std.list.range` + `map` + `fold`)
+
+```sigil
+import std.int
+import std.io
+import std.list
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{List, fold, map, range};
+
+// `std.list.range(start, end)` produces `[start, end)`. `map`
+// transforms each element; `fold` reduces with a `(acc, elem)`
+// combiner. Together they replace manual recursion for any
+// transform-then-reduce shape — concise and idiomatic.
+fn sum_sq(n: Int) -> Int ![] {
+  let xs: List[Int] = range(1, n);
+  let squares: List[Int] = map(xs, fn (k: Int) -> Int ![] => k * k);
+  fold(squares, 0, fn (acc: Int, sq: Int) -> Int ![] => acc + sq)
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(sum_sq(5)));
+  0
+}
+```
+
+### H — `Option` combinators (`unwrap_or`, `map`, `and_then`)
+
+```sigil
+import std.int
+import std.io
+import std.option
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.option.{None, Option, Some, unwrap_or};
+
+// `unwrap_or(opt, default)` collapses `Option[T]` to `T` by
+// returning the wrapped value or a fallback — cleaner than `match`
+// when you just want a default. `std.option` also provides `map`
+// (transform Some payload, pass through None) and `and_then`
+// (chain another `Option`-returning step); both let you compose
+// fallible operations without nested `match`.
+fn lookup_or_default(found: Option[Int], default: Int) -> Int ![] {
+  unwrap_or(found, default)
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(lookup_or_default(Some(42), 0)));
+  perform IO.println(int_to_string(lookup_or_default(None, 99)));
+  0
+}
+```
+
+### Surface-syntax reminders the eight idioms collectively demonstrate
 
 - Files begin with `import std.foo` lines, then optional `use std.foo.{Name1, Name2};` lines that bring those names into local scope.
 - `fn name(arg: T, ...) -> Ret ![<row>] { body }` — `Ret` and the effect row are mandatory; the row contains exactly the effects performed.
@@ -2445,3 +2535,6 @@ fn main() -> Int ![IO] {
 - `match` arms are separated by commas; the last arm has a trailing comma.
 - `IO.println` takes `String`. Convert with `int_to_string`, `bool_to_string`, `char_to_string`, etc., before passing.
 - `/` and `%` trap on a zero divisor and carry NO effect (see §4.2); use `checked_div` / `checked_mod` from `std.int` for the recoverable form.
+- Walking a `List[T]` is `match xs { Nil => ..., Cons(head, tail) => ... }`; the canonical fold is tail-recursive with an accumulator parameter (idiom F).
+- `std.list` provides `range`, `map`, `filter`, `fold`, `length`, `reverse`, `append`, `list_sort_int/string/char/float`. Prefer them over hand-rolled recursion when the shape fits (idiom G).
+- `std.option` provides `unwrap_or`, `map`, `and_then`; `std.result` provides `map`, `map_err`, `and_then`. Compose them instead of nesting `match` (idiom H).
