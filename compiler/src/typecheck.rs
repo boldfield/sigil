@@ -4238,6 +4238,19 @@ impl Tc {
         )
     }
 
+    /// Like `ty_from_type_expr_here` but resolves against a caller-
+    /// supplied generic substitution rather than `current_generic_-
+    /// subst`. Used by `head_ctors` to resolve a variant's field types
+    /// under the scrutinee's type-argument instantiation.
+    fn resolve_field_ty(&self, t: &TypeExpr, subst: &BTreeMap<String, Ty>) -> Option<Ty> {
+        let cont_ctx = match (self.current_arm_scope_id, self.current_fn_scope_var) {
+            (Some(n), _) => ContScopeCtx::Concrete(n),
+            (None, Some(v)) => ContScopeCtx::FnSigVar(v),
+            (None, None) => ContScopeCtx::Reject,
+        };
+        ty_from_type_expr_with_rows(t, &self.types, subst, &self.current_row_var_subst, cont_ctx)
+    }
+
     fn fresh_row_var(&mut self) -> u32 {
         let id = self.next_row_var;
         self.next_row_var += 1;
@@ -8076,53 +8089,58 @@ impl Tc {
         // the same way (literal-pattern errors don't typically pretend
         // to be coverage holes), so the E0066 path runs unconditionally.
         if let Some(ref st) = scrut_ty {
-            if let Ty::User(u, _args) = st {
-                if !any_arm_erred {
-                    if let Some(witness) = self.user_type_witness(u, arms) {
+            // Resolve unification variables so a scrutinee like
+            // `Result[(Int, String, String), _]` carries its concrete
+            // type arguments into field-type resolution.
+            let st = self.deref(st);
+            match &st {
+                Ty::User(u, _args) => {
+                    if !any_arm_erred {
+                        let patterns: Vec<&Pattern> = arms.iter().map(|a| &a.pattern).collect();
+                        if let Some(witness) = self.match_witness(&st, &patterns) {
+                            self.push_error(
+                                "E0120",
+                                span,
+                                format!(
+                                    "`match` on `{u}` is not exhaustive; missing case `{witness}`"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Ty::Tuple(_) => {
+                    // Tuple exhaustiveness needs full Maranget coverage
+                    // across all elements jointly — `is_exhaustive` only
+                    // recognises a whole-tuple catch-all. Route through
+                    // `match_witness` so all-combinations element
+                    // matches (e.g. the idiomatic `(Bool, Bool)`
+                    // `if/elif/else` replacement) saturate, while
+                    // genuinely incomplete coverage still fires E0066.
+                    let patterns: Vec<&Pattern> = arms.iter().map(|a| &a.pattern).collect();
+                    if let Some(witness) = self.match_witness(&st, &patterns) {
                         self.push_error(
-                            "E0120",
+                            "E0066",
                             span,
-                            format!("`match` on `{u}` is not exhaustive; missing case `{witness}`"),
+                            format!(
+                                "`match` on `{}` is not exhaustive; missing case `{witness}`",
+                                ty_display(&st)
+                            ),
                         );
                     }
                 }
-            } else if !is_exhaustive(st, arms) {
-                self.push_error(
-                    "E0066",
-                    span,
-                    format!("`match` on `{}` is not exhaustive", ty_display(st)),
-                );
+                _ => {
+                    if !is_exhaustive(&st, arms) {
+                        self.push_error(
+                            "E0066",
+                            span,
+                            format!("`match` on `{}` is not exhaustive", ty_display(&st)),
+                        );
+                    }
+                }
             }
         }
 
         result_ty
-    }
-
-    /// Plan A3 task 38.4 — top-level exhaustiveness witness for a
-    /// user-typed scrutinee. Returns `None` when exhaustive; returns
-    /// `Some(witness_string)` naming the first uncovered variant when
-    /// not. The witness is pasteable directly into a new arm: `Foo`
-    /// for Unit, `Foo(_, _)` for Positional, `Foo { x: _, y: _ }` for
-    /// Record.
-    ///
-    /// A catch-all arm (wildcard or bare-var binding that is not a
-    /// nullary-ctor promotion) short-circuits to exhaustive. The
-    /// algorithm is full recursive Maranget (Plan B extension over
-    /// Plan A3's original top-level-only check): nested non-
-    /// exhaustiveness inside a covered ctor's fields produces a
-    /// witness with positional / record holes pasted in, e.g.
-    /// `Some(false)` or `Holds(Node(_, _, _))`. See the E0120 catalog
-    /// long-form for the witness format.
-    fn user_type_witness(&self, type_name: &str, arms: &[MatchArm]) -> Option<String> {
-        // For exhaustiveness purposes, the args carried on a generic
-        // user type don't change the variant set — the generic params
-        // are erased to the structural variant list. Use an empty
-        // arg vec here so the witness machinery (which only consults
-        // the declared variants) operates the same way for `List[Int]`
-        // and `List[String]`.
-        let scrut_ty = Ty::User(type_name.to_string(), Vec::new());
-        let patterns: Vec<&Pattern> = arms.iter().map(|a| &a.pattern).collect();
-        self.match_witness(&scrut_ty, &patterns)
     }
 
     /// Plan B A3-carryover — recursive Maranget exhaustiveness.
@@ -8147,153 +8165,292 @@ impl Tc {
     /// nullary-ctor-promotion rule established in Task 38.3); on any
     /// other scrutinee shape it is a fresh catch-all binder.
     fn match_witness(&self, scrut_ty: &Ty, patterns: &[&Pattern]) -> Option<String> {
-        if patterns
+        // Single-column matrix: one row per arm pattern. The coverage
+        // analysis lives in `matrix_witness`, which performs proper
+        // Maranget constructor-specialisation so that multi-field /
+        // multi-element scrutinees (tuples, records, positional
+        // variants) are checked *jointly* across their fields rather
+        // than column-by-column. A per-column check is unsound: it
+        // would accept `(true, true) | (false, false)` as covering
+        // `(Bool, Bool)` even though `(true, false)` is unmatched.
+        let rows: Vec<Vec<Cell>> = patterns
             .iter()
-            .any(|p| self.pattern_is_catchall(p, scrut_ty))
-        {
-            return None;
-        }
-        match scrut_ty {
-            Ty::Bool => {
-                let has_true = patterns
-                    .iter()
-                    .any(|p| matches!(p, Pattern::BoolLit(true, _)));
-                let has_false = patterns
-                    .iter()
-                    .any(|p| matches!(p, Pattern::BoolLit(false, _)));
-                match (has_true, has_false) {
-                    (true, true) => None,
-                    // Missing `false` — witness is the unseen literal.
-                    (true, false) => Some("false".to_string()),
-                    // Missing `true` — ditto.
-                    (false, true) => Some("true".to_string()),
-                    // Missing both — name `false` arbitrarily; the user
-                    // will see they need at least one literal arm.
-                    (false, false) => Some("false".to_string()),
-                }
-            }
-            Ty::Unit => None,
-            // Infinite / un-enumerable value domains: only a wildcard
-            // / fresh-var binder can reach exhaustiveness, and such a
-            // pattern was already caught above by `pattern_is_catchall`.
-            Ty::Int | Ty::Char | Ty::String | Ty::Byte | Ty::Fn(_) => Some("_".to_string()),
-            // Plan B task 48: an inferred `Ty::Var` scrutinee
-            // means the type is still polymorphic at the match.
-            // v1 disallows that — primitives / users dispatch on
-            // shape, and a still-free var has no shape. Fall back
-            // to `_` so downstream cascade is muted; the real
-            // diagnostic surfaces as an E0044 unification failure
-            // somewhere upstream that produced the unconstrained
-            // var in the first place.
-            Ty::Var(_) => Some("_".to_string()),
-            Ty::User(type_name, _args) => {
-                let td = self.types.get(type_name)?;
-                for (variant_idx, variant) in td.variants.iter().enumerate() {
-                    // Gather per-arm field-pattern lists from every
-                    // pattern that matches this variant.
-                    let mut variant_rows: Vec<Vec<Pattern>> = Vec::new();
-                    for p in patterns {
-                        if let Some(fields) =
-                            self.pattern_matches_variant(p, type_name, variant_idx, variant)
-                        {
-                            variant_rows.push(fields);
-                        }
-                    }
-                    if variant_rows.is_empty() {
-                        return Some(ctor_witness_string(variant));
-                    }
-                    // Recurse per field position. The first uncovered
-                    // field yields the witness, with the other fields
-                    // wildcarded.
-                    match &variant.fields {
-                        VariantFields::Unit => {}
-                        VariantFields::Positional(field_tes) => {
-                            for (field_idx, field_te) in field_tes.iter().enumerate() {
-                                let field_ty = match self.ty_from_type_expr_here(field_te) {
-                                    Some(t) => t,
-                                    None => continue,
-                                };
-                                let field_patterns: Vec<&Pattern> =
-                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
-                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
-                                    return Some(positional_witness_with_hole(
-                                        variant, field_idx, &sub,
-                                    ));
-                                }
-                            }
-                        }
-                        VariantFields::Record(record_fields) => {
-                            for (field_idx, record_field) in record_fields.iter().enumerate() {
-                                let field_ty = match self.ty_from_type_expr_here(&record_field.ty) {
-                                    Some(t) => t,
-                                    None => continue,
-                                };
-                                let field_patterns: Vec<&Pattern> =
-                                    variant_rows.iter().map(|row| &row[field_idx]).collect();
-                                if let Some(sub) = self.match_witness(&field_ty, &field_patterns) {
-                                    return Some(record_witness_with_hole(
-                                        variant,
-                                        record_fields,
-                                        field_idx,
-                                        &sub,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
+            .map(|p| vec![Cell::Pat((*p).clone())])
+            .collect();
+        self.matrix_witness(std::slice::from_ref(scrut_ty), &rows)
+            .map(|cols| cols.into_iter().next().unwrap_or_else(|| "_".to_string()))
+    }
+
+    /// Maranget exhaustiveness over a pattern matrix. `col_types` names
+    /// the type of each column; each row in `rows` holds one cell per
+    /// column. Returns `None` when the matrix is exhaustive, or
+    /// `Some(witness)` — one paste-able witness string per column —
+    /// describing a value that no row matches.
+    ///
+    /// The algorithm specialises on the head column's constructor set:
+    /// when every constructor of a finite head type is present, the
+    /// matrix is exhaustive iff each constructor's specialised
+    /// sub-matrix (its fields prepended to the remaining columns) is
+    /// exhaustive; otherwise coverage of the missing constructors flows
+    /// through the wildcard rows of the default matrix. This is what
+    /// makes `(Bool, Bool)` with all four combinations exhaustive while
+    /// the diagonal `(true,true) | (false,false)` correctly yields the
+    /// witness `(true, false)`.
+    fn matrix_witness(&self, col_types: &[Ty], rows: &[Vec<Cell>]) -> Option<Vec<String>> {
+        // Base case: no columns left. The zero-width row `()` is
+        // covered iff at least one row reached here.
+        let Some((head_ty, rest_types)) = col_types.split_first() else {
+            return if rows.is_empty() {
+                Some(Vec::new())
+            } else {
                 None
-            }
-            // Plan D Task 113 — tuple scrutinee. A Pattern::Tuple of the
-            // matching arity is the only constructor; if any of the
-            // patterns is a wildcard / Var catchall, the
-            // pattern_is_catchall guard above already returned None.
-            // Otherwise the tuple has no other constructors, so we
-            // descend element-wise to find the first un-covered element
-            // and synthesize a witness with `_` placeholders elsewhere.
-            Ty::Tuple(elem_tys) => {
-                let tuple_rows: Vec<&Vec<Pattern>> = patterns
+            };
+        };
+
+        match self.head_ctors(head_ty) {
+            // Finite, enumerable constructor set: Bool, Unit, tuple,
+            // user-type variants.
+            Some(ctors) => {
+                let present: Vec<bool> = ctors
                     .iter()
-                    .filter_map(|p| match p {
-                        Pattern::Tuple(pats, _) if pats.len() == elem_tys.len() => Some(pats),
-                        _ => None,
+                    .map(|ctor| {
+                        rows.iter().any(|row| {
+                            matches!(
+                                self.classify_head(&row[0], head_ty, ctor),
+                                HeadMatch::Matches(_)
+                            )
+                        })
                     })
                     .collect();
-                if tuple_rows.is_empty() {
-                    let placeholders = vec!["_"; elem_tys.len()].join(", ");
-                    return Some(format!("({placeholders})"));
+                let complete = present.iter().all(|&seen| seen);
+                if complete {
+                    // Every constructor appears under a concrete head
+                    // pattern. Exhaustive iff each constructor's
+                    // specialised sub-matrix is exhaustive.
+                    for ctor in &ctors {
+                        let sub_rows = self.specialize(rows, head_ty, ctor);
+                        let mut sub_types = ctor.arg_tys.clone();
+                        sub_types.extend_from_slice(rest_types);
+                        if let Some(witness) = self.matrix_witness(&sub_types, &sub_rows) {
+                            let (fields, tail) = witness.split_at(ctor.arg_tys.len());
+                            let mut out = Vec::with_capacity(1 + tail.len());
+                            out.push(ctor.render(fields));
+                            out.extend_from_slice(tail);
+                            return Some(out);
+                        }
+                    }
+                    None
+                } else {
+                    // Some constructor is unmatched by any concrete
+                    // head pattern. Only wildcard rows can cover the
+                    // missing constructors; recurse on the default
+                    // matrix over the remaining columns and, if a tail
+                    // witness exists, prefix a missing-constructor head.
+                    let default_rows = self.default_matrix(rows, head_ty);
+                    self.matrix_witness(rest_types, &default_rows).map(|tail| {
+                        let mut out = Vec::with_capacity(1 + tail.len());
+                        out.push(self.missing_ctor_witness(&ctors, &present));
+                        out.extend(tail);
+                        out
+                    })
                 }
-                for (elem_idx, elem_ty) in elem_tys.iter().enumerate() {
-                    let elem_patterns: Vec<&Pattern> =
-                        tuple_rows.iter().map(|row| &row[elem_idx]).collect();
-                    if let Some(sub) = self.match_witness(elem_ty, &elem_patterns) {
-                        let parts: Vec<String> = (0..elem_tys.len())
-                            .map(|i| {
-                                if i == elem_idx {
-                                    sub.clone()
-                                } else {
-                                    "_".to_string()
-                                }
-                            })
-                            .collect();
-                        return Some(format!("({})", parts.join(", ")));
+            }
+            // Infinite / un-enumerable head domain (Int, Char, String,
+            // Byte, Fn, still-free Var, Continuation): a literal head
+            // can never saturate the column, so coverage flows entirely
+            // through the wildcard rows in the default matrix. A `_`
+            // head names some value distinct from every literal seen.
+            None => {
+                let default_rows = self.default_matrix(rows, head_ty);
+                self.matrix_witness(rest_types, &default_rows).map(|tail| {
+                    let mut out = Vec::with_capacity(1 + tail.len());
+                    out.push("_".to_string());
+                    out.extend(tail);
+                    out
+                })
+            }
+        }
+    }
+
+    /// Enumerate the constructors of a finite head type for Maranget
+    /// specialisation. Returns `None` for infinite / opaque domains
+    /// (Int, Char, String, Byte, Fn, Var, Continuation, and any user
+    /// type whose definition or field types fail to resolve) — those
+    /// can only be covered by a wildcard.
+    fn head_ctors(&self, head_ty: &Ty) -> Option<Vec<HeadCtor>> {
+        match head_ty {
+            Ty::Bool => Some(vec![HeadCtor::boolean(true), HeadCtor::boolean(false)]),
+            Ty::Unit => Some(vec![HeadCtor::unit()]),
+            Ty::Tuple(elem_tys) => Some(vec![HeadCtor::tuple(elem_tys.clone())]),
+            Ty::User(type_name, args) => {
+                let td = self.types.get(type_name)?;
+                // Bind the type definition's generic parameters to the
+                // scrutinee's instantiation so a field declared `A`
+                // resolves to its concrete argument (e.g. `Result`'s
+                // `Ok(A)` field becomes the real `(Int, String, String)`
+                // tuple when matching `Result[(Int, String, String), _]`).
+                // Mirrors the `current_generic_subst` extension in
+                // `check_pattern`'s `Pattern::Ctor` arm. Layer over the
+                // ambient substitution so nested fn generics still
+                // resolve.
+                let mut subst = self.current_generic_subst.clone();
+                if td.generic_params.len() == args.len() {
+                    for (gp, arg) in td.generic_params.iter().zip(args.iter()) {
+                        subst.insert(gp.name.clone(), arg.clone());
                     }
                 }
-                None
+                let mut ctors = Vec::with_capacity(td.variants.len());
+                for (idx, variant) in td.variants.iter().enumerate() {
+                    // A field type may still fail to resolve (e.g. an
+                    // un-instantiated generic parameter outside any
+                    // substitution context). Such a field has an opaque
+                    // domain, so we stand in a fresh `Ty::Var`:
+                    // `head_ctors` treats it as un-enumerable, meaning
+                    // only a wildcard sub-pattern can cover it. This
+                    // stays sound — never claiming exhaustiveness over a
+                    // domain we couldn't inspect.
+                    let opaque = || Ty::Var(u32::MAX);
+                    let (shape, arg_tys) = match &variant.fields {
+                        VariantFields::Unit => (CtorShape::Unit, Vec::new()),
+                        VariantFields::Positional(field_tes) => {
+                            let tys = field_tes
+                                .iter()
+                                .map(|te| self.resolve_field_ty(te, &subst).unwrap_or_else(opaque))
+                                .collect();
+                            (CtorShape::Positional, tys)
+                        }
+                        VariantFields::Record(record_fields) => {
+                            let tys = record_fields
+                                .iter()
+                                .map(|rf| {
+                                    self.resolve_field_ty(&rf.ty, &subst).unwrap_or_else(opaque)
+                                })
+                                .collect();
+                            let names =
+                                record_fields.iter().map(|rf| rf.name.clone()).collect();
+                            (CtorShape::Record(names), tys)
+                        }
+                    };
+                    ctors.push(HeadCtor {
+                        arg_tys,
+                        kind: HeadCtorKind::Variant {
+                            idx,
+                            name: variant.name.clone(),
+                            shape,
+                        },
+                    });
+                }
+                Some(ctors)
             }
-            // Plan D Task 117 — Continuation scrutinees have no
-            // user-constructible value form (no surface syntax
-            // produces a Continuation literal); user code can only
-            // bind `k` and pass it through let-aliases. A `match k`
-            // expression has no destructuring rules and the only
-            // pattern shape that would typecheck is `Pattern::Var`
-            // (catchall, handled at the top of this fn). Any
-            // structured pattern would have failed typecheck E0066
-            // upstream. Return None (treat as exhaustive once a
-            // catchall is present; otherwise the caller surfaces
-            // the empty-witness case).
-            Ty::Continuation(_) => None,
+            _ => None,
         }
+    }
+
+    /// Classify how a head cell relates to a candidate constructor.
+    /// `Catchall` covers every constructor (a `_` or a binding `Var`);
+    /// `Matches` carries the constructor's field sub-patterns when the
+    /// concrete pattern selects this constructor; `NoMatch` drops the
+    /// row from this constructor's specialised matrix.
+    fn classify_head(&self, cell: &Cell, head_ty: &Ty, ctor: &HeadCtor) -> HeadMatch {
+        let p = match cell {
+            Cell::Wild => return HeadMatch::Catchall,
+            Cell::Pat(p) => p,
+        };
+        if self.pattern_is_catchall(p, head_ty) {
+            return HeadMatch::Catchall;
+        }
+        match &ctor.kind {
+            HeadCtorKind::Bool(want) => match p {
+                Pattern::BoolLit(b, _) if b == want => HeadMatch::Matches(Vec::new()),
+                _ => HeadMatch::NoMatch,
+            },
+            // A unit-typed scrutinee has no concrete (non-catchall)
+            // pattern form, so any non-catchall pattern is a mismatch.
+            HeadCtorKind::Unit => HeadMatch::NoMatch,
+            HeadCtorKind::Tuple => match p {
+                Pattern::Tuple(subs, _) if subs.len() == ctor.arg_tys.len() => {
+                    HeadMatch::Matches(subs.iter().cloned().map(Cell::Pat).collect())
+                }
+                _ => HeadMatch::NoMatch,
+            },
+            HeadCtorKind::Variant { idx, .. } => {
+                if let Ty::User(type_name, _) = head_ty {
+                    if let Some(td) = self.types.get(type_name) {
+                        if let Some(variant) = td.variants.get(*idx) {
+                            if let Some(sub_pats) =
+                                self.pattern_matches_variant(p, type_name, *idx, variant)
+                            {
+                                return HeadMatch::Matches(
+                                    sub_pats.into_iter().map(Cell::Pat).collect(),
+                                );
+                            }
+                        }
+                    }
+                }
+                HeadMatch::NoMatch
+            }
+        }
+    }
+
+    /// Specialise `rows` for `ctor`: keep rows whose head matches the
+    /// constructor (expanding the head into the constructor's field
+    /// cells) or is a catch-all (expanding into wildcard field cells),
+    /// and drop rows whose concrete head names a different constructor.
+    fn specialize(&self, rows: &[Vec<Cell>], head_ty: &Ty, ctor: &HeadCtor) -> Vec<Vec<Cell>> {
+        let arity = ctor.arg_tys.len();
+        let mut out = Vec::new();
+        for row in rows {
+            let tail = &row[1..];
+            match self.classify_head(&row[0], head_ty, ctor) {
+                HeadMatch::Catchall => {
+                    let mut new_row = vec![Cell::Wild; arity];
+                    new_row.extend_from_slice(tail);
+                    out.push(new_row);
+                }
+                HeadMatch::Matches(mut sub_cells) => {
+                    sub_cells.extend_from_slice(tail);
+                    out.push(sub_cells);
+                }
+                HeadMatch::NoMatch => {}
+            }
+        }
+        out
+    }
+
+    /// Default matrix: keep only rows whose head is a catch-all,
+    /// dropping the head column. Used when the head column's concrete
+    /// constructors are incomplete — these wildcard rows are what cover
+    /// the missing constructors.
+    fn default_matrix(&self, rows: &[Vec<Cell>], head_ty: &Ty) -> Vec<Vec<Cell>> {
+        rows.iter()
+            .filter_map(|row| {
+                let head_catchall = match &row[0] {
+                    Cell::Wild => true,
+                    Cell::Pat(p) => self.pattern_is_catchall(p, head_ty),
+                };
+                head_catchall.then(|| row[1..].to_vec())
+            })
+            .collect()
+    }
+
+    /// Name a constructor not yet covered by any concrete head pattern.
+    /// When no constructor appears at all (an empty column), any value
+    /// works, so `_` is returned — this preserves the established
+    /// witness convention of wildcarding fields the analysis did not
+    /// need to pin (e.g. `P { a: false, b: _ }`).
+    fn missing_ctor_witness(&self, ctors: &[HeadCtor], present: &[bool]) -> String {
+        if present.iter().all(|&seen| !seen) {
+            return "_".to_string();
+        }
+        for (ctor, &seen) in ctors.iter().zip(present) {
+            if !seen {
+                let holes = vec!["_".to_string(); ctor.arg_tys.len()];
+                return ctor.render(&holes);
+            }
+        }
+        // Unreachable: callers only invoke this when `present` is not
+        // all-true, so at least one `seen` is false.
+        "_".to_string()
     }
 
     /// True when `p` covers every possible value of `scrut_ty`.
@@ -9089,73 +9246,101 @@ fn binop_symbol(op: BinOp) -> &'static str {
     }
 }
 
-/// Build a paste-able witness pattern for an uncovered variant
-/// (Plan A3 task 38.4). Shape follows the variant declaration:
-/// - `Unit` → `Foo`
-/// - `Positional(T1, ..., Tn)` → `Foo(_, ..., _)` (n wildcards)
-/// - `Record { f1: T1, ... }` → `Foo { f1: _, ... }` (one wildcard
-///   per declared field, preserving field-name order)
-fn ctor_witness_string(variant: &Variant) -> String {
-    match &variant.fields {
-        VariantFields::Unit => variant.name.clone(),
-        VariantFields::Positional(params) => {
-            let args = std::iter::repeat_n("_", params.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{}({args})", variant.name)
-        }
-        VariantFields::Record(fields) => {
-            let fs = fields
-                .iter()
-                .map(|f| format!("{}: _", f.name))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("{} {{ {fs} }}", variant.name)
+/// A single cell of a Maranget pattern matrix (see `matrix_witness`).
+/// The `Wild` case matches any value (an explicit `_`, a binding var,
+/// or a position synthesised while specialising a wildcard row against
+/// a constructor's fields); the `Pat` case carries a concrete
+/// sub-pattern still to be inspected.
+#[derive(Clone)]
+enum Cell {
+    Wild,
+    Pat(Pattern),
+}
+
+/// Outcome of testing a head cell against a candidate constructor.
+enum HeadMatch {
+    /// Covers every constructor (wildcard / binding var).
+    Catchall,
+    /// Concrete pattern selecting this constructor; carries its field
+    /// sub-patterns as cells.
+    Matches(Vec<Cell>),
+    /// Concrete pattern naming a different constructor.
+    NoMatch,
+}
+
+/// The surface shape of a user-type variant, retained so a witness can
+/// be rendered in the variant's declared syntax.
+enum CtorShape {
+    Unit,
+    Positional,
+    Record(Vec<String>),
+}
+
+enum HeadCtorKind {
+    Bool(bool),
+    Unit,
+    Tuple,
+    Variant {
+        idx: usize,
+        name: String,
+        shape: CtorShape,
+    },
+}
+
+/// One constructor of a finite head type during exhaustiveness
+/// analysis: its field types (`arg_tys`, for specialisation) plus the
+/// data needed to match a head pattern against it and to render a
+/// witness from per-field witness strings.
+struct HeadCtor {
+    arg_tys: Vec<Ty>,
+    kind: HeadCtorKind,
+}
+
+impl HeadCtor {
+    fn boolean(b: bool) -> Self {
+        HeadCtor {
+            arg_tys: Vec::new(),
+            kind: HeadCtorKind::Bool(b),
         }
     }
-}
 
-/// Plan B A3-carryover — build a positional-variant witness string
-/// with the `hole_idx`-th field replaced by `sub`, other fields left
-/// as `_`.
-fn positional_witness_with_hole(variant: &Variant, hole_idx: usize, sub: &str) -> String {
-    let arity = match &variant.fields {
-        VariantFields::Positional(params) => params.len(),
-        _ => return variant.name.clone(),
-    };
-    let args: Vec<String> = (0..arity)
-        .map(|i| {
-            if i == hole_idx {
-                sub.to_string()
-            } else {
-                "_".to_string()
-            }
-        })
-        .collect();
-    format!("{}({})", variant.name, args.join(", "))
-}
+    fn unit() -> Self {
+        HeadCtor {
+            arg_tys: Vec::new(),
+            kind: HeadCtorKind::Unit,
+        }
+    }
 
-/// Plan B A3-carryover — build a record-variant witness string with
-/// the `hole_idx`-th field (in declared-field order) set to `sub` and
-/// other fields left as `_`.
-fn record_witness_with_hole(
-    variant: &Variant,
-    fields: &[RecordFieldDecl],
-    hole_idx: usize,
-    sub: &str,
-) -> String {
-    let fs: Vec<String> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| {
-            if i == hole_idx {
-                format!("{}: {sub}", f.name)
-            } else {
-                format!("{}: _", f.name)
-            }
-        })
-        .collect();
-    format!("{} {{ {} }}", variant.name, fs.join(", "))
+    fn tuple(arg_tys: Vec<Ty>) -> Self {
+        HeadCtor {
+            arg_tys,
+            kind: HeadCtorKind::Tuple,
+        }
+    }
+
+    /// Render a witness for this constructor from one witness string
+    /// per field (in declared order). The field count always equals
+    /// `arg_tys.len()`.
+    fn render(&self, fields: &[String]) -> String {
+        match &self.kind {
+            HeadCtorKind::Bool(b) => b.to_string(),
+            HeadCtorKind::Unit => "()".to_string(),
+            HeadCtorKind::Tuple => format!("({})", fields.join(", ")),
+            HeadCtorKind::Variant { name, shape, .. } => match shape {
+                CtorShape::Unit => name.clone(),
+                CtorShape::Positional => format!("{name}({})", fields.join(", ")),
+                CtorShape::Record(field_names) => {
+                    let body = field_names
+                        .iter()
+                        .zip(fields)
+                        .map(|(fname, fwitness)| format!("{fname}: {fwitness}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!("{name} {{ {body} }}")
+                }
+            },
+        }
+    }
 }
 
 /// Coarse exhaustiveness check. Wildcard-terminated arm lists are
@@ -10505,6 +10690,105 @@ fn main() -> Int ![IO] {\n\
 
     fn has_code(errs: &[CompilerError], code: &str) -> bool {
         errs.iter().any(|e| e.code.as_str() == code)
+    }
+
+    // ---- tuple exhaustiveness (finite-domain element coverage) ----
+    //
+    // A `(Bool, Bool)` scrutinee whose arms enumerate all four
+    // combinations is exhaustive — the idiomatic `if/elif/else`
+    // replacement (Appendix idiom B) must compile without a wildcard.
+    // Before the fix the checker treated every wildcard-free tuple as
+    // non-exhaustive and wrongly fired E0066.
+
+    #[test]
+    fn tuple_bool_bool_all_four_combos_is_exhaustive() {
+        let src = "fn f(n: Int) -> Int ![] {\n\
+                   match (n == 0, n == 1) {\n\
+                     (true, true) => 0,\n\
+                     (true, false) => 1,\n\
+                     (false, true) => 2,\n\
+                     (false, false) => 3,\n\
+                   }\n\
+                   }\n\
+                   fn main() -> Int ![] { f(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0066"),
+            "all four (Bool, Bool) combos are exhaustive; got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_bool_with_wildcard_tail_is_exhaustive() {
+        // First element (Bool) covers both polarities; the second
+        // element is a wildcard. Exhaustive — no E0066.
+        let src = "fn f(n: Int) -> Int ![] {\n\
+                   match (n == 0, n == 1) {\n\
+                     (true, _) => 0,\n\
+                     (false, _) => 1,\n\
+                   }\n\
+                   }\n\
+                   fn main() -> Int ![] { f(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            !has_code(&errs, "E0066"),
+            "(true, _) | (false, _) covers (Bool, Bool); got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_bool_bool_diagonal_only_is_not_exhaustive() {
+        // SOUNDNESS GUARD: column-wise coverage would wrongly accept
+        // this — col0 has {true,false}, col1 has {true,false} — but
+        // (true, false) and (false, true) are uncovered. Must fire E0066.
+        let src = "fn f(n: Int) -> Int ![] {\n\
+                   match (n == 0, n == 1) {\n\
+                     (true, true) => 0,\n\
+                     (false, false) => 3,\n\
+                   }\n\
+                   }\n\
+                   fn main() -> Int ![] { f(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0066"),
+            "(true,true) | (false,false) leaves (true,false) uncovered; expected E0066, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_bool_bool_missing_one_combo_is_not_exhaustive() {
+        let src = "fn f(n: Int) -> Int ![] {\n\
+                   match (n == 0, n == 1) {\n\
+                     (true, true) => 0,\n\
+                     (true, false) => 1,\n\
+                     (false, true) => 2,\n\
+                   }\n\
+                   }\n\
+                   fn main() -> Int ![] { f(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0066"),
+            "missing (false, false); expected E0066, got {errs:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_bool_int_needs_wildcard_on_int_element() {
+        // SOUNDNESS GUARD: the Int element has an infinite domain, so
+        // pinning literals there cannot saturate even with both Bool
+        // polarities present. Must fire E0066.
+        let src = "fn f(n: Int) -> Int ![] {\n\
+                   match (n == 0, n) {\n\
+                     (true, 0) => 0,\n\
+                     (false, 0) => 1,\n\
+                   }\n\
+                   }\n\
+                   fn main() -> Int ![] { f(0) }\n";
+        let errs = pipeline(src);
+        assert!(
+            has_code(&errs, "E0066"),
+            "Int element pinned to literal 0 is not exhaustive; expected E0066, got {errs:?}"
+        );
     }
 
     #[test]
