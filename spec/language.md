@@ -1814,8 +1814,17 @@ Full catalog: see [`compiler/src/errors/catalog.rs`](../compiler/src/errors/cata
 
 ### §12 — Runtime model
 
-- **Memory:** Boehm conservative GC. Every heap object begins with
-  an 8-byte header `(tag, count, bitmap, reserved)`.
+- **Memory:** Boehm GC, run in **precise mode** for Sigil-allocated
+  objects and Sigil thread stacks. Every heap object begins with an
+  8-byte header `(tag, count, bitmap, reserved)`; the `bitmap` names
+  which payload words hold pointers and drives precise heap marking
+  (`GC_malloc_explicitly_typed`, dispatched through a compile-time
+  shape table). Sigil thread stacks are scanned precisely via
+  Cranelift-emitted stackmaps (the `__SIGIL,__stackmaps` section)
+  walked at GC time rather than by conservative stack scanning.
+  Conservative scanning survives only for `count == 0` payloads
+  (arrays and string-builder segments, whose element count exceeds the
+  6-bit header `count` field's reach) and runtime-internal threads.
 - **Tagged values:** `Int` is signed 64-bit (full i64) and travels
   through the runtime ABI as a 64-bit register value. `Int64` and
   `Float` are heap-boxed.
@@ -2243,7 +2252,7 @@ The following limits are permanent v1 design choices:
 | Format specifiers (`{:.2}`, `{:>10}`, `{:#x}`) — width, precision, alignment, fill, base prefix | Future format-specifiers plan. v1 ships only positional `{}` (each placeholder consumes the next `FormatArg`); width / precision / alignment / fill / base would extend the placeholder grammar and the per-`FormatArg`-variant render path. |
 | Named args (`{name}`) and positional indices (`{0}`, `{1}`) | Future format-specifiers plan. v1's `{}` is strictly positional — each placeholder consumes the next `FormatArg`. |
 | Compiler-level f-string syntax (`f"x = {x}"`) | Future plan. v1 ships only the runtime `format` family in `std.format`; a compile-time f-string surface would lower to `format` calls but requires lexer + parser changes. |
-| Stack traces on `panic` | Future plan. v1's `panic` prints only the user-supplied `msg` and exits — caller-context information has to be encoded into `msg` itself (or built via `format(...)` + `panic(...)`). Precise stack traces require stackmap v1 content (currently `STACKMAP_VERSION_PLACEHOLDER` per §12); deferred to v2 alongside the precise-GC stackmap rework. |
+| Stack traces on `panic` | Future plan. v1's `panic` prints only the user-supplied `msg` and exits — caller-context information has to be encoded into `msg` itself (or built via `format(...)` + `panic(...)`). The v1 stackmap content this would build on now ships (the precise-GC rework, §12), but the symbolizing unwinder that would turn it into a `panic` backtrace is not yet implemented. Still a future plan. |
 
 ### §15 — Build and run
 

@@ -1,8 +1,17 @@
 # Plan E2 — v2 precise GC + real Cranelift stackmaps
 
+> **STATUS: COMPLETE (2026-05-30).** All three phases plus the
+> alloc-trampoline-elision follow-up have shipped to `main`. Every
+> task PR is merged (#151, #156, #157, #159, #162–#167, #169–#171,
+> #178, #181–#186). The design doc now lives at
+> `boldfield/designs/done/2026-05-08-sigil-v2-precise-gc.md`. Per-task
+> statuses below were synced from the stale "in PR" wording to their
+> merged PR numbers on closeout. See `V2_STATUS.md` for the v2-cluster
+> rollup (E1/E2 done, E3 is the open frontier).
+
 Tracks Plan E2's execution against
-`boldfield/designs/in-progress/2026-05-08-sigil-v2-precise-gc.md`
-(moves to `done/` on Phase 3 completion). Plan E1 (runtime profile-
+`boldfield/designs/done/2026-05-08-sigil-v2-precise-gc.md`
+(moved to `done/` on Phase 3 completion). Plan E1 (runtime profile-
 data emission surface) merged as PR #148; Plan E2 builds on it and
 on PR #151's Cranelift 0.131 stackmap API spike.
 
@@ -37,7 +46,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
   refactor.
 - **Task 2b** — Categories 2 (heap-pointer loads) + 3 (block-arg
   confluences) + helper rollout to all 62 alloc sites. status:
-  **in PR #159 review**. Coverage:
+  **merged (PR #159)**. Coverage:
   - **Cat 1 helper rollout**: complete. All 62 alloc sites funnel
     through `lower_alloc_call`. The only `declare_value_needs_stack_map`
     site outside the helper is inside the helper itself.
@@ -81,7 +90,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 4 — Stackmap section v1 writer
 
-- status: **in PR (Task 4 branch)**
+- status: **merged (PR #162)**
 - v1 wire format: per-function blocks. Section header (12B) + per-fn
   header (12B: name_len, record_count, text_offset) + name + per-record
   header (12B: pc_offset, frame_size, entry_count, flags) + 5B entries
@@ -123,7 +132,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 5 — Runtime stackmap reader + cross-check
 
-- status: **in PR** (Task 5 branch)
+- status: **merged (PR #163)**
 - `runtime/src/stackmap.rs` v1 reader. Section locator: ELF uses
   `dlsym("__start_sigil_stackmaps")` / `dlsym("__stop_sigil_stackmaps")`
   (no extern statics — avoids undef-symbol link error in unit-test
@@ -172,7 +181,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 6 — Boehm precise-mode API spike
 
-- status: **in PR (Task 6 branch)**
+- status: **merged (PR #164)**
 - API surface pinned: `GC_make_descriptor(bitmap, len_bits) -> GC_descr` +
   `GC_malloc_explicitly_typed(size_in_bytes, descr) -> *mut c_void`
   (from `gc/gc_typed.h`, libgc 8.x). Heavier alternatives
@@ -204,7 +213,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 7 — Descriptor cache
 
-- status: **in PR (Task 7 branch)**
+- status: **merged (PR #165)**
 - Module: `runtime/src/gc/descriptor.rs` (new, wired via
   `pub(crate) mod descriptor;` in `runtime/src/gc.rs`).
 - API: `get_or_create(sigil_bitmap: u32, payload_word_count: u8)
@@ -240,7 +249,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 8 — `sigil_alloc` registers precise descriptors
 
-- status: **in PR (Task 8 branch)**
+- status: **merged (PR #166)**
 - `runtime/src/gc.rs::sigil_alloc` now routes non-zero-bitmap
   allocations through `descriptor::get_or_create` (Task 7's cache)
   and calls `GC_malloc_explicitly_typed(total, descr)`. Bitmap=0
@@ -270,7 +279,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 9 — Drop conservative heap scan
 
-- status: **in PR (Task 9 branch)**
+- status: **merged (PR #167)**
 - "Drop conservative heap scan" was already structurally complete
   in Task 8: every `bitmap != 0 && count > 0` object now routes
   through `GC_malloc_explicitly_typed`, so Boehm's mark phase
@@ -346,7 +355,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 10 — Per-thread root config spike
 
-- status: **in PR (Task 10 branch)**
+- status: **merged (PR #169)**
 - API question answered: `GC_register_my_thread` takes a
   `const struct GC_stack_base *` and nothing else; the
   precise / conservative distinction is **global** in libgc 8.x,
@@ -452,8 +461,7 @@ pure SSA + block-args, not Variables). Shipped in two tranches:
 
 ### Task 12 — Drop conservative stack scan on Sigil threads
 
-- status: **in PR (Task 12 branch — this commit)** — Phase 3
-  ship gate.
+- status: **merged (PR #171)** — Phase 3 ship gate.
 - Scope expanded per user instruction "no deferrals": Task 12
   ships its original spec plus the items Task 10/11 deferred to
   it (captured-FP mechanism, `GC_do_blocking` wrap,
