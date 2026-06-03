@@ -8326,8 +8326,7 @@ impl Tc {
                                     self.resolve_field_ty(&rf.ty, &subst).unwrap_or_else(opaque)
                                 })
                                 .collect();
-                            let names =
-                                record_fields.iter().map(|rf| rf.name.clone()).collect();
+                            let names = record_fields.iter().map(|rf| rf.name.clone()).collect();
                             (CtorShape::Record(names), tys)
                         }
                     };

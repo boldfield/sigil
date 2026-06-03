@@ -3889,6 +3889,15 @@ enum ChainStepRole {
         /// (CallCps variant) so the resumed arm's `k(value)` dispatches
         /// into the next step's synth-cont.
         next_step_func_id: cranelift_module::FuncId,
+        /// Pure `let`s bound in source AFTER this step's yield and
+        /// BEFORE `next_step`'s yield. They must be evaluated into env
+        /// at THIS Middle step's emit — before lowering `next_step`'s
+        /// perform args — so a `next_step` arg referencing one resolves.
+        /// (The FINAL step also re-evaluates every tail-prefix let for
+        /// the tail; pure lets are idempotent, so the overlap is
+        /// harmless.) Without this, a `perform; let r = e; perform r`
+        /// chain hit the "codegen: unknown ident" ICE on `r`.
+        pre_next_lets: Vec<TailPrefixLet>,
     },
     /// Final step (the last step in the chain): lower `tail_expr`
     /// via Lowerer (env has all chain bindings + captures), widen
@@ -3994,9 +4003,34 @@ fn collect_branch_chain_allocs(
                 // Outer arm bindings must reach inner PerformChain
                 // leaves; dropping them here leaves the synth-cont's
                 // closure record short of those names.
+                //
+                // The arm's pre-yield pure `let`s are bindings too: a
+                // `let name = <pure>` bound in this arm before a nested
+                // perform-bearing branch is live in the outer emit env
+                // at branch-alloc time, but is otherwise dropped here
+                // (only the pattern `arm_bindings` propagated), so a
+                // nested branch step referencing it hits the "codegen:
+                // unknown ident" ICE. Harvest the pure lets before the
+                // first yield and thread them down alongside the
+                // pattern bindings.
+                let mut nested_bindings = arm_bindings.clone();
+                for stmt in stmts {
+                    if let crate::ast::Stmt::Let(l) = stmt {
+                        // A perform-valued let is a yield: later lets may
+                        // depend on its result and can't be captured at
+                        // outer alloc time, so stop here.
+                        if matches!(&l.value, crate::ast::Expr::Perform(_)) {
+                            break;
+                        }
+                        nested_bindings.push(SynthContCapture {
+                            name: l.name.clone(),
+                            kind: slot_kind_for_type_expr_post_mono(&l.ty),
+                        });
+                    }
+                }
                 seed_branch_work(
                     tail,
-                    &arm_bindings,
+                    &nested_bindings,
                     ctors,
                     is_supported,
                     ctor_index,
@@ -4022,6 +4056,12 @@ fn collect_branch_chain_allocs(
                 // at outer alloc time. Evaluated at the Final step
                 // (with prior_bindings already loaded).
                 let mut inner_tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
+                // Parallel record of each post-yield pure let's chain
+                // position: `(branch_steps.len() when seen, let)`. A let
+                // seen after `k` yields, with another yield `k` still to
+                // come (position `k` < branch_yield_count), feeds yield
+                // `k`'s args and must be evaluated at MIDDLE step `k-1`.
+                let mut positioned_inner_lets: Vec<(usize, TailPrefixLet)> = Vec::new();
                 let mut seen_yield = false;
 
                 for stmt in stmts {
@@ -4043,6 +4083,7 @@ fn collect_branch_chain_allocs(
                                     value: l.value.clone(),
                                 };
                                 if seen_yield {
+                                    positioned_inner_lets.push((branch_steps.len(), entry.clone()));
                                     inner_tail_prefix_lets.push(entry);
                                 } else {
                                     pre_yield_pure_lets.push(entry);
@@ -4125,9 +4166,21 @@ fn collect_branch_chain_allocs(
                         })
                         .collect();
                     let role = if step + 1 < branch_yield_count {
+                        // Pure lets bound after yield `step` and before
+                        // yield `step + 1` (position `step + 1`) feed
+                        // yield `step + 1`'s args; evaluate them at THIS
+                        // Middle step. (They also remain in
+                        // `inner_tail_prefix_lets` for the FINAL step's
+                        // tail; pure lets are idempotent.)
+                        let pre_next_lets: Vec<TailPrefixLet> = positioned_inner_lets
+                            .iter()
+                            .filter(|(pos, _)| *pos == step + 1)
+                            .map(|(_, tpl)| tpl.clone())
+                            .collect();
                         ChainStepRole::Middle {
                             next_step: branch_steps[step + 1].clone(),
                             next_step_func_id: branch_func_ids[step + 1],
+                            pre_next_lets,
                         }
                     } else {
                         ChainStepRole::BranchLeafFinal {
@@ -5054,11 +5107,21 @@ fn walk_collect_captures(
                 walk_collect_captures(a, bound, helper_params, out);
             }
         }
-        // Yield-able shapes — classifier rejects, but defensive:
-        Expr::Perform(_)
-        | Expr::Handle { .. }
-        | Expr::Lambda { .. }
-        | Expr::ClosureRecord { .. } => {}
+        // A `perform` embedded in a branched tail (e.g. a match arm
+        // body `perform IO.print(name)`) is NOT decomposed into an
+        // explicit chain step, so its args must be walked here — a
+        // helper param referenced only inside the perform's args is
+        // otherwise never captured into the synth-cont closure record,
+        // producing the "codegen: unknown ident" ICE when the branch
+        // step lowers the perform-arg reference.
+        Expr::Perform(p) => {
+            for arg in &p.args {
+                walk_collect_captures(arg, bound, helper_params, out);
+            }
+        }
+        // Handle/Lambda/ClosureRecord perform their own closure
+        // conversion + capture analysis; nothing to collect here.
+        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {}
         Expr::Tuple { elems, .. } => {
             for el in elems {
                 walk_collect_captures(el, bound, helper_params, out);
@@ -10261,6 +10324,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                         // (after the last yield, before the tail). Lowered
                         // by the FINAL step's emit before tail_expr.
                         let mut tail_prefix_lets: Vec<TailPrefixLet> = Vec::new();
+                        // Parallel record of each pure let's chain position:
+                        // `(steps.len() at the time the let was seen, let)`.
+                        // A let seen after `k` yields and before yield `k`
+                        // (i.e. position `k` < chain_length) must also be
+                        // evaluated at the MIDDLE step that lowers yield
+                        // `k`'s args (step `k-1`). Position == chain_length
+                        // → after the last yield → FINAL step only.
+                        let mut positioned_lets: Vec<(usize, TailPrefixLet)> = Vec::new();
                         for stmt in &arm_body.stmts {
                             let let_stmt = match stmt {
                                 crate::ast::Stmt::Let(l) => l,
@@ -10335,7 +10406,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                         binding_kinds
                                             .push(slot_kind_for_type_expr_post_mono(&let_stmt.ty));
                                     } else {
-                                        tail_prefix_lets.push(TailPrefixLet {
+                                        let entry = TailPrefixLet {
                                             name: let_stmt.name.clone(),
                                             ty: cranelift_ty_for_type_expr(
                                                 &let_stmt.ty,
@@ -10343,7 +10414,9 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                             ),
                                             kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
                                             value: let_stmt.value.clone(),
-                                        });
+                                        };
+                                        positioned_lets.push((steps.len(), entry.clone()));
+                                        tail_prefix_lets.push(entry);
                                     }
                                 }
                                 other => {
@@ -10353,12 +10426,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                     // seen). Append to tail_prefix_lets;
                                     // FINAL step's emit lowers them in
                                     // order before lowering tail_expr.
-                                    tail_prefix_lets.push(TailPrefixLet {
+                                    let entry = TailPrefixLet {
                                         name: let_stmt.name.clone(),
                                         ty: cranelift_ty_for_type_expr(&let_stmt.ty, pointer_ty),
                                         kind: slot_kind_for_type_expr_post_mono(&let_stmt.ty),
                                         value: other.clone(),
-                                    });
+                                    };
+                                    positioned_lets.push((steps.len(), entry.clone()));
+                                    tail_prefix_lets.push(entry);
                                 }
                             }
                         }
@@ -10484,9 +10559,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 })
                                 .collect();
                             let role = if step + 1 < chain_length {
+                                // Pure lets bound after yield `step` and
+                                // before yield `step + 1` (position
+                                // `step + 1`) must be evaluated at THIS
+                                // Middle step so yield `step + 1`'s args
+                                // can reference them.
+                                let pre_next_lets: Vec<TailPrefixLet> = positioned_lets
+                                    .iter()
+                                    .filter(|(pos, _)| *pos == step + 1)
+                                    .map(|(_, tpl)| tpl.clone())
+                                    .collect();
                                 ChainStepRole::Middle {
                                     next_step: steps[step + 1].clone(),
                                     next_step_func_id: step_func_ids[step + 1],
+                                    pre_next_lets,
                                 }
                             } else {
                                 ChainStepRole::Final {
@@ -18912,7 +18998,18 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                             ChainStepRole::Middle {
                                 next_step,
                                 next_step_func_id,
+                                pre_next_lets,
                             } => {
+                                // Evaluate the pure lets bound between
+                                // this step's yield and `next_step`'s
+                                // yield into env, so `next_step`'s perform
+                                // args (lowered below) can reference them.
+                                // (The FINAL step re-evaluates every
+                                // tail-prefix let for the tail; pure lets
+                                // are idempotent, so the overlap is safe.)
+                                for tpl in pre_next_lets {
+                                    lowerer.lower_tail_prefix_let_into_env(tpl, pointer_ty);
+                                }
                                 // Allocate next-step closure record:
                                 // header at +0, null code_ptr at +8,
                                 // captures at +16+8*i, prior_bindings
@@ -23462,6 +23559,42 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         // CONTINUE: caller resumes here.
         self.builder.switch_to_block(continue_blk);
         self.builder.seal_block(continue_blk);
+    }
+
+    /// Lower one tail-prefix pure `let` (`let name = pure_expr`) into
+    /// `self.env`: reset `terminal_out`, lower the RHS, propagate any
+    /// discharge, widen to the env-slot convention, bind under `name`.
+    /// Mirrors the FINAL step's inline tail-prefix-let handling; shared
+    /// so MIDDLE steps can evaluate pure lets that sit between two
+    /// performs and feed the later perform's args.
+    fn lower_tail_prefix_let_into_env(&mut self, tpl: &TailPrefixLet, pointer_ty: Type) {
+        self.emit_terminal_out_reset_to_done();
+        let raw_v = self.lower_expr(&tpl.value);
+        self.emit_discharge_propagation_check();
+        let env_value = match tpl.kind {
+            EnvSlotKind::Int => {
+                let arg_ty = self.builder.func.dfg.value_type(raw_v);
+                if arg_ty.is_int() && arg_ty.bits() < 64 {
+                    self.builder.ins().uextend(types::I64, raw_v)
+                } else {
+                    raw_v
+                }
+            }
+            // Bool/Byte/Unit stay I8; Char/String/Closure/User stay
+            // pointer_ty — both bind raw, matching the env-slot
+            // convention (and the FINAL step's debug-asserted contract).
+            EnvSlotKind::Bool
+            | EnvSlotKind::Byte
+            | EnvSlotKind::Unit
+            | EnvSlotKind::Char
+            | EnvSlotKind::String
+            | EnvSlotKind::Closure
+            | EnvSlotKind::User => {
+                let _ = pointer_ty;
+                raw_v
+            }
+        };
+        self.env.insert(tpl.name.clone(), env_value);
     }
 
     /// Lower an expression to an SSA value. The value's Cranelift

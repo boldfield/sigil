@@ -22914,3 +22914,110 @@ fn main() -> Int ![IO] {\n\
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "65535");
 }
+
+// ===== Auto-CPS synth-cont capture threading — "unknown ident" ICE ==========
+//
+// Regression tests for two capture-threading gaps that made a CPS
+// fn's synth-cont closure record drop a live name, so a perform-arg
+// reference lowered to it hit `unreachable!("codegen: unknown ident
+// ...")`. Both shapes were surfaced by the H04 corpus prompt (stable
+// sort: build `(name, score)` records, perform-print the names).
+
+/// Bug 1: a fn **parameter** referenced inside the arms of a
+/// perform-bearing `match` in statement position. The free-var walker
+/// (`walk_collect_captures`) was a no-op on `Expr::Perform`, so a
+/// param used only inside a perform embedded in a branched tail was
+/// never captured into the branch synth-cont. Before the fix this
+/// panicked with `codegen: unknown ident \`name\``.
+#[test]
+fn auto_cps_param_in_perform_bearing_branch_no_ice() {
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  fn emit(name: String, first: Bool) -> Int ![IO] {\n\
+                    match first {\n\
+                      true => perform IO.print(name),\n\
+                      false => perform IO.print(name),\n\
+                    };\n\
+                    0\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    emit(\"A\", true);\n\
+                    emit(\"B\", false);\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_param_in_perform_branch");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "AB");
+}
+
+/// Bug 2: an **arm-local `let`** bound in an outer `match` arm, before
+/// a nested perform-bearing `match`, and referenced in a *later*
+/// perform of a multi-perform arm. `seed_branch_work`'s `Nested` leaf
+/// propagated only the arm's pattern bindings, dropping the arm's
+/// pre-yield pure `let`s — so the nested branch synth-cont was missing
+/// `name`. Before the fix this panicked with `codegen: unknown ident
+/// \`name\``.
+#[test]
+fn auto_cps_arm_local_let_across_nested_perform_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn ident(x: String) -> String ![] { x }\n\
+                  fn pn(xs: List[String], first: Bool) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(e, rest) => {\n\
+                        let name: String = ident(e);\n\
+                        match first {\n\
+                          true => { perform IO.print(name); pn(rest, false) },\n\
+                          false => { perform IO.print(\" \"); perform IO.print(name); pn(rest, false) },\n\
+                        }\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let xs: List[String] = Cons(\"A\", Cons(\"B\", Cons(\"C\", Nil)));\n\
+                    pn(xs, true);\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_arm_local_let_nested_perform");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A B C");
+}
+
+/// Bug 3: a pure `let` bound *between two performs* and consumed by the
+/// second perform's args (`perform p(s); let mark = …; perform p(mark)`).
+/// Post-yield pure lets were evaluated only at the FINAL step's tail, so
+/// the intermediate (MIDDLE) perform step lowering `mark` found it
+/// unbound. The fix evaluates each mid-chain pure let at the MIDDLE step
+/// that lowers the perform consuming it. Before the fix this panicked
+/// with `codegen: unknown ident \`mark\``.
+#[test]
+fn auto_cps_mid_chain_let_between_performs_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let mark: String = \"-\";\n\
+                        perform IO.print(mark);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_between_performs");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A-B-");
+}
