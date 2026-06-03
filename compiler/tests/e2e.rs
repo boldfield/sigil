@@ -1433,6 +1433,98 @@ fn auto_cps_fallback_note_suppressed_by_quiet_env_var() {
     );
 }
 
+// -------------------------------------------------------------------------
+// Foreign-keyword E0010 hints (parser.rs `foreign_keyword_hint`).
+//
+// Each test compiles a program that uses a foreign-language footgun
+// (return, var, for, while, def, else if) and asserts the compile
+// failed AND stderr carries a hint pointing at the Sigil idiom. The
+// hints reference the `spec/language.md` Appendix Idiomatic Patterns
+// added in PR #202; future spec changes that rename or remove that
+// appendix should also update the hint text in parser.rs and the
+// anchor strings below.
+// -------------------------------------------------------------------------
+
+/// `return` as a foreign keyword: Sigil pre-reserves `TokenKind::Return`
+/// but has no return statement. The hint points at "last expression
+/// IS the value."
+#[test]
+fn e0010_hint_for_return_keyword() {
+    let source = "fn main() -> Int ![] { return 0 }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_return");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("Sigil has no `return` keyword"),
+        "expected return-hint; stderr={stderr:?}"
+    );
+}
+
+/// `var` at statement position: tokenizes as `Ident("var")`, caught
+/// by the pre-emptive check in `parse_block`'s expression-stmt path.
+#[test]
+fn e0010_hint_for_var_keyword() {
+    let source = "fn main() -> Int ![] { var x: Int = 0; 0 }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_var");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("Sigil has no `var` / `mut`"),
+        "expected var-hint; stderr={stderr:?}"
+    );
+}
+
+/// `for` at statement position.
+#[test]
+fn e0010_hint_for_for_keyword() {
+    let source = "fn main() -> Int ![] { for i in xs { 0 }; 0 }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_for");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("iteration uses recursion"),
+        "expected for/while-hint; stderr={stderr:?}"
+    );
+}
+
+/// `while` at statement position — same hint as `for`.
+#[test]
+fn e0010_hint_for_while_keyword() {
+    let source = "fn main() -> Int ![] { while cond { 0 }; 0 }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_while");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("iteration uses recursion"),
+        "expected for/while-hint; stderr={stderr:?}"
+    );
+}
+
+/// `def` at top level: caught by the top-level catch-all hint path.
+#[test]
+fn e0010_hint_for_def_keyword() {
+    let source = "def main() -> Int ![] { 0 }\n";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_def");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("Sigil declares functions with `fn"),
+        "expected def-hint pointing at `fn`; stderr={stderr:?}"
+    );
+}
+
+/// `else if` chain: parse_if_expr detects `If` after `else` and
+/// emits a specific hint pointing at nested if/else or match.
+#[test]
+fn e0010_hint_for_else_if_chain() {
+    let source = "\
+fn main() -> Int ![] {
+  if 1 == 1 { 0 } else if 2 == 2 { 1 } else { 2 }
+}
+";
+    let (stderr, success) = compile_capturing_compile_stderr(source, "hint_else_if");
+    assert!(!success, "must fail; stderr={stderr:?}");
+    assert!(
+        stderr.contains("Sigil has no `else if` chain"),
+        "expected else-if hint; stderr={stderr:?}"
+    );
+}
+
 /// Category A baseline reconciliation — `consume` was one of the 10
 /// v1.1.0 baseline ICE-class failures. With this PR it compiles +
 /// runs cleanly, BUT it reaches Sync ABI via the pre-existing
