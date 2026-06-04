@@ -1,0 +1,20 @@
+// sigil: 0.1
+//
+// std/path.sigil — pure-string POSIX path manipulation.
+//
+// Slash-separated, no filesystem access (that is std.fs's job). Every
+// function is pure (![]). Semantics match Python's `posixpath`
+// (`os.path`) so an LLM author predicts behavior from that prior, with
+// ONE deliberate divergence: path_normalize collapses 2+ leading
+// slashes to a single "/" (posixpath preserves exactly "//"), because
+// the "//"-is-special POSIX corner has no useful LLM prior.
+//
+// See docs/superpowers/specs/2026-06-03-std-path-design.md for the full
+// semantics contract.
+
+// `path_is_absolute(p)` is true iff `p` begins with "/".
+//   path_is_absolute("/a") = true   path_is_absolute("a") = false
+//   path_is_absolute("/")  = true   path_is_absolute("")  = false
+fn path_is_absolute(p: String) -> Bool ![] {
+  string_starts_with(p, "/")
+}

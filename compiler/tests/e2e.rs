@@ -23224,3 +23224,25 @@ fn auto_cps_mid_chain_let_transitive_dependency_no_ice() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "A|<AB|<B");
 }
+
+// ===== std/path =========================================================
+
+#[test]
+fn std_path_is_absolute() {
+    // Contract: is_absolute(p) == p starts with "/".
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_is_absolute};\n\
+                  fn show(b: Bool) -> String ![] { match b { true => \"T\", false => \"F\" } }\n\
+                  fn main() -> Int ![IO] {\n\
+                    perform IO.print(show(path_is_absolute(\"/a\")));\n\
+                    perform IO.print(show(path_is_absolute(\"a\")));\n\
+                    perform IO.print(show(path_is_absolute(\"/\")));\n\
+                    perform IO.println(show(path_is_absolute(\"\")));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_is_absolute");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "TFTF");
+}
