@@ -23505,3 +23505,26 @@ fn field_access_on_sum_type_errors() {
         "expected a sum-type message pointing at match; stderr={stderr}"
     );
 }
+
+#[test]
+fn field_access_h04_style_ergonomic_demo() {
+    // Before this feature, reading `entry.name`/`entry.score` required
+    // a match or an accessor fn per field (the H04 corpus boilerplate).
+    // Now it's direct.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Entry = { name: String, score: Int }\n\
+                  fn describe(e: Entry) -> String ![] {\n\
+                    string_concat(e.name, string_concat(\": \", int_to_string(e.score)))\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let e: Entry = Entry { name: \"Ada\", score: 90 };\n\
+                    perform IO.println(describe(e));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_h04_demo");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ada: 90");
+}

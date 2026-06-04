@@ -236,9 +236,16 @@ fn main() -> Int ![IO] {
 Record fields are declared `name: Type` in the type, constructed
 with `Name { name: value, … }`, and destructured via `match` with
 `Name { name: binding, … }` (field-pun `name` is shorthand for
-`name: name`). v1 has no `.name` field-access syntax; use match
-destructuring instead. Records are nominal — two records with the
-same fields but different declared names do not unify.
+`name: name`). Record fields are read with `binding.field` (field
+access), where the head of the chain is a value of a single-variant
+record type; chains read through nested records (`node.inner.value`).
+Field access is read-only — there is no field-update syntax. `match`
+destructuring remains available and is the only way to read fields of
+a multi-variant sum type (the variant, and hence the field set, is not
+known statically). Field access on a non-identifier head
+(e.g. `make(x).field`) is not yet supported — bind it to a `let`
+first. Records are nominal — two records with the same fields but
+different declared names do not unify.
 
 ### E8 — Effects: `Raise` for exceptions
 
@@ -2639,3 +2646,5 @@ fn main() -> Int ![IO] {
 - Walking a `List[T]` is `match xs { Nil => ..., Cons(head, tail) => ... }`; the canonical fold is tail-recursive with an accumulator parameter (idiom F).
 - `std.list` provides `range`, `map`, `filter`, `fold`, `length`, `reverse`, `append`, `list_sort_int/string/char/float`. Prefer them over hand-rolled recursion when the shape fits (idiom G).
 - `std.option` provides `unwrap_or`, `map`, `and_then`; `std.result` provides `map`, `map_err`, `and_then`. Compose them instead of nesting `match` (idiom H).
+- Read a record field with `r.field` (and chains `r.a.b`); `match`
+  destructuring is still used to read fields of sum-type variants.
