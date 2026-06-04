@@ -23471,7 +23471,8 @@ fn field_access_unknown_field_errors() {
     let source = "type Person = { name: String, age: Int }\n\
                   fn bad(p: Person) -> Int ![] { p.height }\n\
                   fn main() -> Int ![] { 0 }\n";
-    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_unknown_field");
+    let (stderr, succeeded) =
+        compile_capturing_compile_stderr(source, "field_access_unknown_field");
     assert!(!succeeded, "must fail: no field `height`");
     assert!(
         stderr.contains("no field `height`") && stderr.contains("Person"),

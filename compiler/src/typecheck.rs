@@ -2405,10 +2405,22 @@ fn rewrite_block(
     same_file_rename: &BTreeMap<(String, String), String>,
 ) {
     for stmt in &mut b.stmts {
-        rewrite_stmt(stmt, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+        rewrite_stmt(
+            stmt,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        );
     }
     if let Some(tail) = b.tail.as_mut() {
-        rewrite_expr(tail, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+        rewrite_expr(
+            tail,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        );
     }
 }
 
@@ -2420,11 +2432,29 @@ fn rewrite_stmt(
     same_file_rename: &BTreeMap<(String, String), String>,
 ) {
     match s {
-        Stmt::Let(l) => rewrite_expr(&mut l.value, fn_file, resolved_idents, field_access_desugar, same_file_rename),
-        Stmt::Expr(e) => rewrite_expr(e, fn_file, resolved_idents, field_access_desugar, same_file_rename),
+        Stmt::Let(l) => rewrite_expr(
+            &mut l.value,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        ),
+        Stmt::Expr(e) => rewrite_expr(
+            e,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        ),
         Stmt::Perform(p) => {
             for a in &mut p.args {
-                rewrite_expr(a, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
     }
@@ -2450,7 +2480,13 @@ fn rewrite_expr(
             // walked too. Re-keying on the same span is safe — the
             // replacement is a `Match`, not an `Ident`, so this branch
             // does not re-fire.
-            rewrite_expr(e, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                e,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             return;
         }
     }
@@ -2475,16 +2511,46 @@ fn rewrite_expr(
         | Expr::BoolLit(_, _)
         | Expr::UnitLit(_) => {}
         Expr::Unary { operand, .. } => {
-            rewrite_expr(operand, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                operand,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Binary { lhs, rhs, .. } => {
-            rewrite_expr(lhs, fn_file, resolved_idents, field_access_desugar, same_file_rename);
-            rewrite_expr(rhs, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                lhs,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_expr(
+                rhs,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Call { callee, args, .. } => {
-            rewrite_expr(callee, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                callee,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for a in args {
-                rewrite_expr(a, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::If {
@@ -2493,27 +2559,75 @@ fn rewrite_expr(
             else_block,
             ..
         } => {
-            rewrite_expr(cond, fn_file, resolved_idents, field_access_desugar, same_file_rename);
-            rewrite_block(then_block, fn_file, resolved_idents, field_access_desugar, same_file_rename);
-            rewrite_block(else_block, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                cond,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_block(
+                then_block,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_block(
+                else_block,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            rewrite_expr(scrutinee, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                scrutinee,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for arm in arms {
-                rewrite_expr(&mut arm.body, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    &mut arm.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Block(b) => {
-            rewrite_block(b, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_block(
+                b,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Lambda { body, .. } => {
-            rewrite_expr(body, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                body,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Perform(p) => {
             for a in &mut p.args {
-                rewrite_expr(a, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Handle {
@@ -2522,22 +2636,52 @@ fn rewrite_expr(
             return_arm,
             ..
         } => {
-            rewrite_expr(body, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+            rewrite_expr(
+                body,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for arm in op_arms {
-                rewrite_expr(&mut arm.body, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    &mut arm.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
             if let Some(ra) = return_arm.as_mut() {
-                rewrite_expr(&mut ra.body, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    &mut ra.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                rewrite_expr(&mut f.value, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    &mut f.value,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                rewrite_expr(el, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    el,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::ClosureRecord { env_exprs, .. } => {
@@ -2545,7 +2689,13 @@ fn rewrite_expr(
             // pass shouldn't see it, but the recursive walker is
             // total in shape so we cover it for robustness.
             for e in env_exprs {
-                rewrite_expr(e, fn_file, resolved_idents, field_access_desugar, same_file_rename);
+                rewrite_expr(
+                    e,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::ClosureEnvLoad { .. } => {
@@ -4300,9 +4450,7 @@ impl Tc {
                     self.push_error(
                         "E0151",
                         span.clone(),
-                        format!(
-                            "could not resolve the type of field `{field}` on `{type_name}`."
-                        ),
+                        format!("could not resolve the type of field `{field}` on `{type_name}`."),
                     );
                     return FieldAccessOutcome::Errored;
                 }
@@ -4350,10 +4498,7 @@ impl Tc {
     /// Build the generic substitution for a record type declaration applied
     /// to the given type arguments.  Used by `try_resolve_field_access` when
     /// resolving the type of a field on a generic record.
-    fn subst_for(
-        td: &TypeDecl,
-        type_args: &[Ty],
-    ) -> std::collections::BTreeMap<String, Ty> {
+    fn subst_for(td: &TypeDecl, type_args: &[Ty]) -> std::collections::BTreeMap<String, Ty> {
         let mut subst = std::collections::BTreeMap::new();
         for (generic_param, arg_ty) in td.generic_params.iter().zip(type_args.iter()) {
             subst.insert(generic_param.name.clone(), arg_ty.clone());
