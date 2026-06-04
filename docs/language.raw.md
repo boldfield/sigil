@@ -2147,6 +2147,65 @@ it specifically; the `if !cond { panic(msg) }` form one inversion
 away has the same semantics, but `assert` is the prior every LLM
 has.
 
+#### §13.3 — Quick reference: most-used stdlib fns by module
+
+This table lists the `import std.<module>` functions LLM authors
+most often reach for. **It is intentionally non-exhaustive** — full
+per-module documentation lives in `std/<module>.sigil`. The point
+is to settle two recurring failure modes: (a) the model invents
+APIs that don't exist (`xs.max()`, `HashMap::new()`, `xs.length`);
+(b) the model writes manual recursion when a stdlib combinator
+would do it cleanly. None of the listed functions are themselves
+solutions to common problems — `std.list` deliberately has no
+`max`/`min`/`sum`, no list literals, and no methods. Reductions go
+through `fold`; sorts go through `list_sort_*`; everything else is
+built from the primitives below.
+
+Effect rows: every fn listed has row `![]` (pure) unless marked
+`![Mem]` (mutable-array ops). `IO.println`/`IO.print`/`IO.read_line`
+are effect ops (not regular fns) — see §7.
+
+| Module | Function | Type | Purpose |
+|--------|----------|------|---------|
+| `std.int` | `int_to_string(n)` | `(Int) -> String` | format Int as decimal — needed before any `IO.println(int_value)` |
+| `std.int` | `int_max()` / `int_min()` | `() -> Int` | Int range bounds (±2^62) |
+| `std.int` | `int_add_safe(a,b)` / `int_sub_safe(a,b)` | `(Int, Int) -> Option[Int]` | overflow-safe arithmetic |
+| `std.int` | `checked_div(a,b)` / `checked_mod(a,b)` | `(Int, Int) -> Result[Int, String]` | div/mod without trap on zero divisor (see §4.2) |
+| `std.string` | `string_to_int(s)` | `(String) -> Result[Int, ParseError]` | parse decimal Int; `ParseError = \| Empty \| NonDecimal \| Overflow` |
+| `std.string` | `string_split(s, sep)` | `(String, String) -> List[String]` | split on separator |
+| `std.string` | `string_replace(s, find, repl)` | `(String, String, String) -> String` | substring replace |
+| `std.string` | `string_byte_at_opt(s, i)` | `(String, Int) -> Option[Byte]` | safe byte indexing |
+| `std.string` | `string_substring_opt(s, start, end)` | `(String, Int, Int) -> Option[String]` | safe substring `[start, end)` |
+| `std.list` | `length(xs)` | `(List[A]) -> Int` | element count |
+| `std.list` | `range(start, end)` | `(Int, Int) -> List[Int]` | build `[start, end)` |
+| `std.list` | `map(xs, f)` | `(List[A], (A) -> B ![]) -> List[B]` | transform each |
+| `std.list` | `filter(xs, pred)` | `(List[A], (A) -> Bool ![]) -> List[A]` | keep matching |
+| `std.list` | `fold(xs, init, f)` | `(List[A], B, (B, A) -> B ![]) -> B` | reduce — sum, max, count, find, etc. all build on `fold` |
+| `std.list` | `reverse(xs)`, `append(xs, ys)` | `(List[A]) -> List[A]`, `(List[A], List[A]) -> List[A]` | basic ops |
+| `std.list` | `list_sort_int(xs)` / `list_sort_string(xs)` / `list_sort_char(xs)` / `list_sort_float(xs)` | `(List[T]) -> List[T]` | type-specialised stable sort (no comparator arg) |
+| `std.list` | `list_sort(xs, cmp)` | `(List[T], (T, T) -> Ordering ![]) -> List[T]` | generic stable sort with comparator |
+| `std.option` | `unwrap_or(opt, default)` | `(Option[A], A) -> A` | collapse `Option[T]` with fallback |
+| `std.option` | `map(opt, f)` | `(Option[A], (A) -> B ![]) -> Option[B]` | transform `Some` payload |
+| `std.option` | `and_then(opt, f)` | `(Option[A], (A) -> Option[B] ![]) -> Option[B]` | chain `Option`-returning fns |
+| `std.result` | `map(r, f)` / `map_err(r, f)` / `and_then(r, f)` | mirrors `std.option` shape | compose `Result`-returning fns |
+| `std.float` | `string_to_float(s)` | `(String) -> Option[Float]` | parse Float |
+| `std.array` | `array_get_opt(arr, i)` | `(Array[A], Int) -> Option[A]` | safe indexed read (returns `None` on out-of-bounds) |
+| `std.array` | `array_set_opt(arr, i, v)` | `(Array[A], Int, A) -> Option[Array[A]]` | safe indexed write returning a new Array |
+| `std.mut_array` | `mut_array_get_opt(arr, i)` / `mut_array_set_opt(arr, i, v)` | `(MutArray[A], Int) -> Option[A] ![Mem]` / `(MutArray[A], Int, A) -> Option[Unit] ![Mem]` | mutable-array equivalents under `![Mem]` |
+| `std.map` | `map_int_keys()` / `map_string_keys()` / `map_char_keys()` | `() -> Map[K, V]` | construct an empty `Map[K, V]` with built-in comparator |
+| `std.map` | `map_empty(cmp)` | `((K, K) -> Ordering ![]) -> Map[K, V]` | generic empty Map with explicit comparator |
+| `std.map` | `map_get(m, k)` | `(Map[K, V], K) -> Option[V]` | lookup (returns `None` if absent) |
+| `std.map` | `map_contains(m, k)`, `map_insert(m, k, v)`, `map_remove(m, k)`, `map_size(m)`, `map_is_empty(m)` | — | basic ops |
+| `std.map` | `map_keys(m)`, `map_values(m)`, `map_to_list(m)`, `map_from_list(xs, cmp)` | conversion to/from `List[K]` / `List[V]` / `List[(K, V)]` | |
+| `std.map` | `map_fold(m, init, f)`, `map_map(m, f)`, `map_filter(m, pred)` | higher-order over Maps | |
+| `std.set` | `set_int()` / `set_string()` / `set_char()` | `() -> Set[T]` | construct an empty `Set[T]` with built-in comparator |
+| `std.set` | `set_empty(cmp)` | `((T, T) -> Ordering ![]) -> Set[T]` | generic empty Set |
+| `std.set` | `set_contains`, `set_insert`, `set_remove`, `set_size`, `set_is_empty` | — | basic ops |
+| `std.set` | `set_to_list(s)`, `set_from_list(xs, cmp)`, `set_fold(s, init, f)`, `set_filter(s, pred)` | conversion + higher-order | |
+| `std.set` | `set_union`, `set_intersect`, `set_difference`, `set_subset`, `set_eq` | set algebra | |
+| `std.pair` | `fst(p)` / `snd(p)` | `((A, B)) -> A` / `((A, B)) -> B` | tuple component access (works on built-in tuples too) |
+| `std.ordering` | `int_compare` / `string_compare` / `char_compare` / `bool_compare` / `float_compare` | `(T, T) -> Ordering` | comparators for `list_sort` / `map_empty` / `set_empty` |
+
 ### §14 — v1 limits
 
 The following limits are permanent v1 design choices:
@@ -2286,3 +2345,292 @@ pprof -alloc_space /tmp/alloc.pb        # bytes-allocated heatmap
 - Continuous / streaming profiles.
 - GC heap-snapshot profile.
 - Effect-aware per-handler-frame attribution.
+
+---
+
+## Appendix — Idiomatic patterns
+
+Sigil's surface differs from common languages (Python, JS, Go, Rust)
+in five places where authors most often trip up:
+
+| If you'd write (other languages)        | In Sigil, write                              |
+|-----------------------------------------|----------------------------------------------|
+| `for i in 1..=n: total += i` / `while`  | recursive helper with an accumulator param   |
+| `var x = 0; x += y`                     | nothing mutates — bind a new `let` each step |
+| `if a: ... elif b: ... else: ...`       | nested `if`/`else`, OR `match` on conditions |
+| `return value`                          | last expression of the block IS the value    |
+| `print(x)` where `x: Int`               | `perform IO.println(int_to_string(x))`       |
+| `class Color: RED, GREEN, BLUE`         | `type Color = \| Red \| Green \| Blue`       |
+| `try/except` or null sentinels          | return `Option[T]` or `Result[T, E]` + match |
+
+The next five examples are the canonical translations. Each compiles
+and runs as-is; together they cover the surface syntax most prompts
+need (imports, `use` lines, `fn main() -> Int ![<row>]`, recursion,
+exhaustive `match`, sum types, and the stdlib `Option` type).
+
+### A — Iteration → recursion with an accumulator
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `current` walks from 1 to n; `acc` accumulates the running sum.
+// No mutable variable — each recursive call rebinds `current` and `acc`.
+fn count_up_step(n: Int, current: Int, acc: Int) -> Int ![] {
+  if current > n {
+    acc
+  } else {
+    count_up_step(n, current + 1, acc + current)
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(count_up_step(10, 1, 0)));
+  0
+}
+```
+
+### B — Multi-way branching with `match` (Sigil has no `else if`)
+
+**There is no `else if`.** An `else` must be followed by a brace block
+`{ ... }`. Chaining `else if` — the C / Python / JS / Rust habit — is a
+parse error: `E0010`, "expected `{` opening block", reported at the `if`
+that follows `else`.
+
+```text
+// ✗ NOT valid Sigil — `else if` does not exist:
+if n < 0 { "neg" } else if n == 0 { "zero" } else { "pos" }
+```
+
+Write it one of two ways. For a simple two-way split, nest the
+`if`/`else` so every `else` opens its own brace block:
+
+```sigil
+import std.io
+use std.io.{IO};
+
+// ✓ Nested if/else — each `else` is followed by `{ ... }`:
+fn sign(n: Int) -> String ![] {
+  if n < 0 {
+    "negative"
+  } else {
+    if n == 0 { "zero" } else { "positive" }
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(sign(0 - 4));
+  perform IO.println(sign(0));
+  perform IO.println(sign(7));
+  0
+}
+```
+
+For three or more conditions the nesting gets deep — prefer a `match`
+on a tuple of the conditions, the canonical `if/elif/else` replacement:
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `match` on a tuple of conditions is the canonical replacement for
+// `if/elif/else` chains. Each arm pattern picks the first matching
+// shape; `_` is the wildcard. The arm bodies are expressions, not
+// statements — every branch produces the same type.
+fn classify(n: Int) -> String ![] {
+  match (n < 0, n == 0) {
+    (true, _)  => "negative",
+    (_, true)  => "zero",
+    (_, _)     => int_to_string(n),
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(classify(0 - 4));
+  perform IO.println(classify(0));
+  perform IO.println(classify(7));
+  0
+}
+```
+
+### C — Pure helpers + IO main (composing effect rows)
+
+```sigil
+import std.int
+import std.io
+use std.int.{int_to_string};
+use std.io.{IO};
+
+// `double` performs no effects, so its row is `![]`. `print_doubled`
+// uses `IO`, so its row is `![IO]`. `main` calls `print_doubled` and
+// inherits `![IO]`. Effect rows are mandatory and must exactly match
+// the effects actually performed in the body.
+fn double(n: Int) -> Int ![] { n + n }
+
+fn print_doubled(n: Int) -> Int ![IO] {
+  perform IO.println(int_to_string(double(n)));
+  0
+}
+
+fn main() -> Int ![IO] {
+  print_doubled(21)
+}
+```
+
+### D — User-defined sum types with exhaustive `match`
+
+```sigil
+import std.io
+use std.io.{IO};
+
+// Sum types replace enum-like classes / constant tags. Variants
+// after `|` can be nullary (no payload) or carry positional fields.
+// `match` on a sum type is checked for exhaustiveness — leaving an
+// arm out is a compile error (E0066).
+type Mood = | Happy | Sad | Neutral
+
+fn greet(m: Mood) -> String ![] {
+  match m {
+    Happy   => "yay",
+    Sad     => "ouch",
+    Neutral => "ok",
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(greet(Happy));
+  0
+}
+```
+
+### E — `Option[T]` for fallible operations (instead of sentinels or exceptions)
+
+```sigil
+import std.int
+import std.io
+import std.option
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.option.{None, Option, Some};
+
+// Fallible operations return `Option[T]` (no value) or `Result[T, E]`
+// (typed error). Callers `match` on the result; there is no
+// try/except, no null, no sentinel.
+fn nonzero(n: Int) -> Option[Int] ![] {
+  if n == 0 { None } else { Some(n) }
+}
+
+fn main() -> Int ![IO] {
+  match nonzero(7) {
+    Some(v) => perform IO.println(int_to_string(v)),
+    None    => perform IO.println("zero"),
+  };
+  0
+}
+```
+
+### F — List recursion via `match Cons(head, tail)` with an accumulator
+
+```sigil
+import std.int
+import std.io
+import std.list
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{Cons, List, Nil};
+
+// Walk a `List` by matching on `Nil` / `Cons(head, tail)`. The
+// tail-recursive form (accumulator parameter, recursive call at the
+// tail) is the canonical pattern for any per-element fold: count,
+// sum, search, transform, reduce. Every list traversal in Sigil
+// follows this shape.
+fn count_pos_step(xs: List[Int], acc: Int) -> Int ![] {
+  match xs {
+    Nil => acc,
+    Cons(head, tail) => if head > 0 {
+      count_pos_step(tail, acc + 1)
+    } else {
+      count_pos_step(tail, acc)
+    },
+  }
+}
+
+fn count_pos(xs: List[Int]) -> Int ![] {
+  count_pos_step(xs, 0)
+}
+
+fn main() -> Int ![IO] {
+  let xs: List[Int] = Cons(0 - 1, Cons(2, Cons(0, Cons(5, Nil))));
+  perform IO.println(int_to_string(count_pos(xs)));
+  0
+}
+```
+
+### G — Higher-order stdlib (`std.list.range` + `map` + `fold`)
+
+```sigil
+import std.int
+import std.io
+import std.list
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.list.{List, fold, map, range};
+
+// `std.list.range(start, end)` produces `[start, end)`. `map`
+// transforms each element; `fold` reduces with a `(acc, elem)`
+// combiner. Together they replace manual recursion for any
+// transform-then-reduce shape — concise and idiomatic.
+fn sum_sq(n: Int) -> Int ![] {
+  let xs: List[Int] = range(1, n);
+  let squares: List[Int] = map(xs, fn (k: Int) -> Int ![] => k * k);
+  fold(squares, 0, fn (acc: Int, sq: Int) -> Int ![] => acc + sq)
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(sum_sq(5)));
+  0
+}
+```
+
+### H — `Option` combinators (`unwrap_or`, `map`, `and_then`)
+
+```sigil
+import std.int
+import std.io
+import std.option
+use std.int.{int_to_string};
+use std.io.{IO};
+use std.option.{None, Option, Some, unwrap_or};
+
+// `unwrap_or(opt, default)` collapses `Option[T]` to `T` by
+// returning the wrapped value or a fallback — cleaner than `match`
+// when you just want a default. `std.option` also provides `map`
+// (transform Some payload, pass through None) and `and_then`
+// (chain another `Option`-returning step); both let you compose
+// fallible operations without nested `match`.
+fn lookup_or_default(found: Option[Int], default: Int) -> Int ![] {
+  unwrap_or(found, default)
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(int_to_string(lookup_or_default(Some(42), 0)));
+  perform IO.println(int_to_string(lookup_or_default(None, 99)));
+  0
+}
+```
+
+### Surface-syntax reminders the eight idioms collectively demonstrate
+
+- Files begin with `import std.foo` lines, then optional `use std.foo.{Name1, Name2};` lines that bring those names into local scope.
+- `fn name(arg: T, ...) -> Ret ![<row>] { body }` — `Ret` and the effect row are mandatory; the row contains exactly the effects performed.
+- The body is an expression; multi-statement bodies use a block `{ stmt; stmt; tail }` whose **last expression is the block's value** — there is no `return` keyword.
+- `match` arms are separated by commas; the last arm has a trailing comma.
+- `IO.println` takes `String`. Convert with `int_to_string`, `bool_to_string`, `char_to_string`, etc., before passing.
+- `/` and `%` trap on a zero divisor and carry NO effect (see §4.2); use `checked_div` / `checked_mod` from `std.int` for the recoverable form.
+- Walking a `List[T]` is `match xs { Nil => ..., Cons(head, tail) => ... }`; the canonical fold is tail-recursive with an accumulator parameter (idiom F).
+- `std.list` provides `range`, `map`, `filter`, `fold`, `length`, `reverse`, `append`, `list_sort_int/string/char/float`. Prefer them over hand-rolled recursion when the shape fits (idiom G).
+- `std.option` provides `unwrap_or`, `map`, `and_then`; `std.result` provides `map`, `map_err`, `and_then`. Compose them instead of nesting `match` (idiom H).
