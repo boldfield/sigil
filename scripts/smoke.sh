@@ -45,5 +45,6 @@ check_example "${repo_root}/examples/hello.sigil" "hello, world"
 check_example "${repo_root}/examples/option_demo.sigil" "$(printf '42\n-1')"
 check_example "${repo_root}/examples/tree.sigil" "32767"
 check_example "${repo_root}/examples/generic_map.sigil" "$(printf '3\n2')"
+check_example "${repo_root}/examples/path_demo.sigil" "$(printf 'usr/local/bin\nhosts\n/etc\narchive.tar | .gz\na/c/d')"
 
 echo "smoke: OK (all examples passed)"

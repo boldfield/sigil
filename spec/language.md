@@ -2176,6 +2176,12 @@ are effect ops (not regular fns) — see §7.
 | `std.string` | `string_replace(s, find, repl)` | `(String, String, String) -> String` | substring replace |
 | `std.string` | `string_byte_at_opt(s, i)` | `(String, Int) -> Option[Byte]` | safe byte indexing |
 | `std.string` | `string_substring_opt(s, start, end)` | `(String, Int, Int) -> Option[String]` | safe substring `[start, end)` |
+| `std.path` | `path_join(a, b)` | `(String, String) -> String` | join two path segments — **note:** an absolute `b` resets (`path_join("a","/b") == "/b"`), matching `posixpath` |
+| `std.path` | `path_basename(p)` / `path_dirname(p)` | `(String) -> String` | final component / everything before it |
+| `std.path` | `path_split(p)` | `(String) -> (String, String)` | `(dirname, basename)` pair |
+| `std.path` | `path_splitext(p)` | `(String) -> (String, String)` | `(root, ext)`; `ext` includes the dot, `""` if none; a leading-dot dotfile has no ext. (No standalone "extension" fn — use `snd(path_splitext(p))`.) |
+| `std.path` | `path_normalize(p)` | `(String) -> String` | collapse `.` / `..` / duplicate slashes (posixpath `normpath`) |
+| `std.path` | `path_is_absolute(p)` | `(String) -> Bool` | does `p` start with `/` |
 | `std.list` | `length(xs)` | `(List[A]) -> Int` | element count |
 | `std.list` | `range(start, end)` | `(Int, Int) -> List[Int]` | build `[start, end)` |
 | `std.list` | `map(xs, f)` | `(List[A], (A) -> B ![]) -> List[B]` | transform each |
