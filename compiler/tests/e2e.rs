@@ -23060,13 +23060,14 @@ fn auto_cps_mid_chain_let_consumed_by_later_perform_no_ice() {
 }
 
 /// Bug 3c: a mid-chain pure `let` whose RHS depends on a *prior perform's
-/// result* (`let a = perform Counter.tick(); let doubled = int_to_string(a
-/// + a); perform p("["); perform p(doubled); …`). This exercises the
-/// positioning invariant directly — `doubled` (position 1) must be
-/// re-evaluated at the step lowering its consuming perform, and that step
-/// must have the yield-0 result `a` loaded into env (`pos <= step + 1`
-/// holds because `doubled` depends only on yields `< 1`). Confirms the
-/// re-eval carries forward correctly when the let isn't a literal.
+/// result* — `let a = perform Counter.tick()`, then `let doubled =
+/// int_to_string(a + a)`, then a later `perform p(doubled)`. This
+/// exercises the positioning invariant directly: `doubled` (position 1)
+/// must be re-evaluated at the step lowering its consuming perform, and
+/// that step must have the yield-0 result `a` loaded into env
+/// (`pos <= step + 1` holds because `doubled` depends only on yields
+/// `< 1`). Confirms the re-eval carries forward when the let isn't a
+/// literal.
 #[test]
 fn auto_cps_mid_chain_let_depends_on_prior_yield_no_ice() {
     let source = "import std.io\n\
