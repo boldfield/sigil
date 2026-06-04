@@ -12,6 +12,11 @@
 // See docs/superpowers/specs/2026-06-03-std-path-design.md for the full
 // semantics contract.
 
+import std.list
+import std.string
+use std.list.{List, fold};
+use std.string.{string_split, string_replace};
+
 // `path_is_absolute(p)` is true iff `p` begins with "/".
 //   path_is_absolute("/a") = true   path_is_absolute("a") = false
 //   path_is_absolute("/")  = true   path_is_absolute("")  = false
@@ -41,5 +46,82 @@ fn path_join(a: String, b: String) -> String ![] {
         string_concat(string_concat(a, "/"), b)
       }
     }
+  }
+}
+
+// --- shared helpers -----------------------------------------------------
+
+// fold combinator returning the second arg — folds a list to its LAST
+// element (or the seed for an empty list).
+fn __take_second(acc: String, x: String) -> String ![] { x }
+
+// Last element of a non-empty component list ("" for an empty list).
+fn __last_component(comps: List[String]) -> String ![] {
+  fold(comps, "", __take_second)
+}
+
+// True iff `s` is non-empty and consists only of "/" characters.
+fn __is_all_slashes(s: String) -> Bool ![] {
+  if string_length(s) == 0 {
+    false
+  } else {
+    string_length(string_replace(s, "/", "")) == 0
+  }
+}
+
+// Remove ALL trailing "/" from `s`. Caller guarantees `s` is not
+// all-slashes, so this never empties a slash-only string.
+fn __rstrip_slashes(s: String) -> String ![] {
+  if string_ends_with(s, "/") {
+    __rstrip_slashes(string_substring(s, 0, string_length(s) - 1))
+  } else {
+    s
+  }
+}
+
+// posixpath's head normalization: strip trailing slashes from a split
+// head UNLESS it is all-slashes (then keep it verbatim). An empty head
+// is handled by `__is_all_slashes` returning false → rstrip → "".
+fn __strip_head_slashes(head: String) -> String ![] {
+  if __is_all_slashes(head) {
+    head
+  } else {
+    __rstrip_slashes(head)
+  }
+}
+
+// --- split / basename / dirname ----------------------------------------
+
+// `path_split(p)` returns `(head, tail)` where `tail` is the final
+// component (after the last "/") and `head` is everything before it
+// (trailing slashes stripped unless head is all-slashes). Mirrors
+// posixpath.split.
+//   path_split("a/b/c")=("a/b","c")  path_split("a/b/")=("a/b","")
+//   path_split("/a")=("/","a")  path_split("/")=("/","")  path_split("a")=("","a")
+fn path_split(p: String) -> (String, String) ![] {
+  if string_index_of(p, "/") < 0 {
+    ("", p)
+  } else {
+    let tail: String = __last_component(string_split(p, "/"));
+    // Index just past the last "/" = len(p) - len(tail).
+    let cut: Int = string_length(p) - string_length(tail);
+    let head_raw: String = string_substring(p, 0, cut);
+    (__strip_head_slashes(head_raw), tail)
+  }
+}
+
+// `path_basename(p)` is the final component (= path_split's tail).
+//   path_basename("/a/b")="b"  path_basename("/a/b/")=""  path_basename("/")=""
+fn path_basename(p: String) -> String ![] {
+  match path_split(p) {
+    (_, tail) => tail,
+  }
+}
+
+// `path_dirname(p)` is everything before the final component (= head).
+//   path_dirname("/a/b")="/a"  path_dirname("a")=""  path_dirname("/")="/"
+fn path_dirname(p: String) -> String ![] {
+  match path_split(p) {
+    (head, _) => head,
   }
 }

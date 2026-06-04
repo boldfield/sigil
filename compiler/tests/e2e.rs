@@ -23270,3 +23270,41 @@ fn std_path_join() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout, "a/b\na/b\n/b\nb\na/\n/a\n");
 }
+
+#[test]
+fn std_path_split_basename_dirname() {
+    // posixpath.split -> (head, tail); basename=tail, dirname=head.
+    //   split("a/b/c")=("a/b","c")  split("a/b/")=("a/b","")  split("/")=("/","")
+    //   split("a")=("","a")  split("/a")=("/","a")  split("a//b")=("a","b")
+    //   split("//a")=("//","a")  split("")=("","")
+    // Printed as `head|tail` per line; then basename/dirname spot-checks.
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_split, path_basename, path_dirname};\n\
+                  fn pair_line(p: String) -> Int ![IO] {\n\
+                    match path_split(p) {\n\
+                      (h, t) => { perform IO.print(h); perform IO.print(\"|\"); perform IO.println(t); 0 }\n\
+                    }\n\
+                  }\n\
+                  fn line(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    pair_line(\"a/b/c\");\n\
+                    pair_line(\"a/b/\");\n\
+                    pair_line(\"/\");\n\
+                    pair_line(\"a\");\n\
+                    pair_line(\"/a\");\n\
+                    pair_line(\"a//b\");\n\
+                    pair_line(\"//a\");\n\
+                    pair_line(\"\");\n\
+                    line(path_basename(\"/a/b\"));\n\
+                    line(path_dirname(\"/a/b\"));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_split");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "a/b|c\na/b|\n/|\n|a\n/|a\na|b\n//|a\n|\nb\n/a\n"
+    );
+}
