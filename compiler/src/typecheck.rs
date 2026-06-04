@@ -19229,38 +19229,15 @@ fn main() -> Int ![IO] {\n\
         );
     }
 
-    /// E0147 stdlib-shadow extension (2026-05-10 harness-data fix):
-    /// when a user fn collides with a stdlib export, the diagnostic
-    /// appends a hint pointing at the stdlib version. Without this,
-    /// the LLM's natural retry path ("rename my fn") is harder to
-    /// arrive at — the cross-language harness showed sonnet
-    /// repeatedly defining `fn int_compare` because std.ordering
-    /// already exports one and the original E0147 message didn't
-    /// surface that.
-    #[test]
-    #[ignore = "Plan F1 — call-site E0147 stdlib-shadow hint retired. \
-                See `use_line_collision_fires_e0147` for the new \
-                duplicate-`use` surface; the user-vs-stdlib collision \
-                shape is now legal (the user's `fn int_compare` keeps \
-                its identity via `<file>::int_compare`, no E0147)."]
-    fn bare_name_user_vs_stdlib_collision_includes_stdlib_hint() {
-        // Body intentionally minimal — the `#[ignore]` attribute
-        // means cargo skips this test; the body just has to
-        // compile.
-        let _src = "fn main() -> Int ![] { 0 }\n";
-    }
-
-    /// Plan F1 — the cross-stdlib call-site E0147 stdlib-shadow
-    /// hint is retired. The relevant new surface is the
-    /// duplicate-`use`-line E0147; without a `use` line, bare `map`
-    /// is just E0046 (covered by
-    /// `bare_name_collision_across_imports_is_now_e0046`).
-    #[test]
-    #[ignore = "Plan F1 — call-site stdlib-shadow hint retired"]
-    fn bare_name_cross_stdlib_collision_no_stdlib_hint() {
-        // Body intentionally minimal.
-        let _src = "fn main() -> Int ![] { 0 }\n";
-    }
+    // Plan F1 retired the call-site E0147 stdlib-shadow hint: a user fn
+    // colliding with a stdlib export is now legal (the user's
+    // `fn int_compare` keeps its identity via `<file>::int_compare`, no
+    // E0147). The two ex-tests asserting that hint were removed here.
+    // The current E0147 surface — duplicate `use` lines, alias
+    // suppression, and bare-name-collision-is-now-E0046 — is covered by
+    // `use_line_collision_fires_e0147`,
+    // `use_line_collision_resolved_by_alias_no_e0147`, and
+    // `bare_name_collision_across_imports_is_now_e0046` above.
 
     #[test]
     fn bare_name_single_import_is_unambiguous_no_e0147() {
