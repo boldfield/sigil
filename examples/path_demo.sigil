@@ -1,0 +1,15 @@
+import std.io
+import std.path
+use std.io.{IO};
+use std.path.{path_join, path_basename, path_dirname, path_splitext, path_normalize};
+
+fn main() -> Int ![IO] {
+  perform IO.println(path_join("usr/local", "bin"));      // usr/local/bin
+  perform IO.println(path_basename("/etc/hosts"));         // hosts
+  perform IO.println(path_dirname("/etc/hosts"));          // /etc
+  match path_splitext("archive.tar.gz") {                  // archive.tar | .gz
+    (r, e) => { perform IO.print(r); perform IO.print(" | "); perform IO.println(e); 0 }
+  };
+  perform IO.println(path_normalize("a/b/../c/./d"));       // a/c/d
+  0
+}

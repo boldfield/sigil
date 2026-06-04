@@ -23224,3 +23224,166 @@ fn auto_cps_mid_chain_let_transitive_dependency_no_ice() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "A|<AB|<B");
 }
+
+// ===== std/path =========================================================
+
+#[test]
+fn std_path_is_absolute() {
+    // Contract: is_absolute(p) == p starts with "/".
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_is_absolute};\n\
+                  fn show(b: Bool) -> String ![] { match b { true => \"T\", false => \"F\" } }\n\
+                  fn main() -> Int ![IO] {\n\
+                    perform IO.print(show(path_is_absolute(\"/a\")));\n\
+                    perform IO.print(show(path_is_absolute(\"a\")));\n\
+                    perform IO.print(show(path_is_absolute(\"/\")));\n\
+                    perform IO.println(show(path_is_absolute(\"\")));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_is_absolute");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "TFTF");
+}
+
+#[test]
+fn std_path_join() {
+    // Contract (posixpath.join, incl. the absolute-resets wart):
+    //   join("a","b")="a/b"  join("a/","b")="a/b"  join("a","/b")="/b"
+    //   join("","b")="b"     join("a","")="a/"     join("/","a")="/a"
+    //   join("a/b","c")="a/b/c"
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_join};\n\
+                  fn line(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    line(path_join(\"a\", \"b\"));\n\
+                    line(path_join(\"a/\", \"b\"));\n\
+                    line(path_join(\"a\", \"/b\"));\n\
+                    line(path_join(\"\", \"b\"));\n\
+                    line(path_join(\"a\", \"\"));\n\
+                    line(path_join(\"/\", \"a\"));\n\
+                    line(path_join(\"a/b\", \"c\"));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_join");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout, "a/b\na/b\n/b\nb\na/\n/a\na/b/c\n");
+}
+
+#[test]
+fn std_path_split_basename_dirname() {
+    // posixpath.split -> (head, tail); basename=tail, dirname=head.
+    //   split("a/b/c")=("a/b","c")  split("a/b/")=("a/b","")  split("/")=("/","")
+    //   split("a")=("","a")  split("/a")=("/","a")  split("a//b")=("a","b")
+    //   split("//a")=("//","a")  split("")=("","")
+    // Printed as `head|tail` per line; then basename/dirname spot-checks.
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_split, path_basename, path_dirname};\n\
+                  fn pair_line(p: String) -> Int ![IO] {\n\
+                    match path_split(p) {\n\
+                      (h, t) => { perform IO.print(h); perform IO.print(\"|\"); perform IO.println(t); 0 }\n\
+                    }\n\
+                  }\n\
+                  fn line(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    pair_line(\"a/b/c\");\n\
+                    pair_line(\"a/b/\");\n\
+                    pair_line(\"/\");\n\
+                    pair_line(\"a\");\n\
+                    pair_line(\"/a\");\n\
+                    pair_line(\"a//b\");\n\
+                    pair_line(\"//a\");\n\
+                    pair_line(\"\");\n\
+                    line(path_basename(\"/a/b\"));\n\
+                    line(path_dirname(\"/a/b\"));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_split");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout, "a/b|c\na/b|\n/|\n|a\n/|a\na|b\n//|a\n|\nb\n/a\n");
+}
+
+#[test]
+fn std_path_splitext() {
+    // posixpath.splitext -> (root, ext); ext includes the dot, "" if
+    // none; leading dots in the basename are NOT an extension.
+    //   ("a.tar.gz")=("a.tar",".gz")  ("a")=("a","")  ("a.")=("a",".")
+    //   (".bashrc")=(".bashrc","")  ("a/.b")=("a/.b","")  ("/a/b.c")=("/a/b",".c")
+    //   ("a..b")=("a.",".b")
+    // Dots in the DIRNAME must not count (the dotIndex > sepIndex guard):
+    //   ("a.b/c")=("a.b/c","")  ("a.b/c.d")=("a.b/c",".d")
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_splitext};\n\
+                  fn ext_line(p: String) -> Int ![IO] {\n\
+                    match path_splitext(p) {\n\
+                      (r, e) => { perform IO.print(r); perform IO.print(\"|\"); perform IO.println(e); 0 }\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    ext_line(\"a.tar.gz\");\n\
+                    ext_line(\"a\");\n\
+                    ext_line(\"a.\");\n\
+                    ext_line(\".bashrc\");\n\
+                    ext_line(\"a/.b\");\n\
+                    ext_line(\"/a/b.c\");\n\
+                    ext_line(\"a..b\");\n\
+                    ext_line(\"a.b/c\");\n\
+                    ext_line(\"a.b/c.d\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_splitext");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "a.tar|.gz\na|\na|.\n.bashrc|\na/.b|\n/a/b|.c\na.|.b\na.b/c|\na.b/c|.d\n"
+    );
+}
+
+#[test]
+fn std_path_normalize() {
+    // posixpath.normpath, with our one divergence: 2+ leading slashes
+    // collapse to a single "/".
+    //   ("a/../b")="b"  ("a/./b")="a/b"  ("a//b")="a/b"  ("a/b/")="a/b"
+    //   ("a/..")="."  ("")="."  (".")="."  ("./a")="a"  ("../a")="../a"
+    //   ("/../a")="/a"  ("/")="/"  ("/a/b/..")="/a"  ("//a")="/a"  ("///a")="/a"
+    // Multi-".." exercises the "..-on-..-stacks" branch of __norm_push:
+    //   ("../../a")="../../a"  ("a/../..")=".."   and bare ("//")="/"
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_normalize};\n\
+                  fn line(p: String) -> Int ![IO] { perform IO.println(path_normalize(p)); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    line(\"a/../b\");\n\
+                    line(\"a/./b\");\n\
+                    line(\"a//b\");\n\
+                    line(\"a/b/\");\n\
+                    line(\"a/..\");\n\
+                    line(\"\");\n\
+                    line(\".\");\n\
+                    line(\"./a\");\n\
+                    line(\"../a\");\n\
+                    line(\"/../a\");\n\
+                    line(\"/\");\n\
+                    line(\"/a/b/..\");\n\
+                    line(\"//a\");\n\
+                    line(\"///a\");\n\
+                    line(\"../../a\");\n\
+                    line(\"a/../..\");\n\
+                    line(\"//\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_normalize");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n../../a\n..\n/\n"
+    );
+}

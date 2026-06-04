@@ -1,0 +1,266 @@
+// sigil: 0.1
+//
+// std/path.sigil — pure-string POSIX path manipulation.
+//
+// Slash-separated, no filesystem access (that is std.fs's job). Every
+// function is pure (![]). Semantics match Python's `posixpath`
+// (`os.path`) so an LLM author predicts behavior from that prior, with
+// ONE deliberate divergence: path_normalize collapses 2+ leading
+// slashes to a single "/" (posixpath preserves exactly "//"), because
+// the "//"-is-special POSIX corner has no useful LLM prior.
+//
+// See docs/superpowers/specs/2026-06-03-std-path-design.md for the full
+// semantics contract.
+
+import std.list
+import std.string
+use std.list.{List, Cons, Nil, fold, reverse};
+use std.string.{string_split, string_replace};
+
+// `path_is_absolute(p)` is true iff `p` begins with "/".
+//   path_is_absolute("/a") = true   path_is_absolute("a") = false
+//   path_is_absolute("/")  = true   path_is_absolute("")  = false
+fn path_is_absolute(p: String) -> Bool ![] {
+  string_starts_with(p, "/")
+}
+
+// `path_join(a, b)` joins two path segments with "/", matching
+// posixpath.join's binary case:
+//   - if `b` is absolute, the result is `b` (absolute RESETS — a wart
+//     inherited deliberately for prediction-match);
+//   - else if `a` is empty, the result is `b`;
+//   - else if `a` already ends with "/", concatenate directly;
+//   - else insert a single "/".
+//   path_join("a","b")="a/b"  path_join("a/","b")="a/b"
+//   path_join("a","/b")="/b"  path_join("","b")="b"  path_join("a","")="a/"
+fn path_join(a: String, b: String) -> String ![] {
+  if path_is_absolute(b) {
+    b
+  } else {
+    if string_length(a) == 0 {
+      b
+    } else {
+      if string_ends_with(a, "/") {
+        string_concat(a, b)
+      } else {
+        string_concat(string_concat(a, "/"), b)
+      }
+    }
+  }
+}
+
+// --- shared helpers -----------------------------------------------------
+
+// fold combinator returning the second arg — folds a list to its LAST
+// element (or the seed for an empty list).
+//
+// REQUIRES a LEFT fold: `std.list.fold` applies `f(acc, x)` left to
+// right, so discarding `acc` and keeping `x` yields the final element.
+// If `fold` ever became a right fold, this would return the FIRST
+// element and silently break `__last_component` (and split/splitext/
+// normalize through it).
+fn __take_second(acc: String, x: String) -> String ![] { x }
+
+// Last element of a non-empty component list ("" for an empty list).
+fn __last_component(comps: List[String]) -> String ![] {
+  fold(comps, "", __take_second)
+}
+
+// True iff `s` is non-empty and consists only of "/" characters.
+fn __is_all_slashes(s: String) -> Bool ![] {
+  if string_length(s) == 0 {
+    false
+  } else {
+    string_length(string_replace(s, "/", "")) == 0
+  }
+}
+
+// Remove ALL trailing "/" from `s`. Caller guarantees `s` is not
+// all-slashes, so this never empties a slash-only string.
+fn __rstrip_slashes(s: String) -> String ![] {
+  if string_ends_with(s, "/") {
+    __rstrip_slashes(string_substring(s, 0, string_length(s) - 1))
+  } else {
+    s
+  }
+}
+
+// posixpath's head normalization: strip trailing slashes from a split
+// head UNLESS it is all-slashes (then keep it verbatim). An empty head
+// is handled by `__is_all_slashes` returning false → rstrip → "".
+fn __strip_head_slashes(head: String) -> String ![] {
+  if __is_all_slashes(head) {
+    head
+  } else {
+    __rstrip_slashes(head)
+  }
+}
+
+// --- split / basename / dirname ----------------------------------------
+
+// `path_split(p)` returns `(head, tail)` where `tail` is the final
+// component (after the last "/") and `head` is everything before it
+// (trailing slashes stripped unless head is all-slashes). Mirrors
+// posixpath.split.
+//   path_split("a/b/c")=("a/b","c")  path_split("a/b/")=("a/b","")
+//   path_split("/a")=("/","a")  path_split("/")=("/","")  path_split("a")=("","a")
+fn path_split(p: String) -> (String, String) ![] {
+  if string_index_of(p, "/") < 0 {
+    ("", p)
+  } else {
+    let tail: String = __last_component(string_split(p, "/"));
+    // Index just past the last "/" = len(p) - len(tail).
+    let cut: Int = string_length(p) - string_length(tail);
+    let head_raw: String = string_substring(p, 0, cut);
+    (__strip_head_slashes(head_raw), tail)
+  }
+}
+
+// `path_basename(p)` is the final component (= path_split's tail).
+//   path_basename("/a/b")="b"  path_basename("/a/b/")=""  path_basename("/")=""
+fn path_basename(p: String) -> String ![] {
+  match path_split(p) {
+    (_, tail) => tail,
+  }
+}
+
+// `path_dirname(p)` is everything before the final component (= head).
+//   path_dirname("/a/b")="/a"  path_dirname("a")=""  path_dirname("/")="/"
+fn path_dirname(p: String) -> String ![] {
+  match path_split(p) {
+    (head, _) => head,
+  }
+}
+
+// --- splitext ----------------------------------------------------------
+
+// True iff any element of `xs` is a non-empty string.
+fn __or_nonempty(acc: Bool, x: String) -> Bool ![] {
+  if acc { true } else { string_length(x) > 0 }
+}
+fn __any_nonempty(xs: List[String]) -> Bool ![] {
+  fold(xs, false, __or_nonempty)
+}
+
+// Given a basename split on ".", does it have a real "stem" before the
+// final dot? (i.e. some component other than the last is non-empty).
+// Leading-dot dotfiles like ".bashrc" / "..a" have no real stem.
+fn __has_real_stem(parts: List[String]) -> Bool ![] {
+  match reverse(parts) {
+    Nil => false,
+    Cons(_, rest) => __any_nonempty(rest),
+  }
+}
+
+// Extension of a basename (incl. the leading dot), or "" if none.
+//   __ext_of_basename("a.tar.gz")=".gz"  __ext_of_basename(".bashrc")=""
+//   __ext_of_basename("a.")="."  __ext_of_basename("a")=""
+fn __ext_of_basename(b: String) -> String ![] {
+  let parts: List[String] = string_split(b, ".");
+  if __has_real_stem(parts) {
+    string_concat(".", __last_component(parts))
+  } else {
+    ""
+  }
+}
+
+// `path_splitext(p)` splits the trailing extension off `p`'s basename.
+// `ext` includes the dot (or is ""); `root ++ ext == p` always.
+//   path_splitext("a.tar.gz")=("a.tar",".gz")  path_splitext(".bashrc")=(".bashrc","")
+//   path_splitext("a.")=("a",".")  path_splitext("/a/b.c")=("/a/b",".c")
+fn path_splitext(p: String) -> (String, String) ![] {
+  let ext: String = __ext_of_basename(path_basename(p));
+  let root: String = string_substring(p, 0, string_length(p) - string_length(ext));
+  (root, ext)
+}
+
+// --- normalize ---------------------------------------------------------
+
+// Exact-match helpers. Sigil has no `==` on String, so "is this
+// component exactly `.` / `..`?" is expressed as a length check plus a
+// prefix check: a length-1 string starting with "." IS ".", and a
+// length-2 string starting with ".." IS "..".
+fn __is_dot(s: String) -> Bool ![] {
+  if string_length(s) == 1 { string_starts_with(s, ".") } else { false }
+}
+fn __is_dotdot(s: String) -> Bool ![] {
+  if string_length(s) == 2 { string_starts_with(s, "..") } else { false }
+}
+// "" (from "//" or a leading/trailing slash) or "." — dropped in normpath.
+fn __is_empty_or_dot(s: String) -> Bool ![] {
+  if string_length(s) == 0 { true } else { __is_dot(s) }
+}
+
+// Push one component onto the reverse-ordered stack (most-recent first),
+// applying normpath rules:
+//   "." or ""            → dropped (no-op)
+//   ".." + non-".." top  → pop the top (cancel the preceding component)
+//   ".." + ".." top      → push ".." (cannot cancel another "..")
+//   ".." + empty stack   → push ".." if relative; drop if absolute (no
+//                          parent above root)
+//   anything else        → push
+fn __norm_push(stack: List[String], comp: String, is_abs: Bool) -> List[String] ![] {
+  if __is_empty_or_dot(comp) {
+    stack
+  } else {
+    if __is_dotdot(comp) {
+      match stack {
+        Cons(top, rest) =>
+          if __is_dotdot(top) {
+            Cons(comp, stack)
+          } else {
+            rest
+          },
+        Nil =>
+          if is_abs {
+            stack
+          } else {
+            Cons(comp, stack)
+          },
+      }
+    } else {
+      Cons(comp, stack)
+    }
+  }
+}
+
+fn __norm_walk(comps: List[String], is_abs: Bool, stack: List[String]) -> List[String] ![] {
+  match comps {
+    Nil => stack,
+    Cons(comp, rest) => __norm_walk(rest, is_abs, __norm_push(stack, comp, is_abs)),
+  }
+}
+
+// Join components with "/" (no leading/trailing slash).
+fn __join_slash_acc(parts: List[String], acc: String) -> String ![] {
+  match parts {
+    Nil => acc,
+    Cons(h, t) => __join_slash_acc(t, string_concat(string_concat(acc, "/"), h)),
+  }
+}
+fn __join_slash(parts: List[String]) -> String ![] {
+  match parts {
+    Nil => "",
+    Cons(h, t) => __join_slash_acc(t, h),
+  }
+}
+
+// `path_normalize(p)` collapses ".", "..", and redundant slashes
+// (posixpath.normpath). The empty string normalizes to ".". 2+ leading
+// slashes collapse to one (our single deliberate divergence).
+//   path_normalize("a/../b")="b"  path_normalize("a//b")="a/b"
+//   path_normalize("")="."  path_normalize("/../a")="/a"  path_normalize("../a")="../a"
+fn path_normalize(p: String) -> String ![] {
+  if string_length(p) == 0 {
+    "."
+  } else {
+    let is_abs: Bool = path_is_absolute(p);
+    let stack: List[String] = __norm_walk(string_split(p, "/"), is_abs, Nil);
+    let body: String = __join_slash(reverse(stack));
+    if is_abs {
+      string_concat("/", body)
+    } else {
+      if string_length(body) == 0 { "." } else { body }
+    }
+  }
+}

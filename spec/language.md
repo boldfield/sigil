@@ -2176,6 +2176,12 @@ are effect ops (not regular fns) — see §7.
 | `std.string` | `string_replace(s, find, repl)` | `(String, String, String) -> String` | substring replace |
 | `std.string` | `string_byte_at_opt(s, i)` | `(String, Int) -> Option[Byte]` | safe byte indexing |
 | `std.string` | `string_substring_opt(s, start, end)` | `(String, Int, Int) -> Option[String]` | safe substring `[start, end)` |
+| `std.path` | `path_join(a, b)` | `(String, String) -> String` | join two path segments — **note:** an absolute `b` resets (`path_join("a","/b") == "/b"`), matching `posixpath` |
+| `std.path` | `path_basename(p)` / `path_dirname(p)` | `(String) -> String` | final component / everything before it |
+| `std.path` | `path_split(p)` | `(String) -> (String, String)` | `(dirname, basename)` pair |
+| `std.path` | `path_splitext(p)` | `(String) -> (String, String)` | `(root, ext)`; `ext` includes the dot, `""` if none; a leading-dot dotfile has no ext. (No standalone "extension" fn — use `snd(path_splitext(p))`.) |
+| `std.path` | `path_normalize(p)` | `(String) -> String` | collapse `.` / `..` / duplicate slashes (posixpath `normpath`) |
+| `std.path` | `path_is_absolute(p)` | `(String) -> Bool` | does `p` start with `/` |
 | `std.list` | `length(xs)` | `(List[A]) -> Int` | element count |
 | `std.list` | `range(start, end)` | `(Int, Int) -> List[Int]` | build `[start, end)` |
 | `std.list` | `map(xs, f)` | `(List[A], (A) -> B ![]) -> List[B]` | transform each |
@@ -2229,7 +2235,6 @@ The following limits are permanent v1 design choices:
 | Process stdin piping | Future v2 follow-up of the `Process` effect. v1's `Process.run` runs with stdin closed. |
 | Process stdout / stderr streaming | Future v2 follow-up. v1 captures full stdout / stderr after the child exits via `Command::output()`. |
 | Effect ops returning user-defined sum types directly (e.g., `Fs.read_file: (String) -> Result[String, FsError]` as a perform-direct surface) | Path 1 architecture from the CLI-effects plan; deferred. v1 ships path 4 (raw-shape effect ops + stdlib Sigil wrappers — `match read_file(p) { Ok(s) => ..., Err(NotFound) => ... }` as a stdlib fn call). Closure path = future `BuiltinEffectArmSynth` codegen-arm-fn architecture. See `[DEVIATION Task EE]` in `PLAN_C_DEVIATIONS.md`. |
-| Filesystem path manipulation (`join`, `basename`, `dirname`, `normalize`) | Future `std/path.sigil` plan. The CLI-effects plan ships only the `Fs` effect's primitive ops. |
 | Recursive `mkdir -p` and recursive `rm -rf` | Future stdlib helpers layered on top of `mkdir` / `remove_dir` / `read_dir`. v1 `Fs.mkdir` / `remove_dir` are single-level. |
 | Symlink-aware ops (`is_symlink`, `read_link`, `create_symlink`) | Future v2 work. v1 follows symlinks transparently; no symlink-specific surface. |
 | `MutMap`, range queries on `Map` (`map_range`, prefix scans), set operations (`map_union`, `map_intersect`, `map_difference`), `map_for_each`, `map_eq` | Future map-extensions plan. v1 ships only the persistent immutable `Map[K, V]` plus the closed-row pure-helper surface (`map_get` / `map_insert` / `map_remove` / `map_keys` / `map_to_list` / `map_fold` / `map_map` / `map_filter` etc.). |
