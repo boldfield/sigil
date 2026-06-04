@@ -23387,3 +23387,22 @@ fn std_path_normalize() {
         "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n../../a\n..\n/\n"
     );
 }
+
+// ===== record.field field access =======================================
+
+#[test]
+fn field_access_flat_record() {
+    // `p.name` reads the field; was E0151 before this feature.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type Person = { name: String, age: Int }\n\
+                  fn greet(p: Person) -> String ![] { p.name }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let p: Person = Person { name: \"Ada\", age: 36 };\n\
+                    perform IO.println(greet(p));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_flat");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ada");
+}
