@@ -23465,3 +23465,43 @@ fn field_access_three_hop() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "bottom");
 }
+
+#[test]
+fn field_access_unknown_field_errors() {
+    let source = "type Person = { name: String, age: Int }\n\
+                  fn bad(p: Person) -> Int ![] { p.height }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_unknown_field");
+    assert!(!succeeded, "must fail: no field `height`");
+    assert!(
+        stderr.contains("no field `height`") && stderr.contains("Person"),
+        "expected a no-such-field message naming the record; stderr={stderr}"
+    );
+}
+
+#[test]
+fn field_access_on_non_record_errors() {
+    let source = "fn bad(n: Int) -> Int ![] { n.value }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_non_record");
+    assert!(!succeeded, "must fail: Int is not a record");
+    assert!(
+        stderr.contains("not a record"),
+        "expected a not-a-record message; stderr={stderr}"
+    );
+}
+
+#[test]
+fn field_access_on_sum_type_errors() {
+    // A multi-variant sum type has no statically-known field set —
+    // field access must error and point the author at `match`.
+    let source = "type Shape = | Circle(Int) | Square(Int)\n\
+                  fn bad(s: Shape) -> Int ![] { s.radius }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_sum_type");
+    assert!(!succeeded, "must fail: Shape is a multi-variant sum type");
+    assert!(
+        stderr.contains("not a single-variant record") && stderr.contains("match"),
+        "expected a sum-type message pointing at match; stderr={stderr}"
+    );
+}
