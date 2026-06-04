@@ -23576,7 +23576,29 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// Mirrors the FINAL step's inline tail-prefix-let handling; shared
     /// so MIDDLE steps can evaluate pure lets that sit between two
     /// performs and feed the later perform's args.
+    ///
+    /// LOAD-BEARING INVARIANT: a mid-chain tail-prefix let is re-lowered
+    /// at *every* chain step that can see it (each Middle step from its
+    /// binding point onward re-runs the RHS in its own synth-cont env,
+    /// and the FINAL step re-runs it once more). Re-evaluation is sound
+    /// ONLY because a tail-prefix value is effect-free and therefore
+    /// deterministic — pinned by the classifier's `!expr_contains_perform`
+    /// gate (which also conservatively rejects `Handle`/`Lambda`, so a
+    /// `handle { perform Random.gen() }`-style non-deterministic value is
+    /// excluded even though it is not itself an `Expr::Perform`). If a
+    /// future classifier widening admits a non-deterministic value form,
+    /// per-step re-evaluation would diverge silently; this assert trips
+    /// first. (Threading the value through the closure record to compute
+    /// it once would lift this constraint — see PR #205 discussion.)
     fn lower_tail_prefix_let_into_env(&mut self, tpl: &TailPrefixLet, pointer_ty: Type) {
+        debug_assert!(
+            !expr_contains_perform(&tpl.value),
+            "tail-prefix let `{}` is re-evaluated across chain steps, but \
+             its value contains a perform (or handle/lambda) — re-evaluation \
+             is unsound for effectful / non-deterministic values; thread it \
+             through the closure record instead of re-lowering",
+            tpl.name
+        );
         self.emit_terminal_out_reset_to_done();
         let raw_v = self.lower_expr(&tpl.value);
         self.emit_discharge_propagation_check();

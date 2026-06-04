@@ -23058,3 +23058,38 @@ fn auto_cps_mid_chain_let_consumed_by_later_perform_no_ice() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "Ax-Bx-");
 }
+
+/// Bug 3c: a mid-chain pure `let` whose RHS depends on a *prior perform's
+/// result* (`let a = perform Counter.tick(); let doubled = int_to_string(a
+/// + a); perform p("["); perform p(doubled); …`). This exercises the
+/// positioning invariant directly — `doubled` (position 1) must be
+/// re-evaluated at the step lowering its consuming perform, and that step
+/// must have the yield-0 result `a` loaded into env (`pos <= step + 1`
+/// holds because `doubled` depends only on yields `< 1`). Confirms the
+/// re-eval carries forward correctly when the let isn't a literal.
+#[test]
+fn auto_cps_mid_chain_let_depends_on_prior_yield_no_ice() {
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  effect Counter { tick: () -> Int }\n\
+                  fn run() -> Int ![Counter, IO] {\n\
+                    let a: Int = perform Counter.tick();\n\
+                    let doubled: String = int_to_string(a + a);\n\
+                    perform IO.print(\"[\");\n\
+                    perform IO.print(doubled);\n\
+                    perform IO.print(\"]\");\n\
+                    a\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let r: Int = handle run() with {\n\
+                      Counter.tick(k) => k(7),\n\
+                    };\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_prior_yield");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "[14]");
+}
