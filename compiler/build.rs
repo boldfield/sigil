@@ -17,4 +17,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../runtime/src");
     println!("cargo:rerun-if-changed=../runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=../runtime/build.rs");
+    // Embedded via include_dir! in src/stdlib_embed.rs — rebuild the
+    // compiler (and re-embed) whenever any stdlib source changes.
+    println!("cargo:rerun-if-changed=../std");
 }
