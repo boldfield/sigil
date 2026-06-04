@@ -23444,3 +23444,24 @@ fn field_access_generic_record() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "42");
 }
+
+#[test]
+fn field_access_three_hop() {
+    // a.b.c.d — three loop iterations through nested single-variant records.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type C = { d: String }\n\
+                  type B = { c: C }\n\
+                  type A = { b: B }\n\
+                  fn deep(a: A) -> String ![] { a.b.c.d }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let cc: C = C { d: \"bottom\" };\n\
+                    let bb: B = B { c: cc };\n\
+                    let aa: A = A { b: bb };\n\
+                    perform IO.println(deep(aa));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_three_hop");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "bottom");
+}

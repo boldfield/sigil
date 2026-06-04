@@ -4334,7 +4334,7 @@ impl Tc {
                 }],
                 span: inner_span.clone(),
             };
-            cur_ty = field_ty;
+            cur_ty = self.subst.apply_ty(&field_ty);
         }
         // Type-check the fully-built synthetic expression so that all
         // internal annotations (match_scrut_tys, etc.) are populated.
