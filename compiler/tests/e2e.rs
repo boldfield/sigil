@@ -23406,3 +23406,22 @@ fn field_access_flat_record() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "Ada");
 }
+
+#[test]
+fn field_access_chained() {
+    // a.b.c reads through nested single-variant records.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type Inner = { value: String }\n\
+                  type Outer = { inner: Inner, tag: Int }\n\
+                  fn deep(o: Outer) -> String ![] { o.inner.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let i: Inner = Inner { value: \"deep\" };\n\
+                    let o: Outer = Outer { inner: i, tag: 7 };\n\
+                    perform IO.println(deep(o));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_chained");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "deep");
+}

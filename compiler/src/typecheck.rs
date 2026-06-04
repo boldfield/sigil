@@ -4226,111 +4226,139 @@ impl Tc {
             Some(t) => self.subst.apply_ty(&t),
             None => return FieldAccessOutcome::NotFieldAccess,
         };
-        let field = segments[1];
-        // The head must be a nominal user type (i.e. Ty::User).
-        let (type_name, _type_args) = match &head_ty {
-            Ty::User(tn, args) => (tn.clone(), args.clone()),
-            _ => {
-                self.push_error(
-                    "E0151",
-                    span.clone(),
-                    format!(
-                        "cannot read field `{field}`: `{head}` has type `{}`, which is not a \
-                         record. Use `match` to destructure a sum type.",
-                        ty_display(&head_ty)
-                    ),
-                );
-                return FieldAccessOutcome::Errored;
-            }
-        };
-        // The type must be a single-variant record type.
-        let td = match self.types.get(&type_name) {
-            Some(td)
-                if td.variants.len() == 1
-                    && matches!(td.variants[0].fields, VariantFields::Record(_)) =>
-            {
-                td.clone()
-            }
-            _ => {
-                self.push_error(
-                    "E0151",
-                    span.clone(),
-                    format!(
-                        "cannot read field `{field}`: `{head}` has type `{type_name}`, which is \
-                         not a single-variant record. Use `match` to destructure it."
-                    ),
-                );
-                return FieldAccessOutcome::Errored;
-            }
-        };
-        let variant = &td.variants[0];
-        let record_fields = match &variant.fields {
-            VariantFields::Record(fs) => fs.clone(),
-            _ => unreachable!("guarded above"),
-        };
-        // The field name must exist on the record.
-        if !record_fields.iter().any(|f| f.name == field) {
-            let field_names: Vec<String> = record_fields.iter().map(|f| f.name.clone()).collect();
-            self.push_error(
-                "E0151",
-                span.clone(),
-                format!(
-                    "no field `{field}` on record `{type_name}` (fields: {}).",
-                    field_names.join(", ")
-                ),
-            );
-            return FieldAccessOutcome::Errored;
-        }
-        // Build a synthetic match expression that destructures the record
-        // and returns the requested field.
-        //
-        // Internal nodes (scrutinee Ident, arm body Ident, pattern spans)
-        // use `inner_span` — a synthetic span that is NOT keyed in
-        // `field_access_desugar`. This is load-bearing for correctness: the
-        // rewrite pass recurses into the replacement match (so that chained
-        // field access whose scrutinee is itself a desugared sub-expression
-        // gets walked), and that recursion must NOT re-trigger the
-        // desugar-replacement guard for any of the inner Ident nodes.  Only
-        // the outer `Expr::Match` itself is stored under `span`; every
-        // descendant Ident uses `inner_span` so the guard's
-        // `field_access_desugar.get(span)` look-up returns `None` for them.
+        // Walk every segment after the head, threading a current scrutinee
+        // expression and current type through, building one nested match per
+        // field.  All inner AST nodes (Ident, pattern, arm) use `inner_span` —
+        // a synthetic span that is NOT keyed in `field_access_desugar`.  This
+        // is load-bearing for correctness: the rewrite pass recurses into the
+        // replacement match, and that recursion must NOT re-trigger the
+        // desugar-replacement guard for any inner Ident node.
         let inner_span = Span::synthetic(&span.file);
-        let binder_name = format!("__fa_{field}");
-        let variant_name = variant.name.clone();
-        let pat_fields: Vec<CtorPatternField> = record_fields
-            .iter()
-            .map(|f| CtorPatternField {
-                name: f.name.clone(),
-                pattern: if f.name == field {
-                    Pattern::Var(binder_name.clone(), inner_span.clone())
-                } else {
-                    Pattern::Wildcard(inner_span.clone())
-                },
-                span: inner_span.clone(),
-            })
-            .collect();
-        let synthetic_match = Expr::Match {
-            scrutinee: Box::new(Expr::Ident(head.to_string(), inner_span.clone())),
-            arms: vec![MatchArm {
-                pattern: Pattern::Ctor {
-                    name: variant_name,
-                    fields: CtorPatternFields::Record(pat_fields),
+        let mut cur_expr = Expr::Ident(head.to_string(), inner_span.clone());
+        let mut cur_ty = head_ty;
+        for field in &segments[1..] {
+            let field = *field;
+            let (type_name, type_args) = match &cur_ty {
+                Ty::User(tn, args) => (tn.clone(), args.clone()),
+                _ => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "cannot read field `{field}`: the value before `.{field}` has type \
+                             `{}`, which is not a record.",
+                            ty_display(&cur_ty)
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let td = match self.types.get(&type_name) {
+                Some(td)
+                    if td.variants.len() == 1
+                        && matches!(td.variants[0].fields, VariantFields::Record(_)) =>
+                {
+                    td.clone()
+                }
+                _ => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "cannot read field `{field}`: `{type_name}` is not a single-variant \
+                             record. Use `match` to destructure it."
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let variant = &td.variants[0];
+            let decl_fields = match &variant.fields {
+                VariantFields::Record(fs) => fs.clone(),
+                _ => unreachable!("guarded above"),
+            };
+            let decl = match decl_fields.iter().find(|f| f.name == field) {
+                Some(d) => d.clone(),
+                None => {
+                    let field_names: Vec<String> =
+                        decl_fields.iter().map(|f| f.name.clone()).collect();
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "no field `{field}` on record `{type_name}` (fields: {}).",
+                            field_names.join(", ")
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let ty_subst = Self::subst_for(&td, &type_args);
+            let field_ty = match self.resolve_field_ty(&decl.ty, &ty_subst) {
+                Some(t) => t,
+                None => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "could not resolve the type of field `{field}` on `{type_name}`."
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let binder_name = format!("__fa_{field}");
+            let variant_name = variant.name.clone();
+            let pat_fields: Vec<CtorPatternField> = decl_fields
+                .iter()
+                .map(|f| CtorPatternField {
+                    name: f.name.clone(),
+                    pattern: if f.name == field {
+                        Pattern::Var(binder_name.clone(), inner_span.clone())
+                    } else {
+                        Pattern::Wildcard(inner_span.clone())
+                    },
                     span: inner_span.clone(),
-                },
-                body: Expr::Ident(binder_name.clone(), inner_span.clone()),
+                })
+                .collect();
+            cur_expr = Expr::Match {
+                scrutinee: Box::new(cur_expr),
+                arms: vec![MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: variant_name,
+                        fields: CtorPatternFields::Record(pat_fields),
+                        span: inner_span.clone(),
+                    },
+                    body: Expr::Ident(binder_name.clone(), inner_span.clone()),
+                    span: inner_span.clone(),
+                }],
                 span: inner_span.clone(),
-            }],
-            span: span.clone(),
-        };
-        // Type-check the synthetic match so annotations (match_scrut_tys,
-        // etc.) are populated and the result type is known.
-        let field_ty = match self.check_expr(&synthetic_match, row, row_tail) {
+            };
+            cur_ty = field_ty;
+        }
+        // Type-check the fully-built synthetic expression so that all
+        // internal annotations (match_scrut_tys, etc.) are populated.
+        let result_ty = match self.check_expr(&cur_expr, row, row_tail) {
             Some(t) => t,
             None => return FieldAccessOutcome::Errored,
         };
         // Record the desugared form for the rewrite pass.
-        self.field_access_desugar.insert(span.clone(), synthetic_match);
-        FieldAccessOutcome::Resolved(field_ty)
+        self.field_access_desugar.insert(span.clone(), cur_expr);
+        FieldAccessOutcome::Resolved(result_ty)
+    }
+
+    /// Build the generic substitution for a record type declaration applied
+    /// to the given type arguments.  Used by `try_resolve_field_access` when
+    /// resolving the type of a field on a generic record.
+    fn subst_for(
+        td: &TypeDecl,
+        type_args: &[Ty],
+    ) -> std::collections::BTreeMap<String, Ty> {
+        let mut subst = std::collections::BTreeMap::new();
+        for (generic_param, arg_ty) in td.generic_params.iter().zip(type_args.iter()) {
+            subst.insert(generic_param.name.clone(), arg_ty.clone());
+        }
+        subst
     }
 
     fn push_error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
