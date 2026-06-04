@@ -53,6 +53,12 @@ fn path_join(a: String, b: String) -> String ![] {
 
 // fold combinator returning the second arg — folds a list to its LAST
 // element (or the seed for an empty list).
+//
+// REQUIRES a LEFT fold: `std.list.fold` applies `f(acc, x)` left to
+// right, so discarding `acc` and keeping `x` yields the final element.
+// If `fold` ever became a right fold, this would return the FIRST
+// element and silently break `__last_component` (and split/splitext/
+// normalize through it).
 fn __take_second(acc: String, x: String) -> String ![] { x }
 
 // Last element of a non-empty component list ("" for an empty list).

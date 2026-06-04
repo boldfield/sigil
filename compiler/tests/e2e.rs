@@ -23252,6 +23252,7 @@ fn std_path_join() {
     // Contract (posixpath.join, incl. the absolute-resets wart):
     //   join("a","b")="a/b"  join("a/","b")="a/b"  join("a","/b")="/b"
     //   join("","b")="b"     join("a","")="a/"     join("/","a")="/a"
+    //   join("a/b","c")="a/b/c"
     let source = "import std.io\n\
                   import std.path\n\
                   use std.io.{IO};\n\
@@ -23264,11 +23265,12 @@ fn std_path_join() {
                     line(path_join(\"\", \"b\"));\n\
                     line(path_join(\"a\", \"\"));\n\
                     line(path_join(\"/\", \"a\"));\n\
+                    line(path_join(\"a/b\", \"c\"));\n\
                     0\n\
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "std_path_join");
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
-    assert_eq!(stdout, "a/b\na/b\n/b\nb\na/\n/a\n");
+    assert_eq!(stdout, "a/b\na/b\n/b\nb\na/\n/a\na/b/c\n");
 }
 
 #[test]
@@ -23313,6 +23315,8 @@ fn std_path_splitext() {
     //   ("a.tar.gz")=("a.tar",".gz")  ("a")=("a","")  ("a.")=("a",".")
     //   (".bashrc")=(".bashrc","")  ("a/.b")=("a/.b","")  ("/a/b.c")=("/a/b",".c")
     //   ("a..b")=("a.",".b")
+    // Dots in the DIRNAME must not count (the dotIndex > sepIndex guard):
+    //   ("a.b/c")=("a.b/c","")  ("a.b/c.d")=("a.b/c",".d")
     let source = "import std.io\n\
                   import std.path\n\
                   use std.io.{IO};\n\
@@ -23330,13 +23334,15 @@ fn std_path_splitext() {
                     ext_line(\"a/.b\");\n\
                     ext_line(\"/a/b.c\");\n\
                     ext_line(\"a..b\");\n\
+                    ext_line(\"a.b/c\");\n\
+                    ext_line(\"a.b/c.d\");\n\
                     0\n\
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "std_path_splitext");
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(
         stdout,
-        "a.tar|.gz\na|\na|.\n.bashrc|\na/.b|\n/a/b|.c\na.|.b\n"
+        "a.tar|.gz\na|\na|.\n.bashrc|\na/.b|\n/a/b|.c\na.|.b\na.b/c|\na.b/c|.d\n"
     );
 }
 
@@ -23347,6 +23353,8 @@ fn std_path_normalize() {
     //   ("a/../b")="b"  ("a/./b")="a/b"  ("a//b")="a/b"  ("a/b/")="a/b"
     //   ("a/..")="."  ("")="."  (".")="."  ("./a")="a"  ("../a")="../a"
     //   ("/../a")="/a"  ("/")="/"  ("/a/b/..")="/a"  ("//a")="/a"  ("///a")="/a"
+    // Multi-".." exercises the "..-on-..-stacks" branch of __norm_push:
+    //   ("../../a")="../../a"  ("a/../..")=".."   and bare ("//")="/"
     let source = "import std.io\n\
                   import std.path\n\
                   use std.io.{IO};\n\
@@ -23367,12 +23375,15 @@ fn std_path_normalize() {
                     line(\"/a/b/..\");\n\
                     line(\"//a\");\n\
                     line(\"///a\");\n\
+                    line(\"../../a\");\n\
+                    line(\"a/../..\");\n\
+                    line(\"//\");\n\
                     0\n\
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "std_path_normalize");
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(
         stdout,
-        "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n"
+        "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n../../a\n..\n/\n"
     );
 }
