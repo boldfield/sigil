@@ -4168,18 +4168,19 @@ fn collect_branch_chain_allocs(
                     let role = if step + 1 < branch_yield_count {
                         // A pure let at position `pos` depends only on
                         // yields `< pos`, available at any step `k` with
-                        // `pos <= k + 1`. It may be consumed by THIS step's
-                        // next perform OR a later one, so re-evaluate it at
-                        // every Middle step from its binding point onward
-                        // (`pos <= step + 1`); pure lets are idempotent
-                        // (they also remain in `inner_tail_prefix_lets` for
-                        // the FINAL step), so the value carries forward
-                        // without threading through closure records.
-                        let pre_next_lets: Vec<TailPrefixLet> = positioned_inner_lets
-                            .iter()
-                            .filter(|(pos, _)| *pos <= step + 1)
-                            .map(|(_, tpl)| tpl.clone())
-                            .collect();
+                        // `pos <= k + 1`. Of those, evaluate only the lets
+                        // THIS step's next perform actually consumes
+                        // (transitively); a let consumed at a later perform
+                        // is evaluated at that later step instead. Pure lets
+                        // are idempotent (they also remain in
+                        // `inner_tail_prefix_lets` for the FINAL step), so
+                        // no threading through closure records is needed —
+                        // this just avoids recomputing untouched lets.
+                        let pre_next_lets = needed_lets_for_next_step(
+                            &branch_steps[step + 1],
+                            &positioned_inner_lets,
+                            step,
+                        );
                         ChainStepRole::Middle {
                             next_step: branch_steps[step + 1].clone(),
                             next_step_func_id: branch_func_ids[step + 1],
@@ -10565,19 +10566,22 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 // A pure let at position `pos` is bound
                                 // after yield `pos - 1`, so its RHS depends
                                 // only on yields `< pos` — available at any
-                                // step `k` with `pos <= k + 1`. It may be
-                                // consumed by THIS step's next perform OR a
-                                // later one, so re-evaluate it at every
-                                // Middle step from its binding point onward
-                                // (`pos <= step + 1`); pure lets are
-                                // idempotent (the FINAL step re-evaluates
-                                // them too), so the value carries forward
-                                // without threading through closure records.
-                                let pre_next_lets: Vec<TailPrefixLet> = positioned_lets
-                                    .iter()
-                                    .filter(|(pos, _)| *pos <= step + 1)
-                                    .map(|(_, tpl)| tpl.clone())
-                                    .collect();
+                                // step `k` with `pos <= k + 1`. Of those
+                                // available lets, evaluate only the ones
+                                // THIS step's next perform actually consumes
+                                // (transitively); a let consumed at a later
+                                // perform is evaluated at that later step
+                                // instead, where its deps are equally in
+                                // scope. Pure lets are idempotent (the FINAL
+                                // step re-evaluates them for the tail), so
+                                // the value need not thread through closure
+                                // records — this just avoids recomputing, at
+                                // every step, lets the step doesn't touch.
+                                let pre_next_lets = needed_lets_for_next_step(
+                                    &steps[step + 1],
+                                    &positioned_lets,
+                                    step,
+                                );
                                 ChainStepRole::Middle {
                                     next_step: steps[step + 1].clone(),
                                     next_step_func_id: step_func_ids[step + 1],
@@ -23577,12 +23581,13 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// so MIDDLE steps can evaluate pure lets that sit between two
     /// performs and feed the later perform's args.
     ///
-    /// LOAD-BEARING INVARIANT: a mid-chain tail-prefix let is re-lowered
-    /// at *every* chain step that can see it (each Middle step from its
-    /// binding point onward re-runs the RHS in its own synth-cont env,
-    /// and the FINAL step re-runs it once more). Re-evaluation is sound
-    /// ONLY because a tail-prefix value is effect-free and therefore
-    /// deterministic — pinned by the classifier's `!expr_contains_perform`
+    /// LOAD-BEARING INVARIANT: a mid-chain tail-prefix let may be
+    /// re-lowered at more than one chain step — at each Middle step whose
+    /// perform consumes it (a let used by two performs is lowered twice)
+    /// and again at the FINAL step for the tail, each in its own
+    /// synth-cont env. Re-evaluation is sound ONLY because a tail-prefix
+    /// value is effect-free and therefore deterministic — pinned by the
+    /// classifier's `!expr_contains_perform`
     /// gate (which also conservatively rejects `Handle`/`Lambda`, so a
     /// `handle { perform Random.gen() }`-style non-deterministic value is
     /// excluded even though it is not itself an `Expr::Perform`). If a
@@ -32329,6 +32334,184 @@ fn block_contains_perform(b: &crate::ast::Block) -> bool {
         }
     }
     false
+}
+
+/// Collect every name referenced as an `Expr::Ident` anywhere in `e`.
+/// Mirrors [`expr_contains_perform`]'s exhaustive traversal (no `_`
+/// arm) so it stays complete as `Expr` evolves — an added variant
+/// breaks the build here rather than silently under-collecting. For
+/// `Handle`/`Lambda`/`ClosureRecord`, whose bodies may not be cleanly
+/// traversable at this stage, it sets `*opaque = true` instead of
+/// descending; callers MUST treat that as "could reference anything"
+/// and fall back to the full candidate set. Under-collection here would
+/// drop a needed mid-chain let from a step's env and reintroduce the
+/// "unknown ident" ICE, so the bias is deliberately toward over-
+/// collection.
+fn collect_referenced_idents(
+    e: &crate::ast::Expr,
+    out: &mut std::collections::BTreeSet<String>,
+    opaque: &mut bool,
+) {
+    use crate::ast::Expr;
+    match e {
+        Expr::Ident(n, _) => {
+            out.insert(n.clone());
+        }
+        Expr::IntLit(..)
+        | Expr::FloatLit(..)
+        | Expr::StringLit(..)
+        | Expr::BoolLit(..)
+        | Expr::CharLit(..)
+        | Expr::UnitLit(..)
+        | Expr::ClosureEnvLoad { .. } => {}
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_referenced_idents(lhs, out, opaque);
+            collect_referenced_idents(rhs, out, opaque);
+        }
+        Expr::Unary { operand, .. } => collect_referenced_idents(operand, out, opaque),
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+            ..
+        } => {
+            collect_referenced_idents(cond, out, opaque);
+            collect_referenced_idents_block(then_block, out, opaque);
+            collect_referenced_idents_block(else_block, out, opaque);
+        }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            collect_referenced_idents(scrutinee, out, opaque);
+            for a in arms {
+                collect_referenced_idents(&a.body, out, opaque);
+            }
+        }
+        Expr::Block(b) => collect_referenced_idents_block(b, out, opaque),
+        Expr::RecordLit { fields, .. } => {
+            for f in fields {
+                collect_referenced_idents(&f.value, out, opaque);
+            }
+        }
+        Expr::Call { callee, args, .. } => {
+            collect_referenced_idents(callee, out, opaque);
+            for a in args {
+                collect_referenced_idents(a, out, opaque);
+            }
+        }
+        Expr::Tuple { elems, .. } => {
+            for el in elems {
+                collect_referenced_idents(el, out, opaque);
+            }
+        }
+        Expr::Perform(p) => {
+            for a in &p.args {
+                collect_referenced_idents(a, out, opaque);
+            }
+        }
+        Expr::Handle { .. } | Expr::Lambda { .. } | Expr::ClosureRecord { .. } => {
+            *opaque = true;
+        }
+    }
+}
+
+fn collect_referenced_idents_block(
+    b: &crate::ast::Block,
+    out: &mut std::collections::BTreeSet<String>,
+    opaque: &mut bool,
+) {
+    use crate::ast::Stmt;
+    for s in &b.stmts {
+        match s {
+            Stmt::Let(l) => collect_referenced_idents(&l.value, out, opaque),
+            Stmt::Expr(e) => collect_referenced_idents(e, out, opaque),
+            Stmt::Perform(p) => {
+                for a in &p.args {
+                    collect_referenced_idents(a, out, opaque);
+                }
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        collect_referenced_idents(t, out, opaque);
+    }
+}
+
+/// Of the positioned mid-chain pure lets available at a chain step
+/// (`pos <= step + 1`), return only those a given `next_step` (the
+/// perform / CallCps this Middle step lowers) actually needs — i.e.
+/// the lets referenced by `next_step`'s args, transitively through any
+/// let whose RHS references another available let. This avoids
+/// re-evaluating, at every step, lets that this step's perform doesn't
+/// touch (the recompute the PR-205 review flagged).
+///
+/// Bias is toward over-inclusion for safety: if any referenced
+/// expression hits an opaque form (Handle/Lambda/ClosureRecord), every
+/// available let is returned. Under-inclusion would drop a needed let
+/// and ICE; over-inclusion only re-evaluates a few extra pure lets.
+/// Result is in source order (the `positioned` slice's order), which
+/// respects let-before-use dependency order.
+fn needed_lets_for_next_step(
+    next_step: &ChainedNextStep,
+    positioned: &[(usize, TailPrefixLet)],
+    step: usize,
+) -> Vec<TailPrefixLet> {
+    let available: Vec<&(usize, TailPrefixLet)> = positioned
+        .iter()
+        .filter(|(pos, _)| *pos <= step + 1)
+        .collect();
+    let all = || available.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>();
+    if available.is_empty() {
+        return Vec::new();
+    }
+    let candidate_names: std::collections::BTreeSet<String> =
+        available.iter().map(|(_, t)| t.name.clone()).collect();
+
+    let args = match next_step {
+        ChainedNextStep::Perform(p) => &p.args,
+        ChainedNextStep::CallCps { args, .. } => args,
+    };
+    let mut referenced = std::collections::BTreeSet::new();
+    let mut opaque = false;
+    for a in args {
+        collect_referenced_idents(a, &mut referenced, &mut opaque);
+    }
+    if opaque {
+        return all();
+    }
+
+    // Seed: directly-referenced available lets. Then fixpoint over each
+    // needed let's RHS to pull in lets it transitively depends on.
+    let mut needed: std::collections::BTreeSet<String> =
+        referenced.intersection(&candidate_names).cloned().collect();
+    loop {
+        let mut added = false;
+        for (_, tpl) in &available {
+            if !needed.contains(&tpl.name) {
+                continue;
+            }
+            let mut rhs_refs = std::collections::BTreeSet::new();
+            let mut rhs_opaque = false;
+            collect_referenced_idents(&tpl.value, &mut rhs_refs, &mut rhs_opaque);
+            if rhs_opaque {
+                return all();
+            }
+            for name in rhs_refs.intersection(&candidate_names) {
+                if needed.insert(name.clone()) {
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+
+    available
+        .iter()
+        .filter(|(_, t)| needed.contains(&t.name))
+        .map(|(_, t)| t.clone())
+        .collect()
 }
 
 fn expr_is_pure(e: &crate::ast::Expr, ctors: &std::collections::BTreeSet<String>) -> bool {

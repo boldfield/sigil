@@ -23093,3 +23093,41 @@ fn auto_cps_mid_chain_let_depends_on_prior_yield_no_ice() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "[14]");
 }
+
+/// Bug 3d: a mid-chain let consumed *only* by another mid-chain let,
+/// which a later perform consumes (`let base = …; let wrapped =
+/// f(base); perform p(wrapped)`). The consumer-aware step filter
+/// evaluates only the lets a step's perform needs — so it must pull
+/// `base` in transitively when `wrapped` is needed, or `wrapped`'s
+/// re-evaluation would find `base` unbound. Exercises the transitive
+/// closure in `needed_lets_for_next_step`.
+#[test]
+fn auto_cps_mid_chain_let_transitive_dependency_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  import std.string\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  use std.string.{string_concat};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let base: String = \"<\";\n\
+                        let wrapped: String = string_concat(base, s);\n\
+                        perform IO.print(\"|\");\n\
+                        perform IO.print(wrapped);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_transitive_dep");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A|<AB|<B");
+}

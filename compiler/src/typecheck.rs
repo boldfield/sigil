@@ -8309,7 +8309,7 @@ impl Tc {
                     // only a wildcard sub-pattern can cover it. This
                     // stays sound — never claiming exhaustiveness over a
                     // domain we couldn't inspect.
-                    let opaque = || Ty::Var(u32::MAX);
+                    let opaque = || Ty::Var(OPAQUE_FIELD_TY_VAR);
                     let (shape, arg_tys) = match &variant.fields {
                         VariantFields::Unit => (CtorShape::Unit, Vec::new()),
                         VariantFields::Positional(field_tes) => {
@@ -9290,6 +9290,55 @@ enum HeadCtorKind {
 /// analysis: its field types (`arg_tys`, for specialisation) plus the
 /// data needed to match a head pattern against it and to render a
 /// witness from per-field witness strings.
+/// Sentinel `Ty::Var` id for a constructor field whose type could not be
+/// resolved (e.g. an un-instantiated generic parameter outside any
+/// substitution context). `head_ctors` treats *every* `Ty::Var` as
+/// un-enumerable, so the specific id is behaviourally irrelevant — this
+/// named constant just makes the "deliberately opaque, only a wildcard
+/// can cover it" intent legible at the use site instead of a bare
+/// `u32::MAX`. It must stay out of the range the inference engine hands
+/// out (`u32::MAX` is never allocated; see the `next_scope_var` cap).
+const OPAQUE_FIELD_TY_VAR: u32 = u32::MAX;
+
+/// Compile-time tripwire pinning the two assumptions the Maranget
+/// exhaustiveness analysis below relies on for soundness:
+///
+/// 1. **No or-patterns.** `Pattern` has no `Or` alternative, so
+///    `classify_head` / `pattern_matches_variant` can treat each row's
+///    head as selecting a single constructor. If `Pattern` gains an
+///    `Or` variant, the exhaustive `match` here fails to compile —
+///    forcing it to be handled in the matrix (an unhandled or-pattern
+///    would fall through `classify_head`'s `_ => NoMatch` and silently
+///    corrupt the analysis) before the feature can ship.
+/// 2. **No match guards.** `MatchArm` carries no `guard`, so a row that
+///    matches a constructor matches it *unconditionally* — the analysis
+///    may treat it as fully covering that constructor. If a `guard`
+///    field is added, the exhaustive destructure here fails to compile;
+///    a guarded arm must NOT be counted as covering its constructor
+///    (a runtime guard failure would leave the case uncovered — an
+///    unsoundness, claiming exhaustiveness over a case that can escape).
+///
+/// This function is never called; it exists solely so the build breaks
+/// at this comment if either AST shape changes.
+#[allow(dead_code)]
+fn maranget_soundness_assumptions_tripwire(p: &crate::ast::Pattern, arm: &crate::ast::MatchArm) {
+    use crate::ast::Pattern;
+    match p {
+        Pattern::IntLit(..)
+        | Pattern::BoolLit(..)
+        | Pattern::CharLit(..)
+        | Pattern::Wildcard(..)
+        | Pattern::Var(..)
+        | Pattern::Tuple(..)
+        | Pattern::Ctor { .. } => {}
+    }
+    let crate::ast::MatchArm {
+        pattern: _,
+        body: _,
+        span: _,
+    } = arm;
+}
+
 struct HeadCtor {
     arg_tys: Vec<Ty>,
     kind: HeadCtorKind,
