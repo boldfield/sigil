@@ -14,7 +14,7 @@
 
 import std.list
 import std.string
-use std.list.{List, fold};
+use std.list.{List, Cons, Nil, fold, reverse};
 use std.string.{string_split, string_replace};
 
 // `path_is_absolute(p)` is true iff `p` begins with "/".
@@ -124,4 +124,44 @@ fn path_dirname(p: String) -> String ![] {
   match path_split(p) {
     (head, _) => head,
   }
+}
+
+// True iff any element of `xs` is a non-empty string.
+fn __or_nonempty(acc: Bool, x: String) -> Bool ![] {
+  if acc { true } else { string_length(x) > 0 }
+}
+fn __any_nonempty(xs: List[String]) -> Bool ![] {
+  fold(xs, false, __or_nonempty)
+}
+
+// Given a basename split on ".", does it have a real "stem" before the
+// final dot? (i.e. some component other than the last is non-empty).
+// Leading-dot dotfiles like ".bashrc" / "..a" have no real stem.
+fn __has_real_stem(parts: List[String]) -> Bool ![] {
+  match reverse(parts) {
+    Nil => false,
+    Cons(_, rest) => __any_nonempty(rest),
+  }
+}
+
+// Extension of a basename (incl. the leading dot), or "" if none.
+//   __ext_of_basename("a.tar.gz")=".gz"  __ext_of_basename(".bashrc")=""
+//   __ext_of_basename("a.")="."  __ext_of_basename("a")=""
+fn __ext_of_basename(b: String) -> String ![] {
+  let parts: List[String] = string_split(b, ".");
+  if __has_real_stem(parts) {
+    string_concat(".", __last_component(parts))
+  } else {
+    ""
+  }
+}
+
+// `path_splitext(p)` splits the trailing extension off `p`'s basename.
+// `ext` includes the dot (or is ""); `root ++ ext == p` always.
+//   path_splitext("a.tar.gz")=("a.tar",".gz")  path_splitext(".bashrc")=(".bashrc","")
+//   path_splitext("a.")=("a",".")  path_splitext("/a/b.c")=("/a/b",".c")
+fn path_splitext(p: String) -> (String, String) ![] {
+  let ext: String = __ext_of_basename(path_basename(p));
+  let root: String = string_substring(p, 0, string_length(p) - string_length(ext));
+  (root, ext)
 }

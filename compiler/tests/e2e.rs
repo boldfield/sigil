@@ -23308,3 +23308,37 @@ fn std_path_split_basename_dirname() {
         "a/b|c\na/b|\n/|\n|a\n/|a\na|b\n//|a\n|\nb\n/a\n"
     );
 }
+
+#[test]
+fn std_path_splitext() {
+    // posixpath.splitext -> (root, ext); ext includes the dot, "" if
+    // none; leading dots in the basename are NOT an extension.
+    //   ("a.tar.gz")=("a.tar",".gz")  ("a")=("a","")  ("a.")=("a",".")
+    //   (".bashrc")=(".bashrc","")  ("a/.b")=("a/.b","")  ("/a/b.c")=("/a/b",".c")
+    //   ("a..b")=("a.",".b")
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_splitext};\n\
+                  fn ext_line(p: String) -> Int ![IO] {\n\
+                    match path_splitext(p) {\n\
+                      (r, e) => { perform IO.print(r); perform IO.print(\"|\"); perform IO.println(e); 0 }\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    ext_line(\"a.tar.gz\");\n\
+                    ext_line(\"a\");\n\
+                    ext_line(\"a.\");\n\
+                    ext_line(\".bashrc\");\n\
+                    ext_line(\"a/.b\");\n\
+                    ext_line(\"/a/b.c\");\n\
+                    ext_line(\"a..b\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_splitext");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "a.tar|.gz\na|\na|.\n.bashrc|\na/.b|\n/a/b|.c\na.|.b\n"
+    );
+}
