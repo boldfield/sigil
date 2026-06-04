@@ -23529,3 +23529,25 @@ fn field_access_h04_style_ergonomic_demo() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "Ada: 90");
 }
+
+#[test]
+fn field_access_chain_through_generic_record() {
+    // Intermediate chain link (`h.box`) is a GENERIC record Box[Int].
+    // Regression: nested-match span collision used to ICE monomorphize.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Box[U] = { value: U, tag: Int }\n\
+                  type Holder[U] = { box: Box[U], label: String }\n\
+                  fn get(h: Holder[Int]) -> Int ![] { h.box.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let bx: Box[Int] = Box { value: 7, tag: 0 };\n\
+                    let h: Holder[Int] = Holder { box: bx, label: \"x\" };\n\
+                    perform IO.println(int_to_string(get(h)));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_chain_generic");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "7");
+}

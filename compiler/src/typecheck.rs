@@ -4378,16 +4378,38 @@ impl Tc {
         };
         // Walk every segment after the head, threading a current scrutinee
         // expression and current type through, building one nested match per
-        // field.  All inner AST nodes (Ident, pattern, arm) use `inner_span` —
-        // a synthetic span that is NOT keyed in `field_access_desugar`.  This
-        // is load-bearing for correctness: the rewrite pass recurses into the
-        // replacement match, and that recursion must NOT re-trigger the
-        // desugar-replacement guard for any inner Ident node.
-        let inner_span = Span::synthetic(&span.file);
-        let mut cur_expr = Expr::Ident(head.to_string(), inner_span.clone());
+        // field.  Each hop uses its own synthetic span so that the nested
+        // `Expr::Match` nodes have DISTINCT spans when `check_match` inserts
+        // them into `match_scrut_tys` (keyed by span).  A shared span would
+        // clobber earlier hops' scrut-ty entries, causing monomorphize to
+        // fail to mangle the ctor / enqueue the type for generic intermediate
+        // records — manifesting as an ICE in codegen (`type_of_expr: unknown
+        // ident __fa_<field>`).
+        //
+        // Invariants that must hold for the per-hop span:
+        //   1. DISTINCT per hop — `match_scrut_tys` must not clobber.
+        //   2. NOT equal to the original `span` — the rewrite pass guards on
+        //      `field_access_desugar` by span; the head Ident must not match
+        //      the key or it re-triggers the desugar guard (infinite loop).
+        //   3. Synthetic — must not point at misleading real source positions.
+        //
+        // We use `Span::new(file, 0, hop+1, 0, hop+1)`: line 0 is never a
+        // real 1-based source line, and the column equals `hop_index + 1` so
+        // every hop produces a unique span.  Error push_error calls always
+        // use the original `span` so diagnostics point at real source.
+        //
+        // hop_index 0 => col 1 is used for the head Ident and the first
+        // match; hop_index 1 => col 2 for the second match, etc.  The head
+        // Ident and the first match share col 1, which is fine: Ident nodes
+        // do not enter `match_scrut_tys`, only `Expr::Match` nodes do.
+        let head_span = Span::new(&span.file, 0, 1, 0, 1);
+        let mut cur_expr = Expr::Ident(head.to_string(), head_span);
         let mut cur_ty = head_ty;
-        for field in &segments[1..] {
+        for (hop_index, field) in segments[1..].iter().enumerate() {
             let field = *field;
+            // Each hop gets a unique synthetic span: line 0 (never a real
+            // source line), column = hop_index + 1 (1-based, unique per hop).
+            let hop_span = Span::new(&span.file, 0, hop_index as u32 + 1, 0, hop_index as u32 + 1);
             let (type_name, type_args) = match &cur_ty {
                 Ty::User(tn, args) => (tn.clone(), args.clone()),
                 _ => {
@@ -4462,11 +4484,11 @@ impl Tc {
                 .map(|f| CtorPatternField {
                     name: f.name.clone(),
                     pattern: if f.name == field {
-                        Pattern::Var(binder_name.clone(), inner_span.clone())
+                        Pattern::Var(binder_name.clone(), hop_span.clone())
                     } else {
-                        Pattern::Wildcard(inner_span.clone())
+                        Pattern::Wildcard(hop_span.clone())
                     },
-                    span: inner_span.clone(),
+                    span: hop_span.clone(),
                 })
                 .collect();
             cur_expr = Expr::Match {
@@ -4475,12 +4497,12 @@ impl Tc {
                     pattern: Pattern::Ctor {
                         name: variant_name,
                         fields: CtorPatternFields::Record(pat_fields),
-                        span: inner_span.clone(),
+                        span: hop_span.clone(),
                     },
-                    body: Expr::Ident(binder_name.clone(), inner_span.clone()),
-                    span: inner_span.clone(),
+                    body: Expr::Ident(binder_name.clone(), hop_span.clone()),
+                    span: hop_span.clone(),
                 }],
-                span: inner_span.clone(),
+                span: hop_span.clone(),
             };
             cur_ty = self.subst.apply_ty(&field_ty);
         }
