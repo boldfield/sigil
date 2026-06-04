@@ -23303,10 +23303,7 @@ fn std_path_split_basename_dirname() {
                   }\n";
     let (stdout, stderr, code) = compile_and_run(source, "std_path_split");
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
-    assert_eq!(
-        stdout,
-        "a/b|c\na/b|\n/|\n|a\n/|a\na|b\n//|a\n|\nb\n/a\n"
-    );
+    assert_eq!(stdout, "a/b|c\na/b|\n/|\n|a\n/|a\na|b\n//|a\n|\nb\n/a\n");
 }
 
 #[test]
