@@ -18,3 +18,28 @@
 fn path_is_absolute(p: String) -> Bool ![] {
   string_starts_with(p, "/")
 }
+
+// `path_join(a, b)` joins two path segments with "/", matching
+// posixpath.join's binary case:
+//   - if `b` is absolute, the result is `b` (absolute RESETS — a wart
+//     inherited deliberately for prediction-match);
+//   - else if `a` is empty, the result is `b`;
+//   - else if `a` already ends with "/", concatenate directly;
+//   - else insert a single "/".
+//   path_join("a","b")="a/b"  path_join("a/","b")="a/b"
+//   path_join("a","/b")="/b"  path_join("","b")="b"  path_join("a","")="a/"
+fn path_join(a: String, b: String) -> String ![] {
+  if path_is_absolute(b) {
+    b
+  } else {
+    if string_length(a) == 0 {
+      b
+    } else {
+      if string_ends_with(a, "/") {
+        string_concat(a, b)
+      } else {
+        string_concat(string_concat(a, "/"), b)
+      }
+    }
+  }
+}

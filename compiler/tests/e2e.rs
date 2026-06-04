@@ -23246,3 +23246,27 @@ fn std_path_is_absolute() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "TFTF");
 }
+
+#[test]
+fn std_path_join() {
+    // Contract (posixpath.join, incl. the absolute-resets wart):
+    //   join("a","b")="a/b"  join("a/","b")="a/b"  join("a","/b")="/b"
+    //   join("","b")="b"     join("a","")="a/"     join("/","a")="/a"
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_join};\n\
+                  fn line(s: String) -> Int ![IO] { perform IO.println(s); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    line(path_join(\"a\", \"b\"));\n\
+                    line(path_join(\"a/\", \"b\"));\n\
+                    line(path_join(\"a\", \"/b\"));\n\
+                    line(path_join(\"\", \"b\"));\n\
+                    line(path_join(\"a\", \"\"));\n\
+                    line(path_join(\"/\", \"a\"));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_join");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout, "a/b\na/b\n/b\nb\na/\n/a\n");
+}
