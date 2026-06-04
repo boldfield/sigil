@@ -4166,15 +4166,18 @@ fn collect_branch_chain_allocs(
                         })
                         .collect();
                     let role = if step + 1 < branch_yield_count {
-                        // Pure lets bound after yield `step` and before
-                        // yield `step + 1` (position `step + 1`) feed
-                        // yield `step + 1`'s args; evaluate them at THIS
-                        // Middle step. (They also remain in
-                        // `inner_tail_prefix_lets` for the FINAL step's
-                        // tail; pure lets are idempotent.)
+                        // A pure let at position `pos` depends only on
+                        // yields `< pos`, available at any step `k` with
+                        // `pos <= k + 1`. It may be consumed by THIS step's
+                        // next perform OR a later one, so re-evaluate it at
+                        // every Middle step from its binding point onward
+                        // (`pos <= step + 1`); pure lets are idempotent
+                        // (they also remain in `inner_tail_prefix_lets` for
+                        // the FINAL step), so the value carries forward
+                        // without threading through closure records.
                         let pre_next_lets: Vec<TailPrefixLet> = positioned_inner_lets
                             .iter()
-                            .filter(|(pos, _)| *pos == step + 1)
+                            .filter(|(pos, _)| *pos <= step + 1)
                             .map(|(_, tpl)| tpl.clone())
                             .collect();
                         ChainStepRole::Middle {
@@ -10559,14 +10562,20 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                                 })
                                 .collect();
                             let role = if step + 1 < chain_length {
-                                // Pure lets bound after yield `step` and
-                                // before yield `step + 1` (position
-                                // `step + 1`) must be evaluated at THIS
-                                // Middle step so yield `step + 1`'s args
-                                // can reference them.
+                                // A pure let at position `pos` is bound
+                                // after yield `pos - 1`, so its RHS depends
+                                // only on yields `< pos` — available at any
+                                // step `k` with `pos <= k + 1`. It may be
+                                // consumed by THIS step's next perform OR a
+                                // later one, so re-evaluate it at every
+                                // Middle step from its binding point onward
+                                // (`pos <= step + 1`); pure lets are
+                                // idempotent (the FINAL step re-evaluates
+                                // them too), so the value carries forward
+                                // without threading through closure records.
                                 let pre_next_lets: Vec<TailPrefixLet> = positioned_lets
                                     .iter()
-                                    .filter(|(pos, _)| *pos == step + 1)
+                                    .filter(|(pos, _)| *pos <= step + 1)
                                     .map(|(_, tpl)| tpl.clone())
                                     .collect();
                                 ChainStepRole::Middle {

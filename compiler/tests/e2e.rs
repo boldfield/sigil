@@ -23021,3 +23021,40 @@ fn auto_cps_mid_chain_let_between_performs_no_ice() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "A-B-");
 }
+
+/// Bug 3b: a mid-chain pure `let` consumed by a *later, non-adjacent*
+/// perform (`perform s; let mark = …; perform "x"; perform mark`). The
+/// first fix evaluated the let only at the step lowering the
+/// immediately-following perform, then discarded it — so a step lowering
+/// a *later* perform still found it unbound. The let must remain
+/// available at every step from its binding point onward. Re-evaluating
+/// each mid-chain let at all subsequent Middle steps (`pos <= step + 1`)
+/// carries the value forward; pure lets are idempotent. Before the fix
+/// this panicked with `codegen: unknown ident \`mark\``.
+#[test]
+fn auto_cps_mid_chain_let_consumed_by_later_perform_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let mark: String = \"-\";\n\
+                        perform IO.print(\"x\");\n\
+                        perform IO.print(mark);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_later_perform");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ax-Bx-");
+}
