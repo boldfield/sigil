@@ -23342,3 +23342,40 @@ fn std_path_splitext() {
         "a.tar|.gz\na|\na|.\n.bashrc|\na/.b|\n/a/b|.c\na.|.b\n"
     );
 }
+
+#[test]
+fn std_path_normalize() {
+    // posixpath.normpath, with our one divergence: 2+ leading slashes
+    // collapse to a single "/".
+    //   ("a/../b")="b"  ("a/./b")="a/b"  ("a//b")="a/b"  ("a/b/")="a/b"
+    //   ("a/..")="."  ("")="."  (".")="."  ("./a")="a"  ("../a")="../a"
+    //   ("/../a")="/a"  ("/")="/"  ("/a/b/..")="/a"  ("//a")="/a"  ("///a")="/a"
+    let source = "import std.io\n\
+                  import std.path\n\
+                  use std.io.{IO};\n\
+                  use std.path.{path_normalize};\n\
+                  fn line(p: String) -> Int ![IO] { perform IO.println(path_normalize(p)); 0 }\n\
+                  fn main() -> Int ![IO] {\n\
+                    line(\"a/../b\");\n\
+                    line(\"a/./b\");\n\
+                    line(\"a//b\");\n\
+                    line(\"a/b/\");\n\
+                    line(\"a/..\");\n\
+                    line(\"\");\n\
+                    line(\".\");\n\
+                    line(\"./a\");\n\
+                    line(\"../a\");\n\
+                    line(\"/../a\");\n\
+                    line(\"/\");\n\
+                    line(\"/a/b/..\");\n\
+                    line(\"//a\");\n\
+                    line(\"///a\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "std_path_normalize");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n"
+    );
+}

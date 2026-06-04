@@ -126,6 +126,8 @@ fn path_dirname(p: String) -> String ![] {
   }
 }
 
+// --- splitext ----------------------------------------------------------
+
 // True iff any element of `xs` is a non-empty string.
 fn __or_nonempty(acc: Bool, x: String) -> Bool ![] {
   if acc { true } else { string_length(x) > 0 }
@@ -164,4 +166,95 @@ fn path_splitext(p: String) -> (String, String) ![] {
   let ext: String = __ext_of_basename(path_basename(p));
   let root: String = string_substring(p, 0, string_length(p) - string_length(ext));
   (root, ext)
+}
+
+// --- normalize ---------------------------------------------------------
+
+// Exact-match helpers. Sigil has no `==` on String, so "is this
+// component exactly `.` / `..`?" is expressed as a length check plus a
+// prefix check: a length-1 string starting with "." IS ".", and a
+// length-2 string starting with ".." IS "..".
+fn __is_dot(s: String) -> Bool ![] {
+  if string_length(s) == 1 { string_starts_with(s, ".") } else { false }
+}
+fn __is_dotdot(s: String) -> Bool ![] {
+  if string_length(s) == 2 { string_starts_with(s, "..") } else { false }
+}
+// "" (from "//" or a leading/trailing slash) or "." — dropped in normpath.
+fn __is_empty_or_dot(s: String) -> Bool ![] {
+  if string_length(s) == 0 { true } else { __is_dot(s) }
+}
+
+// Push one component onto the reverse-ordered stack (most-recent first),
+// applying normpath rules:
+//   "." or ""            → dropped (no-op)
+//   ".." + non-".." top  → pop the top (cancel the preceding component)
+//   ".." + ".." top      → push ".." (cannot cancel another "..")
+//   ".." + empty stack   → push ".." if relative; drop if absolute (no
+//                          parent above root)
+//   anything else        → push
+fn __norm_push(stack: List[String], comp: String, is_abs: Bool) -> List[String] ![] {
+  if __is_empty_or_dot(comp) {
+    stack
+  } else {
+    if __is_dotdot(comp) {
+      match stack {
+        Cons(top, rest) =>
+          if __is_dotdot(top) {
+            Cons(comp, stack)
+          } else {
+            rest
+          },
+        Nil =>
+          if is_abs {
+            stack
+          } else {
+            Cons(comp, stack)
+          },
+      }
+    } else {
+      Cons(comp, stack)
+    }
+  }
+}
+
+fn __norm_walk(comps: List[String], is_abs: Bool, stack: List[String]) -> List[String] ![] {
+  match comps {
+    Nil => stack,
+    Cons(comp, rest) => __norm_walk(rest, is_abs, __norm_push(stack, comp, is_abs)),
+  }
+}
+
+// Join components with "/" (no leading/trailing slash).
+fn __join_slash_acc(parts: List[String], acc: String) -> String ![] {
+  match parts {
+    Nil => acc,
+    Cons(h, t) => __join_slash_acc(t, string_concat(string_concat(acc, "/"), h)),
+  }
+}
+fn __join_slash(parts: List[String]) -> String ![] {
+  match parts {
+    Nil => "",
+    Cons(h, t) => __join_slash_acc(t, h),
+  }
+}
+
+// `path_normalize(p)` collapses ".", "..", and redundant slashes
+// (posixpath.normpath). The empty string normalizes to ".". 2+ leading
+// slashes collapse to one (our single deliberate divergence).
+//   path_normalize("a/../b")="b"  path_normalize("a//b")="a/b"
+//   path_normalize("")="."  path_normalize("/../a")="/a"  path_normalize("../a")="../a"
+fn path_normalize(p: String) -> String ![] {
+  if string_length(p) == 0 {
+    "."
+  } else {
+    let is_abs: Bool = path_is_absolute(p);
+    let stack: List[String] = __norm_walk(string_split(p, "/"), is_abs, Nil);
+    let body: String = __join_slash(reverse(stack));
+    if is_abs {
+      string_concat("/", body)
+    } else {
+      if string_length(body) == 0 { "." } else { body }
+    }
+  }
 }
