@@ -23425,3 +23425,22 @@ fn field_access_chained() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "deep");
 }
+
+#[test]
+fn field_access_generic_record() {
+    // Field type uses the record's generic param T.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Box[T] = { value: T, label: String }\n\
+                  fn unbox(b: Box[Int]) -> Int ![] { b.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let b: Box[Int] = Box { value: 42, label: \"answer\" };\n\
+                    perform IO.println(int_to_string(unbox(b)));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_generic");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "42");
+}
