@@ -23006,3 +23006,221 @@ fn main() -> Int ![IO] {\n\
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "65535");
 }
+
+// ===== Auto-CPS synth-cont capture threading — "unknown ident" ICE ==========
+//
+// Regression tests for two capture-threading gaps that made a CPS
+// fn's synth-cont closure record drop a live name, so a perform-arg
+// reference lowered to it hit `unreachable!("codegen: unknown ident
+// ...")`. Both shapes were surfaced by the H04 corpus prompt (stable
+// sort: build `(name, score)` records, perform-print the names).
+
+/// Bug 1: a fn **parameter** referenced inside the arms of a
+/// perform-bearing `match` in statement position. The free-var walker
+/// (`walk_collect_captures`) was a no-op on `Expr::Perform`, so a
+/// param used only inside a perform embedded in a branched tail was
+/// never captured into the branch synth-cont. Before the fix this
+/// panicked with `codegen: unknown ident \`name\``.
+#[test]
+fn auto_cps_param_in_perform_bearing_branch_no_ice() {
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  fn emit(name: String, first: Bool) -> Int ![IO] {\n\
+                    match first {\n\
+                      true => perform IO.print(name),\n\
+                      false => perform IO.print(name),\n\
+                    };\n\
+                    0\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    emit(\"A\", true);\n\
+                    emit(\"B\", false);\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_param_in_perform_branch");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "AB");
+}
+
+/// Bug 2: an **arm-local `let`** bound in an outer `match` arm, before
+/// a nested perform-bearing `match`, and referenced in a *later*
+/// perform of a multi-perform arm. `seed_branch_work`'s `Nested` leaf
+/// propagated only the arm's pattern bindings, dropping the arm's
+/// pre-yield pure `let`s — so the nested branch synth-cont was missing
+/// `name`. Before the fix this panicked with `codegen: unknown ident
+/// \`name\``.
+#[test]
+fn auto_cps_arm_local_let_across_nested_perform_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn ident(x: String) -> String ![] { x }\n\
+                  fn pn(xs: List[String], first: Bool) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(e, rest) => {\n\
+                        let name: String = ident(e);\n\
+                        match first {\n\
+                          true => { perform IO.print(name); pn(rest, false) },\n\
+                          false => { perform IO.print(\" \"); perform IO.print(name); pn(rest, false) },\n\
+                        }\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let xs: List[String] = Cons(\"A\", Cons(\"B\", Cons(\"C\", Nil)));\n\
+                    pn(xs, true);\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_arm_local_let_nested_perform");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A B C");
+}
+
+/// Bug 3: a pure `let` bound *between two performs* and consumed by the
+/// second perform's args (`perform p(s); let mark = …; perform p(mark)`).
+/// Post-yield pure lets were evaluated only at the FINAL step's tail, so
+/// the intermediate (MIDDLE) perform step lowering `mark` found it
+/// unbound. The fix evaluates each mid-chain pure let at the MIDDLE step
+/// that lowers the perform consuming it. Before the fix this panicked
+/// with `codegen: unknown ident \`mark\``.
+#[test]
+fn auto_cps_mid_chain_let_between_performs_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let mark: String = \"-\";\n\
+                        perform IO.print(mark);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_between_performs");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A-B-");
+}
+
+/// Bug 3b: a mid-chain pure `let` consumed by a *later, non-adjacent*
+/// perform (`perform s; let mark = …; perform "x"; perform mark`). The
+/// first fix evaluated the let only at the step lowering the
+/// immediately-following perform, then discarded it — so a step lowering
+/// a *later* perform still found it unbound. The let must remain
+/// available at every step from its binding point onward. Re-evaluating
+/// each mid-chain let at all subsequent Middle steps (`pos <= step + 1`)
+/// carries the value forward; pure lets are idempotent. Before the fix
+/// this panicked with `codegen: unknown ident \`mark\``.
+#[test]
+fn auto_cps_mid_chain_let_consumed_by_later_perform_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let mark: String = \"-\";\n\
+                        perform IO.print(\"x\");\n\
+                        perform IO.print(mark);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_later_perform");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ax-Bx-");
+}
+
+/// Bug 3c: a mid-chain pure `let` whose RHS depends on a *prior perform's
+/// result* — `let a = perform Counter.tick()`, then `let doubled =
+/// int_to_string(a + a)`, then a later `perform p(doubled)`. This
+/// exercises the positioning invariant directly: `doubled` (position 1)
+/// must be re-evaluated at the step lowering its consuming perform, and
+/// that step must have the yield-0 result `a` loaded into env
+/// (`pos <= step + 1` holds because `doubled` depends only on yields
+/// `< 1`). Confirms the re-eval carries forward when the let isn't a
+/// literal.
+#[test]
+fn auto_cps_mid_chain_let_depends_on_prior_yield_no_ice() {
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  effect Counter { tick: () -> Int }\n\
+                  fn run() -> Int ![Counter, IO] {\n\
+                    let a: Int = perform Counter.tick();\n\
+                    let doubled: String = int_to_string(a + a);\n\
+                    perform IO.print(\"[\");\n\
+                    perform IO.print(doubled);\n\
+                    perform IO.print(\"]\");\n\
+                    a\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let r: Int = handle run() with {\n\
+                      Counter.tick(k) => k(7),\n\
+                    };\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_prior_yield");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "[14]");
+}
+
+/// Bug 3d: a mid-chain let consumed *only* by another mid-chain let,
+/// which a later perform consumes (`let base = …; let wrapped =
+/// f(base); perform p(wrapped)`). The consumer-aware step filter
+/// evaluates only the lets a step's perform needs — so it must pull
+/// `base` in transitively when `wrapped` is needed, or `wrapped`'s
+/// re-evaluation would find `base` unbound. Exercises the transitive
+/// closure in `needed_lets_for_next_step`.
+#[test]
+fn auto_cps_mid_chain_let_transitive_dependency_no_ice() {
+    let source = "import std.io\n\
+                  import std.list\n\
+                  import std.string\n\
+                  use std.io.{IO};\n\
+                  use std.list.{Cons, List, Nil};\n\
+                  use std.string.{string_concat};\n\
+                  fn walk(xs: List[String]) -> Int ![IO] {\n\
+                    match xs {\n\
+                      Nil => 0,\n\
+                      Cons(s, rest) => {\n\
+                        perform IO.print(s);\n\
+                        let base: String = \"<\";\n\
+                        let wrapped: String = string_concat(base, s);\n\
+                        perform IO.print(\"|\");\n\
+                        perform IO.print(wrapped);\n\
+                        walk(rest)\n\
+                      },\n\
+                    }\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    walk(Cons(\"A\", Cons(\"B\", Nil)));\n\
+                    perform IO.println(\"\");\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "auto_cps_mid_chain_let_transitive_dep");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "A|<AB|<B");
+}

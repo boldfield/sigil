@@ -2394,6 +2394,43 @@ fn main() -> Int ![IO] {
 
 ### B — Multi-way branching with `match` (Sigil has no `else if`)
 
+**There is no `else if`.** An `else` must be followed by a brace block
+`{ ... }`. Chaining `else if` — the C / Python / JS / Rust habit — is a
+parse error: `E0010`, "expected `{` opening block", reported at the `if`
+that follows `else`.
+
+```text
+// ✗ NOT valid Sigil — `else if` does not exist:
+if n < 0 { "neg" } else if n == 0 { "zero" } else { "pos" }
+```
+
+Write it one of two ways. For a simple two-way split, nest the
+`if`/`else` so every `else` opens its own brace block:
+
+```sigil
+import std.io
+use std.io.{IO};
+
+// ✓ Nested if/else — each `else` is followed by `{ ... }`:
+fn sign(n: Int) -> String ![] {
+  if n < 0 {
+    "negative"
+  } else {
+    if n == 0 { "zero" } else { "positive" }
+  }
+}
+
+fn main() -> Int ![IO] {
+  perform IO.println(sign(0 - 4));
+  perform IO.println(sign(0));
+  perform IO.println(sign(7));
+  0
+}
+```
+
+For three or more conditions the nesting gets deep — prefer a `match`
+on a tuple of the conditions, the canonical `if/elif/else` replacement:
+
 ```sigil
 import std.int
 import std.io
