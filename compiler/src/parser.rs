@@ -339,18 +339,6 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Semi) {
             self.advance();
         }
-        // v1 restricts user imports to std.*.
-        if path.first().map(String::as_str) != Some("std") {
-            self.errors.push(CompilerError::new(
-                Severity::Error,
-                errors::code("E0031"),
-                start.clone(),
-                format!(
-                    "user-code imports are not supported in v1 (saw `{}`)",
-                    path.join(".")
-                ),
-            ));
-        }
         Some(ImportDecl {
             path,
             alias,
@@ -459,19 +447,6 @@ impl<'a> Parser<'a> {
                 "`use` declaration must name at least one symbol".to_string(),
             ));
             return None;
-        }
-        // v1 imports gate (E0031 mirror): the `use` source must be a
-        // stdlib path. User-code modules are not addressable in v1.
-        if module_path.first().map(String::as_str) != Some("std") {
-            self.errors.push(CompilerError::new(
-                Severity::Error,
-                errors::code("E0031"),
-                start.clone(),
-                format!(
-                    "user-code modules are not addressable in v1 (saw `use {} ...`)",
-                    module_path.join(".")
-                ),
-            ));
         }
         Some(UseDecl {
             module_path,
@@ -2176,11 +2151,13 @@ mod tests {
     }
 
     #[test]
-    fn user_import_is_e0031() {
-        let src = "import mylib.foo\nfn main() -> Int ![] { 0 }\n";
-        let (toks, _) = lex("x.sigil", src);
-        let (_prog, errs) = parse("x.sigil", &toks);
-        assert!(errs.iter().any(|e| e.code.as_str() == "E0031"));
+    fn parses_user_import() {
+        let (prog, errs) = parse_only("import app.foo;\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Import(imp) = &prog.items[0] else {
+            panic!("expected Item::Import first");
+        };
+        assert_eq!(imp.path, vec!["app".to_string(), "foo".to_string()]);
     }
 
     // --- Plan F1 — qualified imports + use declarations -------------------
@@ -2265,12 +2242,13 @@ mod tests {
     }
 
     #[test]
-    fn user_use_is_e0031() {
-        let (_prog, errs) = parse_only("use mylib.foo.{x};\nfn main() -> Int ![] { 0 }\n");
-        assert!(
-            errs.iter().any(|e| e.code.as_str() == "E0031"),
-            "expected E0031 for non-std `use`, got {errs:?}"
-        );
+    fn parses_user_use() {
+        let (prog, errs) = parse_only("use app.foo.{bar};\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Use(u) = &prog.items[0] else {
+            panic!("expected Item::Use first");
+        };
+        assert_eq!(u.module_path, vec!["app".to_string(), "foo".to_string()]);
     }
 
     #[test]
