@@ -10181,8 +10181,15 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             // can be resolved. The canonical key is <module_label>.<name>
             // (e.g., "app.foo.bar" from "app/foo.sigil"'s "bar"), matching
             // the typecheck-side registration in fn_schemes.
+            // For stdlib files, the module_label includes the "std." prefix
+            // (e.g., "std.list.map" from "std/list.sigil"'s "map").
             let stem = f.span.file.trim_end_matches(".sigil");
-            let canonical_key = format!("{}.{}", stem.replace('/', "."), f.name);
+            let module_label = if checked.program.stdlib_files.contains(&f.span.file) {
+                format!("std.{}", stem.replace('/', "."))
+            } else {
+                stem.replace('/', ".").to_string()
+            };
+            let canonical_key = format!("{}.{}", module_label, f.name);
             if canonical_key != f.name {
                 user_fns.insert(
                     canonical_key,
