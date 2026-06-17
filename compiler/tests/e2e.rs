@@ -23632,5 +23632,8 @@ fn two_file_basic_import_qualified_call() {
                   }\n";
     let (_stdout, stderr, code) =
         compile_and_run_multifile(entry, &[("helper.sigil", helper)], "two_file_import");
-    assert_eq!(code, 42, "two_file import: exit code mismatch; stderr={stderr:?}");
+    assert_eq!(
+        code, 42,
+        "two_file import: exit code mismatch; stderr={stderr:?}"
+    );
 }
