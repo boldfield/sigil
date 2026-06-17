@@ -2246,8 +2246,9 @@ fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
                     // to alias / remove. The diagnostic anchors at the
                     // colliding binding's span (the SECOND occurrence)
                     // — the first occurrence is described in prose.
-                    let new_module_label = module_label_from_stdlib_file(&module_file);
-                    let old_module_label = module_label_from_stdlib_file(&prev.module_file);
+                    let new_module_label = canonical_module_label(&module_file, &tc.stdlib_files);
+                    let old_module_label =
+                        canonical_module_label(&prev.module_file, &tc.stdlib_files);
                     if prev.module_file == module_file && prev.source_name == binding.source_name {
                         // Duplicate `use` of the same `(module, name)`
                         // from the same source — likely a copy-paste
@@ -2938,29 +2939,28 @@ fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
     }
 }
 
-/// Plan F1 — `["std", "list"]` -> `"list.sigil"`, mirroring
+/// Plan F1 — `["std", "list"]` -> `"list.sigil"`, or user paths like
+/// `["app", "foo"]` -> `"app/foo.sigil"`, mirroring
 /// [`crate::imports::path_to_module`]'s shape so the resolver and the
 /// import loader agree on what file string an import / use line
-/// targets. `path[0]` must be `"std"` and there must be at least one
-/// component after it; other shapes return `None`. Invalid paths or
-/// missing modules are handled by the import resolver (E0031, E0032).
+/// targets. For stdlib paths, `path[0]` must be `"std"` and there
+/// must be at least one component after it. For user paths, all segments
+/// are joined with slashes. Empty paths return `None`; parse errors are
+/// handled upstream (E0031 / E0032 / E0033).
 fn module_file_for_path(path: &[String]) -> Option<String> {
-    if path.first().map(String::as_str) != Some("std") || path.len() < 2 {
+    if path.is_empty() {
         return None;
     }
-    Some(format!("{}.sigil", path[1..].join("/")))
-}
-
-/// Render a stdlib module file path like `"list.sigil"` or
-/// `"iter/fold.sigil"` back to the dotted `std.list` / `std.iter.fold`
-/// form for diagnostics. Inverse of [`module_file_for_path`].
-///
-/// Distinct from [`__module_label_from_file`] which preserves the
-/// basename-only convention used by E0147's pre-Plan-F1 emit (and so
-/// doesn't propagate nested-path components into the label).
-fn module_label_from_stdlib_file(file: &str) -> String {
-    let stem = file.trim_end_matches(".sigil");
-    format!("std.{}", stem.replace('/', "."))
+    if path.first().map(String::as_str) == Some("std") {
+        // Stdlib path: must have at least ["std", <name>]
+        if path.len() < 2 {
+            return None;
+        }
+        Some(format!("{}.sigil", path[1..].join("/")))
+    } else {
+        // User module path: all segments joined with slashes
+        Some(format!("{}.sigil", path.join("/")))
+    }
 }
 
 /// Plan F1 — render the canonical key for a fn / type / ctor that
@@ -2986,18 +2986,14 @@ fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> 
 /// once and reuse for both the bare name and the canonical form.
 fn canonical_module_label(file: &str, stdlib_files: &BTreeSet<String>) -> String {
     if stdlib_files.contains(file) {
-        // Stdlib file. Treat the basename (after any `/` prefix) as
-        // the dotted module-label suffix: `list.sigil` → `std.list`,
+        // Stdlib file: `list.sigil` → `std.list`,
         // `iter/fold.sigil` → `std.iter.fold`.
         let stem = file.trim_end_matches(".sigil");
         format!("std.{}", stem.replace('/', "."))
     } else {
-        // User file — use the basename without `.sigil` so the
-        // canonical key for a user-defined fn at `x.sigil` is
-        // `x.<fn_name>`. Matches `__module_label_from_file`'s
-        // basename treatment for the user-file branch.
-        let basename = file.rsplit('/').next().unwrap_or(file);
-        basename.trim_end_matches(".sigil").to_string()
+        // User file: `app/foo.sigil` → `app.foo`, `helper.sigil` → `helper`.
+        let stem = file.trim_end_matches(".sigil");
+        stem.replace('/', ".").to_string()
     }
 }
 
@@ -10937,6 +10933,23 @@ mod tests {
         let (toks, lex_errs) = lex("x.sigil", src);
         let (prog, parse_errs) = parse("x.sigil", &toks);
         let (prog, import_errs) = imports::resolve(prog);
+        let (rp, res_errs) = resolve(prog);
+        let (_tc, tc_errs) = typecheck(rp.program);
+        let mut all = lex_errs;
+        all.extend(parse_errs);
+        all.extend(import_errs);
+        all.extend(res_errs);
+        all.extend(tc_errs);
+        all
+    }
+
+    fn pipeline_with_sources(
+        src: &str,
+        get_source: &dyn Fn(&str) -> Option<String>,
+    ) -> Vec<CompilerError> {
+        let (toks, lex_errs) = lex("x.sigil", src);
+        let (prog, parse_errs) = parse("x.sigil", &toks);
+        let (prog, import_errs) = imports::resolve_with_source(prog, get_source);
         let (rp, res_errs) = resolve(prog);
         let (_tc, tc_errs) = typecheck(rp.program);
         let mut all = lex_errs;
@@ -19226,6 +19239,47 @@ fn main() -> Int ![IO] {\n\
         assert!(
             !has_code(&errs, "E0147"),
             "alias should suppress duplicate-use E0147; got {errs:?}"
+        );
+    }
+
+    /// E0147 with user-module `use` bindings should show module labels
+    /// without spurious `std.` prefix.
+    #[test]
+    fn use_line_collision_user_modules_e0147_label_no_std_prefix() {
+        let get_source = |m: &str| match m {
+            "app/foo.sigil" => Some("fn bar() -> Int ![] { 1 }\n".to_string()),
+            "helper.sigil" => Some("fn bar() -> Int ![] { 2 }\n".to_string()),
+            _ => None,
+        };
+        let src = "import app.foo\n\
+               import helper\n\
+               use app.foo.{bar}\n\
+               use helper.{bar}\n\
+               fn main() -> Int ![] { 0 }\n";
+        let errs = pipeline_with_sources(src, &get_source);
+        let e = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0147")
+            .unwrap_or_else(|| panic!("expected E0147 on duplicate `use`; got {errs:?}"));
+        assert!(
+            e.message.contains("duplicate `use` of name `bar`"),
+            "new E0147 should name the colliding local name: {e:?}"
+        );
+        assert!(
+            e.message.contains("app.foo"),
+            "user module should appear without std. prefix: {e:?}"
+        );
+        assert!(
+            e.message.contains("helper"),
+            "user module should appear without std. prefix: {e:?}"
+        );
+        assert!(
+            !e.message.contains("std.app"),
+            "user module should NOT have std. prefix: {e:?}"
+        );
+        assert!(
+            !e.message.contains("std.helper"),
+            "user module should NOT have std. prefix: {e:?}"
         );
     }
 
