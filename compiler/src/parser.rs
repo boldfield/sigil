@@ -448,19 +448,6 @@ impl<'a> Parser<'a> {
             ));
             return None;
         }
-        // v1 imports gate (E0031 mirror): the `use` source must be a
-        // stdlib path. User-code modules are not addressable in v1.
-        if module_path.first().map(String::as_str) != Some("std") {
-            self.errors.push(CompilerError::new(
-                Severity::Error,
-                errors::code("E0031"),
-                start.clone(),
-                format!(
-                    "user-code modules are not addressable in v1 (saw `use {} ...`)",
-                    module_path.join(".")
-                ),
-            ));
-        }
         Some(UseDecl {
             module_path,
             bindings,
@@ -2260,12 +2247,13 @@ mod tests {
     }
 
     #[test]
-    fn user_use_is_e0031() {
-        let (_prog, errs) = parse_only("use mylib.foo.{x};\nfn main() -> Int ![] { 0 }\n");
-        assert!(
-            errs.iter().any(|e| e.code.as_str() == "E0031"),
-            "expected E0031 for non-std `use`, got {errs:?}"
-        );
+    fn parses_user_use() {
+        let (prog, errs) = parse_only("use app.foo.{bar};\nfn main() -> Int ![] { 0 }\n");
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        let Item::Use(u) = &prog.items[0] else {
+            panic!("expected Item::Use first");
+        };
+        assert_eq!(u.module_path, vec!["app".to_string(), "foo".to_string()]);
     }
 
     #[test]
