@@ -710,9 +710,9 @@ mod tests {
         let (resolved, errs) = resolve_with_source(prog, &get_source);
         assert!(errs.is_empty(), "errs: {errs:?}");
         // Original 3 user items (import a, import helper, main) +
-        // 2 appended (from_a, helped). `helper` is imported both
+        // 3 appended (import helper, from_a, helped). `helper` is imported both
         // directly and transitively via `a`, so it must be deduplicated.
-        assert_eq!(resolved.items.len(), 5);
+        assert_eq!(resolved.items.len(), 6);
         let helped_count = resolved
             .items
             .iter()
