@@ -444,8 +444,11 @@ fn compile_and_run_multifile(
 ) -> (String, String, i32) {
     let sigil_bin = sigil_binary();
 
-    let test_dir = std::env::temp_dir()
-        .join(format!("sigil_e2e_multifile_{}_{}", test_name, std::process::id()));
+    let test_dir = std::env::temp_dir().join(format!(
+        "sigil_e2e_multifile_{}_{}",
+        test_name,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&test_dir).expect("create temp directory");
 
     let entry_path = test_dir.join("main.sigil");
@@ -456,8 +459,11 @@ fn compile_and_run_multifile(
         std::fs::write(&module_path, content).expect("write module file");
     }
 
-    let bin_path = std::env::temp_dir()
-        .join(format!("sigil_e2e_multifile_bin_{}_{}", test_name, std::process::id()));
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_multifile_bin_{}_{}",
+        test_name,
+        std::process::id()
+    ));
 
     let compile = Command::new(&sigil_bin)
         .arg(&entry_path)
