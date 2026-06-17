@@ -23674,3 +23674,20 @@ fn field_access_chain_through_generic_record() {
     assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
     assert_eq!(stdout.trim_end(), "7");
 }
+
+#[test]
+fn two_file_basic_import_qualified_call() {
+    let entry = "import helper\n\
+                 fn main() -> Int ![] {\n\
+                   helper.answer()\n\
+                 }\n";
+    let helper = "fn answer() -> Int ![] {\n\
+                  42\n\
+                  }\n";
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, &[("helper.sigil", helper)], "two_file_import");
+    assert_eq!(
+        code, 42,
+        "two_file import: exit code mismatch; stderr={stderr:?}"
+    );
+}
