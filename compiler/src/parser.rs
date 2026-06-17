@@ -2151,13 +2151,18 @@ mod tests {
     }
 
     #[test]
-    fn parses_user_import() {
-        let (prog, errs) = parse_only("import app.foo;\nfn main() -> Int ![] { 0 }\n");
-        assert!(errs.is_empty(), "errs: {errs:?}");
-        let Item::Import(imp) = &prog.items[0] else {
+    fn user_import_parses_without_error() {
+        let src = "import mylib.foo\nfn main() -> Int ![] { 0 }\n";
+        let (toks, _) = lex("x.sigil", src);
+        let (prog, errs) = parse("x.sigil", &toks);
+        assert!(
+            errs.is_empty(),
+            "user imports should parse without E0031; got: {errs:?}"
+        );
+        let Item::Import(decl) = &prog.items[0] else {
             panic!("expected Item::Import first");
         };
-        assert_eq!(imp.path, vec!["app".to_string(), "foo".to_string()]);
+        assert_eq!(decl.path, vec!["mylib".to_string(), "foo".to_string()]);
     }
 
     // --- Plan F1 — qualified imports + use declarations -------------------
