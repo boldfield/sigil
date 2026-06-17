@@ -23387,3 +23387,167 @@ fn std_path_normalize() {
         "b\na/b\na/b\na/b\n.\n.\n.\na\n../a\n/a\n/\n/a\n/a\n/a\n../../a\n..\n/\n"
     );
 }
+
+// ===== record.field field access =======================================
+
+#[test]
+fn field_access_flat_record() {
+    // `p.name` reads the field; was E0151 before this feature.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type Person = { name: String, age: Int }\n\
+                  fn greet(p: Person) -> String ![] { p.name }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let p: Person = Person { name: \"Ada\", age: 36 };\n\
+                    perform IO.println(greet(p));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_flat");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ada");
+}
+
+#[test]
+fn field_access_chained() {
+    // a.b.c reads through nested single-variant records.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type Inner = { value: String }\n\
+                  type Outer = { inner: Inner, tag: Int }\n\
+                  fn deep(o: Outer) -> String ![] { o.inner.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let i: Inner = Inner { value: \"deep\" };\n\
+                    let o: Outer = Outer { inner: i, tag: 7 };\n\
+                    perform IO.println(deep(o));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_chained");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "deep");
+}
+
+#[test]
+fn field_access_generic_record() {
+    // Field type uses the record's generic param T.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Box[T] = { value: T, label: String }\n\
+                  fn unbox(b: Box[Int]) -> Int ![] { b.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let b: Box[Int] = Box { value: 42, label: \"answer\" };\n\
+                    perform IO.println(int_to_string(unbox(b)));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_generic");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "42");
+}
+
+#[test]
+fn field_access_three_hop() {
+    // a.b.c.d — three loop iterations through nested single-variant records.
+    let source = "import std.io\n\
+                  use std.io.{IO};\n\
+                  type C = { d: String }\n\
+                  type B = { c: C }\n\
+                  type A = { b: B }\n\
+                  fn deep(a: A) -> String ![] { a.b.c.d }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let cc: C = C { d: \"bottom\" };\n\
+                    let bb: B = B { c: cc };\n\
+                    let aa: A = A { b: bb };\n\
+                    perform IO.println(deep(aa));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_three_hop");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "bottom");
+}
+
+#[test]
+fn field_access_unknown_field_errors() {
+    let source = "type Person = { name: String, age: Int }\n\
+                  fn bad(p: Person) -> Int ![] { p.height }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) =
+        compile_capturing_compile_stderr(source, "field_access_unknown_field");
+    assert!(!succeeded, "must fail: no field `height`");
+    assert!(
+        stderr.contains("no field `height`") && stderr.contains("Person"),
+        "expected a no-such-field message naming the record; stderr={stderr}"
+    );
+}
+
+#[test]
+fn field_access_on_non_record_errors() {
+    let source = "fn bad(n: Int) -> Int ![] { n.value }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_non_record");
+    assert!(!succeeded, "must fail: Int is not a record");
+    assert!(
+        stderr.contains("not a record"),
+        "expected a not-a-record message; stderr={stderr}"
+    );
+}
+
+#[test]
+fn field_access_on_sum_type_errors() {
+    // A multi-variant sum type has no statically-known field set —
+    // field access must error and point the author at `match`.
+    let source = "type Shape = | Circle(Int) | Square(Int)\n\
+                  fn bad(s: Shape) -> Int ![] { s.radius }\n\
+                  fn main() -> Int ![] { 0 }\n";
+    let (stderr, succeeded) = compile_capturing_compile_stderr(source, "field_access_sum_type");
+    assert!(!succeeded, "must fail: Shape is a multi-variant sum type");
+    assert!(
+        stderr.contains("not a single-variant record") && stderr.contains("match"),
+        "expected a sum-type message pointing at match; stderr={stderr}"
+    );
+}
+
+#[test]
+fn field_access_h04_style_ergonomic_demo() {
+    // Before this feature, reading `entry.name`/`entry.score` required
+    // a match or an accessor fn per field (the H04 corpus boilerplate).
+    // Now it's direct.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Entry = { name: String, score: Int }\n\
+                  fn describe(e: Entry) -> String ![] {\n\
+                    string_concat(e.name, string_concat(\": \", int_to_string(e.score)))\n\
+                  }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let e: Entry = Entry { name: \"Ada\", score: 90 };\n\
+                    perform IO.println(describe(e));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_h04_demo");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "Ada: 90");
+}
+
+#[test]
+fn field_access_chain_through_generic_record() {
+    // Intermediate chain link (`h.box`) is a GENERIC record Box[Int].
+    // Regression: nested-match span collision used to ICE monomorphize.
+    let source = "import std.io\n\
+                  import std.int\n\
+                  use std.io.{IO};\n\
+                  use std.int.{int_to_string};\n\
+                  type Box[U] = { value: U, tag: Int }\n\
+                  type Holder[U] = { box: Box[U], label: String }\n\
+                  fn get(h: Holder[Int]) -> Int ![] { h.box.value }\n\
+                  fn main() -> Int ![IO] {\n\
+                    let bx: Box[Int] = Box { value: 7, tag: 0 };\n\
+                    let h: Holder[Int] = Holder { box: bx, label: \"x\" };\n\
+                    perform IO.println(int_to_string(get(h)));\n\
+                    0\n\
+                  }\n";
+    let (stdout, stderr, code) = compile_and_run(source, "field_access_chain_generic");
+    assert_eq!(code, 0, "expected clean exit; stderr={stderr}");
+    assert_eq!(stdout.trim_end(), "7");
+}

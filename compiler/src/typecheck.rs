@@ -1430,6 +1430,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         fn_schemes: BTreeMap::new(),
         bare_name_origins: BTreeMap::new(),
         resolved_idents: BTreeMap::new(),
+        field_access_desugar: BTreeMap::new(),
         file_use_bindings: BTreeMap::new(),
         file_module_paths: BTreeMap::new(),
         next_ty_var: 0,
@@ -2127,6 +2128,7 @@ pub fn typecheck(mut program: Program) -> (CheckedProgram, Vec<CompilerError>) {
         rewrite_resolved_idents(
             &mut program,
             &tc.resolved_idents,
+            &tc.field_access_desugar,
             &tc.bare_name_origins,
             &tc.stdlib_files,
         );
@@ -2318,6 +2320,7 @@ fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
 fn rewrite_resolved_idents(
     program: &mut Program,
     resolved_idents: &BTreeMap<Span, String>,
+    field_access_desugar: &BTreeMap<Span, Expr>,
     bare_name_origins: &BTreeMap<String, Vec<String>>,
     stdlib_files: &BTreeSet<String>,
 ) {
@@ -2327,7 +2330,7 @@ fn rewrite_resolved_idents(
             collisions.insert(name.clone());
         }
     }
-    if collisions.is_empty() && resolved_idents.is_empty() {
+    if collisions.is_empty() && resolved_idents.is_empty() && field_access_desugar.is_empty() {
         // Fast path: nothing to rewrite. Pre-migration programs with
         // no `use` lines and no colliding fn names take this path —
         // no AST diff, no fn_schemes mutation.
@@ -2383,7 +2386,13 @@ fn rewrite_resolved_idents(
             if let Some(new_name) = same_file_rename.get(&(file.clone(), f.name.clone())) {
                 f.name = new_name.clone();
             }
-            rewrite_block(&mut f.body, &file, resolved_idents, &same_file_rename);
+            rewrite_block(
+                &mut f.body,
+                &file,
+                resolved_idents,
+                field_access_desugar,
+                &same_file_rename,
+            );
         }
     }
 }
@@ -2392,13 +2401,26 @@ fn rewrite_block(
     b: &mut Block,
     fn_file: &str,
     resolved_idents: &BTreeMap<Span, String>,
+    field_access_desugar: &BTreeMap<Span, Expr>,
     same_file_rename: &BTreeMap<(String, String), String>,
 ) {
     for stmt in &mut b.stmts {
-        rewrite_stmt(stmt, fn_file, resolved_idents, same_file_rename);
+        rewrite_stmt(
+            stmt,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        );
     }
     if let Some(tail) = b.tail.as_mut() {
-        rewrite_expr(tail, fn_file, resolved_idents, same_file_rename);
+        rewrite_expr(
+            tail,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        );
     }
 }
 
@@ -2406,14 +2428,33 @@ fn rewrite_stmt(
     s: &mut Stmt,
     fn_file: &str,
     resolved_idents: &BTreeMap<Span, String>,
+    field_access_desugar: &BTreeMap<Span, Expr>,
     same_file_rename: &BTreeMap<(String, String), String>,
 ) {
     match s {
-        Stmt::Let(l) => rewrite_expr(&mut l.value, fn_file, resolved_idents, same_file_rename),
-        Stmt::Expr(e) => rewrite_expr(e, fn_file, resolved_idents, same_file_rename),
+        Stmt::Let(l) => rewrite_expr(
+            &mut l.value,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        ),
+        Stmt::Expr(e) => rewrite_expr(
+            e,
+            fn_file,
+            resolved_idents,
+            field_access_desugar,
+            same_file_rename,
+        ),
         Stmt::Perform(p) => {
             for a in &mut p.args {
-                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
     }
@@ -2423,8 +2464,32 @@ fn rewrite_expr(
     e: &mut Expr,
     fn_file: &str,
     resolved_idents: &BTreeMap<Span, String>,
+    field_access_desugar: &BTreeMap<Span, Expr>,
     same_file_rename: &BTreeMap<(String, String), String>,
 ) {
+    // Field-access desugar: if this Ident was resolved as a record field
+    // access, replace the entire node with the synthetic match expression
+    // recorded during type-checking.
+    if let Expr::Ident(_, span) = e {
+        if let Some(desugared) = field_access_desugar.get(span) {
+            *e = desugared.clone();
+            // Recurse into the replacement rather than returning: today
+            // the synthetic match's scrutinee is a plain local binding
+            // (no rewrite needed), but chained field access (a.b.c) nests
+            // desugared sub-expressions, so the inserted node must be
+            // walked too. Re-keying on the same span is safe — the
+            // replacement is a `Match`, not an `Ident`, so this branch
+            // does not re-fire.
+            rewrite_expr(
+                e,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            return;
+        }
+    }
     match e {
         Expr::Ident(name, span) => {
             if let Some(canonical) = resolved_idents.get(span) {
@@ -2446,16 +2511,46 @@ fn rewrite_expr(
         | Expr::BoolLit(_, _)
         | Expr::UnitLit(_) => {}
         Expr::Unary { operand, .. } => {
-            rewrite_expr(operand, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                operand,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Binary { lhs, rhs, .. } => {
-            rewrite_expr(lhs, fn_file, resolved_idents, same_file_rename);
-            rewrite_expr(rhs, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                lhs,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_expr(
+                rhs,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Call { callee, args, .. } => {
-            rewrite_expr(callee, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                callee,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for a in args {
-                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::If {
@@ -2464,27 +2559,75 @@ fn rewrite_expr(
             else_block,
             ..
         } => {
-            rewrite_expr(cond, fn_file, resolved_idents, same_file_rename);
-            rewrite_block(then_block, fn_file, resolved_idents, same_file_rename);
-            rewrite_block(else_block, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                cond,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_block(
+                then_block,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
+            rewrite_block(
+                else_block,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Match {
             scrutinee, arms, ..
         } => {
-            rewrite_expr(scrutinee, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                scrutinee,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for arm in arms {
-                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    &mut arm.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Block(b) => {
-            rewrite_block(b, fn_file, resolved_idents, same_file_rename);
+            rewrite_block(
+                b,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Lambda { body, .. } => {
-            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                body,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
         }
         Expr::Perform(p) => {
             for a in &mut p.args {
-                rewrite_expr(a, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    a,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Handle {
@@ -2493,22 +2636,52 @@ fn rewrite_expr(
             return_arm,
             ..
         } => {
-            rewrite_expr(body, fn_file, resolved_idents, same_file_rename);
+            rewrite_expr(
+                body,
+                fn_file,
+                resolved_idents,
+                field_access_desugar,
+                same_file_rename,
+            );
             for arm in op_arms {
-                rewrite_expr(&mut arm.body, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    &mut arm.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
             if let Some(ra) = return_arm.as_mut() {
-                rewrite_expr(&mut ra.body, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    &mut ra.body,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::RecordLit { fields, .. } => {
             for f in fields {
-                rewrite_expr(&mut f.value, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    &mut f.value,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::Tuple { elems, .. } => {
             for el in elems {
-                rewrite_expr(el, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    el,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::ClosureRecord { env_exprs, .. } => {
@@ -2516,7 +2689,13 @@ fn rewrite_expr(
             // pass shouldn't see it, but the recursive walker is
             // total in shape so we cover it for robustness.
             for e in env_exprs {
-                rewrite_expr(e, fn_file, resolved_idents, same_file_rename);
+                rewrite_expr(
+                    e,
+                    fn_file,
+                    resolved_idents,
+                    field_access_desugar,
+                    same_file_rename,
+                );
             }
         }
         Expr::ClosureEnvLoad { .. } => {
@@ -4043,6 +4222,11 @@ struct Tc {
     /// closure record passed as `closure_ptr` to
     /// `sigil_handler_frame_set_return`.
     handle_return_arm_captures: BTreeMap<Span, Vec<(String, Ty)>>,
+    /// Span of a dotted `Expr::Ident` resolved as record field access →
+    /// the equivalent (already type-checked) `match` expression that
+    /// reads the field. `rewrite_expr` replaces the Ident node with this
+    /// match after type-checking, before monomorphize.
+    field_access_desugar: BTreeMap<Span, Expr>,
     /// Plan B Stage 6 cleanup — per-`Expr::Handle` body type.
     /// Populated during `check_handle`'s body walk; consumed by
     /// codegen's return-arm pre-pass to size the `v` binding's
@@ -4061,6 +4245,19 @@ struct HandlerScope {
     /// so it plugs directly into `ty_from_type_expr` when resolving
     /// op param / return types.
     effect_substs: BTreeMap<String, BTreeMap<String, Ty>>,
+}
+
+/// Outcome of `try_resolve_field_access`: distinguishes a successful
+/// field-access resolution from an error (already pushed) from a
+/// definite non-match so the caller can fall through to other resolution
+/// paths.
+enum FieldAccessOutcome {
+    /// Field access resolved; synthetic match recorded; field type returned.
+    Resolved(Ty),
+    /// Looks like field access but invalid; error already pushed.
+    Errored,
+    /// Head segment is not a local binding in scope; caller should fall through.
+    NotFieldAccess,
 }
 
 impl Tc {
@@ -4151,6 +4348,184 @@ impl Tc {
             }
             None
         }
+    }
+
+    /// Attempt to resolve a dotted `name` (e.g. `p.name`) as a record
+    /// field access. Returns `FieldAccessOutcome::Resolved(ty)` when the
+    /// head is a local binding of a single-variant record type and the
+    /// tail names a field on that record; records a synthetic `match`
+    /// expression in `self.field_access_desugar` for the rewrite pass.
+    /// Returns `Errored` when the shape looks like field access but is
+    /// invalid (e.g. wrong type, unknown field); error already pushed.
+    /// Returns `NotFieldAccess` when the head is not a local binding at
+    /// all, so the caller can fall through to other resolution paths.
+    fn try_resolve_field_access(
+        &mut self,
+        name: &str,
+        span: &Span,
+        row: &[EffectInst],
+        row_tail: Option<u32>,
+    ) -> FieldAccessOutcome {
+        let segments: Vec<&str> = name.split('.').collect();
+        if segments.len() < 2 {
+            return FieldAccessOutcome::NotFieldAccess;
+        }
+        let head = segments[0];
+        // Only proceed if the head is a locally-bound identifier.
+        let head_ty = match self.env.get(head).cloned() {
+            Some(t) => self.subst.apply_ty(&t),
+            None => return FieldAccessOutcome::NotFieldAccess,
+        };
+        // Walk every segment after the head, threading a current scrutinee
+        // expression and current type through, building one nested match per
+        // field.  Each hop uses its own synthetic span so that the nested
+        // `Expr::Match` nodes have DISTINCT spans when `check_match` inserts
+        // them into `match_scrut_tys` (keyed by span).  A shared span would
+        // clobber earlier hops' scrut-ty entries, causing monomorphize to
+        // fail to mangle the ctor / enqueue the type for generic intermediate
+        // records — manifesting as an ICE in codegen (`type_of_expr: unknown
+        // ident __fa_<field>`).
+        //
+        // Invariants that must hold for the per-hop span:
+        //   1. DISTINCT per hop — `match_scrut_tys` must not clobber.
+        //   2. NOT equal to the original `span` — the rewrite pass guards on
+        //      `field_access_desugar` by span; the head Ident must not match
+        //      the key or it re-triggers the desugar guard (infinite loop).
+        //   3. Synthetic — must not point at misleading real source positions.
+        //
+        // We use `Span::new(file, 0, hop+1, 0, hop+1)`: line 0 is never a
+        // real 1-based source line, and the column equals `hop_index + 1` so
+        // every hop produces a unique span.  Error push_error calls always
+        // use the original `span` so diagnostics point at real source.
+        //
+        // hop_index 0 => col 1 is used for the head Ident and the first
+        // match; hop_index 1 => col 2 for the second match, etc.  The head
+        // Ident and the first match share col 1, which is fine: Ident nodes
+        // do not enter `match_scrut_tys`, only `Expr::Match` nodes do.
+        let head_span = Span::new(&span.file, 0, 1, 0, 1);
+        let mut cur_expr = Expr::Ident(head.to_string(), head_span);
+        let mut cur_ty = head_ty;
+        for (hop_index, field) in segments[1..].iter().enumerate() {
+            let field = *field;
+            // Each hop gets a unique synthetic span: line 0 (never a real
+            // source line), column = hop_index + 1 (1-based, unique per hop).
+            let hop_span = Span::new(&span.file, 0, hop_index as u32 + 1, 0, hop_index as u32 + 1);
+            let (type_name, type_args) = match &cur_ty {
+                Ty::User(tn, args) => (tn.clone(), args.clone()),
+                _ => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "cannot read field `{field}`: the value before `.{field}` has type \
+                             `{}`, which is not a record.",
+                            ty_display(&cur_ty)
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let td = match self.types.get(&type_name) {
+                Some(td)
+                    if td.variants.len() == 1
+                        && matches!(td.variants[0].fields, VariantFields::Record(_)) =>
+                {
+                    td.clone()
+                }
+                _ => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "cannot read field `{field}`: `{type_name}` is not a single-variant \
+                             record. Use `match` to destructure it."
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let variant = &td.variants[0];
+            let decl_fields = match &variant.fields {
+                VariantFields::Record(fs) => fs.clone(),
+                _ => unreachable!("guarded above"),
+            };
+            let decl = match decl_fields.iter().find(|f| f.name == field) {
+                Some(d) => d.clone(),
+                None => {
+                    let field_names: Vec<String> =
+                        decl_fields.iter().map(|f| f.name.clone()).collect();
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!(
+                            "no field `{field}` on record `{type_name}` (fields: {}).",
+                            field_names.join(", ")
+                        ),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let ty_subst = Self::subst_for(&td, &type_args);
+            let field_ty = match self.resolve_field_ty(&decl.ty, &ty_subst) {
+                Some(t) => t,
+                None => {
+                    self.push_error(
+                        "E0151",
+                        span.clone(),
+                        format!("could not resolve the type of field `{field}` on `{type_name}`."),
+                    );
+                    return FieldAccessOutcome::Errored;
+                }
+            };
+            let binder_name = format!("__fa_{field}");
+            let variant_name = variant.name.clone();
+            let pat_fields: Vec<CtorPatternField> = decl_fields
+                .iter()
+                .map(|f| CtorPatternField {
+                    name: f.name.clone(),
+                    pattern: if f.name == field {
+                        Pattern::Var(binder_name.clone(), hop_span.clone())
+                    } else {
+                        Pattern::Wildcard(hop_span.clone())
+                    },
+                    span: hop_span.clone(),
+                })
+                .collect();
+            cur_expr = Expr::Match {
+                scrutinee: Box::new(cur_expr),
+                arms: vec![MatchArm {
+                    pattern: Pattern::Ctor {
+                        name: variant_name,
+                        fields: CtorPatternFields::Record(pat_fields),
+                        span: hop_span.clone(),
+                    },
+                    body: Expr::Ident(binder_name.clone(), hop_span.clone()),
+                    span: hop_span.clone(),
+                }],
+                span: hop_span.clone(),
+            };
+            cur_ty = self.subst.apply_ty(&field_ty);
+        }
+        // Type-check the fully-built synthetic expression so that all
+        // internal annotations (match_scrut_tys, etc.) are populated.
+        let result_ty = match self.check_expr(&cur_expr, row, row_tail) {
+            Some(t) => t,
+            None => return FieldAccessOutcome::Errored,
+        };
+        // Record the desugared form for the rewrite pass.
+        self.field_access_desugar.insert(span.clone(), cur_expr);
+        FieldAccessOutcome::Resolved(result_ty)
+    }
+
+    /// Build the generic substitution for a record type declaration applied
+    /// to the given type arguments.  Used by `try_resolve_field_access` when
+    /// resolving the type of a field on a generic record.
+    fn subst_for(td: &TypeDecl, type_args: &[Ty]) -> std::collections::BTreeMap<String, Ty> {
+        let mut subst = std::collections::BTreeMap::new();
+        for (generic_param, arg_ty) in td.generic_params.iter().zip(type_args.iter()) {
+            subst.insert(generic_param.name.clone(), arg_ty.clone());
+        }
+        subst
     }
 
     fn push_error(&mut self, code: &'static str, span: Span, msg: impl Into<String>) {
@@ -6463,20 +6838,22 @@ impl Tc {
                         })
                         .unwrap_or(false);
                     if !any_prefix_known {
-                        let head = segments[0];
-                        self.push_error(
-                            "E0151",
-                            span.clone(),
-                            format!(
-                                "Sigil v1 has no field-access operator (`.field`); records \
-                                 are read by pattern-match destructure. Replace `{name}` \
-                                 with `match {head} {{ TypeName {{ field, .. }} => field }}`, \
-                                 or define a small accessor fn over the same destructure. \
-                                 (If you intended a qualified-path reference, no prefix of \
-                                 `{name}` matches a known imported module in this file.)"
-                            ),
-                        );
-                        return None;
+                        match self.try_resolve_field_access(name, span, row, row_tail) {
+                            FieldAccessOutcome::Resolved(field_ty) => return Some(field_ty),
+                            FieldAccessOutcome::Errored => return None,
+                            FieldAccessOutcome::NotFieldAccess => {
+                                let head = segments[0];
+                                self.push_error(
+                                    "E0151",
+                                    span.clone(),
+                                    format!(
+                                        "`{name}` is not a known qualified name, and `{head}` is \
+                                         not a record binding in scope."
+                                    ),
+                                );
+                                return None;
+                            }
+                        }
                     }
                 }
                 if self.ctors.contains_key(name) {
@@ -13491,6 +13868,7 @@ fn main() -> Int ![IO] {\n\
             fn_schemes: BTreeMap::new(),
             bare_name_origins: BTreeMap::new(),
             resolved_idents: BTreeMap::new(),
+            field_access_desugar: BTreeMap::new(),
             file_use_bindings: BTreeMap::new(),
             file_module_paths: BTreeMap::new(),
             next_ty_var: 0,
@@ -18851,38 +19229,15 @@ fn main() -> Int ![IO] {\n\
         );
     }
 
-    /// E0147 stdlib-shadow extension (2026-05-10 harness-data fix):
-    /// when a user fn collides with a stdlib export, the diagnostic
-    /// appends a hint pointing at the stdlib version. Without this,
-    /// the LLM's natural retry path ("rename my fn") is harder to
-    /// arrive at — the cross-language harness showed sonnet
-    /// repeatedly defining `fn int_compare` because std.ordering
-    /// already exports one and the original E0147 message didn't
-    /// surface that.
-    #[test]
-    #[ignore = "Plan F1 — call-site E0147 stdlib-shadow hint retired. \
-                See `use_line_collision_fires_e0147` for the new \
-                duplicate-`use` surface; the user-vs-stdlib collision \
-                shape is now legal (the user's `fn int_compare` keeps \
-                its identity via `<file>::int_compare`, no E0147)."]
-    fn bare_name_user_vs_stdlib_collision_includes_stdlib_hint() {
-        // Body intentionally minimal — the `#[ignore]` attribute
-        // means cargo skips this test; the body just has to
-        // compile.
-        let _src = "fn main() -> Int ![] { 0 }\n";
-    }
-
-    /// Plan F1 — the cross-stdlib call-site E0147 stdlib-shadow
-    /// hint is retired. The relevant new surface is the
-    /// duplicate-`use`-line E0147; without a `use` line, bare `map`
-    /// is just E0046 (covered by
-    /// `bare_name_collision_across_imports_is_now_e0046`).
-    #[test]
-    #[ignore = "Plan F1 — call-site stdlib-shadow hint retired"]
-    fn bare_name_cross_stdlib_collision_no_stdlib_hint() {
-        // Body intentionally minimal.
-        let _src = "fn main() -> Int ![] { 0 }\n";
-    }
+    // Plan F1 retired the call-site E0147 stdlib-shadow hint: a user fn
+    // colliding with a stdlib export is now legal (the user's
+    // `fn int_compare` keeps its identity via `<file>::int_compare`, no
+    // E0147). The two ex-tests asserting that hint were removed here.
+    // The current E0147 surface — duplicate `use` lines, alias
+    // suppression, and bare-name-collision-is-now-E0046 — is covered by
+    // `use_line_collision_fires_e0147`,
+    // `use_line_collision_resolved_by_alias_no_e0147`, and
+    // `bare_name_collision_across_imports_is_now_e0046` above.
 
     #[test]
     fn bare_name_single_import_is_unambiguous_no_e0147() {
