@@ -339,18 +339,6 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Semi) {
             self.advance();
         }
-        // v1 restricts user imports to std.*.
-        if path.first().map(String::as_str) != Some("std") {
-            self.errors.push(CompilerError::new(
-                Severity::Error,
-                errors::code("E0031"),
-                start.clone(),
-                format!(
-                    "user-code imports are not supported in v1 (saw `{}`)",
-                    path.join(".")
-                ),
-            ));
-        }
         Some(ImportDecl {
             path,
             alias,
@@ -2176,11 +2164,18 @@ mod tests {
     }
 
     #[test]
-    fn user_import_is_e0031() {
+    fn user_import_parses_without_error() {
         let src = "import mylib.foo\nfn main() -> Int ![] { 0 }\n";
         let (toks, _) = lex("x.sigil", src);
-        let (_prog, errs) = parse("x.sigil", &toks);
-        assert!(errs.iter().any(|e| e.code.as_str() == "E0031"));
+        let (prog, errs) = parse("x.sigil", &toks);
+        assert!(
+            errs.is_empty(),
+            "user imports should parse without E0031; got: {errs:?}"
+        );
+        let Item::Import(decl) = &prog.items[0] else {
+            panic!("expected Item::Import first");
+        };
+        assert_eq!(decl.path, vec!["mylib".to_string(), "foo".to_string()]);
     }
 
     // --- Plan F1 — qualified imports + use declarations -------------------
