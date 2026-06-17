@@ -659,13 +659,20 @@ mod tests {
 
         let (resolved, errs) = resolve(prog);
         assert!(errs.is_empty(), "errs: {errs:?}");
-        assert_eq!(resolved.items.len(), 3, "should have 3 items: import, main, helper_fn");
+        assert_eq!(
+            resolved.items.len(),
+            3,
+            "should have 3 items: import, main, helper_fn"
+        );
 
         let helper_fn = resolved
             .items
             .iter()
             .find(|i| matches!(i, Item::Fn(f) if f.name == "helper_fn"));
-        assert!(helper_fn.is_some(), "helper_fn should be loaded from filesystem");
+        assert!(
+            helper_fn.is_some(),
+            "helper_fn should be loaded from filesystem"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

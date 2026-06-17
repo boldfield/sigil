@@ -339,18 +339,6 @@ impl<'a> Parser<'a> {
         if matches!(self.peek().kind, TokenKind::Semi) {
             self.advance();
         }
-        // v1 restricts user imports to std.*.
-        if path.first().map(String::as_str) != Some("std") {
-            self.errors.push(CompilerError::new(
-                Severity::Error,
-                errors::code("E0031"),
-                start.clone(),
-                format!(
-                    "user-code imports are not supported in v1 (saw `{}`)",
-                    path.join(".")
-                ),
-            ));
-        }
         Some(ImportDecl {
             path,
             alias,
