@@ -6713,9 +6713,13 @@ impl Tc {
                                 .insert(span.clone(), bare_suffix.clone());
                         }
                         bare_suffix.clone()
-                    } else if !name.contains('.') && is_colliding && canonical != name {
-                        // (b): bare source, colliding → AST goes
-                        // canonical.
+                    } else if !name.contains('.') && canonical != name {
+                        // (b): bare source, colliding or use-bound
+                        // alias → AST goes canonical. Includes both
+                        // colliding names (tracked in bare_name_origins)
+                        // and use-bound aliases whose canonical form
+                        // (e.g. "app.foo.bar" from "use app.foo.{bar
+                        // as app_bar}") differs from the alias name.
                         self.resolved_idents.insert(span.clone(), canonical.clone());
                         canonical.clone()
                     } else {

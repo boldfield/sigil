@@ -10170,12 +10170,31 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 f.name.clone(),
                 UserFnEntry {
                     func_id,
-                    signature: sig,
-                    param_tys,
+                    signature: sig.clone(),
+                    param_tys: param_tys.clone(),
                     ret_ty,
                     abi,
                 },
             );
+            // Plan F1 — also register under the canonical (root-relative)
+            // key so use-bound aliases rewritten to their canonical forms
+            // can be resolved. The canonical key is <module_label>.<name>
+            // (e.g., "app.foo.bar" from "app/foo.sigil"'s "bar"), matching
+            // the typecheck-side registration in fn_schemes.
+            let stem = f.span.file.trim_end_matches(".sigil");
+            let canonical_key = format!("{}.{}", stem.replace('/', "."), f.name);
+            if canonical_key != f.name {
+                user_fns.insert(
+                    canonical_key,
+                    UserFnEntry {
+                        func_id,
+                        signature: sig,
+                        param_tys,
+                        ret_ty,
+                        abi,
+                    },
+                );
+            }
 
             // Stage-6.8-followup Layer 3b — declare Sync shim for
             // Cps-ABI fns. Sig: `(closure_ptr, params..., terminal_out)
