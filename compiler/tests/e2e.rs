@@ -543,6 +543,28 @@ fn multifile_two_user_modules_same_basename_no_collision() {
     );
 }
 
+/// Plan F1 Task 3 — qualified user-module calls resolve through the same
+/// machinery as qualified stdlib calls. A program that calls a user-module
+/// function by its fully qualified path (e.g. app.parser.parse(...))
+/// with an explicit import should typecheck and run correctly.
+#[test]
+fn multifile_qualified_user_module_calls() {
+    let entry = "import app.parser\n\
+                 fn main() -> Int ![] {\n\
+                   app.parser.parse()\n\
+                 }\n";
+    let parser = "fn parse() -> Int ![] { 42 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", parser)],
+        "qualified_user_module_calls",
+    );
+    assert_eq!(
+        code, 42,
+        "qualified user-module call: exit code should be 42; stderr={stderr:?}"
+    );
+}
+
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
 /// (compile-only, no link), inspect the `.o` file's stackmap section
 /// bytes, and parse them via the runtime's v1 parser. Asserts the v1

@@ -4275,16 +4275,42 @@ impl Tc {
         let file = self.current_fn_file.as_ref()?;
         if name.contains('.') {
             // Qualified-path reference. Walk segments against the
-            // current file's import / alias table.
-            let modules = self.file_module_paths.get(file)?;
+            // current file's import / alias table, then try resolving
+            // as a direct user-module path.
             let segments: Vec<&str> = name.split('.').collect();
             // Try the longest module label first so single-alias
             // `O.map` doesn't mismatch a multi-segment import.
+
+            // Plan F1 — first, try the explicit import / alias table
+            // (imports take priority over user-module paths).
+            if let Some(modules) = self.file_module_paths.get(file) {
+                for split in (1..segments.len()).rev() {
+                    let module_label = segments[..split].join(".");
+                    let sym = segments[split..].join(".");
+                    if let Some(module_file) = modules.get(&module_label) {
+                        let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                        if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                            return Some((scheme, canonical));
+                        }
+                        // Builtins fall back to the bare source-name key.
+                        if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
+                            return Some((scheme, sym));
+                        }
+                        return None;
+                    }
+                }
+            }
+
+            // Plan F1 Task 3 — try resolving as a direct user-module path
+            // (e.g., `app.parser.parse` -> look for `app/parser.sigil::parse`).
+            // For each split point, try converting the prefix to a module path
+            // using module_file_for_path. This allows qualified calls without
+            // explicit import statements.
             for split in (1..segments.len()).rev() {
-                let module_label = segments[..split].join(".");
+                let module_path: Vec<String> = segments[..split].iter().map(|s| s.to_string()).collect();
                 let sym = segments[split..].join(".");
-                if let Some(module_file) = modules.get(&module_label) {
-                    let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                if let Some(module_file) = module_file_for_path(&module_path) {
+                    let canonical = canonical_fn_key(&module_file, &sym, &self.stdlib_files);
                     if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
                         return Some((scheme, canonical));
                     }
@@ -4292,6 +4318,9 @@ impl Tc {
                     if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
                         return Some((scheme, sym));
                     }
+                    // If we resolved to a module file but couldn't find the
+                    // function, don't fall through to other splits
+                    // (the user meant this module, not a different one).
                     return None;
                 }
             }
@@ -6838,6 +6867,10 @@ impl Tc {
                     // head "std" but module label "std.list"). Only
                     // when NO prefix matches a known module do we
                     // fire E0151.
+                    //
+                    // Plan F1 Task 3 — also check direct user-module
+                    // paths, so `app.parser.parse` can resolve even
+                    // without explicit imports.
                     let segments: Vec<&str> = name.split('.').collect();
                     let modules = self
                         .current_fn_file
@@ -6849,7 +6882,12 @@ impl Tc {
                                 .any(|split| map.contains_key(&segments[..split].join(".")))
                         })
                         .unwrap_or(false);
-                    if !any_prefix_known {
+                    let any_prefix_is_user_module = (1..segments.len())
+                        .any(|split| {
+                            let module_path: Vec<String> = segments[..split].iter().map(|s| s.to_string()).collect();
+                            module_file_for_path(&module_path).is_some()
+                        });
+                    if !any_prefix_known && !any_prefix_is_user_module {
                         match self.try_resolve_field_access(name, span, row, row_tail) {
                             FieldAccessOutcome::Resolved(field_ty) => return Some(field_ty),
                             FieldAccessOutcome::Errored => return None,
