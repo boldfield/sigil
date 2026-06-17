@@ -113,6 +113,7 @@ pub(crate) fn resolve_with_source(
 ) -> (Program, Vec<CompilerError>) {
     let mut errs: Vec<CompilerError> = Vec::new();
     let mut loaded: BTreeSet<String> = BTreeSet::new();
+    let mut stdlib_files: BTreeSet<String> = BTreeSet::new();
     let mut in_progress: BTreeSet<String> = BTreeSet::new();
     let mut imported_items: Vec<Item> = Vec::new();
 
@@ -130,6 +131,7 @@ pub(crate) fn resolve_with_source(
                 &decl.path,
                 &decl.span,
                 &mut loaded,
+                &mut stdlib_files,
                 &mut in_progress,
                 &mut imported_items,
                 &mut errs,
@@ -141,8 +143,8 @@ pub(crate) fn resolve_with_source(
     let mut new_items: Vec<Item> = program.items.clone();
     new_items.extend(imported_items);
 
-    // `loaded` records every module that successfully loaded source
-    // from the stdlib (or test-injected) embedded tree; `loaded` keys
+    // `stdlib_files` records every stdlib module that successfully loaded source
+    // from the stdlib (or test-injected) embedded tree; `stdlib_files` keys
     // are the bare relative paths (e.g., `state.sigil`,
     // `iter/fold.sigil`) that `lexer::lex` was called with — i.e.,
     // exactly the strings that `span.file` carries on stdlib-origin
@@ -154,7 +156,7 @@ pub(crate) fn resolve_with_source(
         Program {
             items: new_items,
             file: program.file,
-            stdlib_files: loaded,
+            stdlib_files,
         },
         errs,
     )
@@ -213,6 +215,7 @@ fn load_module(
     import_path: &[String],
     import_span: &Span,
     loaded: &mut BTreeSet<String>,
+    stdlib_files: &mut BTreeSet<String>,
     in_progress: &mut BTreeSet<String>,
     out: &mut Vec<Item>,
     errs: &mut Vec<CompilerError>,
@@ -294,6 +297,7 @@ fn load_module(
                 &decl.path,
                 &decl.span,
                 loaded,
+                stdlib_files,
                 in_progress,
                 out,
                 errs,
@@ -315,8 +319,9 @@ fn load_module(
     }
 
     in_progress.remove(module);
+    loaded.insert(module.to_string());
     if is_stdlib {
-        loaded.insert(module.to_string());
+        stdlib_files.insert(module.to_string());
     }
 }
 
@@ -684,5 +689,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn duplicate_user_module_import_appended_items_dedupe() {
+        // Regression test: user modules imported multiple times must be
+        // loaded exactly once to avoid duplicate definitions in codegen.
+        // This exercises deduplication for user modules via the
+        // `loaded.contains(module)` early return in `load_module`.
+        let get_source = |m: &str| match m {
+            "helper.sigil" => Some("fn helped() -> Int ![] { 7 }\n".to_string()),
+            "a.sigil" => Some("import helper\nfn from_a() -> Int ![] { 1 }\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import a\nimport helper\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("main.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("main.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        // Original 3 user items (import a, import helper, main) +
+        // 2 appended (from_a, helped). `helper` is imported both
+        // directly and transitively via `a`, so it must be deduplicated.
+        assert_eq!(resolved.items.len(), 5);
+        let helped_count = resolved
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::Fn(f) if f.name == "helped"))
+            .count();
+        assert_eq!(
+            helped_count, 1,
+            "helped must be appended exactly once despite being imported twice"
+        );
     }
 }
