@@ -315,7 +315,9 @@ fn load_module(
     }
 
     in_progress.remove(module);
-    loaded.insert(module.to_string());
+    if is_stdlib {
+        loaded.insert(module.to_string());
+    }
 }
 
 #[cfg(test)]

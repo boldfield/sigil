@@ -2247,7 +2247,8 @@ fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
                     // colliding binding's span (the SECOND occurrence)
                     // — the first occurrence is described in prose.
                     let new_module_label = canonical_module_label(&module_file, &tc.stdlib_files);
-                    let old_module_label = canonical_module_label(&prev.module_file, &tc.stdlib_files);
+                    let old_module_label =
+                        canonical_module_label(&prev.module_file, &tc.stdlib_files);
                     if prev.module_file == module_file && prev.source_name == binding.source_name {
                         // Duplicate `use` of the same `(module, name)`
                         // from the same source — likely a copy-paste
@@ -2962,18 +2963,6 @@ fn module_file_for_path(path: &[String]) -> Option<String> {
     }
 }
 
-/// Render a stdlib module file path like `"list.sigil"` or
-/// `"iter/fold.sigil"` back to the dotted `std.list` / `std.iter.fold`
-/// form for diagnostics. Inverse of [`module_file_for_path`].
-///
-/// Distinct from [`__module_label_from_file`] which preserves the
-/// basename-only convention used by E0147's pre-Plan-F1 emit (and so
-/// doesn't propagate nested-path components into the label).
-fn module_label_from_stdlib_file(file: &str) -> String {
-    let stem = file.trim_end_matches(".sigil");
-    format!("std.{}", stem.replace('/', "."))
-}
-
 /// Plan F1 — render the canonical key for a fn / type / ctor that
 /// lives in a given source `file`. The canonical key is the
 /// user-facing qualified-path form: `std.list.map` for a stdlib fn,
@@ -2997,18 +2986,14 @@ fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> 
 /// once and reuse for both the bare name and the canonical form.
 fn canonical_module_label(file: &str, stdlib_files: &BTreeSet<String>) -> String {
     if stdlib_files.contains(file) {
-        // Stdlib file. Treat the basename (after any `/` prefix) as
-        // the dotted module-label suffix: `list.sigil` → `std.list`,
+        // Stdlib file: `list.sigil` → `std.list`,
         // `iter/fold.sigil` → `std.iter.fold`.
         let stem = file.trim_end_matches(".sigil");
         format!("std.{}", stem.replace('/', "."))
     } else {
-        // User file — use the basename without `.sigil` so the
-        // canonical key for a user-defined fn at `x.sigil` is
-        // `x.<fn_name>`. Matches `__module_label_from_file`'s
-        // basename treatment for the user-file branch.
-        let basename = file.rsplit('/').next().unwrap_or(file);
-        basename.trim_end_matches(".sigil").to_string()
+        // User file: `app/foo.sigil` → `app.foo`, `helper.sigil` → `helper`.
+        let stem = file.trim_end_matches(".sigil");
+        stem.replace('/', ".").to_string()
     }
 }
 
