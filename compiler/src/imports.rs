@@ -77,11 +77,28 @@ const BUILTIN_INJECTED: &[&str] = &[
     "panic.sigil",
 ];
 
-/// Resolve every `Item::Import` in `program` against the embedded stdlib.
+/// Resolve every `Item::Import` in `program` against the embedded stdlib
+/// and user modules from the filesystem (rooted at the entry file's directory).
 /// Returns a new `Program` with imported items appended, plus diagnostics
 /// for missing modules (E0032) and circular imports (E0033).
 pub fn resolve(program: Program) -> (Program, Vec<CompilerError>) {
-    resolve_with_source(program, &|m| stdlib_embed::get(m).map(String::from))
+    let root = std::path::Path::new(&program.file)
+        .parent()
+        .map(|p| p.to_path_buf());
+    resolve_with_source(program, &|m| {
+        // Try stdlib first
+        if let Some(s) = stdlib_embed::get(m) {
+            return Some(String::from(s));
+        }
+        // Try filesystem if root exists
+        if let Some(ref root_dir) = root {
+            let path = root_dir.join(m);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                return Some(contents);
+            }
+        }
+        None
+    })
 }
 
 /// Same as [`resolve`] but with the source lookup injected — used by
@@ -142,20 +159,30 @@ pub(crate) fn resolve_with_source(
     )
 }
 
-/// Convert an import path like `["std", "option"]` to the embedded-tree
-/// relative path `option.sigil`. `["std", "iter", "fold"]` becomes
-/// `iter/fold.sigil`. The `"std"` head is required (the parser enforces
-/// it via E0031); other shapes return `None`.
+/// Convert an import path to a module file path. For `["std", "option"]`,
+/// returns `option.sigil` (embedded stdlib). For `["std", "iter", "fold"]`,
+/// returns `iter/fold.sigil`. For user modules like `["helper"]`, returns
+/// `helper.sigil`. The first segment can be either `"std"` (for stdlib) or
+/// a user module name (for filesystem). All paths end with `.sigil`.
 fn path_to_module(path: &[String]) -> Option<String> {
-    if path.first().map(String::as_str) != Some("std") || path.len() < 2 {
+    if path.is_empty() || path.len() < 1 {
         return None;
     }
-    Some(format!("{}.sigil", path[1..].join("/")))
+    if path.first().map(String::as_str) == Some("std") {
+        // Stdlib path: must have at least ["std", <name>]
+        if path.len() < 2 {
+            return None;
+        }
+        Some(format!("{}.sigil", path[1..].join("/")))
+    } else {
+        // User module path: all segments joined with slashes
+        Some(format!("{}.sigil", path.join("/")))
+    }
 }
 
 fn render_module_for_diagnostic(module: &str) -> String {
     let stem = module.trim_end_matches(".sigil");
-    format!("std.{}", stem.replace('/', "."))
+    stem.replace('/', ".")
 }
 
 /// Wrap a lex / parse error from a stdlib module load with an
@@ -485,15 +512,92 @@ mod tests {
     }
 
     #[test]
-    fn path_to_module_with_one_segment_returns_none() {
+    fn user_module_import_loads_from_custom_source() {
+        // Test that non-stdlib modules can be loaded via the injected
+        // source closure. This simulates user-module filesystem loading.
+        let get_source = |m: &str| match m {
+            "helper.sigil" => Some("fn helper_fn() -> Int ![] { 42 }\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import helper\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("main.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("main.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        // Original 2 user items (import + main) + 1 appended (helper_fn).
+        assert_eq!(resolved.items.len(), 3);
+        let helper_fn = resolved
+            .items
+            .iter()
+            .find(|i| matches!(i, Item::Fn(f) if f.name == "helper_fn"));
+        assert!(
+            helper_fn.is_some(),
+            "helper_fn should be loaded from user module"
+        );
+    }
+
+    #[test]
+    fn missing_user_module_is_e0032() {
+        // When a user module cannot be loaded, E0032 is emitted.
+        let get_source = |_m: &str| None; // No modules available
+        let user_src = "import helper\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("main.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("main.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (_resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(has_code(&errs, "E0032"), "expected E0032, got: {errs:?}");
+        let msg = errs
+            .iter()
+            .find(|e| e.code.as_str() == "E0032")
+            .map(|e| e.message.clone())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("helper"),
+            "diagnostic should name the missing user module; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn stdlib_module_priority_over_filesystem() {
+        // If both a stdlib module and a filesystem module exist with the
+        // same name, stdlib takes priority. This tests that `resolve()`'s
+        // source closure checks stdlib first.
+        let get_source = |m: &str| match m {
+            "helper.sigil" => Some("fn from_stdlib() -> Int ![] { 1 }\n".to_string()),
+            _ => None,
+        };
+        let user_src = "import std.helper\nfn main() -> Int ![] { 0 }\n";
+        let (toks, lex_errs) = lexer::lex("main.sigil", user_src);
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse("main.sigil", &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+        let (resolved, errs) = resolve_with_source(prog, &get_source);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        // Verify the stdlib version was loaded
+        let fn_item = resolved
+            .items
+            .iter()
+            .find(|i| matches!(i, Item::Fn(f) if f.name == "from_stdlib"));
+        assert!(fn_item.is_some(), "stdlib version should be loaded");
+    }
+
+    #[test]
+    fn path_to_module_with_only_std_returns_none() {
         assert_eq!(path_to_module(&["std".to_string()]), None);
     }
 
     #[test]
-    fn path_to_module_with_non_std_head_returns_none() {
+    fn path_to_module_with_non_std_head_is_user_module() {
+        assert_eq!(
+            path_to_module(&["other".to_string()]),
+            Some("other.sigil".to_string())
+        );
         assert_eq!(
             path_to_module(&["other".to_string(), "thing".to_string()]),
-            None
+            Some("other/thing.sigil".to_string())
         );
     }
 
@@ -514,11 +618,15 @@ mod tests {
     }
 
     #[test]
-    fn render_module_for_diagnostic_strips_extension_and_dots_separators() {
-        assert_eq!(render_module_for_diagnostic("option.sigil"), "std.option");
+    fn render_module_for_diagnostic_strips_extension_and_uses_dots_separators() {
+        assert_eq!(render_module_for_diagnostic("option.sigil"), "option");
         assert_eq!(
             render_module_for_diagnostic("iter/fold.sigil"),
-            "std.iter.fold"
+            "iter.fold"
+        );
+        assert_eq!(
+            render_module_for_diagnostic("helper.sigil"),
+            "helper"
         );
     }
 }
