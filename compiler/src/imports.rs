@@ -267,16 +267,29 @@ fn load_module(
     // didn't write. CI catches stdlib breakage before release; this
     // path is the in-development safety net for stdlib-author edits.
     let (tokens, lex_errs) = lexer::lex(module, &src);
+    let is_stdlib = import_path.first() == Some(&"std".to_string());
     errs.extend(
         lex_errs
             .into_iter()
-            .map(|e| wrap_stdlib_error(e, import_path)),
+            .map(|e| {
+                if is_stdlib {
+                    wrap_stdlib_error(e, import_path)
+                } else {
+                    e
+                }
+            }),
     );
     let (subprog, parse_errs) = parser::parse(module, &tokens);
     errs.extend(
         parse_errs
             .into_iter()
-            .map(|e| wrap_stdlib_error(e, import_path)),
+            .map(|e| {
+                if is_stdlib {
+                    wrap_stdlib_error(e, import_path)
+                } else {
+                    e
+                }
+            }),
     );
 
     for sub_item in &subprog.items {
