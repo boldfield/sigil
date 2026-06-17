@@ -105,11 +105,11 @@ Default to rebuilding release after any runtime edit.
   open frontier** — only its Phase 1 analyzer (PR #175) landed, the
   codegen that acts on it is not built. See `V2_STATUS.md` for the
   rollup, plus the standing codegen ICE noted there.
-- **H-tier friction follow-ups (queued for v2):**
+- **H-tier friction follow-ups:**
   - Qualified call syntax (`std.list.map(...)`) to close E0147
-    ambiguous-bare-name failures on H03.
+    ambiguous-bare-name failures on H03 — **still open.**
   - Field-access operator (`record.field`) to close E0151 failures
-    on H04 — **in progress on the `record-field-access` branch.**
+    on H04 — **landed (#208).**
 
 ## What lives where
 
