@@ -500,8 +500,12 @@ fn hello() {
 fn multifile_entry_with_helper_module() {
     let entry = "import helper\nfn main() -> Int ![] { helper_fn() }\n";
     let helper = "fn helper_fn() -> Int ![] { 42 }\n";
-    let (stdout, stderr, code) = compile_and_run_multifile(entry, &[("helper.sigil", helper)], "multifile");
-    assert_eq!(code, 0, "multifile exit code; stderr={stderr:?}");
+    let (stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("helper.sigil", helper)],
+        "multifile",
+    );
+    assert_eq!(code, 42, "multifile exit code; stderr={stderr:?}");
 }
 
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
