@@ -185,11 +185,6 @@ fn render_import_path(path: &[String]) -> String {
     path.join(".")
 }
 
-fn render_module_for_diagnostic(module: &str) -> String {
-    let stem = module.trim_end_matches(".sigil");
-    stem.replace('/', ".")
-}
-
 /// Wrap a lex / parse error from a stdlib module load with an
 /// "internal compiler error" framing so users can tell the failure
 /// is in stdlib code, not their own. The original message is
@@ -212,6 +207,7 @@ fn wrap_stdlib_error(err: CompilerError, import_path: &[String]) -> CompilerErro
     wrapped
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_module(
     module: &str,
     import_path: &[String],
@@ -268,29 +264,21 @@ fn load_module(
     // path is the in-development safety net for stdlib-author edits.
     let (tokens, lex_errs) = lexer::lex(module, &src);
     let is_stdlib = import_path.first() == Some(&"std".to_string());
-    errs.extend(
-        lex_errs
-            .into_iter()
-            .map(|e| {
-                if is_stdlib {
-                    wrap_stdlib_error(e, import_path)
-                } else {
-                    e
-                }
-            }),
-    );
+    errs.extend(lex_errs.into_iter().map(|e| {
+        if is_stdlib {
+            wrap_stdlib_error(e, import_path)
+        } else {
+            e
+        }
+    }));
     let (subprog, parse_errs) = parser::parse(module, &tokens);
-    errs.extend(
-        parse_errs
-            .into_iter()
-            .map(|e| {
-                if is_stdlib {
-                    wrap_stdlib_error(e, import_path)
-                } else {
-                    e
-                }
-            }),
-    );
+    errs.extend(parse_errs.into_iter().map(|e| {
+        if is_stdlib {
+            wrap_stdlib_error(e, import_path)
+        } else {
+            e
+        }
+    }));
 
     for sub_item in &subprog.items {
         if let Item::Import(decl) = sub_item {
@@ -642,6 +630,11 @@ mod tests {
         );
     }
 
+    fn render_module_for_diagnostic(module: &str) -> String {
+        let stem = module.trim_end_matches(".sigil");
+        stem.replace('/', ".")
+    }
+
     #[test]
     fn render_module_for_diagnostic_strips_extension_and_uses_dots_separators() {
         assert_eq!(render_module_for_diagnostic("option.sigil"), "option");
@@ -650,6 +643,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::disallowed_methods)]
     fn e2e_user_module_from_filesystem() {
         let temp_dir = std::env::temp_dir().join("sigil_test_user_module");
         let _ = std::fs::create_dir_all(&temp_dir);

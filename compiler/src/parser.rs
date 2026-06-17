@@ -2168,7 +2168,10 @@ mod tests {
         let src = "import mylib.foo\nfn main() -> Int ![] { 0 }\n";
         let (toks, _) = lex("x.sigil", src);
         let (prog, errs) = parse("x.sigil", &toks);
-        assert!(errs.is_empty(), "user imports should parse without E0031; got: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "user imports should parse without E0031; got: {errs:?}"
+        );
         let Item::Import(decl) = &prog.items[0] else {
             panic!("expected Item::Import first");
         };
