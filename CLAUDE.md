@@ -7,8 +7,11 @@ guidance on top.
 ## What sigil is
 
 A compiled, statically-typed language designed around LLM authorship.
-v1.0.0 shipped. Currently working through the v2 architectural cluster
-(profile-data emission, precise GC, per-context CPS).
+v1.0.0 shipped. The v2 architectural cluster is mostly landed: E1
+(profile-data emission) and E2 (precise GC + Cranelift stackmaps) are
+**done**; E3 (per-context CPS) is the remaining open frontier. See
+`V2_STATUS.md` for the one-screen rollup (trust it over the
+per-plan `PLAN_*.md` status lines, which lag).
 
 - Spec: `spec/language.md` (canonical)
 - Published site: <https://sigillang.ai/> (sourced from `docs/`)
@@ -96,14 +99,17 @@ Default to rebuilding release after any runtime edit.
 
 ## Open work pointers
 
-- **v2 cluster (active):** `queue/2026-05-08-sigil-v2-*` in the
-  designs repo. PR #148 ships profile-data emission as the foundation
-  for the other two.
+- **v2 cluster:** three plans in `boldfield/designs`
+  (`2026-05-08-sigil-v2-*`). E1 (profile-data, PR #148) and E2 (precise
+  GC + Cranelift stackmaps) are **done**; **E3 (per-context CPS) is the
+  open frontier** — only its Phase 1 analyzer (PR #175) landed, the
+  codegen that acts on it is not built. See `V2_STATUS.md` for the
+  rollup, plus the standing codegen ICE noted there.
 - **H-tier friction follow-ups (queued for v2):**
   - Qualified call syntax (`std.list.map(...)`) to close E0147
     ambiguous-bare-name failures on H03.
   - Field-access operator (`record.field`) to close E0151 failures
-    on H04.
+    on H04 — **in progress on the `record-field-access` branch.**
 
 ## What lives where
 
