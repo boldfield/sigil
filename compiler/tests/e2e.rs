@@ -433,6 +433,60 @@ fn compile_file_and_run_timed(
     (stdout, stderr, code, elapsed)
 }
 
+/// Compiles a multi-file program where the entry file and module files
+/// are placed in a temporary directory. Entry file is written as "main.sigil",
+/// modules are written with their given filenames (e.g., "helper.sigil").
+/// Returns (stdout, stderr, exit_code) just like single-file helpers.
+fn compile_and_run_multifile(
+    entry_content: &str,
+    modules: &[(&str, &str)],
+    test_name: &str,
+) -> (String, String, i32) {
+    let sigil_bin = sigil_binary();
+
+    let test_dir = std::env::temp_dir()
+        .join(format!("sigil_e2e_multifile_{}_{}", test_name, std::process::id()));
+    std::fs::create_dir_all(&test_dir).expect("create temp directory");
+
+    let entry_path = test_dir.join("main.sigil");
+    std::fs::write(&entry_path, entry_content).expect("write entry file");
+
+    for (filename, content) in modules {
+        let module_path = test_dir.join(filename);
+        std::fs::write(&module_path, content).expect("write module file");
+    }
+
+    let bin_path = std::env::temp_dir()
+        .join(format!("sigil_e2e_multifile_bin_{}_{}", test_name, std::process::id()));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&entry_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("failed to invoke sigil compiler");
+
+    assert!(
+        compile.status.success(),
+        "compile failed for {test_name}: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr),
+    );
+
+    let run = Command::new(&bin_path)
+        .output()
+        .expect("failed to execute compiled binary");
+
+    let code = run.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_dir_all(&test_dir);
+
+    (stdout, stderr, code)
+}
+
 #[test]
 fn hello() {
     let root = workspace_root();
@@ -440,6 +494,14 @@ fn hello() {
     let (stdout, stderr, code) = compile_file_and_run(&source, "hello");
     assert_eq!(code, 0, "hello exit code; stderr={stderr:?}");
     assert_eq!(stdout, "hello, world\n", "hello-world stdout mismatch");
+}
+
+#[test]
+fn multifile_entry_with_helper_module() {
+    let entry = "import helper\nfn main() -> Int ![] { helper_fn() }\n";
+    let helper = "fn helper_fn() -> Int ![] { 42 }\n";
+    let (stdout, stderr, code) = compile_and_run_multifile(entry, &[("helper.sigil", helper)], "multifile");
+    assert_eq!(code, 0, "multifile exit code; stderr={stderr:?}");
 }
 
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
