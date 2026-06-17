@@ -456,6 +456,9 @@ fn compile_and_run_multifile(
 
     for (filename, content) in modules {
         let module_path = test_dir.join(filename);
+        if let Some(parent) = module_path.parent() {
+            std::fs::create_dir_all(parent).expect("create module parent dir");
+        }
         std::fs::write(&module_path, content).expect("write module file");
     }
 
