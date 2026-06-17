@@ -127,6 +127,7 @@ pub(crate) fn resolve_with_source(
             }
             load_module(
                 &module,
+                &decl.path,
                 &decl.span,
                 &mut loaded,
                 &mut in_progress,
@@ -165,7 +166,7 @@ pub(crate) fn resolve_with_source(
 /// `helper.sigil`. The first segment can be either `"std"` (for stdlib) or
 /// a user module name (for filesystem). All paths end with `.sigil`.
 fn path_to_module(path: &[String]) -> Option<String> {
-    if path.is_empty() || path.len() < 1 {
+    if path.is_empty() {
         return None;
     }
     if path.first().map(String::as_str) == Some("std") {
@@ -180,6 +181,10 @@ fn path_to_module(path: &[String]) -> Option<String> {
     }
 }
 
+fn render_import_path(path: &[String]) -> String {
+    path.join(".")
+}
+
 fn render_module_for_diagnostic(module: &str) -> String {
     let stem = module.trim_end_matches(".sigil");
     stem.replace('/', ".")
@@ -190,7 +195,8 @@ fn render_module_for_diagnostic(module: &str) -> String {
 /// is in stdlib code, not their own. The original message is
 /// preserved verbatim after the framing prefix; the span points at
 /// the stdlib file for stdlib-author debugging.
-fn wrap_stdlib_error(err: CompilerError, module_pretty: &str) -> CompilerError {
+fn wrap_stdlib_error(err: CompilerError, import_path: &[String]) -> CompilerError {
+    let module_pretty = render_import_path(import_path);
     let new_message = format!(
         "internal compiler error in stdlib module `{module_pretty}`: {}",
         err.message
@@ -208,6 +214,7 @@ fn wrap_stdlib_error(err: CompilerError, module_pretty: &str) -> CompilerError {
 
 fn load_module(
     module: &str,
+    import_path: &[String],
     import_span: &Span,
     loaded: &mut BTreeSet<String>,
     in_progress: &mut BTreeSet<String>,
@@ -224,8 +231,8 @@ fn load_module(
             errors::code("E0033"),
             import_span.clone(),
             format!(
-                "circular stdlib import involving `{}`",
-                render_module_for_diagnostic(module)
+                "circular import involving `{}`",
+                render_import_path(import_path)
             ),
         ));
         return;
@@ -233,13 +240,19 @@ fn load_module(
     let src = match get_source(module) {
         Some(s) => s,
         None => {
+            let module_type = if import_path.first().map(String::as_str) == Some("std") {
+                "stdlib module"
+            } else {
+                "module"
+            };
             errs.push(CompilerError::new(
                 Severity::Error,
                 errors::code("E0032"),
                 import_span.clone(),
                 format!(
-                    "stdlib module `{}` not found",
-                    render_module_for_diagnostic(module)
+                    "{} `{}` not found",
+                    module_type,
+                    render_import_path(import_path)
                 ),
             ));
             return;
@@ -247,8 +260,6 @@ fn load_module(
     };
 
     in_progress.insert(module.to_string());
-
-    let module_pretty = render_module_for_diagnostic(module);
 
     // Transform lex / parse errors that originate from stdlib source
     // so users see "internal compiler error in stdlib module `std.X`"
@@ -259,13 +270,13 @@ fn load_module(
     errs.extend(
         lex_errs
             .into_iter()
-            .map(|e| wrap_stdlib_error(e, &module_pretty)),
+            .map(|e| wrap_stdlib_error(e, import_path)),
     );
     let (subprog, parse_errs) = parser::parse(module, &tokens);
     errs.extend(
         parse_errs
             .into_iter()
-            .map(|e| wrap_stdlib_error(e, &module_pretty)),
+            .map(|e| wrap_stdlib_error(e, import_path)),
     );
 
     for sub_item in &subprog.items {
@@ -279,6 +290,7 @@ fn load_module(
             }
             load_module(
                 &sub_module,
+                &decl.path,
                 &decl.span,
                 loaded,
                 in_progress,
@@ -620,13 +632,41 @@ mod tests {
     #[test]
     fn render_module_for_diagnostic_strips_extension_and_uses_dots_separators() {
         assert_eq!(render_module_for_diagnostic("option.sigil"), "option");
-        assert_eq!(
-            render_module_for_diagnostic("iter/fold.sigil"),
-            "iter.fold"
+        assert_eq!(render_module_for_diagnostic("iter/fold.sigil"), "iter.fold");
+        assert_eq!(render_module_for_diagnostic("helper.sigil"), "helper");
+    }
+
+    #[test]
+    fn e2e_user_module_from_filesystem() {
+        let temp_dir = std::env::temp_dir().join("sigil_test_user_module");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let main_file = temp_dir.join("main.sigil");
+        let helper_file = temp_dir.join("helper.sigil");
+
+        std::fs::write(&main_file, "import helper\nfn main() -> Int ![] { 42 }\n")
+            .expect("write main file");
+        std::fs::write(&helper_file, "fn helper_fn() -> Int ![] { 99 }\n")
+            .expect("write helper file");
+
+        let (toks, lex_errs) = lexer::lex(
+            main_file.to_str().unwrap(),
+            "import helper\nfn main() -> Int ![] { 42 }\n",
         );
-        assert_eq!(
-            render_module_for_diagnostic("helper.sigil"),
-            "helper"
-        );
+        assert!(lex_errs.is_empty(), "lex errs: {lex_errs:?}");
+        let (prog, parse_errs) = parser::parse(main_file.to_str().unwrap(), &toks);
+        assert!(parse_errs.is_empty(), "parse errs: {parse_errs:?}");
+
+        let (resolved, errs) = resolve(prog);
+        assert!(errs.is_empty(), "errs: {errs:?}");
+        assert_eq!(resolved.items.len(), 3, "should have 3 items: import, main, helper_fn");
+
+        let helper_fn = resolved
+            .items
+            .iter()
+            .find(|i| matches!(i, Item::Fn(f) if f.name == "helper_fn"));
+        assert!(helper_fn.is_some(), "helper_fn should be loaded from filesystem");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
