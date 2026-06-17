@@ -85,9 +85,8 @@ pub struct ImportDecl {
 /// typo.
 #[derive(Clone, Debug)]
 pub struct UseDecl {
-    /// The module path being `use`d, with `std` head and submodule
-    /// segments (e.g. `["std", "list"]`). The dot-prefixed leading
-    /// `std.` is required by the same E0031 rule that gates imports.
+    /// The module path being `use`d (e.g. `["std", "list"]` for `use std.list.{...}`).
+    /// Both standard library modules (`std.*`) and user modules are supported.
     pub module_path: Vec<String>,
     /// Symbols to bring bare. Order is source order; duplicates within
     /// a single `use` line are rejected by the resolver.

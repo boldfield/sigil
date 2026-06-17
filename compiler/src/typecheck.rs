@@ -2231,10 +2231,10 @@ fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
         let mut map: BTreeMap<String, FileQualifiedSym> = BTreeMap::new();
         for u in uses {
             // Resolve this use's module path to a file key. Failure
-            // here means the module path is invalid (E0031 already fired
-            // at parse), or the module isn't loaded (E0032). Either way,
-            // skip this `use` line silently — the upstream error is the
-            // user-actionable one.
+            // here means the module path is invalid or the module doesn't exist
+            // (E0031 / E0032 / E0033 are emitted during import resolution).
+            // Either way, skip this `use` line silently — the upstream error
+            // is the user-actionable one.
             let module_file = match module_file_for_path(&u.module_path) {
                 Some(f) => f,
                 None => continue,
@@ -2946,7 +2946,7 @@ fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
 /// targets. For stdlib paths, `path[0]` must be `"std"` and there
 /// must be at least one component after it. For user paths, all segments
 /// are joined with slashes. Empty paths return `None`; parse errors are
-/// handled upstream (E0031 / E0032).
+/// handled upstream (E0031 / E0032 / E0033).
 fn module_file_for_path(path: &[String]) -> Option<String> {
     if path.is_empty() {
         return None;
