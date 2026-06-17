@@ -2157,7 +2157,7 @@ mod tests {
         let (prog, errs) = parse("x.sigil", &toks);
         assert!(
             errs.is_empty(),
-            "user imports should parse without E0031; got: {errs:?}"
+            "user module imports should parse without errors; got: {errs:?}"
         );
         let Item::Import(decl) = &prog.items[0] else {
             panic!("expected Item::Import first");

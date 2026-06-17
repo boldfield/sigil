@@ -93,36 +93,66 @@ pub const CATALOG: &[ErrorEntry] = &[
     },
     ErrorEntry {
         code: "E0031",
-        short: "user-code imports are not supported in v1",
-        long: "Plan A1 restricts imports to the Sigil standard library. User-code \
-               imports (cross-file imports between user modules) ship in v2. If you \
-               need functionality from another module, inline it into the current \
-               file for now, or import the matching capability from `std.*` if one \
-               exists.",
-        fix_example: "import std.io",
+        short: "import path is not valid",
+        long: "An `import` or `use` statement references a module path that is \
+               neither a standard library module (`std.*`) nor a user module in the \
+               current project. Sigil resolves module paths as follows:\n\n\
+               - **Standard library**: `import std.X` finds a module in the \
+                 compiler's embedded stdlib.\n\
+               - **User modules**: `import mod` or `import dir.mod` finds a `.sigil` \
+                 file in the current project's module tree, resolving paths relative \
+                 to the project root. `import foo` loads `foo.sigil`; \
+                 `import foo.bar` loads `foo/bar.sigil`.\n\n\
+               Check that the path resolves to an existing `.sigil` file (for user \
+               modules) or an embedded stdlib module name (for standard library \
+               imports). Typos, missing files, or invalid path structure all produce \
+               this error.",
+        fix_example: "// User module in project root:\nimport foo          // loads foo.sigil\n\n\
+                      // User module in a directory:\nimport dir.mod      // loads dir/mod.sigil\n\n\
+                      // Standard library:\nimport std.io           // loads embedded stdlib",
     },
     ErrorEntry {
         code: "E0032",
-        short: "stdlib module not found",
-        long: "An `import std.X` (or `import std.X.Y`) named a module path with no \
-               matching file in the embedded standard library tree. Sigil's stdlib \
-               is a fixed set of modules baked into the compiler binary; only modules \
-               that ship with the compiler can be imported. Check the path for typos, \
-               or remove the import if the module name is wrong.",
-        fix_example: "// Wrong:\n// import std.optionz\n\n\
-                      // Right:\nimport std.option",
+        short: "module not found",
+        long: "An `import` statement named a module path with no matching file. \
+               Sigil resolves imports as follows:\n\n\
+               - **User modules**: `import foo` looks for `foo.sigil` in the \
+                 project's module tree. `import foo.bar` looks for `foo/bar.sigil`. \
+                 Paths are resolved relative to the project root.\n\
+               - **Standard library**: `import std.X` looks for module `X` in the \
+                 compiler's embedded stdlib. Only modules that ship with the \
+                 compiler can be imported.\n\n\
+               Check that the path matches an existing `.sigil` file (for user \
+               modules) or an embedded stdlib module name. Common causes: typo in \
+               the module name, a missing `.sigil` file, or incorrect directory \
+               structure for nested modules.",
+        fix_example: "// User module — wrong:\n// import foo      (file foo.sigil doesn't exist)\n\n\
+                      // User module — right:\nimport foo           // imports foo.sigil\n\n\
+                      // Nested module:\nimport foo.bar           // imports foo/bar.sigil\n\n\
+                      // Stdlib — wrong:\n// import std.optionz\n\n\
+                      // Stdlib — right:\nimport std.option",
     },
     ErrorEntry {
         code: "E0033",
-        short: "circular stdlib import",
-        long: "Two or more stdlib modules import each other directly or via a chain. \
-               The import resolver loads each module exactly once via depth-first \
-               traversal; a cycle would loop forever. This is a stdlib bug, not a \
-               user error: a stdlib commit introduced an `import std.X` whose \
-               transitive imports re-enter the importer. Report the diagnostic with \
-               the module names from the cycle so the stdlib import graph can be \
-               un-cycled.",
-        fix_example: "// Stdlib bug. No user-side fix. Report with the cycle named in the diagnostic.",
+        short: "circular import",
+        long: "Two or more modules import each other directly or via a chain, \
+               creating a cycle. The import resolver loads each module exactly once \
+               via depth-first traversal; a cycle would loop forever. The diagnostic \
+               names the modules involved in the cycle so you can break it.\n\n\
+               Cycles can involve user modules, stdlib modules, or a mix:\n\n\
+               - **User-module cycles**: A user module `foo` imports `bar`, which \
+                 (directly or indirectly) imports `foo` back. Refactor the code to \
+                 move shared definitions into a separate module that both import, \
+                 or inline definitions to eliminate one of the imports.\n\
+               - **Stdlib cycles**: A stdlib commit introduced a `import std.X` whose \
+                 transitive imports re-enter the importer. This is a stdlib bug; \
+                 report it with the cycle named in the diagnostic.",
+        fix_example: "// User-module cycle (foo.sigil imports bar, bar.sigil imports foo):\n\
+                      // Break it by extracting shared code to a third module:\n\
+                      // shared.sigil — defines the common part\n\
+                      // foo.sigil — import shared\n\
+                      // bar.sigil — import shared\n\n\
+                      // Or inline definitions to eliminate one import.",
     },
     ErrorEntry {
         code: "E0034",
