@@ -2231,10 +2231,10 @@ fn build_use_bindings_prepass(tc: &mut Tc, program: &Program) {
         let mut map: BTreeMap<String, FileQualifiedSym> = BTreeMap::new();
         for u in uses {
             // Resolve this use's module path to a file key. Failure
-            // here means the module path isn't a `std.*` form (E0031
-            // already fired at parse), or the module isn't loaded
-            // (E0032). Either way, skip this `use` line silently —
-            // the upstream error is the user-actionable one.
+            // here means the module path is invalid or the module doesn't exist
+            // (E0031 / E0032 / E0033 are emitted during import resolution).
+            // Either way, skip this `use` line silently — the upstream error
+            // is the user-actionable one.
             let module_file = match module_file_for_path(&u.module_path) {
                 Some(f) => f,
                 None => continue,
@@ -2941,9 +2941,9 @@ fn register_builtin_file_qualified_mirrors(tc: &mut Tc) {
 /// Plan F1 — `["std", "list"]` -> `"list.sigil"`, mirroring
 /// [`crate::imports::path_to_module`]'s shape so the resolver and the
 /// import loader agree on what file string an import / use line
-/// targets. `path[0]` must be `"std"` (the v1 import gate) and there
-/// must be at least one component after it; other shapes return
-/// `None` (the user's E0031 / E0032 diagnostics handle the error).
+/// targets. `path[0]` must be `"std"` and there must be at least one
+/// component after it; other shapes return `None`. Invalid paths or
+/// missing modules are handled by the import resolver (E0031, E0032).
 fn module_file_for_path(path: &[String]) -> Option<String> {
     if path.first().map(String::as_str) != Some("std") || path.len() < 2 {
         return None;
