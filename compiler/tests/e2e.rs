@@ -534,7 +534,10 @@ fn multifile_two_user_modules_same_basename_no_collision() {
         &[("app/foo.sigil", app_foo), ("helper/foo.sigil", helper_foo)],
         "two_modules_same_basename",
     );
-    assert_eq!(code, 42, "two modules with same basename: exit code should be 42; stderr={stderr:?}");
+    assert_eq!(
+        code, 42,
+        "two modules with same basename: exit code should be 42; stderr={stderr:?}"
+    );
 }
 
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
