@@ -4307,7 +4307,8 @@ impl Tc {
             // using module_file_for_path. This allows qualified calls without
             // explicit import statements.
             for split in (1..segments.len()).rev() {
-                let module_path: Vec<String> = segments[..split].iter().map(|s| s.to_string()).collect();
+                let module_path: Vec<String> =
+                    segments[..split].iter().map(|s| s.to_string()).collect();
                 let sym = segments[split..].join(".");
                 if let Some(module_file) = module_file_for_path(&module_path) {
                     let canonical = canonical_fn_key(&module_file, &sym, &self.stdlib_files);
@@ -6859,7 +6860,7 @@ impl Tc {
                 // dotted name whose first segment is not a known
                 // imported module is almost certainly the user
                 // writing `record.field` intending field access
-                // (Sigil v1 has no field-access operator).
+                // (with the field-access operator added in #208).
                 if name.contains('.') {
                     // Check ANY dotted prefix of the name against the
                     // file's import / alias table — qualified paths
@@ -6882,11 +6883,20 @@ impl Tc {
                                 .any(|split| map.contains_key(&segments[..split].join(".")))
                         })
                         .unwrap_or(false);
-                    let any_prefix_is_user_module = (1..segments.len())
-                        .any(|split| {
-                            let module_path: Vec<String> = segments[..split].iter().map(|s| s.to_string()).collect();
-                            module_file_for_path(&module_path).is_some()
-                        });
+                    let any_prefix_is_user_module = (1..segments.len()).any(|split| {
+                        let module_path: Vec<String> =
+                            segments[..split].iter().map(|s| s.to_string()).collect();
+                        if module_file_for_path(&module_path).is_some() {
+                            // Check if this module actually has functions in fn_schemes,
+                            // not just that the file path can be constructed.
+                            let module_label = module_path.join(".");
+                            self.fn_schemes
+                                .keys()
+                                .any(|k| k.contains(&format!("{}::", module_label)))
+                        } else {
+                            false
+                        }
+                    });
                     if !any_prefix_known && !any_prefix_is_user_module {
                         match self.try_resolve_field_access(name, span, row, row_tail) {
                             FieldAccessOutcome::Resolved(field_ty) => return Some(field_ty),
