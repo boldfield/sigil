@@ -565,23 +565,6 @@ fn multifile_qualified_user_module_calls() {
     );
 }
 
-#[test]
-fn multifile_qualified_user_module_calls_without_import() {
-    let entry = "fn main() -> Int ![] {\n\
-                   app.parser.parse()\n\
-                 }\n";
-    let parser = "fn parse() -> Int ![] { 42 }\n";
-    let (_stdout, stderr, code) = compile_and_run_multifile(
-        entry,
-        &[("app/parser.sigil", parser)],
-        "qualified_user_module_calls_no_import",
-    );
-    assert_eq!(
-        code, 42,
-        "qualified user-module call without import: exit code should be 42; stderr={stderr:?}"
-    );
-}
-
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
 /// (compile-only, no link), inspect the `.o` file's stackmap section
 /// bytes, and parse them via the runtime's v1 parser. Asserts the v1

@@ -6892,7 +6892,7 @@ impl Tc {
                             let module_label = module_path.join(".");
                             self.fn_schemes
                                 .keys()
-                                .any(|k| k.contains(&format!("{}::", module_label)))
+                                .any(|k| k.contains(&format!("{}.", module_label)))
                         } else {
                             false
                         }
