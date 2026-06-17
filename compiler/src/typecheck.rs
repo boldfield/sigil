@@ -6704,6 +6704,15 @@ impl Tc {
                     .bare_name_origins
                     .get(&bare_suffix)
                     .is_some_and(|origins| origins.len() >= 2);
+                let is_use_bound_alias = self
+                    .current_fn_file
+                    .as_ref()
+                    .and_then(|file| {
+                        self.file_use_bindings
+                            .get(file)
+                            .and_then(|bindings| bindings.get(name))
+                    })
+                    .is_some_and(|resolved| name != &resolved.source_name);
                 let ast_name: String = if let Some((_, ref canonical)) = plan_f1_resolved {
                     if name.contains('.') && !is_colliding {
                         // (a): dotted source, non-colliding bare
@@ -6713,9 +6722,16 @@ impl Tc {
                                 .insert(span.clone(), bare_suffix.clone());
                         }
                         bare_suffix.clone()
-                    } else if !name.contains('.') && is_colliding && canonical != name {
-                        // (b): bare source, colliding → AST goes
-                        // canonical.
+                    } else if !name.contains('.')
+                        && (is_colliding || is_use_bound_alias)
+                        && canonical != name
+                    {
+                        // (b): bare source, colliding or use-bound
+                        // alias → AST goes canonical. Includes both
+                        // colliding names (tracked in bare_name_origins)
+                        // and use-bound aliases whose canonical form
+                        // (e.g. "app.foo.bar" from "use app.foo.{bar
+                        // as app_bar}") differs from the alias name.
                         self.resolved_idents.insert(span.clone(), canonical.clone());
                         canonical.clone()
                     } else {

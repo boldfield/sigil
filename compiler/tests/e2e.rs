@@ -456,6 +456,9 @@ fn compile_and_run_multifile(
 
     for (filename, content) in modules {
         let module_path = test_dir.join(filename);
+        if let Some(parent) = module_path.parent() {
+            std::fs::create_dir_all(parent).expect("create module parent dir");
+        }
         std::fs::write(&module_path, content).expect("write module file");
     }
 
@@ -509,6 +512,35 @@ fn multifile_entry_with_helper_module() {
     let (_stdout, stderr, code) =
         compile_and_run_multifile(entry, &[("helper.sigil", helper)], "multifile");
     assert_eq!(code, 42, "multifile exit code; stderr={stderr:?}");
+}
+
+/// Acceptance test for root-relative module keying: two user modules with the same
+/// function basename in different directories should compile and run without collision.
+/// `app/foo.sigil` and `helper/foo.sigil` both define `bar()`, but with different
+/// return values. When imported and used via aliased `use` bindings, both functions
+/// should resolve to their respective module implementations.
+#[test]
+fn multifile_two_user_modules_same_basename_no_collision() {
+    let entry = "import app.foo\n\
+               import helper.foo\n\
+               use app.foo.{bar as app_bar}\n\
+               use helper.foo.{bar as helper_bar}\n\
+               fn main() -> Int ![] {\n\
+                 let x: Int = app_bar();\n\
+                 let y: Int = helper_bar();\n\
+                 x + y\n\
+               }\n";
+    let app_foo = "fn bar() -> Int ![] { 10 }\n";
+    let helper_foo = "fn bar() -> Int ![] { 32 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/foo.sigil", app_foo), ("helper/foo.sigil", helper_foo)],
+        "two_modules_same_basename",
+    );
+    assert_eq!(
+        code, 42,
+        "two modules with same basename: exit code should be 42; stderr={stderr:?}"
+    );
 }
 
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
