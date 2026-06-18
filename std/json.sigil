@@ -345,58 +345,65 @@ fn __json_parse_positive_int(b: ByteArray) -> JValue ![State[Int], Raise[String]
 fn __json_parse_number(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
   let pos: Int = perform State.get();
   let c: Int = __json_byte_at_or_neg1(b, pos);
-  if c == 45 {
-    let _adv: Int = perform State.set(pos + 1);
-    __json_parse_negative_int(b)
+  let check_start: Int = if c == 45 { pos + 1 } else { pos };
+  if __json_number_is_float(b, check_start) {
+    __json_parse_float(b)
   } else {
-    __json_parse_positive_int(b)
+    if c == 45 {
+      let _adv: Int = perform State.set(pos + 1);
+      __json_parse_negative_int(b)
+    } else {
+      __json_parse_positive_int(b)
+    }
+  }
+}
+
+fn __json_number_is_float(b: ByteArray, start: Int) -> Bool ![] {
+  __json_number_is_float_loop(b, start)
+}
+
+fn __json_number_is_float_loop(b: ByteArray, pos: Int) -> Bool ![] {
+  if pos >= byte_array_length(b) {
+    false
+  } else {
+    let c: Int = byte_to_int(byte_array_get(b, pos));
+    if c == 46 || c == 101 || c == 69 {
+      true
+    } else {
+      if __json_is_digit(c) {
+        __json_number_is_float_loop(b, pos + 1)
+      } else {
+        false
+      }
+    }
   }
 }
 
 fn __json_parse_float(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
   let start: Int = perform State.get();
 
-  // Handle optional minus sign
-  let pos: Int = perform State.get();
-  let c: Int = __json_byte_at_or_neg1(b, pos);
-  if c == 45 {
-    let _: Int = perform State.set(pos + 1);
-    ()
-  } else {
-    ()
-  };
+  // Skip optional minus sign
+  let _has_minus: Bool = __json_advance_if_char_is(b, 45);
 
   // Parse integer part
-  let _: Int = __json_parse_digits(b, 0, false);
+  let _int_digits: Int = __json_parse_digits(b, 0, false);
 
-  // Handle optional fractional part
-  let pos_frac: Int = perform State.get();
-  let c_frac: Int = __json_byte_at_or_neg1(b, pos_frac);
-  if c_frac == 46 {
-    let _: Int = perform State.set(pos_frac + 1);
-    let _: Int = __json_parse_digits(b, 0, false);
-    ()
+  // Skip optional fractional part
+  let _has_frac: Bool = if __json_advance_if_char_is(b, 46) {
+    let _frac_digits: Int = __json_parse_digits(b, 0, false);
+    true
   } else {
-    ()
+    false
   };
 
-  // Handle optional exponent
-  let pos_exp: Int = perform State.get();
-  let c_exp: Int = __json_byte_at_or_neg1(b, pos_exp);
-  if c_exp == 101 || c_exp == 69 {
-    let _: Int = perform State.set(pos_exp + 1);
-    let pos2: Int = perform State.get();
-    let c2: Int = __json_byte_at_or_neg1(b, pos2);
-    if c2 == 43 || c2 == 45 {
-      let _: Int = perform State.set(pos2 + 1);
-      ()
-    } else {
-      ()
-    };
-    let _: Int = __json_parse_digits(b, 0, false);
-    ()
+  // Skip optional exponent
+  let _has_exp: Bool = if __json_advance_if_char_is_one_of(b, 101, 69) {
+    // Skip optional +/- in exponent
+    let _has_sign: Bool = __json_advance_if_char_is_one_of(b, 43, 45);
+    let _exp_digits: Int = __json_parse_digits(b, 0, false);
+    true
   } else {
-    ()
+    false
   };
 
   let end: Int = perform State.get();
@@ -408,6 +415,28 @@ fn __json_parse_float(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
   match string_to_float(s) {
     Some(f) => JFloat(f),
     None => raise("invalid float"),
+  }
+}
+
+fn __json_advance_if_char_is(b: ByteArray, expected: Int) -> Bool ![State[Int]] {
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == expected {
+    let _: Int = perform State.set(pos + 1);
+    true
+  } else {
+    false
+  }
+}
+
+fn __json_advance_if_char_is_one_of(b: ByteArray, expected1: Int, expected2: Int) -> Bool ![State[Int]] {
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == expected1 || c == expected2 {
+    let _: Int = perform State.set(pos + 1);
+    true
+  } else {
+    false
   }
 }
 
