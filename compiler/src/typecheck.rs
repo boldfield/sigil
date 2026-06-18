@@ -4578,11 +4578,12 @@ impl Tc {
         self.errors.push(err);
     }
 
-    fn get_exported_names_for_module(&self, module_label: &str) -> Vec<String> {
+    fn get_exported_names_for_module(&self, module_file: &str) -> Vec<String> {
+        let canonical_label = canonical_module_label(module_file, &self.stdlib_files);
         let mut exports = Vec::new();
         for key in self.fn_schemes.keys() {
-            if key.starts_with(&format!("{}.", module_label)) {
-                let suffix = &key[module_label.len() + 1..];
+            if key.starts_with(&format!("{}.", canonical_label)) {
+                let suffix = &key[canonical_label.len() + 1..];
                 exports.push(suffix.to_string());
             }
         }
@@ -6931,8 +6932,9 @@ impl Tc {
                             let module_label = segments[..split].join(".");
                             if let Some(file) = &self.current_fn_file {
                                 if let Some(modules) = self.file_module_paths.get(file) {
-                                    if modules.contains_key(&module_label) {
-                                        let exports = self.get_exported_names_for_module(&module_label);
+                                    if let Some(module_file) = modules.get(&module_label) {
+                                        let exports =
+                                            self.get_exported_names_for_module(module_file);
                                         if !exports.is_empty() {
                                             msg.push_str(&format!(
                                                 "; {} exports: {}",
@@ -6946,12 +6948,7 @@ impl Tc {
                             }
                         }
                     }
-                    self.push_error_with_import_hint(
-                        "E0046",
-                        span.clone(),
-                        msg,
-                        name,
-                    );
+                    self.push_error_with_import_hint("E0046", span.clone(), msg, name);
                     None
                 }
             }

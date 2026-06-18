@@ -258,10 +258,7 @@ fn load_module_impl(
             Severity::Error,
             errors::code("E0033"),
             import_span.clone(),
-            format!(
-                "circular import: {}",
-                cycle_path
-            ),
+            format!("circular import: {}", cycle_path),
         ));
         stack.pop();
         return;
@@ -270,11 +267,7 @@ fn load_module_impl(
         Some(s) => s,
         None => {
             let is_stdlib = import_path.first().map(String::as_str) == Some("std");
-            let module_type = if is_stdlib {
-                "stdlib module"
-            } else {
-                "module"
-            };
+            let module_type = if is_stdlib { "stdlib module" } else { "module" };
             let expected_path = if is_stdlib {
                 format!("expected stdlib module `{}`", module)
             } else {
@@ -506,8 +499,8 @@ mod tests {
             .map(|e| e.message.clone())
             .unwrap_or_default();
         assert!(
-            msg.contains("std.phantom_a"),
-            "diagnostic should name the cycle-closing module; got: {msg}"
+            msg.contains("phantom_a") && msg.contains("phantom_b"),
+            "diagnostic should name the full cycle path; got: {msg}"
         );
     }
 
