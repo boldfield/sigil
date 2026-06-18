@@ -613,7 +613,8 @@ impl<'a> Monomorphizer<'a> {
                     // different modules with the same simple name don't
                     // collide. Keys match those in fn_schemes so both bare
                     // cross-module calls and qualified calls resolve correctly.
-                    let canonical = canonical_fn_key(&f.span.file, &f.name, &checked.program.stdlib_files);
+                    let canonical =
+                        canonical_fn_key(&f.span.file, &f.name, &checked.program.stdlib_files);
                     fn_decls.insert(canonical.clone(), f.as_ref());
                     // Also track the simple name → canonical mapping for
                     // lookups when we have just the simple name.
