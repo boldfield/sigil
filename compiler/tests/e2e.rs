@@ -23867,11 +23867,12 @@ fn two_file_cross_module_generic_with_builtins() {
     // This ensures the fix that guards enqueue_fn with resolve_fn_key doesn't
     // prevent legitimate cross-module generic instantiation.
     let entry = "import helper\n\
-                 fn main() -> Unit ![] {\n\
-                   helper.print_value(42)\n\
+                 fn main() -> Int ![] {\n\
+                   helper.print_value(42);\n\
+                   0\n\
                  }\n";
     let helper = "fn print_value[T](x: T) -> Unit ![] {\n\
-                  ignore(x)\n\
+                  ()\n\
                   }\n";
     let (_stdout, stderr, code) = compile_and_run_multifile(
         entry,
