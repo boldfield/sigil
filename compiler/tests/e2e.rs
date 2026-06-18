@@ -565,6 +565,34 @@ fn multifile_qualified_user_module_calls() {
     );
 }
 
+/// Regression test for field-access operator with user-module imports.
+/// When a local binding shadows an imported module namespace, field access
+/// on that binding should resolve correctly (not be misinterpreted as a
+/// qualified module call). E.g., with `import app.parser` and
+/// `let app: Person = ...`, the expression `app.name` should resolve to the
+/// `name` field of the Person record, not to anything in app.parser.
+#[test]
+fn field_access_with_imported_module_namespace_collision() {
+    let entry = "import app.parser\n\
+                 use std.io.{IO};\n\
+                 type Person = { name: String, age: Int }\n\
+                 fn main() -> Int ![] {\n\
+                   let app: Person = Person { name: \"Ada\", age: 36 };\n\
+                   let result = app.name;\n\
+                   if result == \"Ada\" { 0 } else { 1 }\n\
+                 }\n";
+    let parser = "fn parse() -> Int ![] { 42 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", parser)],
+        "field_access_module_collision",
+    );
+    assert_eq!(
+        code, 0,
+        "field access should resolve to record field, not module: stderr={stderr:?}"
+    );
+}
+
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
 /// (compile-only, no link), inspect the `.o` file's stackmap section
 /// bytes, and parse them via the runtime's v1 parser. Asserts the v1

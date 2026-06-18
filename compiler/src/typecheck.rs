@@ -4315,10 +4315,6 @@ impl Tc {
                     if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
                         return Some((scheme, canonical));
                     }
-                    // Builtins fall back to the bare source-name key.
-                    if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
-                        return Some((scheme, sym));
-                    }
                     // If we resolved to a module file but couldn't find the
                     // function, don't fall through to other splits
                     // (the user meant this module, not a different one).
