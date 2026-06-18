@@ -23873,8 +23873,11 @@ fn two_file_cross_module_generic_with_builtins() {
     let helper = "fn print_value[T](x: T) -> Unit ![] {\n\
                   ignore(x)\n\
                   }\n";
-    let (_stdout, stderr, code) =
-        compile_and_run_multifile(entry, &[("helper.sigil", helper)], "cross_module_generic_builtins");
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("helper.sigil", helper)],
+        "cross_module_generic_builtins",
+    );
     assert_eq!(
         code, 0,
         "cross-module generic with builtins: exit code mismatch; stderr={stderr:?}"
