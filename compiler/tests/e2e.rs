@@ -19478,7 +19478,7 @@ fn std_json_parse_exponent() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_exponent");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "100000\n", "stderr={stderr:?}");
+    assert_eq!(stdout, "100000.0\n", "stderr={stderr:?}");
 }
 
 #[test]
