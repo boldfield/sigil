@@ -806,8 +806,50 @@ impl<'a> Monomorphizer<'a> {
     /// when resolving captured instantiations whose type-args still
     /// reference outer-fn vars).
     fn fn_subst(&self, name: &str, type_args: &[Ty]) -> Substitution {
-        let f = self.fn_decls.get(name);
-        let scheme = self.fn_schemes.get(name);
+        // Try to find f in fn_decls: first by the given name, then by simple name
+        let f = self
+            .fn_decls
+            .get(name)
+            .or_else(|| {
+                if name.contains('.') {
+                    let simple = name.split('.').next_back().unwrap_or(name);
+                    self.fn_decls.get(simple)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                if !name.contains('.') {
+                    self.fn_name_to_canonical
+                        .get(name)
+                        .and_then(|canonical| self.fn_decls.get(canonical))
+                } else {
+                    None
+                }
+            });
+        // Try to find the scheme: first by the given name (which may be canonical),
+        // then by the simple name if the given name contains dots (cross-module case).
+        let scheme = self
+            .fn_schemes
+            .get(name)
+            .or_else(|| {
+                if name.contains('.') {
+                    let simple = name.split('.').next_back().unwrap_or(name);
+                    self.fn_schemes.get(simple)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                // Also try looking up by canonical form if we have a simple name
+                if !name.contains('.') {
+                    self.fn_name_to_canonical
+                        .get(name)
+                        .and_then(|canonical| self.fn_schemes.get(canonical))
+                } else {
+                    None
+                }
+            });
         let mut name_subst: BTreeMap<String, Ty> = BTreeMap::new();
         let mut var_subst: BTreeMap<u32, Ty> = BTreeMap::new();
         if let (Some(f), Some(scheme)) = (f, scheme) {
@@ -1120,15 +1162,14 @@ impl<'a> Monomorphizer<'a> {
                 if let Some(inst) = self.call_sites.get(span) {
                     if name == &inst.name {
                         let resolved = subst.resolve_instantiation(inst);
-                        // Resolve to canonical form to look up the correct scheme,
-                        // but mangle using the simple name so it matches what the
-                        // definition emits.
-                        if let Some(canonical) = self.resolve_fn_key(&resolved.name) {
-                            self.enqueue_fn(canonical.clone(), resolved.type_args.clone());
-                            let simple = self.simple_name_from_canonical(&canonical);
-                            let mangled = mangle_fn(simple, &resolved.type_args);
-                            return Expr::Ident(mangled, span.clone());
-                        }
+                        // The instantiation name should already be in canonical form from typecheck
+                        // (for cross-module calls with collisions, typecheck rewrites to canonical).
+                        // Use it directly to avoid losing information to fn_name_to_canonical collisions.
+                        let canonical = resolved.name.clone();
+                        self.enqueue_fn(canonical.clone(), resolved.type_args.clone());
+                        let simple = self.simple_name_from_canonical(&canonical);
+                        let mangled = mangle_fn(simple, &resolved.type_args);
+                        return Expr::Ident(mangled, span.clone());
                     }
                 }
                 if let Some(inst) = self.ctor_sites.get(span) {
