@@ -1,0 +1,17 @@
+// Test for JFloat support in std.json
+import std.json
+import std.io
+
+use std.io.{IO};
+
+fn main() -> Int ![IO, Mem] {
+  let int_val: JValue = JInt(42);
+  let float_val: JValue = JFloat(3.14);
+
+  let int_str: String = json_render(int_val);
+  let float_str: String = json_render(float_val);
+
+  perform IO.println(int_str);
+  perform IO.println(float_str);
+  0
+}
