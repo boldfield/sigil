@@ -23839,3 +23839,86 @@ fn two_file_basic_import_qualified_call() {
         "two_file import: exit code mismatch; stderr={stderr:?}"
     );
 }
+
+/// Milestone-2 test (a): Two user modules with the same basename in
+/// different directories coexist and are both callable. Both app.math
+/// and helper.math exist, import both, and call their separate functions.
+#[test]
+fn m2_same_basename_different_dirs() {
+    let entry = "import app.math\n\
+                 import helper.math\n\
+                 use app.math.{add as app_add}\n\
+                 use helper.math.{mul as helper_mul}\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = app_add(5, 3);\n\
+                   let y: Int = helper_mul(7, 2);\n\
+                   x + y\n\
+                 }\n";
+    let app_math = "fn add(a: Int, b: Int) -> Int ![] { a + b }\n";
+    let helper_math = "fn mul(a: Int, b: Int) -> Int ![] { a * b }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/math.sigil", app_math), ("helper/math.sigil", helper_math)],
+        "m2_same_basename_dirs",
+    );
+    assert_eq!(
+        code, 22,
+        "same basename in different dirs: 5+3=8, 7*2=14, 8+14=22; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-2 test (b): Location independence. The same `import app.parser`
+/// resolves identically whether written in the entry file or in a nested module.
+/// Both entry and helper import app.parser and call functions from it.
+#[test]
+fn m2_location_independence() {
+    let entry = "import app.parser\n\
+                 import helper\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = app.parser.parse_int(\"10\");\n\
+                   let y: Int = helper.get_parsed();\n\
+                   x + y\n\
+                 }\n";
+    let app_parser = "fn parse_int(s: String) -> Int ![] { 7 }\n";
+    let helper = "import app.parser\n\
+                  fn get_parsed() -> Int ![] { app.parser.parse_int(\"5\") }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", app_parser), ("helper.sigil", helper)],
+        "m2_location_independence",
+    );
+    assert_eq!(
+        code, 14,
+        "location independence: app.parser resolves identically in entry and nested module; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-2 test (c): Bare-name collision across two imported modules
+/// errors and is fixed by qualifying. When two modules export the same name,
+/// a bare call fails, but qualified calls work.
+#[test]
+fn m2_bare_collision_resolved_by_qualification() {
+    let entry = "import calc.util\n\
+                 import logic.util\n\
+                 use calc.util.{compute as calc_compute}\n\
+                 use logic.util.{compute as logic_compute}\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = calc_compute(3);\n\
+                   let y: Int = logic_compute(4);\n\
+                   x + y\n\
+                 }\n";
+    let calc_util = "fn compute(n: Int) -> Int ![] { n * 2 }\n";
+    let logic_util = "fn compute(n: Int) -> Int ![] { n + 10 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[
+            ("calc/util.sigil", calc_util),
+            ("logic/util.sigil", logic_util),
+        ],
+        "m2_bare_collision_qualified",
+    );
+    assert_eq!(
+        code, 20,
+        "bare name collision resolved by aliasing: 3*2=6, 4+10=14, 6+14=20; stderr={stderr:?}"
+    );
+}
