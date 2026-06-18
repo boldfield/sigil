@@ -23859,3 +23859,24 @@ fn two_file_cross_module_generic_instantiation() {
         "cross-module generic: exit code mismatch; stderr={stderr:?}"
     );
 }
+
+#[test]
+fn two_file_cross_module_generic_with_builtins() {
+    // Test that a cross-module generic function can call builtins (which have
+    // schemes but no FnDecl) without causing monomorphization panics.
+    // This ensures the fix that guards enqueue_fn with resolve_fn_key doesn't
+    // prevent legitimate cross-module generic instantiation.
+    let entry = "import helper\n\
+                 fn main() -> Unit ![] {\n\
+                   helper.print_value(42)\n\
+                 }\n";
+    let helper = "fn print_value[T](x: T) -> Unit ![] {\n\
+                  ignore(x)\n\
+                  }\n";
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, &[("helper.sigil", helper)], "cross_module_generic_builtins");
+    assert_eq!(
+        code, 0,
+        "cross-module generic with builtins: exit code mismatch; stderr={stderr:?}"
+    );
+}
