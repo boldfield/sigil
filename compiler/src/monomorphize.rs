@@ -763,10 +763,16 @@ impl<'a> Monomorphizer<'a> {
         None
     }
 
+    /// Extract the simple (bare) name from a canonical key.
+    /// For "std.list.map", returns "map".
+    /// For "map" (simple name), returns "map".
+    fn simple_name_from_canonical<'b>(&self, canonical: &'b str) -> &'b str {
+        canonical.split('.').next_back().unwrap_or(canonical)
+    }
+
     fn enqueue_fn(&mut self, name: String, type_args: Vec<Ty>) {
-        // Resolve the name to the canonical form to check fn_decls and
-        // compute the dedup key. But keep the simple name in the worklist
-        // so the output mangled name is correct (e.g., "id$$Int" not "test.id$$Int").
+        // Resolve the name to canonical form. The name might already be canonical
+        // (from typecheck's cross-module resolution) or simple (from local refs).
         let canonical_name = if self.fn_decls.contains_key(&name) {
             name.clone()
         } else if let Some(canonical) = self.fn_name_to_canonical.get(&name) {
@@ -779,9 +785,10 @@ impl<'a> Monomorphizer<'a> {
         // Use the canonical name for dedup so cross-module instances don't collide
         let mangled = mangle_fn(&canonical_name, &type_args);
         if self.fn_seen.insert(mangled) {
-            // Store the simple name in the worklist, not the canonical key.
-            // The simple name is what we need for correct output mangling.
-            self.fn_worklist.push_back((name, type_args));
+            // Store the CANONICAL name in the worklist so clone_fn can look up
+            // the correct scheme and type_vars without losing info to collisions
+            // in fn_name_to_canonical.
+            self.fn_worklist.push_back((canonical_name, type_args));
         }
     }
 
@@ -842,25 +849,25 @@ impl<'a> Monomorphizer<'a> {
     }
 
     fn clone_fn(&mut self, key: &FnKey) -> FnDecl {
-        let (simple_name, type_args) = key;
-        // Worklist stores simple function names. Resolve to canonical key
-        // for fn_decls lookup. The name could be simple (e.g., "identity")
-        // or already canonical (e.g., "helper.identity").
-        let canonical_key = if self.fn_decls.contains_key(simple_name) {
-            simple_name.clone()
-        } else if let Some(canonical) = self.fn_name_to_canonical.get(simple_name) {
-            canonical.clone()
-        } else {
-            // Fallback: try as simple name
-            simple_name.clone()
-        };
-        let original = self.fn_decls.get(&canonical_key).copied().unwrap_or_else(|| {
-            unreachable!("monomorphize: fn worklist entry `{simple_name}` (canonical: `{canonical_key}`) missing from fn_decls")
-        });
-        let subst = self.fn_subst(&canonical_key, type_args);
-        // Mangle using the original function's simple name so the output
-        // mangled name is correct (e.g., "id$$Int" not "test.id$$Int").
-        let mangled_name = mangle_fn(&original.name, type_args);
+        let (canonical_key, type_args) = key;
+        // Worklist now stores canonical keys directly to avoid losing
+        // information to fn_name_to_canonical collisions. Use it directly.
+        let original = self
+            .fn_decls
+            .get(canonical_key)
+            .copied()
+            .unwrap_or_else(|| {
+                unreachable!(
+                    "monomorphize: fn worklist entry `{canonical_key}` missing from fn_decls"
+                )
+            });
+        let subst = self.fn_subst(canonical_key, type_args);
+        // Mangle using the simple name (extracted from canonical key) so it
+        // matches the mangled name emitted by the call site. For non-cross-module
+        // calls, the canonical key IS the simple name; for cross-module calls,
+        // we extract it by taking the part after the last dot.
+        let simple = self.simple_name_from_canonical(canonical_key);
+        let mangled_name = mangle_fn(simple, type_args);
 
         // Plan B' Stage 6.8 Phase C++ — track the current clone's
         // fn name so the Lambda arm of `rewrite_expr` can record
@@ -1113,11 +1120,13 @@ impl<'a> Monomorphizer<'a> {
                 if let Some(inst) = self.call_sites.get(span) {
                     if name == &inst.name {
                         let resolved = subst.resolve_instantiation(inst);
-                        // Check if the resolved function exists. The name might be
-                        // canonical (module-qualified) or simple; resolve_fn_key handles both.
-                        if self.resolve_fn_key(&resolved.name).is_some() {
-                            self.enqueue_fn(resolved.name.clone(), resolved.type_args.clone());
-                            let mangled = mangle_fn(&resolved.name, &resolved.type_args);
+                        // Resolve to canonical form to look up the correct scheme,
+                        // but mangle using the simple name so it matches what the
+                        // definition emits.
+                        if let Some(canonical) = self.resolve_fn_key(&resolved.name) {
+                            self.enqueue_fn(canonical.clone(), resolved.type_args.clone());
+                            let simple = self.simple_name_from_canonical(&canonical);
+                            let mangled = mangle_fn(simple, &resolved.type_args);
                             return Expr::Ident(mangled, span.clone());
                         }
                     }
