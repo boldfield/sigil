@@ -74,7 +74,7 @@ import std.raise
 import std.result
 import std.state
 use std.byte_array.{byte_array_get, byte_array_length, byte_array_slice, byte_to_int, string_from_bytes_alloc, string_to_bytes};
-use std.float.{float_to_string};
+use std.float.{float_to_string, string_to_float};
 use std.int.{int_to_string};
 use std.mem.{Mem};
 use std.raise.{Raise, catch, raise};
@@ -350,6 +350,64 @@ fn __json_parse_number(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
     __json_parse_negative_int(b)
   } else {
     __json_parse_positive_int(b)
+  }
+}
+
+fn __json_parse_float(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
+  let start: Int = perform State.get();
+
+  // Handle optional minus sign
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == 45 {
+    let _: Int = perform State.set(pos + 1);
+    ()
+  } else {
+    ()
+  };
+
+  // Parse integer part
+  let _: Int = __json_parse_digits(b, 0, false);
+
+  // Handle optional fractional part
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == 46 {
+    let _: Int = perform State.set(pos + 1);
+    let _: Int = __json_parse_digits(b, 0, false);
+    ()
+  } else {
+    ()
+  };
+
+  // Handle optional exponent
+  let pos: Int = perform State.get();
+  let c: Int = __json_byte_at_or_neg1(b, pos);
+  if c == 101 || c == 69 {
+    let _: Int = perform State.set(pos + 1);
+    let pos2: Int = perform State.get();
+    let c2: Int = __json_byte_at_or_neg1(b, pos2);
+    if c2 == 43 || c2 == 45 {
+      let _: Int = perform State.set(pos2 + 1);
+      ()
+    } else {
+      ()
+    };
+    let _: Int = __json_parse_digits(b, 0, false);
+    ()
+  } else {
+    ()
+  };
+
+  let end: Int = perform State.get();
+
+  // Extract substring and parse
+  let slice: ByteArray = byte_array_slice(b, start, end);
+  let s: String = string_from_bytes_alloc(slice);
+
+  match string_to_float(s) {
+    Some(f) => JFloat(f),
+    None => raise("invalid float"),
   }
 }
 
