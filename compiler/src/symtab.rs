@@ -159,34 +159,23 @@ pub fn render(entries: &[SymtabEntry]) -> String {
 
 /// Undo the compiler's name mangling for display in the profile sidecar.
 ///
-/// Mirrors `codegen::mangle_user_fn`:
+/// Reverses the mangling done by `codegen::mangle_user_fn`:
 /// - `sigil_user_main` → `main`
-/// - `sigil_user_<module>_<rest>` → `<module>.<rest>` with `__` → `$`
-///   where `<module>` is the module label with dots replaced by underscores
+/// - `sigil_user_<name>` → `<name>` (with `__` → `$` for monomorphization)
 /// - any other input is passed through unchanged
 ///
-/// Module demangling is lossy when underscores appear in user function names,
-/// since we cannot disambiguate `sigil_user_app_utils_identity` between:
-/// - module `app.utils`, function `identity`
-/// - module `app`, function `utils_identity`
-/// - module `app.utils_identity`, function (none)
-///
-/// Currently returns the first interpretation (module up to the last underscore
-/// before a known pattern). Symbols are stable as long as the module structure
-/// is known.
+/// Note: module and function boundaries are ambiguous when underscores appear
+/// in function names or module labels (e.g., `sigil_user_app_utils_identity`
+/// could be module `app.utils` + function `identity`, or module `app` +
+/// function `utils_identity`). The current implementation restores `$` symbols
+/// for monomorphized generics but does not attempt to disambiguate module
+/// boundaries without additional context.
 pub fn demangle(name: &str) -> String {
     if name == "sigil_user_main" {
         return "main".to_string();
     }
     if let Some(rest) = name.strip_prefix("sigil_user_") {
-        let with_dollars = rest.replace("__", "$");
-        // Try to restore the module.function separation by looking for
-        // underscores followed by identifiers. Since the monomorphization
-        // suffix uses $$..., we look for the last underscore sequence that
-        // precedes a $$ pattern, or treat the whole thing as a bare name
-        // if no $$ is found.
-        // For now, just restore the $$ back and return the full name.
-        return with_dollars;
+        return rest.replace("__", "$");
     }
     name.to_string()
 }
@@ -205,7 +194,10 @@ mod tests {
     fn demangle_user_fn_strips_prefix() {
         // New format includes module label: `sigil_user_<module>_<name>`
         assert_eq!(demangle("sigil_user_app_foo"), "app_foo");
-        assert_eq!(demangle("sigil_user_app_utils_my_helper"), "app_utils_my_helper");
+        assert_eq!(
+            demangle("sigil_user_app_utils_my_helper"),
+            "app_utils_my_helper"
+        );
         // Module label with stdlib prefix
         assert_eq!(demangle("sigil_user_std_list_map"), "std_list_map");
     }
@@ -225,7 +217,10 @@ mod tests {
     fn demangle_monomorphic_generic_fn() {
         // Monomorphized generic: `map$$Int` from module `std.list`
         // becomes `sigil_user_std_list_map____Int` (four underscores for $$)
-        assert_eq!(demangle("sigil_user_std_list_map____Int"), "std_list_map$$Int");
+        assert_eq!(
+            demangle("sigil_user_std_list_map____Int"),
+            "std_list_map$$Int"
+        );
     }
 
     /// Audit for the PR #148 review's item #6 — demangler vs. stdlib
