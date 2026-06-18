@@ -713,6 +713,57 @@ fn field_access_with_imported_module_namespace_collision() {
     );
 }
 
+/// Cross-module generic monomorphization: a generic function defined in a helper
+/// module instantiated from the entry module via a qualified call produces the
+/// correct monomorphized result. Exercises the path-based keying in the
+/// monomorphizer's `fn_decls` for a non-colliding user-module generic.
+#[test]
+fn two_file_cross_module_generic_instantiation() {
+    let helper = "fn identity[T](x: T) -> T ![] { x }\n";
+    let entry = "import helper\n\
+                 fn main() -> Int ![] {\n\
+                   helper.identity(42)\n\
+                 }\n";
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, &[("helper.sigil", helper)], "cross_module_generic");
+    assert_eq!(
+        code, 42,
+        "cross-module generic instantiation: exit code should be 42; stderr={stderr:?}"
+    );
+}
+
+/// Cross-module generic monomorphization with same-basename collision: two user
+/// modules both define a generic function named `identity`. The entry module
+/// aliases them via `use` and calls each with different arguments. The
+/// monomorphizer must key each clone by its canonical (module-qualified) name so
+/// both produce the correct result despite sharing the same bare suffix.
+#[test]
+fn two_file_cross_module_generic_same_basename() {
+    let app_utils = "fn identity[T](x: T) -> T ![] { x }\n";
+    let helper_utils = "fn identity[T](x: T) -> T ![] { x }\n";
+    let entry = "import app.utils\n\
+                 import helper.utils\n\
+                 use app.utils.{identity as app_identity}\n\
+                 use helper.utils.{identity as helper_identity}\n\
+                 fn main() -> Int ![] {\n\
+                   let a: Int = app_identity(40);\n\
+                   let b: Int = helper_identity(2);\n\
+                   a + b\n\
+                 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[
+            ("app/utils.sigil", app_utils),
+            ("helper/utils.sigil", helper_utils),
+        ],
+        "cross_module_generic_same_basename",
+    );
+    assert_eq!(
+        code, 42,
+        "same-basename generic: exit code should be 42; stderr={stderr:?}"
+    );
+}
+
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
 /// (compile-only, no link), inspect the `.o` file's stackmap section
 /// bytes, and parse them via the runtime's v1 parser. Asserts the v1
