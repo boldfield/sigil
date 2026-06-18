@@ -14,7 +14,7 @@
 // ## Surface
 //
 // **Types**
-//   - `JValue = | JNull | JBool(Bool) | JInt(Int) | JString(String)
+//   - `JValue = | JNull | JBool(Bool) | JInt(Int) | JFloat(Float) | JString(String)
 //                | JArray(JList) | JObject(JObject)`
 //   - `JList = | JLNil | JLCons(JValue, JList)`
 //   - `JObject = | JONil | JOCons(String, JValue, JObject)`

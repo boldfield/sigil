@@ -3,6 +3,7 @@ import std.json
 import std.io
 
 use std.io.{IO};
+use std.json.{JValue, JInt, JFloat, json_render};
 
 fn main() -> Int ![IO, Mem] {
   let int_val: JValue = JInt(42);

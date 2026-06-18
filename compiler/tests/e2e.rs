@@ -19371,6 +19371,24 @@ fn std_json_parse_malformed_returns_err() {
     assert_eq!(stdout, "err\n", "stderr={stderr:?}");
 }
 
+#[test]
+fn std_json_render_jfloat() {
+    let src = "import std.io\n\
+               import std.mem\n\
+               import std.json\n\
+               use std.io.{IO};\n\
+               use std.json.{JFloat, JValue, json_render};\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               let v: JValue = JFloat(3.14);\n\
+               perform IO.println(json_render(v));\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_render_jfloat");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3.14\n", "stderr={stderr:?}");
+}
+
 // Plan State-Cell — deep-recursion State stress test. Pins the
 // invariant that `__set_then_arg` collapses the State.set arm body
 // to a single tail-`k` call so it doesn't push an
