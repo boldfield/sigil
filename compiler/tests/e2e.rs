@@ -23858,7 +23858,10 @@ fn m2_same_basename_different_dirs() {
     let helper_math = "fn mul(a: Int, b: Int) -> Int ![] { a * b }\n";
     let (_stdout, stderr, code) = compile_and_run_multifile(
         entry,
-        &[("app/math.sigil", app_math), ("helper/math.sigil", helper_math)],
+        &[
+            ("app/math.sigil", app_math),
+            ("helper/math.sigil", helper_math),
+        ],
         "m2_same_basename_dirs",
     );
     assert_eq!(
@@ -23895,30 +23898,46 @@ fn m2_location_independence() {
 
 /// Milestone-2 test (c): Bare-name collision across two imported modules
 /// errors and is fixed by qualifying. When two modules export the same name,
-/// a bare call fails, but qualified calls work.
+/// a bare use-statement brings in a collision error, and qualified module
+/// calls resolve it.
 #[test]
 fn m2_bare_collision_resolved_by_qualification() {
-    let entry = "import calc.util\n\
-                 import logic.util\n\
-                 use calc.util.{compute as calc_compute}\n\
-                 use logic.util.{compute as logic_compute}\n\
-                 fn main() -> Int ![] {\n\
-                   let x: Int = calc_compute(3);\n\
-                   let y: Int = logic_compute(4);\n\
-                   x + y\n\
-                 }\n";
     let calc_util = "fn compute(n: Int) -> Int ![] { n * 2 }\n";
     let logic_util = "fn compute(n: Int) -> Int ![] { n + 10 }\n";
-    let (_stdout, stderr, code) = compile_and_run_multifile(
-        entry,
-        &[
-            ("calc/util.sigil", calc_util),
-            ("logic/util.sigil", logic_util),
-        ],
-        "m2_bare_collision_qualified",
+    let modules = &[
+        ("calc/util.sigil", calc_util),
+        ("logic/util.sigil", logic_util),
+    ];
+
+    // Part 1: Verify the bare-name collision error.
+    // Two imports with identical bare names cause E0147.
+    let entry_with_collision = "import calc.util\n\
+                                import logic.util\n\
+                                use calc.util.{compute}\n\
+                                use logic.util.{compute}\n\
+                                fn main() -> Int ![] {\n\
+                                  compute(3)\n\
+                                }\n";
+    let (success, stderr) =
+        compile_multifile_for_diagnostics(entry_with_collision, modules, "m2_bare_collision_error");
+    assert!(
+        !success && (stderr.contains("E0147") || stderr.contains("ambiguous")),
+        "bare-name collision should error with E0147; stderr={stderr:?}"
     );
+
+    // Part 2: Verify qualified module calls resolve the collision.
+    // Using qualified calls like calc.util.compute(...) bypasses the bare-name error.
+    let entry_qualified = "import calc.util\n\
+                           import logic.util\n\
+                           fn main() -> Int ![] {\n\
+                             let x: Int = calc.util.compute(3);\n\
+                             let y: Int = logic.util.compute(4);\n\
+                             x + y\n\
+                           }\n";
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry_qualified, modules, "m2_bare_collision_qualified");
     assert_eq!(
         code, 20,
-        "bare name collision resolved by aliasing: 3*2=6, 4+10=14, 6+14=20; stderr={stderr:?}"
+        "qualified calls resolve collision: 3*2=6, 4+10=14, 6+14=20; stderr={stderr:?}"
     );
 }
