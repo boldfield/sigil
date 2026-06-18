@@ -7799,13 +7799,15 @@ fn rewrite_block(
 /// `main` keeps the historical mangling `sigil_user_main` (the C-main
 /// shim calls this symbol). Other names get a `sigil_user_` prefix with
 /// `$` from synthetic names (`$lambda_N`) rewritten to `__` so the
-/// result is legal on both ELF and Mach-O.
-fn mangle_user_fn(name: &str) -> String {
+/// result is legal on both ELF and Mach-O. The module_label is incorporated
+/// to ensure symbols are collision-free across user modules.
+fn mangle_user_fn(module_label: &str, name: &str) -> String {
     if name == "main" {
         return "sigil_user_main".to_string();
     }
     let sanitized = name.replace('$', "__");
-    format!("sigil_user_{sanitized}")
+    let module_part = module_label.replace('.', "_");
+    format!("sigil_user_{}_{}", module_part, sanitized)
 }
 
 /// Accumulator for v1 stackmap records, populated post-`define_function`
@@ -10162,7 +10164,19 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
                 }
             };
 
-            let mangled = mangle_user_fn(&f.name);
+            // Compute module_label for collision-free linker symbols across user modules.
+            // The canonical key is <module_label>.<name> (e.g., "app.foo.bar" from
+            // "app/foo.sigil"'s "bar"), matching the typecheck-side registration in
+            // fn_schemes. For stdlib files, the module_label includes the "std." prefix
+            // (e.g., "std.list.map" from "std/list.sigil"'s "map").
+            let stem = f.span.file.trim_end_matches(".sigil");
+            let module_label = if checked.program.stdlib_files.contains(&f.span.file) {
+                format!("std.{}", stem.replace('/', "."))
+            } else {
+                stem.replace('/', ".").to_string()
+            };
+
+            let mangled = mangle_user_fn(&module_label, &f.name);
             let func_id = module
                 .declare_function(&mangled, Linkage::Export, &sig)
                 .map_err(|e| format!("declare {mangled}: {e}"))?;
@@ -10178,17 +10192,7 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             );
             // Plan F1 — also register under the canonical (root-relative)
             // key so use-bound aliases rewritten to their canonical forms
-            // can be resolved. The canonical key is <module_label>.<name>
-            // (e.g., "app.foo.bar" from "app/foo.sigil"'s "bar"), matching
-            // the typecheck-side registration in fn_schemes.
-            // For stdlib files, the module_label includes the "std." prefix
-            // (e.g., "std.list.map" from "std/list.sigil"'s "map").
-            let stem = f.span.file.trim_end_matches(".sigil");
-            let module_label = if checked.program.stdlib_files.contains(&f.span.file) {
-                format!("std.{}", stem.replace('/', "."))
-            } else {
-                stem.replace('/', ".").to_string()
-            };
+            // can be resolved.
             let canonical_key = format!("{}.{}", module_label, f.name);
             if canonical_key != f.name {
                 user_fns.insert(
