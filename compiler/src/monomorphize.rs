@@ -1162,14 +1162,15 @@ impl<'a> Monomorphizer<'a> {
                 if let Some(inst) = self.call_sites.get(span) {
                     if name == &inst.name {
                         let resolved = subst.resolve_instantiation(inst);
-                        // The instantiation name should already be in canonical form from typecheck
-                        // (for cross-module calls with collisions, typecheck rewrites to canonical).
-                        // Use it directly to avoid losing information to fn_name_to_canonical collisions.
-                        let canonical = resolved.name.clone();
-                        self.enqueue_fn(canonical.clone(), resolved.type_args.clone());
-                        let simple = self.simple_name_from_canonical(&canonical);
-                        let mangled = mangle_fn(simple, &resolved.type_args);
-                        return Expr::Ident(mangled, span.clone());
+                        // Check if the name actually resolves to a function before enqueueing.
+                        // This guard prevents enqueueing scheme-only builtins (int_to_string,
+                        // array_alloc, etc.) that have no FnDecl and would panic in clone_fn.
+                        if let Some(canonical) = self.resolve_fn_key(&resolved.name) {
+                            self.enqueue_fn(canonical.clone(), resolved.type_args.clone());
+                            let simple = self.simple_name_from_canonical(&canonical);
+                            let mangled = mangle_fn(simple, &resolved.type_args);
+                            return Expr::Ident(mangled, span.clone());
+                        }
                     }
                 }
                 if let Some(inst) = self.ctor_sites.get(span) {
