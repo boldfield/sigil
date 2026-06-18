@@ -4578,6 +4578,18 @@ impl Tc {
         self.errors.push(err);
     }
 
+    fn get_exported_names_for_module(&self, module_label: &str) -> Vec<String> {
+        let mut exports = Vec::new();
+        for key in self.fn_schemes.keys() {
+            if key.starts_with(&format!("{}.", module_label)) {
+                let suffix = &key[module_label.len() + 1..];
+                exports.push(suffix.to_string());
+            }
+        }
+        exports.sort();
+        exports
+    }
+
     /// Task 78.5 G6 — shared E0137 emission for unbound row-variable
     /// names. Used by both the `TypeExpr::Fn` walk in
     /// `check_type_expr_known` (annotation position) and the
@@ -6912,10 +6924,32 @@ impl Tc {
                 if self.ctors.contains_key(name) {
                     self.resolve_ctor_unit_use(name, span)
                 } else {
+                    let mut msg = format!("unknown identifier `{name}`");
+                    if name.contains('.') {
+                        let segments: Vec<&str> = name.split('.').collect();
+                        for split in (1..segments.len()).rev() {
+                            let module_label = segments[..split].join(".");
+                            if let Some(file) = &self.current_fn_file {
+                                if let Some(modules) = self.file_module_paths.get(file) {
+                                    if modules.contains_key(&module_label) {
+                                        let exports = self.get_exported_names_for_module(&module_label);
+                                        if !exports.is_empty() {
+                                            msg.push_str(&format!(
+                                                "; {} exports: {}",
+                                                module_label,
+                                                exports.join(", ")
+                                            ));
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.push_error_with_import_hint(
                         "E0046",
                         span.clone(),
-                        format!("unknown identifier `{name}`"),
+                        msg,
                         name,
                     );
                     None
