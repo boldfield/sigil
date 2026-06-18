@@ -1,0 +1,9 @@
+import std.io
+import helper
+use std.io.{IO};
+use helper.{get_greeting};
+
+fn main() -> Int ![IO] {
+  perform IO.println(get_greeting());
+  0
+}
