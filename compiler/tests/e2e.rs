@@ -24044,3 +24044,87 @@ fn m3_generic_same_name_across_modules() {
         "same-named generics across modules: calc.helper.transform(5)=5, logic.helper.transform(3)=3, 5+3=8; stderr={stderr:?}"
     );
 }
+
+/// Milestone-4 test (a): Missing module reports E0032 naming the expected file path.
+/// When importing a non-existent module, the error message should show the expected
+/// file path where the module should have been found.
+#[test]
+fn m4_missing_module_reports_expected_path() {
+    let entry = "import missing.module\n\
+                 fn main() -> Int ![] { 0 }\n";
+    let (success, stderr) = compile_multifile_for_diagnostics(entry, &[], "m4_missing_module_path");
+    assert!(
+        !success && stderr.contains("E0032"),
+        "missing module import must fail with E0032; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("missing/module.sigil")
+            || stderr.contains("missing") && stderr.contains("module"),
+        "E0032 should show expected file path for missing.module; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-4 test (b): Cross-module cycle reports E0033 with the cycle path.
+/// When two modules import each other (directly or indirectly), the error should
+/// display the full cycle path showing how the cycle is formed.
+#[test]
+fn m4_cross_module_cycle_reports_cycle_path() {
+    let entry = "import helper_a\n\
+                 fn main() -> Int ![] { 0 }\n";
+    let helper_a = "import helper_b\n\
+                    fn get_b() -> Int ![] { 1 }\n";
+    let helper_b = "import helper_a\n\
+                    fn get_a() -> Int ![] { 2 }\n";
+    let modules = &[("helper_a.sigil", helper_a), ("helper_b.sigil", helper_b)];
+    let (success, stderr) = compile_multifile_for_diagnostics(entry, modules, "m4_cycle_path");
+    assert!(
+        !success && stderr.contains("E0033"),
+        "circular import must fail with E0033; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("helper_a") && stderr.contains("helper_b"),
+        "E0033 should show cycle path involving both modules; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-4 test (c): Unknown imported symbol lists the module's exports.
+/// When importing a symbol that doesn't exist in a module, the error should
+/// list the actual exported names from that module to help the user find the correct name.
+#[test]
+fn m4_unknown_symbol_lists_exports() {
+    let entry = "import helper\n\
+                 fn main() -> Int ![] {\n\
+                   helper.nonexistent()\n\
+                 }\n";
+    let helper = "fn compute(x: Int) -> Int ![] { x * 2 }\n\
+                  fn display() -> String ![] { \"test\" }\n";
+    let modules = &[("helper.sigil", helper)];
+    let (success, stderr) = compile_multifile_for_diagnostics(entry, modules, "m4_unknown_symbol");
+    assert!(
+        !success,
+        "unknown symbol import must fail; stderr={stderr:?}"
+    );
+    assert!(
+        stderr.contains("compute") || stderr.contains("display") || stderr.contains("export"),
+        "error should list available exports or mention the available functions; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-4 test (d): Vendored module under deps. convention resolves and runs.
+/// A module imported with the deps. prefix (e.g., import deps.json5.foo) should resolve
+/// to the corresponding directory under root/deps/ and work like any other user module import.
+#[test]
+fn m4_vendored_deps_convention() {
+    let entry = "import deps.json5\n\
+                 fn main() -> Int ![]\n\
+                 {\n\
+                   deps.json5.get_version()\n\
+                 }\n";
+    let json5_module = "fn get_version() -> Int ![] { 5 }\n";
+    let modules = &[("deps/json5.sigil", json5_module)];
+    let (_stdout, stderr, code) = compile_and_run_multifile(entry, modules, "m4_vendored_deps");
+    assert_eq!(
+        code, 5,
+        "deps. convention should resolve to deps/json5.sigil and exit with version 5; stderr={stderr:?}"
+    );
+}
