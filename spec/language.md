@@ -1835,11 +1835,10 @@ use helper.parser.{parse as helper_parse};
 **Error diagnostics.** User-module errors are designed to close the
 edit loop:
 
-- **E0032 (missing module):** names the exact expected file path
-  ("no module `app.parser` — expected `<root>/app/parser.sigil`").
-- **E0033 (module cycle):** names the full cycle path across modules,
-  e.g., `app.parser` → `app.lexer` → `app.parser`.
-- **Unknown imported symbol:** lists the module's exported names.
+- **E0032 (missing module):** names the missing module
+  (e.g., "module `app.parser` not found").
+- **E0033 (module cycle):** names the cycle-closing module
+  (e.g., "circular import involving `app.parser`").
 
 **Third-party libraries via vendoring.** Third-party code requires
 **zero additional language machinery** — it is vendored source that
@@ -1889,8 +1888,8 @@ Common codes:
 | Code | Meaning |
 |------|---------|
 | E0010 | parser syntax error |
-| E0032 | missing user module (named expected file path) |
-| E0033 | module cycle detected (names the cycle path) |
+| E0032 | missing user module |
+| E0033 | module cycle detected |
 | E0042 | effect not in row |
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
