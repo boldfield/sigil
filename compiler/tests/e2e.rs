@@ -575,18 +575,17 @@ fn field_access_with_imported_module_namespace_collision() {
     let entry = "import app.parser\n\
                  type Person = { name: String, age: Int }\n\
                  fn main() -> Int ![] {\n\
-                   let app: Person = Person { name: \"Ada\", age: 36 };\n\
-                   let result: String = app.name;\n\
-                   if result == \"Ada\" { 0 } else { 1 }\n\
+                   let app: Person = Person { name: \"Ada\", age: 42 };\n\
+                   app.age\n\
                  }\n";
-    let parser = "fn parse() -> Int ![] { 42 }\n";
+    let parser = "fn parse() -> Int ![] { 7 }\n";
     let (_stdout, stderr, code) = compile_and_run_multifile(
         entry,
         &[("app/parser.sigil", parser)],
         "field_access_module_collision",
     );
     assert_eq!(
-        code, 0,
+        code, 42,
         "field access should resolve to record field, not module: stderr={stderr:?}"
     );
 }
