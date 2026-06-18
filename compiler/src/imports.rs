@@ -221,37 +221,67 @@ fn load_module(
     errs: &mut Vec<CompilerError>,
     get_source: &dyn Fn(&str) -> Option<String>,
 ) {
+    load_module_impl(
+        module,
+        import_path,
+        import_span,
+        loaded,
+        stdlib_files,
+        in_progress,
+        out,
+        errs,
+        get_source,
+        &mut Vec::new(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_module_impl(
+    module: &str,
+    import_path: &[String],
+    import_span: &Span,
+    loaded: &mut BTreeSet<String>,
+    stdlib_files: &mut BTreeSet<String>,
+    in_progress: &mut BTreeSet<String>,
+    out: &mut Vec<Item>,
+    errs: &mut Vec<CompilerError>,
+    get_source: &dyn Fn(&str) -> Option<String>,
+    stack: &mut Vec<String>,
+) {
     if loaded.contains(module) {
         return;
     }
     if in_progress.contains(module) {
+        stack.push(module.to_string());
+        let cycle_path = stack.join(" -> ");
         errs.push(CompilerError::new(
             Severity::Error,
             errors::code("E0033"),
             import_span.clone(),
-            format!(
-                "circular import involving `{}`",
-                render_import_path(import_path)
-            ),
+            format!("circular import: {}", cycle_path),
         ));
+        stack.pop();
         return;
     }
     let src = match get_source(module) {
         Some(s) => s,
         None => {
-            let module_type = if import_path.first().map(String::as_str) == Some("std") {
-                "stdlib module"
+            let is_stdlib = import_path.first().map(String::as_str) == Some("std");
+            let module_type = if is_stdlib { "stdlib module" } else { "module" };
+            let expected_path = if is_stdlib {
+                format!("expected stdlib module `{}`", module)
             } else {
-                "module"
+                format!("expected `<root>/{}`", module)
             };
             errs.push(CompilerError::new(
                 Severity::Error,
                 errors::code("E0032"),
                 import_span.clone(),
                 format!(
-                    "{} `{}` not found",
+                    "{} `{}` not found; {}",
                     module_type,
-                    render_import_path(import_path)
+                    render_import_path(import_path),
+                    expected_path
                 ),
             ));
             return;
@@ -259,6 +289,7 @@ fn load_module(
     };
 
     in_progress.insert(module.to_string());
+    stack.push(module.to_string());
 
     // Transform lex / parse errors that originate from stdlib source
     // so users see "internal compiler error in stdlib module `std.X`"
@@ -292,7 +323,7 @@ fn load_module(
             if BUILTIN_INJECTED.contains(&sub_module.as_str()) {
                 continue;
             }
-            load_module(
+            load_module_impl(
                 &sub_module,
                 &decl.path,
                 &decl.span,
@@ -302,6 +333,7 @@ fn load_module(
                 out,
                 errs,
                 get_source,
+                stack,
             );
         }
     }
@@ -318,6 +350,7 @@ fn load_module(
         out.push(sub_item);
     }
 
+    stack.pop();
     in_progress.remove(module);
     loaded.insert(module.to_string());
     if is_stdlib {
@@ -466,8 +499,8 @@ mod tests {
             .map(|e| e.message.clone())
             .unwrap_or_default();
         assert!(
-            msg.contains("std.phantom_a"),
-            "diagnostic should name the cycle-closing module; got: {msg}"
+            msg.contains("phantom_a") && msg.contains("phantom_b"),
+            "diagnostic should name the full cycle path; got: {msg}"
         );
     }
 
