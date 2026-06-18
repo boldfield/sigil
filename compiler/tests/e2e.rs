@@ -496,6 +496,53 @@ fn compile_and_run_multifile(
     (stdout, stderr, code)
 }
 
+fn compile_multifile_for_diagnostics(
+    entry_content: &str,
+    modules: &[(&str, &str)],
+    test_name: &str,
+) -> (bool, String) {
+    let sigil_bin = sigil_binary();
+
+    let test_dir = std::env::temp_dir().join(format!(
+        "sigil_e2e_multifile_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&test_dir).expect("create temp directory");
+
+    let entry_path = test_dir.join("main.sigil");
+    std::fs::write(&entry_path, entry_content).expect("write entry file");
+
+    for (filename, content) in modules {
+        let module_path = test_dir.join(filename);
+        if let Some(parent) = module_path.parent() {
+            std::fs::create_dir_all(parent).expect("create module parent dir");
+        }
+        std::fs::write(&module_path, content).expect("write module file");
+    }
+
+    let bin_path = std::env::temp_dir().join(format!(
+        "sigil_e2e_multifile_bin_{}_{}",
+        test_name,
+        std::process::id()
+    ));
+
+    let compile = Command::new(&sigil_bin)
+        .arg(&entry_path)
+        .arg("-o")
+        .arg(&bin_path)
+        .output()
+        .expect("failed to invoke sigil compiler");
+
+    let success = compile.status.success();
+    let stderr = String::from_utf8_lossy(&compile.stderr).into_owned();
+
+    let _ = std::fs::remove_file(&bin_path);
+    let _ = std::fs::remove_dir_all(&test_dir);
+
+    (success, stderr)
+}
+
 #[test]
 fn hello() {
     let root = workspace_root();
@@ -562,6 +609,82 @@ fn multifile_qualified_user_module_calls() {
     assert_eq!(
         code, 42,
         "qualified user-module call: exit code should be 42; stderr={stderr:?}"
+    );
+}
+
+/// Plan F1 Task 5 — bare use names resolve when unambiguous.
+/// A program that uses `use app.parser.{parse}` can call `parse()` bare.
+#[test]
+fn multifile_bare_use_name_resolves() {
+    let entry = "import app.parser\n\
+                 use app.parser.{parse}\n\
+                 fn main() -> Int ![] {\n\
+                   parse()\n\
+                 }\n";
+    let parser = "fn parse() -> Int ![] { 42 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", parser)],
+        "bare_use_name_resolves",
+    );
+    assert_eq!(
+        code, 42,
+        "bare use name should resolve when unambiguous; stderr={stderr:?}"
+    );
+}
+
+/// Plan F1 Task 5 — ambiguous bare use names emit E0147 and direct to qualification.
+/// When two use statements bring the same bare name, the second one fails with E0147,
+/// and the user must alias one of them or qualify the call.
+#[test]
+fn multifile_ambiguous_bare_use_name_errors() {
+    let entry = "import app.parser\n\
+                 import helper.parser\n\
+                 use app.parser.{parse}\n\
+                 use helper.parser.{parse}\n\
+                 fn main() -> Int ![] {\n\
+                   parse()\n\
+                 }\n";
+    let app_parser = "fn parse() -> Int ![] { 10 }\n";
+    let helper_parser = "fn parse() -> Int ![] { 32 }\n";
+    let modules = &[
+        ("app/parser.sigil", app_parser),
+        ("helper/parser.sigil", helper_parser),
+    ];
+    let (success, stderr) =
+        compile_multifile_for_diagnostics(entry, modules, "ambiguous_bare_use_name");
+    // E0147 should be in the errors
+    assert!(
+        !success && (stderr.contains("E0147") || stderr.contains("duplicate")),
+        "should emit E0147 for ambiguous bare use names; stderr={stderr:?}"
+    );
+}
+
+/// Plan F1 Task 5 — resolving ambiguous bare use names via qualification.
+/// When two use statements bring the same bare name and the second is aliased,
+/// the user can call either one using their qualified or aliased name.
+#[test]
+fn multifile_ambiguous_bare_use_name_resolved_by_qualification() {
+    let entry = "import app.parser\n\
+                 import helper.parser\n\
+                 use app.parser.{parse as app_parse}\n\
+                 use helper.parser.{parse as helper_parse}\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = app_parse();\n\
+                   let y: Int = helper_parse();\n\
+                   x + y\n\
+                 }\n";
+    let app_parser = "fn parse() -> Int ![] { 10 }\n";
+    let helper_parser = "fn parse() -> Int ![] { 32 }\n";
+    let modules = &[
+        ("app/parser.sigil", app_parser),
+        ("helper/parser.sigil", helper_parser),
+    ];
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, modules, "ambiguous_bare_use_name_aliased");
+    assert_eq!(
+        code, 42,
+        "aliasing should resolve ambiguity; stderr={stderr:?}"
     );
 }
 
