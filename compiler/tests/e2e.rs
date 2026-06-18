@@ -543,6 +543,53 @@ fn multifile_two_user_modules_same_basename_no_collision() {
     );
 }
 
+/// Plan F1 Task 3 — qualified user-module calls resolve through the
+/// same path-based machinery as qualified stdlib calls. A program that
+/// imports a user module and calls a function via its fully qualified
+/// path (e.g. `app.parser.parse(...)`) must typecheck and run.
+#[test]
+fn multifile_qualified_user_module_calls() {
+    let entry = "import app.parser\n\
+                 fn main() -> Int ![] {\n\
+                   app.parser.parse()\n\
+                 }\n";
+    let parser = "fn parse() -> Int ![] { 42 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", parser)],
+        "qualified_user_module_calls",
+    );
+    assert_eq!(
+        code, 42,
+        "qualified user-module call: exit code should be 42; stderr={stderr:?}"
+    );
+}
+
+/// Regression test for field-access (#208) when a local binding's name
+/// matches an imported module's namespace prefix. A local `app: Person`
+/// binding must shadow `import app.parser` for the purpose of field
+/// access — `app.name` should resolve to the `name` field, not to
+/// anything in the `app.*` module namespace.
+#[test]
+fn field_access_with_imported_module_namespace_collision() {
+    let entry = "import app.parser\n\
+                 type Person = { name: String, age: Int }\n\
+                 fn main() -> Int ![] {\n\
+                   let app: Person = Person { name: \"Ada\", age: 42 };\n\
+                   app.age\n\
+                 }\n";
+    let parser = "fn parse() -> Int ![] { 7 }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("app/parser.sigil", parser)],
+        "field_access_module_collision",
+    );
+    assert_eq!(
+        code, 42,
+        "field access should resolve to record field, not module: stderr={stderr:?}"
+    );
+}
+
 /// Plan E2 Phase 1 Task 4 G1 — compile `examples/option_demo.sigil`
 /// (compile-only, no link), inspect the `.o` file's stackmap section
 /// bytes, and parse them via the runtime's v1 parser. Asserts the v1

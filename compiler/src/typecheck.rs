@@ -4275,22 +4275,44 @@ impl Tc {
         let file = self.current_fn_file.as_ref()?;
         if name.contains('.') {
             // Qualified-path reference. Walk segments against the
-            // current file's import / alias table.
-            let modules = self.file_module_paths.get(file)?;
+            // current file's import / alias table, then try resolving
+            // as a direct user-module path.
             let segments: Vec<&str> = name.split('.').collect();
             // Try the longest module label first so single-alias
             // `O.map` doesn't mismatch a multi-segment import.
+
+            // Phase 1 — explicit import / alias table (imports take priority).
+            if let Some(modules) = self.file_module_paths.get(file) {
+                for split in (1..segments.len()).rev() {
+                    let module_label = segments[..split].join(".");
+                    let sym = segments[split..].join(".");
+                    if let Some(module_file) = modules.get(&module_label) {
+                        let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                        if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
+                            return Some((scheme, canonical));
+                        }
+                        // Builtins fall back to the bare source-name key.
+                        if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
+                            return Some((scheme, sym));
+                        }
+                        return None;
+                    }
+                }
+            }
+
+            // Phase 2 — direct user-module path lookup via canonical key.
+            // Resolves `app.parser.parse` → `app/parser.sigil` → fn_schemes key
+            // `app.parser.parse`. Fires when the module was loaded (e.g. via
+            // a same-file or transitive import) but not aliased under the
+            // canonical label in the import table.
             for split in (1..segments.len()).rev() {
-                let module_label = segments[..split].join(".");
+                let module_path: Vec<String> =
+                    segments[..split].iter().map(|s| s.to_string()).collect();
                 let sym = segments[split..].join(".");
-                if let Some(module_file) = modules.get(&module_label) {
-                    let canonical = canonical_fn_key(module_file, &sym, &self.stdlib_files);
+                if let Some(module_file) = module_file_for_path(&module_path) {
+                    let canonical = canonical_fn_key(&module_file, &sym, &self.stdlib_files);
                     if let Some(scheme) = self.fn_schemes.get(&canonical).cloned() {
                         return Some((scheme, canonical));
-                    }
-                    // Builtins fall back to the bare source-name key.
-                    if let Some(scheme) = self.fn_schemes.get(&sym).cloned() {
-                        return Some((scheme, sym));
                     }
                     return None;
                 }
@@ -6830,7 +6852,7 @@ impl Tc {
                 // dotted name whose first segment is not a known
                 // imported module is almost certainly the user
                 // writing `record.field` intending field access
-                // (Sigil v1 has no field-access operator).
+                // (field-access operator landed in #208).
                 if name.contains('.') {
                     // Check ANY dotted prefix of the name against the
                     // file's import / alias table — qualified paths
@@ -6854,16 +6876,35 @@ impl Tc {
                             FieldAccessOutcome::Resolved(field_ty) => return Some(field_ty),
                             FieldAccessOutcome::Errored => return None,
                             FieldAccessOutcome::NotFieldAccess => {
-                                let head = segments[0];
-                                self.push_error(
-                                    "E0151",
-                                    span.clone(),
-                                    format!(
-                                        "`{name}` is not a known qualified name, and `{head}` is \
-                                         not a record binding in scope."
-                                    ),
-                                );
-                                return None;
+                                // Suppress E0151 when the prefix is a loaded
+                                // user module (e.g. `app.parser.parse` where
+                                // `app.parser` was imported). In that case,
+                                // the name is a qualified call attempt and
+                                // E0046 is more appropriate than E0151.
+                                let any_prefix_is_user_module = (1..segments.len()).any(|split| {
+                                    let module_path: Vec<String> =
+                                        segments[..split].iter().map(|s| s.to_string()).collect();
+                                    if module_file_for_path(&module_path).is_some() {
+                                        let module_label = module_path.join(".");
+                                        self.fn_schemes
+                                            .keys()
+                                            .any(|k| k.starts_with(&format!("{}.", module_label)))
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if !any_prefix_is_user_module {
+                                    let head = segments[0];
+                                    self.push_error(
+                                        "E0151",
+                                        span.clone(),
+                                        format!(
+                                            "`{name}` is not a known qualified name, and `{head}` \
+                                             is not a record binding in scope."
+                                        ),
+                                    );
+                                    return None;
+                                }
                             }
                         }
                     }
