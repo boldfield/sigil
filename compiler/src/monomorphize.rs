@@ -103,7 +103,7 @@ use crate::ast::{
 };
 use crate::elaborate::AnfProgram;
 use crate::errors::Span;
-use crate::typecheck::{GenericInstantiation, Scheme, Ty};
+use crate::typecheck::{canonical_fn_key, GenericInstantiation, Scheme, Ty};
 
 /// Plan B' Stage 6.8 Phase C++ — per-clone resolved
 /// `lambda_captures`. See `MonoProgram::lambda_captures_resolved`.
@@ -467,10 +467,16 @@ struct Monomorphizer<'a> {
     /// Reference to the original `Program::items` so imports can be
     /// preserved in the output without re-cloning.
     original_items: &'a [Item],
-    /// Source items, indexed by name for O(log n) lookup during
-    /// reachability traversal.
+    /// Source items, indexed by canonical (module-qualified) name for
+    /// O(log n) lookup during reachability traversal. Keys match those in
+    /// `fn_schemes` so cross-module generic instantiations are resolved
+    /// correctly. See `canonical_fn_key` in typecheck.rs for the keying
+    /// scheme.
     fn_decls: BTreeMap<String, &'a FnDecl>,
     type_decls: BTreeMap<String, &'a TypeDecl>,
+    /// Per-function simple names → canonical keys, used when rewriting
+    /// call sites to look up fn_decls by canonical keys.
+    fn_name_to_canonical: BTreeMap<String, String>,
     /// Reverse index: ctor name → owning type name. Built from the
     /// original (pre-mono) types registry. Used at pattern-rewriting
     /// time to identify which type a pattern ctor belongs to.
@@ -598,10 +604,20 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
         }
+        let mut fn_name_to_canonical: BTreeMap<String, String> = BTreeMap::new();
         for item in &checked.program.items {
             match item {
                 Item::Fn(f) => {
-                    fn_decls.insert(f.name.clone(), f.as_ref());
+                    // Cross-module generic monomorphization keying: use
+                    // canonical (module-qualified) names so functions from
+                    // different modules with the same simple name don't
+                    // collide. Keys match those in fn_schemes so both bare
+                    // cross-module calls and qualified calls resolve correctly.
+                    let canonical = canonical_fn_key(&f.span.file, &f.name, &checked.program.stdlib_files);
+                    fn_decls.insert(canonical.clone(), f.as_ref());
+                    // Also track the simple name → canonical mapping for
+                    // lookups when we have just the simple name.
+                    fn_name_to_canonical.insert(f.name.clone(), canonical);
                 }
                 Item::Type(td) => {
                     type_decls.insert(td.name.clone(), td.as_ref());
@@ -623,6 +639,7 @@ impl<'a> Monomorphizer<'a> {
             fn_decls,
             type_decls,
             ctor_to_type,
+            fn_name_to_canonical,
             fn_schemes: &checked.fn_schemes,
             call_sites: &checked.call_site_instantiations,
             ctor_sites: &checked.ctor_site_instantiations,
@@ -677,7 +694,7 @@ impl<'a> Monomorphizer<'a> {
         // generic by construction — typecheck E0040 guards an absent
         // main). Main's reachability transitively pulls in every
         // call / ctor / pattern site we care about.
-        if self.fn_decls.contains_key("main") {
+        if self.resolve_fn_key("main").is_some() {
             self.enqueue_fn("main".to_string(), Vec::new());
         }
 
@@ -725,9 +742,44 @@ impl<'a> Monomorphizer<'a> {
         out
     }
 
+    /// Resolve a function name (simple or canonical) to the canonical key
+    /// used in fn_decls. If the name is already canonical (contains a dot),
+    /// return it as-is. Otherwise, try to look it up in fn_name_to_canonical;
+    /// if not found, assume it's a simple name and try that directly. This
+    /// handles both cross-module qualified calls and local function references.
+    fn resolve_fn_key(&self, name: &str) -> Option<String> {
+        if name.contains('.') {
+            // Already canonical; if it's in fn_decls, return it
+            if self.fn_decls.contains_key(name) {
+                return Some(name.to_string());
+            }
+        }
+        // Try looking up the simple name in the mapping
+        if let Some(canonical) = self.fn_name_to_canonical.get(name) {
+            return Some(canonical.clone());
+        }
+        // Not found in either form
+        None
+    }
+
     fn enqueue_fn(&mut self, name: String, type_args: Vec<Ty>) {
-        let mangled = mangle_fn(&name, &type_args);
+        // Resolve the name to the canonical form to check fn_decls and
+        // compute the dedup key. But keep the simple name in the worklist
+        // so the output mangled name is correct (e.g., "id$$Int" not "test.id$$Int").
+        let canonical_name = if self.fn_decls.contains_key(&name) {
+            name.clone()
+        } else if let Some(canonical) = self.fn_name_to_canonical.get(&name) {
+            canonical.clone()
+        } else {
+            // Name not found in either form; this shouldn't happen, but keep
+            // the original name for graceful degradation.
+            name.clone()
+        };
+        // Use the canonical name for dedup so cross-module instances don't collide
+        let mangled = mangle_fn(&canonical_name, &type_args);
         if self.fn_seen.insert(mangled) {
+            // Store the simple name in the worklist, not the canonical key.
+            // The simple name is what we need for correct output mangling.
             self.fn_worklist.push_back((name, type_args));
         }
     }
@@ -789,16 +841,25 @@ impl<'a> Monomorphizer<'a> {
     }
 
     fn clone_fn(&mut self, key: &FnKey) -> FnDecl {
-        let (name, type_args) = key;
-        // Worklist invariant: every key was inserted via `enqueue_fn`,
-        // and `enqueue_fn` only fires for names that already exist in
-        // `self.fn_decls` (the call/value-ref rewriter checks
-        // `self.fn_decls.contains_key` before enqueueing).
-        let original = self.fn_decls.get(name).copied().unwrap_or_else(|| {
-            unreachable!("monomorphize: fn worklist entry `{name}` missing from fn_decls")
+        let (simple_name, type_args) = key;
+        // Worklist stores simple function names. Resolve to canonical key
+        // for fn_decls lookup. The name could be simple (e.g., "identity")
+        // or already canonical (e.g., "helper.identity").
+        let canonical_key = if self.fn_decls.contains_key(simple_name) {
+            simple_name.clone()
+        } else if let Some(canonical) = self.fn_name_to_canonical.get(simple_name) {
+            canonical.clone()
+        } else {
+            // Fallback: try as simple name
+            simple_name.clone()
+        };
+        let original = self.fn_decls.get(&canonical_key).copied().unwrap_or_else(|| {
+            unreachable!("monomorphize: fn worklist entry `{simple_name}` (canonical: `{canonical_key}`) missing from fn_decls")
         });
-        let subst = self.fn_subst(name, type_args);
-        let mangled_name = mangle_fn(name, type_args);
+        let subst = self.fn_subst(&canonical_key, type_args);
+        // Mangle using the original function's simple name so the output
+        // mangled name is correct (e.g., "id$$Int" not "test.id$$Int").
+        let mangled_name = mangle_fn(&original.name, type_args);
 
         // Plan B' Stage 6.8 Phase C++ — track the current clone's
         // fn name so the Lambda arm of `rewrite_expr` can record
@@ -1051,7 +1112,9 @@ impl<'a> Monomorphizer<'a> {
                 if let Some(inst) = self.call_sites.get(span) {
                     if name == &inst.name {
                         let resolved = subst.resolve_instantiation(inst);
-                        if self.fn_decls.contains_key(&resolved.name) {
+                        // Check if the resolved function exists. The name might be
+                        // canonical (module-qualified) or simple; resolve_fn_key handles both.
+                        if self.resolve_fn_key(&resolved.name).is_some() {
                             self.enqueue_fn(resolved.name.clone(), resolved.type_args.clone());
                             let mangled = mangle_fn(&resolved.name, &resolved.type_args);
                             return Expr::Ident(mangled, span.clone());

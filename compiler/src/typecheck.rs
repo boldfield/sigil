@@ -2976,7 +2976,12 @@ fn module_file_for_path(path: &[String]) -> Option<String> {
 /// that set, the label is `std.<dotted-path>`; for everything else
 /// (user files, synthesized spans), the label is the basename stem
 /// without a `std.` prefix.
-fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> String {
+/// Compute a canonical (module-qualified) function key for cross-module
+/// generic monomorphization. Used by typecheck to key fn_schemes and by
+/// monomorphization to key fn_decls so cross-module generic instantiations
+/// resolve correctly. Format: `<module_label>.<name>` where module_label is
+/// `std.<parts>` for stdlib files or `<parts>` for user modules.
+pub fn canonical_fn_key(file: &str, name: &str, stdlib_files: &BTreeSet<String>) -> String {
     let module_label = canonical_module_label(file, stdlib_files);
     format!("{module_label}.{name}")
 }

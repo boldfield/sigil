@@ -23839,3 +23839,23 @@ fn two_file_basic_import_qualified_call() {
         "two_file import: exit code mismatch; stderr={stderr:?}"
     );
 }
+
+#[test]
+fn two_file_cross_module_generic_instantiation() {
+    // Test that a generic function defined in one module and instantiated
+    // from another module creates the correct monomorphized clone with the
+    // right module-qualified key.
+    let entry = "import helper\n\
+                 fn main() -> Int ![] {\n\
+                   helper.identity(42)\n\
+                 }\n";
+    let helper = "fn identity[T](x: T) -> T ![] {\n\
+                  x\n\
+                  }\n";
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, &[("helper.sigil", helper)], "cross_module_generic");
+    assert_eq!(
+        code, 42,
+        "cross-module generic: exit code mismatch; stderr={stderr:?}"
+    );
+}
