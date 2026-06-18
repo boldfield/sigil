@@ -6897,21 +6897,26 @@ impl Tc {
                             false
                         }
                     });
-                    if !any_prefix_known && !any_prefix_is_user_module {
+                    if !any_prefix_known {
                         match self.try_resolve_field_access(name, span, row, row_tail) {
                             FieldAccessOutcome::Resolved(field_ty) => return Some(field_ty),
                             FieldAccessOutcome::Errored => return None,
                             FieldAccessOutcome::NotFieldAccess => {
-                                let head = segments[0];
-                                self.push_error(
-                                    "E0151",
-                                    span.clone(),
-                                    format!(
-                                        "`{name}` is not a known qualified name, and `{head}` is \
-                                         not a record binding in scope."
-                                    ),
-                                );
-                                return None;
+                                // Only fire E0151 if this isn't a user-module-qualified call.
+                                // If any_prefix_is_user_module, let it fall through to
+                                // other resolution paths (or E0046 if no other match).
+                                if !any_prefix_is_user_module {
+                                    let head = segments[0];
+                                    self.push_error(
+                                        "E0151",
+                                        span.clone(),
+                                        format!(
+                                            "`{name}` is not a known qualified name, and `{head}` is \
+                                             not a record binding in scope."
+                                        ),
+                                    );
+                                    return None;
+                                }
                             }
                         }
                     }
