@@ -1601,10 +1601,11 @@ is a single global capability.
 
 ### §10 — Modules and imports
 
-Sigil's stdlib lives in [`std/`](../std/). User code reaches a
-stdlib symbol via two declarations: an `import` line that names
-the module, and a `use` line that opts specific symbols into the
-file's bare namespace.
+Sigil programs may span a single file or multiple `.sigil` files. Sigil's
+stdlib lives in [`std/`](../std/). Both stdlib and user-written modules
+are reached via the same two declarations: an `import` line that makes
+a module addressable, and a `use` line that opts specific symbols into
+the file's bare namespace.
 
 ```sigil
 import std.option              // make `std.option` addressable
@@ -1693,11 +1694,9 @@ let m: O.Option[Int] = O.map(O.Some(7), fn (x: Int) -> Int ![] => x + 1);
 
 The alias `O` only applies to **qualified-path call sites**
 (`O.map(opt, f)`, `O.Some(7)`); it is not itself a binding and
-cannot appear on a `use` line. `use` declarations must always
-name the module's full `std.<name>` form (E0031: the `use`
-source must start with `std.`). To use names bare in this file,
-add `use std.option.{Option, Some, map};` alongside the aliased
-import.
+cannot appear on a `use` line. Module aliases work for both stdlib
+and user modules. To use names bare in this file, add
+`use std.option.{Option, Some, map};` alongside the aliased import.
 
 **Aliasing in `use`.** Two modules may export the same bare name
 (e.g., `map` is in `std.list`, `std.option`, and `std.result`).
@@ -1779,6 +1778,95 @@ sources will rewrite (re-strip + re-emit) those manual `use`
 lines. PR #173's N1 finding documents the specific case
 (`int_list_print_helper` and its 5 host tests).
 
+#### User-module imports
+
+A program may be split across multiple `.sigil` files. User modules
+use the **same** `import` / `use` syntax as the standard library:
+
+```sigil
+import app.parser        // make user module addressable
+import app.lexer         // another user module
+use app.parser.{parse};  // opt parse into bare namespace
+use app.lexer.{scan};    // opt scan into bare namespace
+
+fn main() -> Int ![] {
+  let tokens = scan(input);
+  let ast = parse(tokens);
+  0
+}
+```
+
+**Root-anchored location-independent resolution.** The **root** is
+the directory containing the entry file handed to the compiler (the
+file defining `main`). Every user import resolves against that fixed
+root, with dotted segments mapping to path segments:
+
+- `import app.parser` → `<root>/app/parser.sigil`
+- `import app.parser.lexer` → `<root>/app/parser/lexer.sigil`
+- `use app.parser.{parse}` → binds `parse` from `<root>/app/parser.sigil`
+
+The rule is identical from every file in the program — a given `import`
+means the same file regardless of which file writes it. The importing
+file's location never affects resolution. (The `std.` prefix is
+unchanged: it continues to resolve from the stdlib embedded in the
+compiler, and always wins for that prefix.)
+
+**Filesystem is the module tree.** There is no manifest and no
+module-declaration step. A module exists iff its `.sigil` file exists
+at the resolved path. Authors add a module by creating a file; nothing
+registers it.
+
+**Qualified vs. bare names.** Qualified calls (`app.parser.parse(...)`)
+always work and are the recommended form — they are self-documenting
+(the origin is in the call site) and avoid collision. Bare names
+(`parse(...)` after `use app.parser.{parse};`) are ergonomic and valid
+as long as the name is unambiguous across the file's imports. When a
+bare name is ambiguous — e.g., both `app.parser` and `helper.parser`
+export a `parse` function — the second `use` line is rejected with
+**E0147** (duplicate bare name). Fix by qualifying the call or by
+aliasing one of the imports:
+
+```sigil
+use app.parser.{parse as app_parse};
+use helper.parser.{parse as helper_parse};
+// ... now app_parse() and helper_parse() are unambiguous
+```
+
+**Error diagnostics.** User-module errors are designed to close the
+edit loop:
+
+- **E0032 (missing module):** names the missing module
+  (e.g., "module `app.parser` not found").
+- **E0033 (module cycle):** names the cycle-closing module
+  (e.g., "circular import involving `app.parser`").
+
+**Third-party libraries via vendoring.** Third-party code requires
+**zero additional language machinery** — it is vendored source that
+lives in the project tree and imports through the identical root-anchored
+rule. There is deliberately **no package manager, registry, version
+resolver, lockfile, or network fetch.**
+
+By convention, vendored third-party source lives under a `deps.`-
+prefixed root:
+
+```sigil
+import deps.json5.parse      // → <root>/deps/json5/parse.sigil
+import deps.http.client      // → <root>/deps/http/client.sigil
+use deps.json5.{parse};
+use deps.http.client.{get};
+```
+
+The `deps.` prefix is a recommended layout convention, **not** a special
+language construct — it resolves by the ordinary root-anchored rule.
+Provenance-in-the-name tells an LLM author at the call site that the code
+is external, the same way qualified calls put origin in the call. This
+keeps programs self-contained, byte-reproducible, and offline.
+
+**Generics across modules.** A generic function defined in one user
+module and instantiated from another monomorphizes into the single
+compilation unit, exactly as cross-module stdlib generics do today.
+There are no separate or precompiled module artifacts.
+
 ### §11 — Diagnostics
 
 Compiler errors are emitted as JSONL on stderr by default:
@@ -1800,10 +1888,13 @@ Common codes:
 | Code | Meaning |
 |------|---------|
 | E0010 | parser syntax error |
+| E0032 | missing user module |
+| E0033 | module cycle detected |
 | E0042 | effect not in row |
 | E0044 | type mismatch |
 | E0066 | non-exhaustive match |
 | E0113 | duplicate type declaration |
+| E0147 | duplicate bare name across imports (qualification required) |
 
 Recent additions (Plan D + state-cell):
 
