@@ -19389,6 +19389,54 @@ fn std_json_render_jfloat() {
     assert_eq!(stdout, "3.14\n", "stderr={stderr:?}");
 }
 
+#[test]
+fn std_json_parse_float() {
+    let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.json\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               match json_parse(string_to_bytes(\"3.14\")) {\n\
+               Ok(v) => perform IO.println(json_render(v)),\n\
+               Err(_) => perform IO.println(\"ERR\"),\n\
+               };\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_float");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "3.14\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_int_vs_float() {
+    let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.json\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               match json_parse(string_to_bytes(\"42\")) {\n\
+               Ok(v) => perform IO.println(json_render(v)),\n\
+               Err(_) => perform IO.println(\"ERR\"),\n\
+               };\n\
+               match json_parse(string_to_bytes(\"3.14\")) {\n\
+               Ok(v) => perform IO.println(json_render(v)),\n\
+               Err(_) => perform IO.println(\"ERR\"),\n\
+               };\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_int_vs_float");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "42\n3.14\n", "stderr={stderr:?}");
+}
+
 // Plan State-Cell — deep-recursion State stress test. Pins the
 // invariant that `__set_then_arg` collapses the State.set arm body
 // to a single tail-`k` call so it doesn't push an

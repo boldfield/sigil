@@ -345,11 +345,37 @@ fn __json_parse_positive_int(b: ByteArray) -> JValue ![State[Int], Raise[String]
 fn __json_parse_number(b: ByteArray) -> JValue ![State[Int], Raise[String]] {
   let pos: Int = perform State.get();
   let c: Int = __json_byte_at_or_neg1(b, pos);
-  if c == 45 {
-    let _adv: Int = perform State.set(pos + 1);
-    __json_parse_negative_int(b)
+  let check_start: Int = if c == 45 { pos + 1 } else { pos };
+  if __json_number_is_float(b, check_start) {
+    __json_parse_float(b)
   } else {
-    __json_parse_positive_int(b)
+    if c == 45 {
+      let _adv: Int = perform State.set(pos + 1);
+      __json_parse_negative_int(b)
+    } else {
+      __json_parse_positive_int(b)
+    }
+  }
+}
+
+fn __json_number_is_float(b: ByteArray, start: Int) -> Bool ![] {
+  __json_number_is_float_loop(b, start)
+}
+
+fn __json_number_is_float_loop(b: ByteArray, pos: Int) -> Bool ![] {
+  if pos >= byte_array_length(b) {
+    false
+  } else {
+    let c: Int = byte_to_int(byte_array_get(b, pos));
+    if c == 46 || c == 101 || c == 69 {
+      true
+    } else {
+      if __json_is_digit(c) {
+        __json_number_is_float_loop(b, pos + 1)
+      } else {
+        false
+      }
+    }
   }
 }
 
