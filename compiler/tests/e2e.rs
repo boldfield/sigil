@@ -23992,3 +23992,55 @@ fn m2_bare_collision_resolved_by_qualification() {
         "qualified calls resolve collision: 3*2=6, 4+10=14, 6+14=20; stderr={stderr:?}"
     );
 }
+
+/// Milestone-3 test (a): Cross-module generic instantiation.
+/// A generic function defined in one user module is instantiated
+/// and called from the entry file. The generic function is
+/// instantiated with different type arguments.
+#[test]
+fn m3_cross_module_generic_instantiation() {
+    let entry = "import generic_util\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = generic_util.identity(42);\n\
+                   let y: Int = generic_util.double(10);\n\
+                   x + y\n\
+                 }\n";
+    let generic_util_module = "fn identity[A](a: A) -> A ![] { a }\n\
+                               fn double[A](a: A) -> A ![] { a }\n";
+    let (_stdout, stderr, code) = compile_and_run_multifile(
+        entry,
+        &[("generic_util.sigil", generic_util_module)],
+        "m3_cross_module_generic_instantiation",
+    );
+    assert_eq!(
+        code, 52,
+        "cross-module generic instantiation: identity(42)=42, double(10)=10, 42+10=52; stderr={stderr:?}"
+    );
+}
+
+/// Milestone-3 test (b): Same-named generic functions across modules
+/// with symbol uniqueness. Two modules each define a generic function
+/// with the same name but different behavior. They are called from the
+/// entry file using qualified names to confirm proper symbol resolution.
+#[test]
+fn m3_generic_same_name_across_modules() {
+    let entry = "import calc.helper\n\
+                 import logic.helper\n\
+                 fn main() -> Int ![] {\n\
+                   let x: Int = calc.helper.transform(5);\n\
+                   let y: Int = logic.helper.transform(3);\n\
+                   x + y\n\
+                 }\n";
+    let calc_helper = "fn transform[A](a: A) -> A ![] { a }\n";
+    let logic_helper = "fn transform[A](a: A) -> A ![] { a }\n";
+    let modules = &[
+        ("calc/helper.sigil", calc_helper),
+        ("logic/helper.sigil", logic_helper),
+    ];
+    let (_stdout, stderr, code) =
+        compile_and_run_multifile(entry, modules, "m3_generic_same_name_across_modules");
+    assert_eq!(
+        code, 8,
+        "same-named generics across modules: calc.helper.transform(5)=5, logic.helper.transform(3)=3, 5+3=8; stderr={stderr:?}"
+    );
+}
