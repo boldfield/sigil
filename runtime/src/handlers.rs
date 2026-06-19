@@ -630,11 +630,17 @@ mod outer_post_arm_k_stack_api {
             let new_buf: Vec<u8> = vec![0u8; 256];
             let third_buf: Vec<u8> = vec![0u8; 256];
 
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
             let old_base = old_buf.as_ptr() as *mut c_void;
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
             let old_end = unsafe { (old_buf.as_ptr().add(old_buf.len())) as *mut c_void };
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
             let new_base = new_buf.as_ptr() as *mut c_void;
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
             let new_end = unsafe { (new_buf.as_ptr().add(new_buf.len())) as *mut c_void };
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
             let third_base = third_buf.as_ptr() as *mut c_void;
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
             let third_end = unsafe { (third_buf.as_ptr().add(third_buf.len())) as *mut c_void };
 
             // Register the old extent and seed OUTER_POST_ARM_K_LAST_ROOTED
