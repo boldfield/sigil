@@ -637,8 +637,11 @@ mod outer_post_arm_k_stack_api {
             let third_base = third_buf.as_ptr() as *mut c_void;
             let third_end = unsafe { (third_buf.as_ptr().add(third_buf.len())) as *mut c_void };
 
-            // Seed OUTER_POST_ARM_K_LAST_ROOTED with the initial extent to
-            // ensure the unregister branch is exercised on the first call.
+            // Register the old extent and seed OUTER_POST_ARM_K_LAST_ROOTED
+            // so the unregister branch is exercised on the first call.
+            unsafe {
+                crate::gc::GC_add_roots(old_base, old_end);
+            }
             OUTER_POST_ARM_K_LAST_ROOTED
                 .with(|cell| cell.set((old_base as usize, old_end as usize)));
 
