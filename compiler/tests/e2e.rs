@@ -1219,7 +1219,10 @@ fn fib_cps_shallow_perf_prints_610_under_100ms() {
     let source = root.join("examples/fib_cps_shallow_perf.sigil");
     let (stdout, stderr, code, elapsed) =
         compile_file_and_run_timed(&source, "fib_cps_shallow_perf_example");
-    assert_eq!(code, 0, "fib_cps_shallow_perf.sigil exit code; stderr={stderr:?}");
+    assert_eq!(
+        code, 0,
+        "fib_cps_shallow_perf.sigil exit code; stderr={stderr:?}"
+    );
     assert_eq!(
         stdout, "610\n",
         "fib_cps_shallow_perf.sigil stdout must be exactly \"610\\n\""
