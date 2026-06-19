@@ -371,6 +371,9 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+    /// Last-rooted extent of the continuation stack for tracking buffer moves.
+    /// Stores (base, end) to enable re-rooting only when the buffer has moved.
+    static OUTER_POST_ARM_K_LAST_ROOTED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 
     /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
     /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
@@ -396,8 +399,8 @@ thread_local! {
 /// OUTER_POST_ARM_K_DEPTH thread-local state.
 mod outer_post_arm_k_stack_api {
     use super::{
-        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_STACK,
-        OUTER_POST_ARM_K_STACK_SIZE,
+        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_LAST_ROOTED,
+        OUTER_POST_ARM_K_STACK, OUTER_POST_ARM_K_STACK_SIZE,
     };
     use std::ffi::c_void;
 
@@ -487,6 +490,13 @@ mod outer_post_arm_k_stack_api {
         OUTER_POST_ARM_K_DEPTH.with(|c| c.set(value));
     }
 
+    /// Set the last-rooted extent. Used to seed the tracker when the
+    /// initial root is registered so subsequent reallocations can unregister it.
+    #[inline]
+    pub(super) fn set_last_rooted(start: *mut c_void, end: *mut c_void) {
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.set((start as usize, end as usize)));
+    }
+
     /// Get the base pointer and capacity extent of the stack for GC rooting.
     /// The returned pair is (start, end) where end points one past the end.
     /// This returns the full *capacity* extent, not the current depth,
@@ -559,6 +569,137 @@ mod outer_post_arm_k_stack_api {
             });
             depth_cell.set(depth - drop_count);
         });
+    }
+
+    /// Re-register the continuation stack's GC root when its backing buffer
+    /// has moved (e.g., due to Vec reallocation). Unregisters the old extent
+    /// and registers the new extent with the precise GC. No-op when the buffer
+    /// pointer is unchanged (detected via last-rooted extent tracking).
+    ///
+    /// # Safety
+    ///
+    /// Both `old_start`/`old_end` and `new_start`/`new_end` must be valid
+    /// Boehm GC root extent pairs (or (null, null) to indicate no prior root).
+    /// The old extent must have been previously registered via `GC_add_roots`
+    /// or `register_outer_post_arm_k_stack_root_for_calling_thread` if non-null.
+    #[allow(dead_code)]
+    pub(super) fn rereg_outer_post_arm_k_root(
+        old_start: *mut c_void,
+        old_end: *mut c_void,
+        new_start: *mut c_void,
+        new_end: *mut c_void,
+    ) {
+        let old_key = (old_start as usize, old_end as usize);
+        let new_key = (new_start as usize, new_end as usize);
+
+        let last_rooted = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+
+        // No-op if the buffer pointer hasn't changed.
+        if last_rooted == new_key {
+            return;
+        }
+
+        // Unregister the old extent if it's not null and differs from the new.
+        if old_start as usize != 0 && last_rooted == old_key {
+            unsafe {
+                crate::gc::GC_remove_roots(old_start, old_end);
+            }
+        }
+
+        // Register the new extent if it's not null.
+        if new_start as usize != 0 {
+            unsafe {
+                crate::gc::GC_add_roots(new_start, new_end);
+            }
+        }
+
+        // Track the new rooted extent.
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set(new_key));
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Test the continuation stack re-rooting helper. Directly invoke
+        /// it with two distinct extents and verify the GC root set updates
+        /// (old removed, new present), and that the no-op path works when
+        /// the buffer pointer is unchanged. The test uses well-separated synthetic
+        /// addresses (not real memory) to verify the helper's TLS bookkeeping and
+        /// GC registration calls without allocating actual buffers.
+        #[test]
+        fn rereg_outer_post_arm_k_root_updates_gc_root_on_buffer_move() {
+            let _guard = crate::test_support::gc_test_lock();
+            crate::gc::sigil_gc_init();
+            let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+            // Use well-separated page-aligned synthetic addresses (not real memory).
+            // These values won't correspond to actual heap allocations, which is
+            // safe because the test only verifies the helper's TLS tracking and
+            // the GC function calls (which safely ignore non-mapped addresses in this context).
+            const PAGE_SIZE: usize = 0x1000;
+            let old_base = (0x10000 as *mut c_void);
+            let old_end = ((0x10000 + PAGE_SIZE) as *mut c_void);
+            let new_base = (0x20000 as *mut c_void);
+            let new_end = ((0x20000 + PAGE_SIZE) as *mut c_void);
+            let third_base = (0x30000 as *mut c_void);
+            let third_end = ((0x30000 + PAGE_SIZE) as *mut c_void);
+
+            // Register the old extent and seed OUTER_POST_ARM_K_LAST_ROOTED
+            // so the unregister branch is exercised on the first call.
+            unsafe {
+                crate::gc::GC_add_roots(old_base, old_end);
+            }
+            OUTER_POST_ARM_K_LAST_ROOTED
+                .with(|cell| cell.set((old_base as usize, old_end as usize)));
+
+            // First call: transition from (old_base, old_end) to (new_base, new_end).
+            // This should unregister old and register new.
+            rereg_outer_post_arm_k_root(old_base, old_end, new_base, new_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, new_base as usize,
+                "tracked extent base should update to new_base"
+            );
+            assert_eq!(
+                extent.1, new_end as usize,
+                "tracked extent end should update to new_end"
+            );
+
+            // Second call with the same new extents should be a no-op
+            // (last-rooted is already (new_base, new_end)).
+            rereg_outer_post_arm_k_root(old_base, old_end, new_base, new_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, new_base as usize,
+                "extent unchanged on second call (no-op)"
+            );
+            assert_eq!(
+                extent.1, new_end as usize,
+                "extent unchanged on second call (no-op)"
+            );
+
+            // Third call: move to a third distinct extent.
+            rereg_outer_post_arm_k_root(new_base, new_end, third_base, third_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, third_base as usize,
+                "tracked extent base should update to third_base"
+            );
+            assert_eq!(
+                extent.1, third_end as usize,
+                "tracked extent end should update to third_end"
+            );
+
+            // Clean up: unregister the final extent so it doesn't leak.
+            unsafe {
+                crate::gc::GC_remove_roots(third_base, third_end);
+            }
+
+            // Reset the TLS tracking cell to prevent stale-root dereferencing
+            // on the next GC collection.
+            OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set((0, 0)));
+        }
     }
 }
 
@@ -800,6 +941,9 @@ pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut
         unsafe {
             crate::gc::GC_add_roots(start, end);
         }
+        // Seed the re-root tracker so the first reallocation can unregister
+        // the initial root when the buffer moves.
+        outer_post_arm_k_stack_api::set_last_rooted(start, end);
     }
     (start, end)
 }

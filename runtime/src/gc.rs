@@ -80,13 +80,16 @@ extern "C" {
     // (TLS slots are not enumerated portably; the arena's `Vec<u8>`
     // payload lives on the system allocator's heap, not Boehm's).
     pub(crate) fn GC_add_roots(start: *mut c_void, end: *mut c_void);
-    // Symmetric counterpart to `GC_add_roots`. Used by
-    // `GcThreadEnrolment::drop` in tests to unregister a thread-local
-    // root range when the thread is about to exit (cargo test spawns
-    // a fresh thread per test under `--test-threads=N`; without
-    // unregistration, stale ranges from finished test threads pile up
-    // in Boehm's root list and segfault on the next collection).
-    #[cfg(test)]
+    // Symmetric counterpart to `GC_add_roots`. Used to unregister a
+    // root range. In tests, `GcThreadEnrolment::drop` calls this to
+    // unregister a thread-local root range when the thread is about to
+    // exit (cargo test spawns a fresh thread per test under
+    // `--test-threads=N`; without unregistration, stale ranges from
+    // finished test threads pile up in Boehm's root list and segfault
+    // on the next collection). In production, used by the continuation
+    // stack re-rooting helper when the Vec backing buffer is reallocated
+    // to a new address.
+    #[allow(dead_code)]
     pub(crate) fn GC_remove_roots(start: *mut c_void, end: *mut c_void);
     // Force a full GC cycle. Used by GC stress tests to deterministically
     // exercise reachability — without it, a passing test under low
