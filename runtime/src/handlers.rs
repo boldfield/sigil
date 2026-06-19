@@ -366,11 +366,8 @@ struct OuterPostArmKEntry {
 }
 
 thread_local! {
-    static OUTER_POST_ARM_K_STACK: Cell<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> = const {
-        Cell::new([OuterPostArmKEntry {
-            closure_ptr: ptr::null_mut(),
-            fn_ptr: ptr::null_mut(),
-        }; OUTER_POST_ARM_K_STACK_SIZE])
+    static OUTER_POST_ARM_K_STACK: RefCell<Vec<OuterPostArmKEntry>> = const {
+        RefCell::new(Vec::new())
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
@@ -413,12 +410,23 @@ mod outer_post_arm_k_stack_api {
                 return false;
             }
             OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                let mut stack = stack_cell.get();
+                let mut stack = stack_cell.borrow_mut();
+                if stack.capacity() == 0 {
+                    stack.reserve(OUTER_POST_ARM_K_STACK_SIZE);
+                }
+                if depth >= stack.len() {
+                    stack.resize(
+                        depth + 1,
+                        OuterPostArmKEntry {
+                            closure_ptr: std::ptr::null_mut(),
+                            fn_ptr: std::ptr::null_mut(),
+                        },
+                    );
+                }
                 stack[depth] = OuterPostArmKEntry {
                     closure_ptr,
                     fn_ptr,
                 };
-                stack_cell.set(stack);
             });
             depth_cell.set(depth + 1);
             if trace_opak() {
@@ -444,7 +452,7 @@ mod outer_post_arm_k_stack_api {
             } else {
                 depth_cell.set(depth - 1);
                 OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                    let mut stack = stack_cell.get();
+                    let mut stack = stack_cell.borrow_mut();
                     let popped = stack[depth - 1];
                     // Clear the slot so a stale pointer doesn't survive
                     // in the TLS-rooted range across the next GC scan.
@@ -452,7 +460,6 @@ mod outer_post_arm_k_stack_api {
                         closure_ptr: std::ptr::null_mut(),
                         fn_ptr: std::ptr::null_mut(),
                     };
-                    stack_cell.set(stack);
                     if trace_opak() {
                         eprintln!(
                             "[OPAK POP] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
@@ -480,16 +487,18 @@ mod outer_post_arm_k_stack_api {
         OUTER_POST_ARM_K_DEPTH.with(|c| c.set(value));
     }
 
-    /// Get the base pointer and length of the stack for GC rooting.
+    /// Get the base pointer and capacity extent of the stack for GC rooting.
     /// The returned pair is (start, end) where end points one past the end.
+    /// This returns the full *capacity* extent, not the current depth,
+    /// to match the array version's full-extent root.
     pub(super) fn root_extent() -> (*mut c_void, *mut c_void) {
         OUTER_POST_ARM_K_STACK.with(|cell| {
-            let start = cell as *const _ as *mut c_void;
-            let end = unsafe {
-                (start as *mut u8).add(core::mem::size_of::<
-                    [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE],
-                >()) as *mut c_void
-            };
+            let stack = cell.borrow();
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; range bounded by
+            // capacity * sizeof(Entry); storage lives for thread lifetime).
+            let start = stack.as_ptr() as *mut c_void;
+            let capacity_bytes = stack.capacity() * core::mem::size_of::<OuterPostArmKEntry>();
+            let end = unsafe { (start as *mut u8).add(capacity_bytes) as *mut c_void };
             (start, end)
         })
     }
@@ -497,7 +506,7 @@ mod outer_post_arm_k_stack_api {
     /// Check if any entry in the range [min_depth, max_depth) has the given fn_ptr.
     pub(super) fn has_fn_ptr_in_range(fn_ptr: *mut u8, min_depth: usize, max_depth: usize) -> bool {
         OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-            let stack = stack_cell.get();
+            let stack = stack_cell.borrow();
             let mut i = max_depth;
             while i > min_depth {
                 i -= 1;
@@ -541,14 +550,13 @@ mod outer_post_arm_k_stack_api {
                 return;
             }
             OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                let mut stack = stack_cell.get();
+                let mut stack = stack_cell.borrow_mut();
                 for i in 0..drop_count {
                     stack[depth - 1 - i] = OuterPostArmKEntry {
                         closure_ptr: std::ptr::null_mut(),
                         fn_ptr: std::ptr::null_mut(),
                     };
                 }
-                stack_cell.set(stack);
             });
             depth_cell.set(depth - drop_count);
         });
@@ -775,6 +783,14 @@ pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut
 /// [`register_handler_stack_root_for_calling_thread`]'s discipline.
 pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
 {
+    // Pre-reserve the stack to capacity 256 before registering with GC,
+    // so root_extent() captures the real heap buffer, not a dangling pointer.
+    OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+        let mut stack = stack_cell.borrow_mut();
+        if stack.capacity() == 0 {
+            stack.reserve(OUTER_POST_ARM_K_STACK_SIZE);
+        }
+    });
     let (start, end) = outer_post_arm_k_stack_api::root_extent();
     let already_registered = OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| {
         let r = rooted.get();
