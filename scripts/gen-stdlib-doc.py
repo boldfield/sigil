@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Generate docs/stdlib.raw.md — a raw API reference for the Sigil stdlib,
-extracted from std/*.sigil at a given tag/ref (public types + function
-signatures + each module's purpose). Internal `__`-prefixed helpers are
-excluded. Front-matter-less, so GitHub Pages serves it verbatim at
-sigillang.ai/stdlib.raw.md for LLM ingestion.
+extracted from std/*.sigil at a given tag/ref: public types, function
+signatures, AND builtin-effect operations (invoked via `perform`, whose
+signatures live in module doc-comments, e.g. `IO.read_line() -> String`).
+Internal `__`-prefixed helpers are excluded. Front-matter-less, so GitHub
+Pages serves it verbatim at sigillang.ai/stdlib.raw.md for LLM ingestion.
 
 Usage: scripts/gen-stdlib-doc.py [ref]   (ref defaults to v1.2.0)
 """
@@ -12,6 +13,9 @@ import subprocess, re, os, sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REF = sys.argv[1] if len(sys.argv) > 1 else "v1.2.0"
 OUT = os.path.join(REPO, "docs", "stdlib.raw.md")
+NOISE = re.compile(r'(Plan [A-Z]|post-PR|PR #\d|Task \d|follow-on|addendum|'
+                   r'Tier \d|Stage \d|Documentation only|DEVIATION)', re.I)
+PAREN = re.compile(r'\s*\((?:post-PR|Plan|Tier|Stage|Task)[^)]*\)\.?')
 
 def git(*args):
     return subprocess.run(["git", "-C", REPO, *args],
@@ -22,7 +26,12 @@ def module_purpose(lines, mod):
                 if ln.strip().startswith("//") and f"std/{mod}.sigil" in ln), None)
     if hdr is None:
         return ""
-    noise = re.compile(r'(Plan [A-Z]|post-PR|PR #\d|Task \d|follow-on|addendum|Tier \d|Stage \d)', re.I)
+    # 1) prefer the header line's own post-dash description
+    m = re.search(r'[—-]\s*(.+)', lines[hdr])
+    head = PAREN.sub('', m.group(1).strip()) if m else ""
+    if head and not NOISE.search(head):
+        return head
+    # 2) else the first non-noise comment block after the header
     k = hdr + 1
     while k < len(lines) and lines[k].strip() == "//":
         k += 1
@@ -31,13 +40,27 @@ def module_purpose(lines, mod):
         t = lines[k].strip().lstrip("/").strip()
         if t == "":
             break
-        if not desc and noise.search(t):
+        if NOISE.search(t):
+            if desc:
+                break
             k += 1; continue
         desc.append(t); k += 1
         if len(desc) >= 2:
             break
-    p = " ".join(desc)
-    return re.sub(r'\s*\((?:post-PR|Plan|Tier|Stage|Task)[^)]*\)\.?', '', p).strip()
+    return PAREN.sub('', " ".join(desc)).strip()
+
+def effect_ops(lines):
+    """Backtick-wrapped `Effect.op(args) -> ret` signatures from comments."""
+    pat = re.compile(r'`([A-Z]\w*\.\w+\([^`]*\)\s*->\s*[^`]+?)`')
+    ops, seen = [], set()
+    for ln in lines:
+        if not ln.strip().startswith("//"):
+            continue
+        for m in pat.finditer(ln):
+            sig = re.sub(r'\s+', ' ', m.group(1)).strip()
+            if sig not in seen:
+                seen.add(sig); ops.append(sig)
+    return ops
 
 def public_types(lines):
     out, i, n = [], 0, len(lines)
@@ -70,9 +93,10 @@ doc = [
  "",
  f"Generated from `std/*.sigil` at Sigil {REF}. Import a module as",
  "`import std.<name>`; call qualified (`std.<name>.<fn>(...)`) or bind names",
- "with `use std.<name>.{<fn>};`. Signatures show parameter types, the return",
- "type, and the effect row `![...]` (`![]` = pure). Reuse these types and",
- "functions — never redefine `JValue`, `List`, `Option`, etc.",
+ "with `use std.<name>.{<fn>};`. Builtin **effects** (IO, Fs, Env, ...) are",
+ "invoked with `perform <Effect>.<op>(...)`. Signatures show parameter types,",
+ "the return type, and the effect row `![...]` (`![]` = pure). Reuse these",
+ "types and functions — never redefine `JValue`, `List`, `Option`, etc.",
  "",
 ]
 for path in paths:
@@ -82,6 +106,10 @@ for path in paths:
     p = module_purpose(lines, mod)
     if p:
         doc.append(p); doc.append("")
+    ops = effect_ops(lines)
+    if ops:
+        doc.append("Effect operations (invoke with `perform`):"); doc.append("```")
+        doc.extend(ops); doc.append("```"); doc.append("")
     ts = public_types(lines)
     if ts:
         doc.append("Types:"); doc.append("```")

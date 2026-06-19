@@ -2,9 +2,10 @@
 
 Generated from `std/*.sigil` at Sigil v1.2.0. Import a module as
 `import std.<name>`; call qualified (`std.<name>.<fn>(...)`) or bind names
-with `use std.<name>.{<fn>};`. Signatures show parameter types, the return
-type, and the effect row `![...]` (`![]` = pure). Reuse these types and
-functions — never redefine `JValue`, `List`, `Option`, etc.
+with `use std.<name>.{<fn>};`. Builtin **effects** (IO, Fs, Env, ...) are
+invoked with `perform <Effect>.<op>(...)`. Signatures show parameter types,
+the return type, and the effect row `![...]` (`![]` = pure). Reuse these
+types and functions — never redefine `JValue`, `List`, `Option`, etc.
 
 ## std.array
 
@@ -26,7 +27,7 @@ fn string_from_bytes(ba: ByteArray) -> Option[String] ![]
 
 ## std.char
 
-**Documentation only.** The `Char` primitive type and its operations are registered at the typechecker as builtins via
+operations are registered at the typechecker as builtins via `register_builtin_char_schemes()`. Edits to this file have no
 
 ## std.choose
 
@@ -64,7 +65,7 @@ fn env_vars() -> List[(String, String)] ![Env]
 
 ## std.float
 
-The `Float` type and its arithmetic/comparison/math/conversion builtins are registered at the typechecker via
+`Float` type + operations.
 
 Functions:
 ```
@@ -155,7 +156,14 @@ This file is listed in `compiler/src/imports.rs::BUILTIN_INJECTED` — `import s
 
 ## std.io
 
-injection (vs. full stdlib loading)` in PLAN_B_DEVIATIONS.md, the `effect IO { ... }` declaration is constructed in code by
+IO effect declaration.
+
+Effect operations (invoke with `perform`):
+```
+IO.print(s: String) -> Unit
+IO.println(s: String) -> Unit
+IO.read_line() -> String
+```
 
 ## std.json
 
@@ -248,7 +256,7 @@ fn map_char_keys[V]() -> Map[Char, V] ![]
 
 ## std.mem
 
-**Documentation only.** The `Mem` effect ships as a synthetic builtin in Plan C Task 66 (`[DEVIATION Task 66]` in
+injection pattern. Edits to this file have no effect on compilation. `import std.mem` is allowed (skip-list path) but is
 
 ## std.mut_array
 
@@ -315,7 +323,7 @@ This module is a documentation-only header. Both functions are builtin-injected:
 
 ## std.path
 
-Slash-separated, no filesystem access (that is std.fs's job). Every function is pure (![]). Semantics match Python's `posixpath`
+pure-string POSIX path manipulation.
 
 Functions:
 ```
@@ -415,7 +423,7 @@ fn set_char() -> Set[Char] ![]
 
 ## std.state
 
-`State[S]` is the canonical mutable-state-via-effect surface, parametric over the state type `S`. A computation accesses an
+runtime-cell-backed State implementation.
 
 Functions:
 ```
