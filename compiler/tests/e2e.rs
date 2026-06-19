@@ -1201,6 +1201,38 @@ fn fib_cps_perf_example_prints_6765_under_500ms() {
     );
 }
 
+/// Plan E3 Phase 1 (PR #245) — shallow-path performance guard for the
+/// growable continuation stack. Computes fib(15) = 610 forced to
+/// CPS-color via `perform State.get()` at each call. Max call stack
+/// depth is 15, staying well under the old 256-frame cap. The Vec-based
+/// growable stack with amortized reallocation must show zero regression
+/// in steady state (no per-push overhead) for shallow pushes.
+///
+/// **Why fib(15)**: Shallow enough to never trigger growth (stays <<256),
+/// yet substantial enough (610 function calls) to yield meaningful
+/// wall-clock time for measurement without inflating workflow runtime.
+///
+/// Invariant: stdout = "610\n", stderr = "", exit 0, wall-clock < 100ms.
+#[test]
+fn fib_cps_shallow_perf_prints_610_under_100ms() {
+    let root = workspace_root();
+    let source = root.join("examples/fib_cps_shallow_perf.sigil");
+    let (stdout, stderr, code, elapsed) =
+        compile_file_and_run_timed(&source, "fib_cps_shallow_perf_example");
+    assert_eq!(
+        code, 0,
+        "fib_cps_shallow_perf.sigil exit code; stderr={stderr:?}"
+    );
+    assert_eq!(
+        stdout, "610\n",
+        "fib_cps_shallow_perf.sigil stdout must be exactly \"610\\n\""
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "fib_cps_shallow_perf.sigil wall-clock {elapsed:?} exceeds the 100ms Plan E3 shallow-path floor (no regression vs fixed-array)",
+    );
+}
+
 /// Plan B Task 60 — performance floor #3: multi-shot Choose stress
 /// driver. Plan wording calls for "Multi-shot stress test (3-element
 /// Choose combinator, N=1000 iterations) in <5s on both hosts".
