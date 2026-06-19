@@ -616,35 +616,74 @@ mod outer_post_arm_k_stack_api {
 
         /// Test the continuation stack re-rooting helper. Directly invoke
         /// it with two distinct extents and verify the GC root set updates
-        /// (old removed, new present). The test calls the helper with two
-        /// different buffer addresses to simulate a buffer move (e.g., from
-        /// Vec reallocation). Verifies that the helper correctly unregisters
-        /// the old root and registers the new one, and that calling it again
-        /// with the same extent is a no-op (tracked via last-rooted extent).
+        /// (old removed, new present), and that the no-op path works when
+        /// the buffer pointer is unchanged. The test uses real allocated
+        /// buffers and asserts transitions in the tracked last-rooted extent.
         #[test]
         fn rereg_outer_post_arm_k_root_updates_gc_root_on_buffer_move() {
-            // Create two distinct extent pairs to simulate a buffer move.
-            let old_base = 0x1000_usize as *mut c_void;
-            let old_end = 0x1100_usize as *mut c_void;
-            let new_base = 0x2000_usize as *mut c_void;
-            let new_end = 0x2100_usize as *mut c_void;
+            let _guard = crate::test_support::gc_test_lock();
+            crate::gc::sigil_gc_init();
+            let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+            // Allocate three real buffers to use as extent pairs.
+            let old_buf: Vec<u8> = vec![0u8; 256];
+            let new_buf: Vec<u8> = vec![0u8; 256];
+            let third_buf: Vec<u8> = vec![0u8; 256];
+
+            let old_base = old_buf.as_ptr() as *mut c_void;
+            let old_end = unsafe { (old_buf.as_ptr().add(old_buf.len())) as *mut c_void };
+            let new_base = new_buf.as_ptr() as *mut c_void;
+            let new_end = unsafe { (new_buf.as_ptr().add(new_buf.len())) as *mut c_void };
+            let third_base = third_buf.as_ptr() as *mut c_void;
+            let third_end = unsafe { (third_buf.as_ptr().add(third_buf.len())) as *mut c_void };
+
+            // Seed OUTER_POST_ARM_K_LAST_ROOTED with the initial extent to
+            // ensure the unregister branch is exercised on the first call.
+            OUTER_POST_ARM_K_LAST_ROOTED
+                .with(|cell| cell.set((old_base as usize, old_end as usize)));
 
             // First call: transition from (old_base, old_end) to (new_base, new_end).
             // This should unregister old and register new.
             rereg_outer_post_arm_k_root(old_base, old_end, new_base, new_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, new_base as usize,
+                "tracked extent base should update to new_base"
+            );
+            assert_eq!(
+                extent.1, new_end as usize,
+                "tracked extent end should update to new_end"
+            );
 
             // Second call with the same new extents should be a no-op
             // (last-rooted is already (new_base, new_end)).
             rereg_outer_post_arm_k_root(old_base, old_end, new_base, new_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, new_base as usize,
+                "extent unchanged on second call (no-op)"
+            );
+            assert_eq!(
+                extent.1, new_end as usize,
+                "extent unchanged on second call (no-op)"
+            );
 
             // Third call: move to a third distinct extent.
-            let third_base = 0x3000_usize as *mut c_void;
-            let third_end = 0x3100_usize as *mut c_void;
             rereg_outer_post_arm_k_root(new_base, new_end, third_base, third_end);
+            let extent = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, third_base as usize,
+                "tracked extent base should update to third_base"
+            );
+            assert_eq!(
+                extent.1, third_end as usize,
+                "tracked extent end should update to third_end"
+            );
 
-            // Verify no panics or crashes — the helper's GC root operations
-            // succeeded. Actual GC root set membership would require introspection
-            // into Boehm's internal state, which is not available in unit tests.
+            // Clean up: unregister the final extent so it doesn't leak.
+            unsafe {
+                crate::gc::GC_remove_roots(third_base, third_end);
+            }
         }
     }
 }
