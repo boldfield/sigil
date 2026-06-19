@@ -86,7 +86,15 @@ extern "C" {
     // a fresh thread per test under `--test-threads=N`; without
     // unregistration, stale ranges from finished test threads pile up
     // in Boehm's root list and segfault on the next collection).
-    #[cfg(test)]
+    //
+    // Also referenced (currently unwired) by
+    // `handlers::rereg_outer_post_arm_k_root`, which drops the stale
+    // root range when the continuation stack's backing buffer moves —
+    // so the extern can no longer be test-only. The Boehm symbol is
+    // always present in libgc; `#[allow(dead_code)]` keeps it quiet
+    // until the stack-growth task wires the re-root helper onto a hot
+    // path.
+    #[allow(dead_code)]
     pub(crate) fn GC_remove_roots(start: *mut c_void, end: *mut c_void);
     // Force a full GC cycle. Used by GC stress tests to deterministically
     // exercise reachability — without it, a passing test under low
