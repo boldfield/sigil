@@ -830,6 +830,76 @@ pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut
     (start, end)
 }
 
+/// A precise-GC root-set mutation issued by
+/// [`rereg_outer_post_arm_k_root`]. Under `cfg(test)` the helper records
+/// these (see [`REROOT_GC_OP_LOG`]) instead of mutating Boehm's real root
+/// set, so a unit test can assert the helper's add/remove decision —
+/// "old removed, new present" — directly and without any GC-table risk.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RerootGcOp {
+    /// Unregister `[start, end)` — fields are `(start_addr, end_addr)`.
+    Remove(usize, usize),
+    /// Register `[start, end)` — fields are `(start_addr, end_addr)`.
+    Add(usize, usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// In-test log of the GC root mutations `rereg_outer_post_arm_k_root`
+    /// would issue. Real in-process `GC_add_roots`/`GC_remove_roots` on the
+    /// synthetic extents a unit test supplies corrupt Boehm's dynamic root
+    /// table (Boehm rounds/coalesces ranges) and SIGSEGV at the next
+    /// collection — the failure mode every prior real-Boehm test hit. So
+    /// under test the helper records its decision here; the production
+    /// (`cfg(not(test))`) path calls Boehm directly. Drained by the test.
+    static REROOT_GC_OP_LOG: RefCell<Vec<RerootGcOp>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Empty the re-root GC-op log (test-only).
+#[cfg(test)]
+fn reroot_gc_clear_log() {
+    REROOT_GC_OP_LOG.with(|log| log.borrow_mut().clear());
+}
+
+/// Take and clear the re-root GC-op log (test-only).
+#[cfg(test)]
+fn reroot_gc_take_log() -> Vec<RerootGcOp> {
+    REROOT_GC_OP_LOG.with(|log| std::mem::take(&mut *log.borrow_mut()))
+}
+
+/// Unregister `[start, end)` from the precise GC as part of a re-root.
+/// Production forwards to Boehm; under test it records the intent in
+/// [`REROOT_GC_OP_LOG`] without touching Boehm's root set.
+#[allow(dead_code)]
+fn reroot_gc_remove(start: *mut c_void, end: *mut c_void) {
+    #[cfg(test)]
+    REROOT_GC_OP_LOG.with(|log| {
+        log.borrow_mut()
+            .push(RerootGcOp::Remove(start as usize, end as usize))
+    });
+    #[cfg(not(test))]
+    unsafe {
+        crate::gc::GC_remove_roots(start, end);
+    }
+}
+
+/// Register `[start, end)` with the precise GC as part of a re-root.
+/// Production forwards to Boehm; under test it records the intent in
+/// [`REROOT_GC_OP_LOG`] without touching Boehm's root set.
+#[allow(dead_code)]
+fn reroot_gc_add(start: *mut c_void, end: *mut c_void) {
+    #[cfg(test)]
+    REROOT_GC_OP_LOG.with(|log| {
+        log.borrow_mut()
+            .push(RerootGcOp::Add(start as usize, end as usize))
+    });
+    #[cfg(not(test))]
+    unsafe {
+        crate::gc::GC_add_roots(start, end);
+    }
+}
+
 /// Re-register the calling thread's `OUTER_POST_ARM_K_STACK` precise-GC
 /// root after its backing buffer has moved (a `Vec` realloc): unregister
 /// the previously-rooted `[old_start, old_end)` extent, register the new
@@ -861,16 +931,16 @@ pub(crate) fn rereg_outer_post_arm_k_root(
     if outer_post_arm_k_stack_api::last_rooted() == new_key {
         return;
     }
-    unsafe {
-        // Drop the stale root *before* adding the new one, so the GC never
-        // holds two ranges for the same logical buffer and never scans the
-        // moved-from extent. `old_start` is null only when nothing was
-        // rooted yet (initial registration handles that path).
-        if !old_start.is_null() {
-            crate::gc::GC_remove_roots(old_start, old_end);
-        }
-        crate::gc::GC_add_roots(new_start, new_end);
+    // Drop the stale root *before* adding the new one, so the GC never
+    // holds two ranges for the same logical buffer and never scans the
+    // moved-from extent. `old_start` is null only when nothing was rooted
+    // yet (initial registration handles that path). The GC mutation goes
+    // through `reroot_gc_remove`/`reroot_gc_add`, which call Boehm in
+    // production and record into `REROOT_GC_OP_LOG` under test.
+    if !old_start.is_null() {
+        reroot_gc_remove(old_start, old_end);
     }
+    reroot_gc_add(new_start, new_end);
     outer_post_arm_k_stack_api::set_last_rooted(new_start, new_end);
 }
 
@@ -2858,125 +2928,99 @@ mod tests {
         crate::gc::sigil_gc_init();
     }
 
-    /// Directly exercise `rereg_outer_post_arm_k_root`: walk the helper
-    /// through a move, an unchanged-buffer no-op, and a second move, and
-    /// assert after each call that the tracked last-rooted extent
-    /// (`OUTER_POST_ARM_K_LAST_ROOTED`, the testable proxy for "which
-    /// extent is registered with Boehm") transitioned as the spec requires
-    /// — old extent dropped, new extent registered, and no change on the
-    /// no-op path.
+    /// Directly exercise `rereg_outer_post_arm_k_root`: invoke the real
+    /// helper through a move, an unchanged-buffer no-op, a second move, and
+    /// the first-registration (null-old) path, asserting after each call
+    /// both halves of its contract:
+    ///   - the GC root-set mutation it issued — the *old extent removed* and
+    ///     the *new extent added*, in that order, and *nothing* on the no-op
+    ///     path — captured via the test-only [`REROOT_GC_OP_LOG`]; and
+    ///   - the tracked last-rooted extent (`OUTER_POST_ARM_K_LAST_ROOTED`),
+    ///     which the helper advances in lockstep with those mutations.
     ///
-    /// Boehm exposes no way to enumerate the dynamic root set, so the
-    /// last-rooted tracker is the observable contract: the helper only ever
-    /// writes it in lockstep with its `GC_add_roots`/`GC_remove_roots`
-    /// calls, so a wrong add/remove decision is a wrong tracker value.
-    ///
-    /// GC safety: every extent registered is a real, capacity-256 `Vec`
-    /// buffer (the same backing store and size the production stack uses),
-    /// kept alive until after cleanup, and the helper holds at most one of
-    /// them rooted at a time — it drops the old root before adding the new.
-    /// A forced collection mid-test would crash on any stale/unmapped root;
-    /// it must succeed. The final root is removed and the tracker reset
-    /// before the buffers drop, leaving Boehm's root set as we found it.
+    /// Why no real Boehm calls: under `cfg(test)` the helper records its
+    /// add/remove decision instead of calling `GC_add_roots`/
+    /// `GC_remove_roots` (see `reroot_gc_remove`/`reroot_gc_add`). Issuing
+    /// those on synthetic extents in the shared cargo-test process corrupts
+    /// Boehm's dynamic root table — it rounds/coalesces ranges — and SIGSEGVs
+    /// at the next collection (the failure mode every prior real-Boehm
+    /// attempt hit, on both Linux and macOS). Recording the decision asserts
+    /// the exact "old removed, new present" contract the spec asks for with
+    /// zero GC-table risk, so this test is portable and crash-proof. The
+    /// extents are never dereferenced — only their addresses are recorded —
+    /// so they need no backing memory and need not be page-mapped.
     #[test]
     fn rereg_outer_post_arm_k_root_transitions_gc_root_on_buffer_move() {
-        let _guard = crate::test_support::gc_test_lock();
-        ensure_gc();
-        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        let p = |addr: usize| addr as *mut c_void;
+        // Three well-separated synthetic extents standing in for the stack
+        // backing buffer before and after two reallocations.
+        let (old_start, old_end) = (p(0x1000), p(0x2000));
+        let (new_start, new_end) = (p(0x3000), p(0x4000));
+        let (third_start, third_end) = (p(0x5000), p(0x6000));
 
-        // Three distinct backing buffers standing in for the stack before
-        // and after two reallocations, each capacity-256 (the production
-        // stack's size and backing type).
-        //
-        // They are deliberately LEAKED (`'static`). Boehm's
-        // `GC_remove_roots` only reliably drops a root range that *exactly*
-        // matches a previously-added one — it may round ranges to its own
-        // granularity and silently retain a partially-overlapping segment.
-        // If such a retained root pointed into a buffer we then freed, the
-        // next collection (a later test's, or the test binary's process-exit
-        // sweep) would scan freed memory and SIGSEGV. Leaking the storage
-        // means every extent we ever register points into permanently-mapped
-        // memory, so even an imperfectly-removed root can never dereference
-        // freed memory. The few KiB leaked once per test run is the price of
-        // a SIGSEGV-proof GC-root test. Each is zero-initialised so a scan
-        // sees only null words (no spurious conservative retention).
-        let leak_extent = || -> (*mut c_void, *mut c_void) {
-            let buf: Box<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> = Box::new(
-                [OuterPostArmKEntry {
-                    closure_ptr: ptr::null_mut(),
-                    fn_ptr: ptr::null_mut(),
-                }; OUTER_POST_ARM_K_STACK_SIZE],
-            );
-            let leaked: &'static mut [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] =
-                Box::leak(buf);
-            // SAFETY: gc-heap-ptr arithmetic (leaked 'static buffer; len*sizeof(Entry) bound).
-            let start = leaked.as_mut_ptr() as *mut c_void;
-            let bytes = leaked.len() * core::mem::size_of::<OuterPostArmKEntry>();
-            // SAFETY: gc-heap-ptr arithmetic (one-past-end of the leaked buffer).
-            let end = unsafe { (start as *mut u8).add(bytes) as *mut c_void };
-            (start, end)
-        };
-        let key = |s: *mut c_void, e: *mut c_void| (s as usize, e as usize);
-
-        let (old_start, old_end) = leak_extent();
-        let (new_start, new_end) = leak_extent();
-        let (third_start, third_end) = leak_extent();
-
-        // Simulate the initial registration that
-        // `register_outer_post_arm_k_stack_root_for_calling_thread` would
-        // have performed: the `old` extent is the live root and the tracker
-        // knows it. This makes the helper's first `GC_remove_roots(old)`
-        // operate on a range Boehm actually holds.
-        unsafe {
-            crate::gc::GC_add_roots(old_start, old_end);
-        }
+        // Start from a known tracker state and an empty op log. Both are
+        // thread-locals that can carry over from an earlier test on the same
+        // thread under `--test-threads=1`, so seed them explicitly rather
+        // than rely on the initial `(0, 0)`.
+        reroot_gc_clear_log();
         outer_post_arm_k_stack_api::set_last_rooted(old_start, old_end);
-        assert_eq!(
-            outer_post_arm_k_stack_api::last_rooted(),
-            key(old_start, old_end),
-            "precondition: old extent is the live root"
-        );
 
-        // (1) Buffer moved old -> new: old root dropped, new root added.
+        // (1) Buffer moved old -> new: old root removed, then new root added.
         rereg_outer_post_arm_k_root(old_start, old_end, new_start, new_end);
         assert_eq!(
+            reroot_gc_take_log(),
+            vec![
+                RerootGcOp::Remove(old_start as usize, old_end as usize),
+                RerootGcOp::Add(new_start as usize, new_end as usize),
+            ],
+            "move must drop the old root before adding the new one"
+        );
+        assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key(new_start, new_end),
+            (new_start as usize, new_end as usize),
             "after move, last-rooted extent must be the new buffer"
         );
 
-        // (2) Buffer unchanged: no-op path — last-rooted extent unchanged,
-        // and the helper issues no GC add/remove (it returns before them).
+        // (2) Buffer unchanged: no-op path — no GC mutation, tracker frozen.
         rereg_outer_post_arm_k_root(new_start, new_end, new_start, new_end);
+        assert!(
+            reroot_gc_take_log().is_empty(),
+            "unchanged buffer must issue no GC root mutation"
+        );
         assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key(new_start, new_end),
-            "unchanged buffer must be a no-op (last-rooted extent stays put)"
+            (new_start as usize, new_end as usize),
+            "no-op must leave the last-rooted extent untouched"
         );
 
-        // (3) Buffer moved new -> third: new root dropped, third added.
+        // (3) Buffer moved new -> third: new root removed, then third added.
         rereg_outer_post_arm_k_root(new_start, new_end, third_start, third_end);
         assert_eq!(
+            reroot_gc_take_log(),
+            vec![
+                RerootGcOp::Remove(new_start as usize, new_end as usize),
+                RerootGcOp::Add(third_start as usize, third_end as usize),
+            ],
+            "second move must drop the new root before adding the third"
+        );
+        assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key(third_start, third_end),
+            (third_start as usize, third_end as usize),
             "second move must advance the last-rooted extent to the third buffer"
         );
 
-        // NB: we deliberately do NOT force a collection here. Every test in
-        // this file that calls `GC_gcollect()` is isolated into a subprocess
-        // (`in_stress_subprocess` / `run_stress_in_subprocess`), because a
-        // forced stop-the-world collection in the shared cargo-test process
-        // is unsafe. This test exercises the helper's register/unregister
-        // calls and asserts the resulting tracker state — the testable proxy
-        // for the GC root set — without needing a live mark phase.
-        // `GC_add_roots`/`GC_remove_roots` themselves are safe in-process
-        // (every `GcThreadEnrolment`-based test relies on exactly that).
+        // (4) First-ever registration: nothing rooted yet (null old) means
+        // add-only, never a remove of a phantom extent.
+        reroot_gc_clear_log();
+        outer_post_arm_k_stack_api::set_last_rooted(ptr::null_mut(), ptr::null_mut());
+        rereg_outer_post_arm_k_root(ptr::null_mut(), ptr::null_mut(), old_start, old_end);
+        assert_eq!(
+            reroot_gc_take_log(),
+            vec![RerootGcOp::Add(old_start as usize, old_end as usize)],
+            "first registration (null old) must add only, never remove"
+        );
 
-        // Drop the one tracked root and reset the tracker for hygiene. The
-        // leaked buffers make any leftover root harmless either way.
-        unsafe {
-            crate::gc::GC_remove_roots(third_start, third_end);
-        }
+        // Leave the thread-local tracker clean for any thread-reusing test.
         outer_post_arm_k_stack_api::set_last_rooted(ptr::null_mut(), ptr::null_mut());
     }
 
