@@ -168,7 +168,7 @@ jobs:
           git worktree add /tmp/pre-checkpoint ${{ inputs.pre_sha }}
           cd /tmp/pre-checkpoint
           git log --oneline -1
-          for w in descriptor_cache_stress tree_stress_repeat_large deep_sync_call_chain; do
+          for w in fib_cps_shallow_perf descriptor_cache_stress tree_stress_repeat_large deep_sync_call_chain; do
             src="examples/${w}.sigil"
             if [[ ! -f "${src}" ]]; then
               cp "${{ github.workspace }}/${src}" "${src}"
