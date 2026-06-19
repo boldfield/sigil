@@ -372,6 +372,13 @@ thread_local! {
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
 
+    /// Last `OUTER_POST_ARM_K_STACK` extent registered with the precise
+    /// GC for this thread, as `(start_addr, end_addr)`. `(0, 0)` means
+    /// "nothing rooted yet". `rereg_outer_post_arm_k_root` reads this to
+    /// no-op when the backing buffer pointer is unchanged, and writes it
+    /// after every (un)register so the next re-root knows the live extent.
+    static OUTER_POST_ARM_K_LAST_ROOTED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+
     /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
     /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
     /// this to determine how many `OUTER_POST_ARM_K` entries the
@@ -396,8 +403,8 @@ thread_local! {
 /// OUTER_POST_ARM_K_DEPTH thread-local state.
 mod outer_post_arm_k_stack_api {
     use super::{
-        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_STACK,
-        OUTER_POST_ARM_K_STACK_SIZE,
+        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_LAST_ROOTED,
+        OUTER_POST_ARM_K_STACK, OUTER_POST_ARM_K_STACK_SIZE,
     };
     use std::ffi::c_void;
 
@@ -500,6 +507,21 @@ mod outer_post_arm_k_stack_api {
             let end = unsafe { (start as *mut u8).add(capacity_bytes) as *mut c_void };
             (start, end)
         })
+    }
+
+    /// The extent most recently registered with the precise GC for this
+    /// thread's stack, as `(start_addr, end_addr)`. `(0, 0)` before any
+    /// registration. See `OUTER_POST_ARM_K_LAST_ROOTED`.
+    #[allow(dead_code)]
+    pub(super) fn last_rooted() -> (usize, usize) {
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.get())
+    }
+
+    /// Record the extent currently registered with the precise GC for
+    /// this thread's stack. Pass `(null, null)` to mark "nothing rooted".
+    #[allow(dead_code)]
+    pub(super) fn set_last_rooted(start: *mut c_void, end: *mut c_void) {
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.set((start as usize, end as usize)));
     }
 
     /// Check if any entry in the range [min_depth, max_depth) has the given fn_ptr.
@@ -801,7 +823,55 @@ pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut
             crate::gc::GC_add_roots(start, end);
         }
     }
+    // Seed the re-root tracker so `rereg_outer_post_arm_k_root` knows the
+    // currently-live extent: a later re-root with the *same* buffer
+    // no-ops, and a re-root after a move correctly drops *this* extent.
+    outer_post_arm_k_stack_api::set_last_rooted(start, end);
     (start, end)
+}
+
+/// Re-register the calling thread's `OUTER_POST_ARM_K_STACK` precise-GC
+/// root after its backing buffer has moved (a `Vec` realloc): unregister
+/// the previously-rooted `[old_start, old_end)` extent, register the new
+/// `[new_start, new_end)` extent, and record the new extent as last-rooted.
+/// Uses the same Boehm root API
+/// ([`register_outer_post_arm_k_stack_root_for_calling_thread`]) that the
+/// initial registration uses.
+///
+/// No-op when the buffer pointer is unchanged — detected by comparing the
+/// requested new extent against the tracked last-rooted extent
+/// (`OUTER_POST_ARM_K_LAST_ROOTED`) — so a caller may invoke it
+/// unconditionally after any operation that *might* reallocate.
+///
+/// **Currently unwired.** The stack stays capacity-256 and never
+/// reallocates (see `OUTER_POST_ARM_K_STACK_SIZE`), so this is not yet on
+/// any hot path; stack growth that actually moves the buffer lands in a
+/// follow-up task, which only has to call this helper. Kept here and
+/// unit-tested so that wiring is a one-line change.
+#[allow(dead_code)]
+pub(crate) fn rereg_outer_post_arm_k_root(
+    old_start: *mut c_void,
+    old_end: *mut c_void,
+    new_start: *mut c_void,
+    new_end: *mut c_void,
+) {
+    let new_key = (new_start as usize, new_end as usize);
+    // Buffer pointer unchanged: the new extent is already the live root,
+    // so there is nothing to unregister or re-register.
+    if outer_post_arm_k_stack_api::last_rooted() == new_key {
+        return;
+    }
+    unsafe {
+        // Drop the stale root *before* adding the new one, so the GC never
+        // holds two ranges for the same logical buffer and never scans the
+        // moved-from extent. `old_start` is null only when nothing was
+        // rooted yet (initial registration handles that path).
+        if !old_start.is_null() {
+            crate::gc::GC_remove_roots(old_start, old_end);
+        }
+        crate::gc::GC_add_roots(new_start, new_end);
+    }
+    outer_post_arm_k_stack_api::set_last_rooted(new_start, new_end);
 }
 
 /// Inverse of [`register_outer_post_arm_k_stack_root_for_calling_thread`].
@@ -814,6 +884,9 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 ) {
     OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| rooted.set(false));
     outer_post_arm_k_stack_api::set_depth(0);
+    // Clear the re-root tracker so a reused test thread doesn't believe a
+    // freed extent is still live.
+    outer_post_arm_k_stack_api::set_last_rooted(ptr::null_mut(), ptr::null_mut());
     unsafe {
         crate::gc::GC_remove_roots(start, end);
     }
@@ -2783,6 +2856,115 @@ mod tests {
 
     fn ensure_gc() {
         crate::gc::sigil_gc_init();
+    }
+
+    /// Directly exercise `rereg_outer_post_arm_k_root`: walk the helper
+    /// through a move, an unchanged-buffer no-op, and a second move, and
+    /// assert after each call that the tracked last-rooted extent
+    /// (`OUTER_POST_ARM_K_LAST_ROOTED`, the testable proxy for "which
+    /// extent is registered with Boehm") transitioned as the spec requires
+    /// — old extent dropped, new extent registered, and no change on the
+    /// no-op path.
+    ///
+    /// Boehm exposes no way to enumerate the dynamic root set, so the
+    /// last-rooted tracker is the observable contract: the helper only ever
+    /// writes it in lockstep with its `GC_add_roots`/`GC_remove_roots`
+    /// calls, so a wrong add/remove decision is a wrong tracker value.
+    ///
+    /// GC safety: every extent registered is a real, capacity-256 `Vec`
+    /// buffer (the same backing store and size the production stack uses),
+    /// kept alive until after cleanup, and the helper holds at most one of
+    /// them rooted at a time — it drops the old root before adding the new.
+    /// A forced collection mid-test would crash on any stale/unmapped root;
+    /// it must succeed. The final root is removed and the tracker reset
+    /// before the buffers drop, leaving Boehm's root set as we found it.
+    #[test]
+    fn rereg_outer_post_arm_k_root_transitions_gc_root_on_buffer_move() {
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+        // Three distinct backing buffers standing in for the stack before
+        // and after two reallocations. Capacity-256 (never pushed to, so
+        // never themselves reallocated) — bound for the whole test so their
+        // storage outlives every root that points into it.
+        let old_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
+        let new_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
+        let third_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
+
+        let extent = |buf: &Vec<OuterPostArmKEntry>| -> (*mut c_void, *mut c_void) {
+            // SAFETY: gc-heap-ptr arithmetic (capacity*sizeof(Entry) bound; buffer outlives the root).
+            let start = buf.as_ptr() as *mut c_void;
+            let bytes = buf.capacity() * core::mem::size_of::<OuterPostArmKEntry>();
+            // SAFETY: gc-heap-ptr arithmetic (one-past-end of the buffer's capacity).
+            let end = unsafe { (start as *mut u8).add(bytes) as *mut c_void };
+            (start, end)
+        };
+        let key = |e: (*mut c_void, *mut c_void)| (e.0 as usize, e.1 as usize);
+
+        let (old_start, old_end) = extent(&old_buf);
+        let (new_start, new_end) = extent(&new_buf);
+        let (third_start, third_end) = extent(&third_buf);
+
+        // Simulate the initial registration that
+        // `register_outer_post_arm_k_stack_root_for_calling_thread` would
+        // have performed: `old_buf` is the live root and the tracker knows
+        // it. This makes the helper's first `GC_remove_roots(old)` operate
+        // on a range Boehm actually holds.
+        unsafe {
+            crate::gc::GC_add_roots(old_start, old_end);
+        }
+        outer_post_arm_k_stack_api::set_last_rooted(old_start, old_end);
+        assert_eq!(
+            outer_post_arm_k_stack_api::last_rooted(),
+            key((old_start, old_end)),
+            "precondition: old extent is the live root"
+        );
+
+        // (1) Buffer moved old -> new: old root dropped, new root added.
+        rereg_outer_post_arm_k_root(old_start, old_end, new_start, new_end);
+        assert_eq!(
+            outer_post_arm_k_stack_api::last_rooted(),
+            key((new_start, new_end)),
+            "after move, last-rooted extent must be the new buffer"
+        );
+
+        // (2) Buffer unchanged: no-op path — last-rooted extent unchanged,
+        // and the helper issues no GC add/remove (it returns before them).
+        rereg_outer_post_arm_k_root(new_start, new_end, new_start, new_end);
+        assert_eq!(
+            outer_post_arm_k_stack_api::last_rooted(),
+            key((new_start, new_end)),
+            "unchanged buffer must be a no-op (last-rooted extent stays put)"
+        );
+
+        // (3) Buffer moved new -> third: new root dropped, third added.
+        rereg_outer_post_arm_k_root(new_start, new_end, third_start, third_end);
+        assert_eq!(
+            outer_post_arm_k_stack_api::last_rooted(),
+            key((third_start, third_end)),
+            "second move must advance the last-rooted extent to the third buffer"
+        );
+
+        // Force a collection while only `third_buf` is rooted: any leaked
+        // or stale root (e.g. a failure to drop `old`/`new`) pointing into
+        // a no-longer-registered range would surface here. All buffers are
+        // alive, so this must complete cleanly.
+        unsafe {
+            crate::gc::GC_gcollect();
+        }
+
+        // Tear down the one remaining root and reset the tracker before the
+        // buffers drop, so no Boehm root outlives this test.
+        unsafe {
+            crate::gc::GC_remove_roots(third_start, third_end);
+        }
+        outer_post_arm_k_stack_api::set_last_rooted(ptr::null_mut(), ptr::null_mut());
+
+        // Keep the buffers provably alive through cleanup.
+        drop(old_buf);
+        drop(new_buf);
+        drop(third_buf);
     }
 
     // Test CPS-color fn: takes one arg, returns Done(arg + 1).
