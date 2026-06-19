@@ -19437,6 +19437,82 @@ fn std_json_parse_int_vs_float() {
     assert_eq!(stdout, "42\n3.14\n", "stderr={stderr:?}");
 }
 
+#[test]
+fn std_json_parse_negative_float() {
+    let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.json\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               match json_parse(string_to_bytes(\"-0.5\")) {\n\
+               Ok(v) => perform IO.println(json_render(v)),\n\
+               Err(_) => perform IO.println(\"ERR\"),\n\
+               };\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_negative_float");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "-0.5\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_exponent() {
+    let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.json\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               match json_parse(string_to_bytes(\"1e5\")) {\n\
+               Ok(v) => perform IO.println(json_render(v)),\n\
+               Err(_) => perform IO.println(\"ERR\"),\n\
+               };\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_exponent");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "100000.0\n", "stderr={stderr:?}");
+}
+
+#[test]
+fn std_json_parse_mixed_document_round_trip() {
+    let src = "import std.byte_array\n\
+               import std.io\n\
+               import std.mem\n\
+               import std.string\n\
+               import std.json\n\
+               import std.result\n\
+               use std.byte_array.{string_to_bytes};\n\
+               use std.io.{IO};\n\
+               use std.json.{JArray, JFloat, JInt, JLCons, JLNil, JValue, json_parse, json_render};\n\
+               use std.mem.{Mem};\n\
+               use std.result.{Err, Ok};\n\
+               use std.string.{string_concat};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+               let v: JValue = JArray(\n\
+               JLCons(JInt(42),\n\
+               JLCons(JFloat(3.14),\n\
+               JLCons(JInt(-7),\n\
+               JLNil))));\n\
+               let s: String = json_render(v);\n\
+               match json_parse(string_to_bytes(s)) {\n\
+               Ok(v2) => perform IO.println(json_render(v2)),\n\
+               Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n\
+               };\n\
+               0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_json_parse_mixed_round_trip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "[42, 3.14, -7]\n", "stderr={stderr:?}");
+}
+
 // Plan State-Cell — deep-recursion State stress test. Pins the
 // invariant that `__set_then_arg` collapses the State.set arm body
 // to a single tail-`k` call so it doesn't push an
