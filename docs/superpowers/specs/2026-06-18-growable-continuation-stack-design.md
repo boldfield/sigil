@@ -93,10 +93,40 @@ Continuation-depth behavior is adjacent to the **per-context CPS** work
 it removes a hard *correctness* ceiling that makes `std.json` unusable on
 real input, independent of the larger per-context-CPS codegen.
 
-## Note on difficulty / model
+## Decomposition (board tasks)
 
-This is subtle runtime + precise-GC-rooting work — the highest-risk kind
-for an autonomous implementer. The GC-rooting requirement (criterion 3)
-is where a naive growable-buffer swap will silently break. Consider a
-higher model tier than the default, or human authorship, with heavy
-adversarial review.
+The risk concentrates in one place — GC rooting across reallocation — so
+the decomposition *isolates* it: a behavior-preserving chain on
+`handlers.rs` introduces a seam, swaps the backing to a pre-reserved
+`Vec` (still capped), and adds a separately-unit-tested re-root helper,
+**before** any growth is enabled. Each step compiles green and changes
+no observable behavior until the final swap, which keeps every task
+Haiku-sized (no model escalation).
+
+**`handlers.rs` chain (serial; behavior-preserving until the last):**
+
+1. **Extract the stack behind an API** (`push`/`pop`/`depth`/
+   `root_extent()`) over the existing fixed `[Entry; 256]` array — pure
+   refactor.
+2. **Route GC rooting through `root_extent()`** — no-op (same bounds).
+3. **Swap backing → pre-reserved `Vec<Entry>` (cap 256)** — behavior
+   identical; the cap/abort stays, so it never reallocates yet.
+4. **Add the re-root-on-realloc helper**, unit-tested directly with two
+   extents — the GC crux, isolated and proven before it's on the hot
+   path.
+5. **Enable growth + delete the abort** — `push` grows the `Vec` and
+   re-roots via (4) on relocation. The actual uncapping.
+
+**Validation (depend on #5):**
+
+6. **e2e regression** — parse a ≥10,000-element JSON array via
+   `std.json`, assert correct, no abort (the test sjq's oracle lacked).
+7. **GC cross-check** — `SIGIL_GC_CROSS_CHECK=1` on the deep-recursion
+   workload, wired into the gated invariants.
+8. **Perf guard** — shallow-recursion benchmark, no regression on the
+   common sub-256 path.
+
+Model `haiku`, opus+sonnet review on each. The GC-rooting requirement
+(acceptance criterion 3) lives almost entirely in task 4 (helper + unit
+test) and task 5 (wire-in); reviewers should scrutinize those two
+hardest.
