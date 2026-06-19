@@ -420,6 +420,7 @@ mod outer_post_arm_k_stack_api {
                     let mut stack = stack_cell.borrow_mut();
 
                     // Capture old buffer state for reallocation detection
+                    // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity*sizeof(Entry) bounded; thread lifetime).
                     let old_ptr = stack.as_ptr();
                     let old_capacity = stack.capacity();
 
@@ -445,12 +446,13 @@ mod outer_post_arm_k_stack_api {
                         fn_ptr,
                     };
 
-                    // Check for reallocation (buffer pointer changed)
+                    // Check for reallocation (buffer pointer changed or capacity increased)
+                    // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity*sizeof(Entry) bounded; thread lifetime).
                     let new_ptr = stack.as_ptr();
                     let new_capacity = stack.capacity();
 
-                    if old_capacity > 0 && old_ptr != new_ptr {
-                        // Reallocation occurred - compute old and new extents
+                    if old_capacity > 0 && (old_ptr != new_ptr || new_capacity != old_capacity) {
+                        // Reallocation/growth occurred - compute old and new extents
                         let old_start = old_ptr as *mut c_void;
                         let old_end = unsafe {
                             (old_ptr as *mut u8)
@@ -947,17 +949,12 @@ fn reroot_gc_add(start: *mut c_void, end: *mut c_void) {
 /// ([`register_outer_post_arm_k_stack_root_for_calling_thread`]) that the
 /// initial registration uses.
 ///
-/// No-op when the buffer pointer is unchanged — detected by comparing the
-/// requested new extent against the tracked last-rooted extent
-/// (`OUTER_POST_ARM_K_LAST_ROOTED`) — so a caller may invoke it
-/// unconditionally after any operation that *might* reallocate.
-///
-/// **Currently unwired.** The stack stays capacity-256 and never
-/// reallocates (see `OUTER_POST_ARM_K_STACK_SIZE`), so this is not yet on
-/// any hot path; stack growth that actually moves the buffer lands in a
-/// follow-up task, which only has to call this helper. Kept here and
-/// unit-tested so that wiring is a one-line change.
-#[allow(dead_code)]
+/// Adjusts the GC root extent when the continuation stack reallocates
+/// (pointer moves) or grows (capacity increases). Unregisters the old extent,
+/// registers the new extent. No-op when the buffer extent is unchanged — detected
+/// by comparing the requested new extent against the tracked last-rooted extent
+/// (`OUTER_POST_ARM_K_LAST_ROOTED`) — so a caller may invoke it unconditionally
+/// after any operation that *might* reallocate or grow.
 pub(crate) fn rereg_outer_post_arm_k_root(
     old_start: *mut c_void,
     old_end: *mut c_void,
@@ -1003,9 +1000,8 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 
 /// Push an outer `post_arm_k` pair onto the thread-local stack.
 /// Codegen emits a call to this fn from B.2 helper Middle's emit
-/// before issuing `sigil_perform` for the next chain step. Aborts on
-/// stack overflow (stack size 32; helper-perform chains beyond that
-/// depth are not supported in v1).
+/// before issuing `sigil_perform` for the next chain step. Supports
+/// unbounded depth with automatic re-rooting on buffer growth (for precise GC).
 ///
 /// # Push/pop balance discipline
 ///
@@ -4221,9 +4217,10 @@ mod tests {
 
     #[test]
     fn outer_post_arm_k_stack_fills_to_cap_minus_one() {
-        // Push OUTER_POST_ARM_K_STACK_SIZE - 1 entries; the cap is
-        // OUTER_POST_ARM_K_STACK_SIZE. The Nth push (where N == cap)
-        // would abort; verifying the cap-1 case stays safe + LIFO.
+        // Push OUTER_POST_ARM_K_STACK_SIZE - 1 entries; the initial cap is
+        // OUTER_POST_ARM_K_STACK_SIZE. Verifies that pushing up to the cap-1
+        // stays safe + LIFO and preserves the invariant that all live
+        // continuations remain rooted across any reallocations.
         if !in_stress_subprocess() {
             run_stress_in_subprocess("outer_post_arm_k_stack_fills_to_cap_minus_one");
             return;
@@ -4248,6 +4245,47 @@ mod tests {
                 Some(e) => e,
                 None => {
                     eprintln!("test bug: try_pop returned None at depth in cap-fill walk");
+                    std::process::abort();
+                }
+            };
+            assert_eq!(popped.closure_ptr, *c);
+            assert_eq!(popped.fn_ptr, fn_ptr);
+        }
+        assert!(outer_post_arm_k_try_pop().is_none());
+        reset_outer_post_arm_k_stack();
+    }
+
+    #[test]
+    fn outer_post_arm_k_stack_grows_beyond_cap() {
+        // Push 300+ entries, well beyond OUTER_POST_ARM_K_STACK_SIZE (256).
+        // Verifies that the stack grows unbounded, re-rooting on buffer
+        // reallocation/growth so all live continuations remain GC-rooted.
+        // This is the critical acceptance criterion for the growth task:
+        // deep-CPS workloads that previously aborted at 256 now succeed.
+        if !in_stress_subprocess() {
+            run_stress_in_subprocess("outer_post_arm_k_stack_grows_beyond_cap");
+            return;
+        }
+        let _guard = crate::test_support::gc_test_lock();
+        ensure_gc();
+        let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+        reset_outer_post_arm_k_stack();
+
+        let n = 300;
+        let closures: Vec<*mut u8> = (0..n)
+            .map(|_| crate::gc::sigil_alloc(0, 64, u32::MAX))
+            .collect();
+        let fn_ptr = cps_done_with_arg as *mut u8;
+        unsafe {
+            for c in closures.iter() {
+                sigil_outer_post_arm_k_push(*c, fn_ptr);
+            }
+        }
+        for c in closures.iter().rev() {
+            let popped = match outer_post_arm_k_try_pop() {
+                Some(e) => e,
+                None => {
+                    eprintln!("test bug: try_pop returned None at depth in beyond-cap walk");
                     std::process::abort();
                 }
             };
