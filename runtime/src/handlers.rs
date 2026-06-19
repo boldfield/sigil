@@ -408,33 +408,72 @@ mod outer_post_arm_k_stack_api {
     };
     use std::ffi::c_void;
 
-    /// Push an entry onto the stack. Returns false if the stack is full
-    /// (depth >= OUTER_POST_ARM_K_STACK_SIZE).
+    /// Push an entry onto the stack. Supports unbounded growth with automatic
+    /// re-rooting when the backing buffer reallocates (for precise GC).
     pub(super) fn push(closure_ptr: *mut u8, fn_ptr: *mut u8) -> bool {
         OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
             let depth = depth_cell.get();
-            if depth >= OUTER_POST_ARM_K_STACK_SIZE {
-                return false;
+
+            // Capture reallocation info to call re-root after releasing the borrow
+            let reroot_info: Option<(*mut c_void, *mut c_void, *mut c_void, *mut c_void)> =
+                OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+                    let mut stack = stack_cell.borrow_mut();
+
+                    // Capture old buffer state for reallocation detection
+                    let old_ptr = stack.as_ptr();
+                    let old_capacity = stack.capacity();
+
+                    // Ensure we have a buffer allocated
+                    if stack.capacity() == 0 {
+                        stack.reserve(OUTER_POST_ARM_K_STACK_SIZE);
+                    }
+
+                    // Resize to accommodate the entry
+                    if depth >= stack.len() {
+                        stack.resize(
+                            depth + 1,
+                            OuterPostArmKEntry {
+                                closure_ptr: std::ptr::null_mut(),
+                                fn_ptr: std::ptr::null_mut(),
+                            },
+                        );
+                    }
+
+                    // Write the entry
+                    stack[depth] = OuterPostArmKEntry {
+                        closure_ptr,
+                        fn_ptr,
+                    };
+
+                    // Check for reallocation (buffer pointer changed)
+                    let new_ptr = stack.as_ptr();
+                    let new_capacity = stack.capacity();
+
+                    if old_capacity > 0 && old_ptr != new_ptr {
+                        // Reallocation occurred - compute old and new extents
+                        let old_start = old_ptr as *mut c_void;
+                        let old_end = unsafe {
+                            (old_ptr as *mut u8)
+                                .add(old_capacity * std::mem::size_of::<OuterPostArmKEntry>())
+                                as *mut c_void
+                        };
+                        let new_start = new_ptr as *mut c_void;
+                        let new_end = unsafe {
+                            (new_ptr as *mut u8)
+                                .add(new_capacity * std::mem::size_of::<OuterPostArmKEntry>())
+                                as *mut c_void
+                        };
+                        Some((old_start, old_end, new_start, new_end))
+                    } else {
+                        None
+                    }
+                });
+
+            // Call re-root helper if reallocation occurred
+            if let Some((old_start, old_end, new_start, new_end)) = reroot_info {
+                super::rereg_outer_post_arm_k_root(old_start, old_end, new_start, new_end);
             }
-            OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                let mut stack = stack_cell.borrow_mut();
-                if stack.capacity() == 0 {
-                    stack.reserve(OUTER_POST_ARM_K_STACK_SIZE);
-                }
-                if depth >= stack.len() {
-                    stack.resize(
-                        depth + 1,
-                        OuterPostArmKEntry {
-                            closure_ptr: std::ptr::null_mut(),
-                            fn_ptr: std::ptr::null_mut(),
-                        },
-                    );
-                }
-                stack[depth] = OuterPostArmKEntry {
-                    closure_ptr,
-                    fn_ptr,
-                };
-            });
+
             depth_cell.set(depth + 1);
             if trace_opak() {
                 eprintln!(
@@ -1000,14 +1039,7 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 /// pairs every push with a perform that eventually drives a Done.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
-    if !outer_post_arm_k_stack_api::push(closure_ptr, fn_ptr) {
-        let depth = outer_post_arm_k_stack_api::current_depth();
-        eprintln!(
-            "sigil_outer_post_arm_k_push: stack overflow (depth {} >= cap {})",
-            depth, OUTER_POST_ARM_K_STACK_SIZE
-        );
-        std::process::abort();
-    }
+    outer_post_arm_k_stack_api::push(closure_ptr, fn_ptr);
 }
 
 /// Pop the top of the outer `post_arm_k` stack. Called by the
