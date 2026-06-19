@@ -2885,39 +2885,55 @@ mod tests {
         let _enrol = crate::test_support::GcThreadEnrolment::acquire();
 
         // Three distinct backing buffers standing in for the stack before
-        // and after two reallocations. Capacity-256 (never pushed to, so
-        // never themselves reallocated) — bound for the whole test so their
-        // storage outlives every root that points into it.
-        let old_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
-        let new_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
-        let third_buf: Vec<OuterPostArmKEntry> = Vec::with_capacity(OUTER_POST_ARM_K_STACK_SIZE);
-
-        let extent = |buf: &Vec<OuterPostArmKEntry>| -> (*mut c_void, *mut c_void) {
-            // SAFETY: gc-heap-ptr arithmetic (capacity*sizeof(Entry) bound; buffer outlives the root).
-            let start = buf.as_ptr() as *mut c_void;
-            let bytes = buf.capacity() * core::mem::size_of::<OuterPostArmKEntry>();
-            // SAFETY: gc-heap-ptr arithmetic (one-past-end of the buffer's capacity).
+        // and after two reallocations, each capacity-256 (the production
+        // stack's size and backing type).
+        //
+        // They are deliberately LEAKED (`'static`). Boehm's
+        // `GC_remove_roots` only reliably drops a root range that *exactly*
+        // matches a previously-added one — it may round ranges to its own
+        // granularity and silently retain a partially-overlapping segment.
+        // If such a retained root pointed into a buffer we then freed, the
+        // next collection (this test's, a later test's, or the process-exit
+        // sweep) would scan freed memory and SIGSEGV. Leaking the storage
+        // means every extent we ever register points into permanently-mapped
+        // memory, so even an imperfectly-removed root can never dereference
+        // freed memory. The few KiB leaked once per test run is the price of
+        // a SIGSEGV-proof GC-root test. Each is zero-initialised so a scan
+        // sees only null words (no spurious conservative retention).
+        let leak_extent = || -> (*mut c_void, *mut c_void) {
+            let buf: Box<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> = Box::new(
+                [OuterPostArmKEntry {
+                    closure_ptr: ptr::null_mut(),
+                    fn_ptr: ptr::null_mut(),
+                }; OUTER_POST_ARM_K_STACK_SIZE],
+            );
+            let leaked: &'static mut [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE] =
+                Box::leak(buf);
+            // SAFETY: gc-heap-ptr arithmetic (leaked 'static buffer; len*sizeof(Entry) bound).
+            let start = leaked.as_mut_ptr() as *mut c_void;
+            let bytes = leaked.len() * core::mem::size_of::<OuterPostArmKEntry>();
+            // SAFETY: gc-heap-ptr arithmetic (one-past-end of the leaked buffer).
             let end = unsafe { (start as *mut u8).add(bytes) as *mut c_void };
             (start, end)
         };
-        let key = |e: (*mut c_void, *mut c_void)| (e.0 as usize, e.1 as usize);
+        let key = |s: *mut c_void, e: *mut c_void| (s as usize, e as usize);
 
-        let (old_start, old_end) = extent(&old_buf);
-        let (new_start, new_end) = extent(&new_buf);
-        let (third_start, third_end) = extent(&third_buf);
+        let (old_start, old_end) = leak_extent();
+        let (new_start, new_end) = leak_extent();
+        let (third_start, third_end) = leak_extent();
 
         // Simulate the initial registration that
         // `register_outer_post_arm_k_stack_root_for_calling_thread` would
-        // have performed: `old_buf` is the live root and the tracker knows
-        // it. This makes the helper's first `GC_remove_roots(old)` operate
-        // on a range Boehm actually holds.
+        // have performed: the `old` extent is the live root and the tracker
+        // knows it. This makes the helper's first `GC_remove_roots(old)`
+        // operate on a range Boehm actually holds.
         unsafe {
             crate::gc::GC_add_roots(old_start, old_end);
         }
         outer_post_arm_k_stack_api::set_last_rooted(old_start, old_end);
         assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key((old_start, old_end)),
+            key(old_start, old_end),
             "precondition: old extent is the live root"
         );
 
@@ -2925,7 +2941,7 @@ mod tests {
         rereg_outer_post_arm_k_root(old_start, old_end, new_start, new_end);
         assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key((new_start, new_end)),
+            key(new_start, new_end),
             "after move, last-rooted extent must be the new buffer"
         );
 
@@ -2934,7 +2950,7 @@ mod tests {
         rereg_outer_post_arm_k_root(new_start, new_end, new_start, new_end);
         assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key((new_start, new_end)),
+            key(new_start, new_end),
             "unchanged buffer must be a no-op (last-rooted extent stays put)"
         );
 
@@ -2942,29 +2958,23 @@ mod tests {
         rereg_outer_post_arm_k_root(new_start, new_end, third_start, third_end);
         assert_eq!(
             outer_post_arm_k_stack_api::last_rooted(),
-            key((third_start, third_end)),
+            key(third_start, third_end),
             "second move must advance the last-rooted extent to the third buffer"
         );
 
-        // Force a collection while only `third_buf` is rooted: any leaked
-        // or stale root (e.g. a failure to drop `old`/`new`) pointing into
-        // a no-longer-registered range would surface here. All buffers are
-        // alive, so this must complete cleanly.
+        // Force a collection with the `third` extent registered: it (and
+        // every other extent we touched) is leaked-and-mapped, so the mark
+        // phase scans real memory and must complete cleanly.
         unsafe {
             crate::gc::GC_gcollect();
         }
 
-        // Tear down the one remaining root and reset the tracker before the
-        // buffers drop, so no Boehm root outlives this test.
+        // Drop the one tracked root and reset the tracker for hygiene. The
+        // leaked buffers make leftover roots harmless either way.
         unsafe {
             crate::gc::GC_remove_roots(third_start, third_end);
         }
         outer_post_arm_k_stack_api::set_last_rooted(ptr::null_mut(), ptr::null_mut());
-
-        // Keep the buffers provably alive through cleanup.
-        drop(old_buf);
-        drop(new_buf);
-        drop(third_buf);
     }
 
     // Test CPS-color fn: takes one arg, returns Done(arg + 1).
