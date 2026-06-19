@@ -494,8 +494,7 @@ mod outer_post_arm_k_stack_api {
     pub(super) fn root_extent() -> (*mut c_void, *mut c_void) {
         OUTER_POST_ARM_K_STACK.with(|cell| {
             let stack = cell.borrow();
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; range bounded by
-            // capacity * sizeof(Entry); storage lives for thread lifetime).
+            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity*sizeof(Entry) bounded; thread lifetime).
             let start = stack.as_ptr() as *mut c_void;
             let capacity_bytes = stack.capacity() * core::mem::size_of::<OuterPostArmKEntry>();
             let end = unsafe { (start as *mut u8).add(capacity_bytes) as *mut c_void };
