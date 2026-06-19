@@ -687,6 +687,10 @@ mod outer_post_arm_k_stack_api {
             unsafe {
                 crate::gc::GC_remove_roots(third_base, third_end);
             }
+
+            // Reset the TLS tracking cell to prevent stale-root dereferencing
+            // on the next GC collection after the buffers are freed.
+            OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set((0, 0)));
         }
     }
 }
