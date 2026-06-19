@@ -19523,25 +19523,28 @@ fn std_json_parse_large_array_no_abort() {
     let json_string = format!("[{}]", elements.join(", "));
     let escaped_json = json_string.replace('\\', "\\\\").replace('"', "\\\"");
 
-    let src = format!("import std.byte_array\n\
-                       import std.io\n\
-                       import std.mem\n\
-                       import std.string\n\
-                       import std.json\n\
-                       import std.result\n\
-                       use std.byte_array::{{string_to_bytes}};\n\
-                       use std.io::{{IO}};\n\
-                       use std.json::{{json_parse}};\n\
-                       use std.mem::{{Mem}};\n\
-                       use std.result::{{Err, Ok}};\n\
-                       use std.string::{{string_concat}};\n\
-                       fn main() -> Int ![IO, Mem] {{\n\
-                       match json_parse(string_to_bytes(\"{}\")) {{\n\
-                       Ok(_) => perform IO.println(\"OK\"),\n\
-                       Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n\
-                       }};\n\
-                       0\n\
-                       }}\n", escaped_json);
+    let src = format!(
+        "import std.byte_array\n\
+        import std.io\n\
+        import std.mem\n\
+        import std.string\n\
+        import std.json\n\
+        import std.result\n\
+        use std.byte_array.{{string_to_bytes}};\n\
+        use std.io.{{IO}};\n\
+        use std.json.{{json_parse}};\n\
+        use std.mem.{{Mem}};\n\
+        use std.result.{{Err, Ok}};\n\
+        use std.string.{{string_concat}};\n\
+        fn main() -> Int ![IO, Mem] {{\n\
+        match json_parse(string_to_bytes(\"{}\")) {{\n\
+        Ok(_) => perform IO.println(\"OK\"),\n\
+        Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n\
+        }};\n\
+        0\n\
+        }}\n",
+        escaped_json
+    );
 
     let (stdout, stderr, code) = compile_and_run(&src, "std_json_parse_large_array");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
