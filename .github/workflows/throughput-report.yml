@@ -91,6 +91,7 @@ jobs:
           test -f examples/descriptor_cache_stress.sigil
           test -f examples/tree_stress_repeat_large.sigil
           test -f examples/deep_sync_call_chain.sigil
+          test -f examples/fib_cps_shallow_perf.sigil
           test -x scripts/measure-throughput.sh
           test -x scripts/diff-throughput.py
 
@@ -115,7 +116,7 @@ jobs:
       - name: post — compile workloads
         run: |
           mkdir -p post-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
+          for w in fib_perf fib_cps_perf fib_cps_shallow_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             ./target/release/sigil "examples/${w}.sigil" -o "post-bins/${w}"
           done
 
@@ -141,7 +142,7 @@ jobs:
           SIGIL_ALLOC_ELIDE_WRAP: ${{ inputs.alloc_elide_wrap }}
         run: |
           mkdir -p throughput-data/post
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
+          for w in fib_perf fib_cps_perf fib_cps_shallow_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             scripts/measure-throughput.sh "post-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/post/${w}.json"
             echo "--- post/${w} ---"
@@ -228,7 +229,7 @@ jobs:
         run: |
           cd /tmp/pre-checkpoint
           mkdir -p ${{ github.workspace }}/pre-bins
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
+          for w in fib_perf fib_cps_perf fib_cps_shallow_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             ./target/release/sigil "examples/${w}.sigil" \
               -o "${{ github.workspace }}/pre-bins/${w}"
           done
@@ -253,7 +254,7 @@ jobs:
           SIGIL_FORCE_GC_EVERY_N_ALLOCS: ${{ inputs.force_gc_every_n_allocs }}
         run: |
           mkdir -p throughput-data/pre
-          for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
+          for w in fib_perf fib_cps_perf fib_cps_shallow_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
             scripts/measure-throughput.sh "pre-bins/${w}" "${{ inputs.runs }}" \
               > "throughput-data/pre/${w}.json"
             echo "--- pre/${w} ---"
@@ -284,7 +285,7 @@ jobs:
             echo "Force-GC cadence: \`${INJECT}\` allocations"
             echo "Alloc-elide-wrap (POST only): \`${ELIDE}\`"
             echo ""
-            for w in fib_perf fib_cps_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
+            for w in fib_perf fib_cps_perf fib_cps_shallow_perf tree tree_stress_repeat tree_stress_repeat_large descriptor_cache_stress deep_sync_call_chain; do
               scripts/diff-throughput.py "${w}" \
                 "throughput-data/pre/${w}.json" \
                 "throughput-data/post/${w}.json"
