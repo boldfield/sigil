@@ -19513,6 +19513,41 @@ fn std_json_parse_mixed_document_round_trip() {
     assert_eq!(stdout, "[42, 3.14, -7]\n", "stderr={stderr:?}");
 }
 
+#[test]
+fn std_json_parse_large_array_no_abort() {
+    // Regression test: verify that large JSON arrays (10,000+ elements)
+    // parse successfully without SIGABRT. Prior to enabling growth, the
+    // 256-frame continuation cap would cause the recursive-descent
+    // JSON parser to abort on deeply nested structures.
+    let elements: Vec<String> = (0..10000).map(|i| i.to_string()).collect();
+    let json_string = format!("[{}]", elements.join(", "));
+    let escaped_json = json_string.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let src = format!("import std.byte_array\n\
+                       import std.io\n\
+                       import std.mem\n\
+                       import std.string\n\
+                       import std.json\n\
+                       import std.result\n\
+                       use std.byte_array::{{string_to_bytes}};\n\
+                       use std.io::{{IO}};\n\
+                       use std.json::{{json_parse}};\n\
+                       use std.mem::{{Mem}};\n\
+                       use std.result::{{Err, Ok}};\n\
+                       use std.string::{{string_concat}};\n\
+                       fn main() -> Int ![IO, Mem] {{\n\
+                       match json_parse(string_to_bytes(\"{}\")) {{\n\
+                       Ok(_) => perform IO.println(\"OK\"),\n\
+                       Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n\
+                       }};\n\
+                       0\n\
+                       }}\n", escaped_json);
+
+    let (stdout, stderr, code) = compile_and_run(&src, "std_json_parse_large_array");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
+}
+
 // Plan State-Cell — deep-recursion State stress test. Pins the
 // invariant that `__set_then_arg` collapses the State.set arm body
 // to a single tail-`k` call so it doesn't push an
