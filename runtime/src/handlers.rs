@@ -394,6 +394,167 @@ thread_local! {
     static RUN_LOOP_ENTRY_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
+/// Internal API for the outer post-arm-k continuation stack.
+/// Encapsulates all direct access to OUTER_POST_ARM_K_STACK and
+/// OUTER_POST_ARM_K_DEPTH thread-local state.
+mod outer_post_arm_k_stack_api {
+    use super::{
+        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_STACK,
+        OUTER_POST_ARM_K_STACK_SIZE,
+    };
+    use std::ffi::c_void;
+
+    /// Push an entry onto the stack. Returns false if the stack is full
+    /// (depth >= OUTER_POST_ARM_K_STACK_SIZE).
+    pub(super) fn push(closure_ptr: *mut u8, fn_ptr: *mut u8) -> bool {
+        OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+            let depth = depth_cell.get();
+            if depth >= OUTER_POST_ARM_K_STACK_SIZE {
+                return false;
+            }
+            OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+                let mut stack = stack_cell.get();
+                stack[depth] = OuterPostArmKEntry {
+                    closure_ptr,
+                    fn_ptr,
+                };
+                stack_cell.set(stack);
+            });
+            depth_cell.set(depth + 1);
+            if trace_opak() {
+                eprintln!(
+                    "[OPAK PUSH] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
+                    depth,
+                    depth + 1,
+                    closure_ptr as usize,
+                    fn_ptr as usize
+                );
+            }
+            true
+        })
+    }
+
+    /// Pop the top entry from the stack. Returns None if the stack is empty.
+    /// Overwrites the popped slot with nulls for stale-pointer hygiene.
+    pub(super) fn pop() -> Option<OuterPostArmKEntry> {
+        OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+            let depth = depth_cell.get();
+            if depth == 0 {
+                None
+            } else {
+                depth_cell.set(depth - 1);
+                OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+                    let mut stack = stack_cell.get();
+                    let popped = stack[depth - 1];
+                    // Clear the slot so a stale pointer doesn't survive
+                    // in the TLS-rooted range across the next GC scan.
+                    stack[depth - 1] = OuterPostArmKEntry {
+                        closure_ptr: std::ptr::null_mut(),
+                        fn_ptr: std::ptr::null_mut(),
+                    };
+                    stack_cell.set(stack);
+                    if trace_opak() {
+                        eprintln!(
+                            "[OPAK POP] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
+                            depth,
+                            depth - 1,
+                            popped.closure_ptr as usize,
+                            popped.fn_ptr as usize
+                        );
+                    }
+                    Some(popped)
+                })
+            }
+        })
+    }
+
+    /// Get the current depth of the stack.
+    #[inline]
+    pub(super) fn current_depth() -> usize {
+        OUTER_POST_ARM_K_DEPTH.with(|c| c.get())
+    }
+
+    /// Set the current depth of the stack.
+    #[inline]
+    pub(super) fn set_depth(value: usize) {
+        OUTER_POST_ARM_K_DEPTH.with(|c| c.set(value));
+    }
+
+    /// Get the base pointer and length of the stack for GC rooting.
+    /// The returned pair is (start, end) where end points one past the end.
+    pub(super) fn root_extent() -> (*mut c_void, *mut c_void) {
+        OUTER_POST_ARM_K_STACK.with(|cell| {
+            let start = cell as *const _ as *mut c_void;
+            let end = unsafe {
+                (start as *mut u8).add(core::mem::size_of::<
+                    [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE],
+                >()) as *mut c_void
+            };
+            (start, end)
+        })
+    }
+
+    /// Check if any entry in the range [min_depth, max_depth) has the given fn_ptr.
+    pub(super) fn has_fn_ptr_in_range(fn_ptr: *mut u8, min_depth: usize, max_depth: usize) -> bool {
+        OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+            let stack = stack_cell.get();
+            let mut i = max_depth;
+            while i > min_depth {
+                i -= 1;
+                if stack[i].fn_ptr == fn_ptr {
+                    return true;
+                }
+            }
+            false
+        })
+    }
+
+    /// Drop (without dispatching) the top n entries from the stack.
+    /// Overwrites dropped slots with nulls for stale-pointer hygiene.
+    /// If n exceeds current depth, drops only what's available.
+    pub(super) fn drop_top(n: u32) {
+        if n == 0 {
+            return;
+        }
+        if trace_opak() {
+            let cur = current_depth();
+            eprintln!(
+                "[OPAK DROP] requesting drop of {} entries; depth={}",
+                n, cur
+            );
+        }
+        OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
+            let depth = depth_cell.get();
+            let drop_count = (n as usize).min(depth);
+            if drop_count < (n as usize) {
+                // Underflow: caller asked for more than available.
+                // Don't abort — the runtime stays well-formed. Logged so
+                // a future codegen-discipline regression surfaces.
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "outer_post_arm_k_stack_api::drop_top: requested {} but only {} available; \
+                     dropping what's available (codegen chain-push count mismatch?)",
+                    n, depth
+                );
+            }
+            if drop_count == 0 {
+                return;
+            }
+            OUTER_POST_ARM_K_STACK.with(|stack_cell| {
+                let mut stack = stack_cell.get();
+                for i in 0..drop_count {
+                    stack[depth - 1 - i] = OuterPostArmKEntry {
+                        closure_ptr: std::ptr::null_mut(),
+                        fn_ptr: std::ptr::null_mut(),
+                    };
+                }
+                stack_cell.set(stack);
+            });
+            depth_cell.set(depth - drop_count);
+        });
+    }
+}
+
 #[inline]
 fn run_loop_entry_depth_get() -> usize {
     RUN_LOOP_ENTRY_DEPTH.with(|c| c.get())
@@ -413,7 +574,7 @@ fn run_loop_entry_depth_set(value: usize) {
 /// discipline without needing to drive run_loop transitively.
 #[inline]
 pub fn outer_post_arm_k_depth_snapshot() -> usize {
-    OUTER_POST_ARM_K_DEPTH.with(|c| c.get())
+    outer_post_arm_k_stack_api::current_depth()
 }
 
 // Plan D Task 112e — env-var-gated runtime trace flags. Read once
@@ -453,7 +614,7 @@ fn trace_call() -> bool {
 /// trampoline routes through the outer chain instead).
 #[inline]
 pub fn outer_post_arm_k_depth_restore(target: usize) {
-    OUTER_POST_ARM_K_DEPTH.with(|c| c.set(target));
+    outer_post_arm_k_stack_api::set_depth(target);
 }
 
 // 2026-05-04 return-arm-via-args lift Stage 5 — the
@@ -614,26 +775,18 @@ pub unsafe extern "C" fn sigil_pop_crossed_frames(count: u32, terminal_out: *mut
 /// [`register_handler_stack_root_for_calling_thread`]'s discipline.
 pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut c_void, *mut c_void)
 {
-    OUTER_POST_ARM_K_STACK.with(|cell| {
-        let start =
-            cell as *const Cell<[OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE]> as *mut c_void;
-        let end = unsafe {
-            (start as *mut u8).add(core::mem::size_of::<
-                [OuterPostArmKEntry; OUTER_POST_ARM_K_STACK_SIZE],
-            >()) as *mut c_void
-        };
-        let already_registered = OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| {
-            let r = rooted.get();
-            rooted.set(true);
-            r
-        });
-        if !already_registered {
-            unsafe {
-                crate::gc::GC_add_roots(start, end);
-            }
+    let (start, end) = outer_post_arm_k_stack_api::root_extent();
+    let already_registered = OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| {
+        let r = rooted.get();
+        rooted.set(true);
+        r
+    });
+    if !already_registered {
+        unsafe {
+            crate::gc::GC_add_roots(start, end);
         }
-        (start, end)
-    })
+    }
+    (start, end)
 }
 
 /// Inverse of [`register_outer_post_arm_k_stack_root_for_calling_thread`].
@@ -645,7 +798,7 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
     end: *mut c_void,
 ) {
     OUTER_POST_ARM_K_STACK_ROOTED.with(|rooted| rooted.set(false));
-    OUTER_POST_ARM_K_DEPTH.with(|depth| depth.set(0));
+    outer_post_arm_k_stack_api::set_depth(0);
     unsafe {
         crate::gc::GC_remove_roots(start, end);
     }
@@ -689,34 +842,14 @@ pub(crate) fn unregister_outer_post_arm_k_stack_root_for_calling_thread(
 /// pairs every push with a perform that eventually drives a Done.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_ptr: *mut u8) {
-    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        if depth >= OUTER_POST_ARM_K_STACK_SIZE {
-            eprintln!(
-                "sigil_outer_post_arm_k_push: stack overflow (depth {} >= cap {})",
-                depth, OUTER_POST_ARM_K_STACK_SIZE
-            );
-            std::process::abort();
-        }
-        OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-            let mut stack = stack_cell.get();
-            stack[depth] = OuterPostArmKEntry {
-                closure_ptr,
-                fn_ptr,
-            };
-            stack_cell.set(stack);
-        });
-        depth_cell.set(depth + 1);
-        if trace_opak() {
-            eprintln!(
-                "[OPAK PUSH] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
-                depth,
-                depth + 1,
-                closure_ptr as usize,
-                fn_ptr as usize
-            );
-        }
-    });
+    if !outer_post_arm_k_stack_api::push(closure_ptr, fn_ptr) {
+        let depth = outer_post_arm_k_stack_api::current_depth();
+        eprintln!(
+            "sigil_outer_post_arm_k_push: stack overflow (depth {} >= cap {})",
+            depth, OUTER_POST_ARM_K_STACK_SIZE
+        );
+        std::process::abort();
+    }
 }
 
 /// Pop the top of the outer `post_arm_k` stack. Called by the
@@ -733,35 +866,7 @@ pub unsafe extern "C" fn sigil_outer_post_arm_k_push(closure_ptr: *mut u8, fn_pt
 /// pointer mis-classification when the test-mode pushed values are
 /// non-heap-allocated synthetic pointers.
 fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
-    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        if depth == 0 {
-            None
-        } else {
-            depth_cell.set(depth - 1);
-            OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-                let mut stack = stack_cell.get();
-                let popped = stack[depth - 1];
-                // Clear the slot so a stale pointer doesn't survive
-                // in the TLS-rooted range across the next GC scan.
-                stack[depth - 1] = OuterPostArmKEntry {
-                    closure_ptr: ptr::null_mut(),
-                    fn_ptr: ptr::null_mut(),
-                };
-                stack_cell.set(stack);
-                if trace_opak() {
-                    eprintln!(
-                        "[OPAK POP] depth {} -> {} (closure=0x{:x} fn=0x{:x})",
-                        depth,
-                        depth - 1,
-                        popped.closure_ptr as usize,
-                        popped.fn_ptr as usize
-                    );
-                }
-                Some(popped)
-            })
-        }
-    })
+    outer_post_arm_k_stack_api::pop()
 }
 
 /// Drop (without dispatching) the top `n` entries of the outer
@@ -802,45 +907,7 @@ fn outer_post_arm_k_try_pop() -> Option<OuterPostArmKEntry> {
 /// reference remains.
 #[no_mangle]
 pub unsafe extern "C" fn sigil_outer_post_arm_k_drop(n: u32) {
-    if n == 0 {
-        return;
-    }
-    if trace_opak() {
-        let cur = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
-        eprintln!(
-            "[OPAK DROP] requesting drop of {} entries; depth={}",
-            n, cur
-        );
-    }
-    OUTER_POST_ARM_K_DEPTH.with(|depth_cell| {
-        let depth = depth_cell.get();
-        let drop_count = (n as usize).min(depth);
-        if drop_count < (n as usize) {
-            // Underflow: caller asked for more than available.
-            // Don't abort — the runtime stays well-formed. Logged so
-            // a future codegen-discipline regression surfaces.
-            #[cfg(debug_assertions)]
-            eprintln!(
-                "sigil_outer_post_arm_k_drop: requested {} but only {} available; \
-                 dropping what's available (codegen chain-push count mismatch?)",
-                n, depth
-            );
-        }
-        if drop_count == 0 {
-            return;
-        }
-        OUTER_POST_ARM_K_STACK.with(|stack_cell| {
-            let mut stack = stack_cell.get();
-            for i in 0..drop_count {
-                stack[depth - 1 - i] = OuterPostArmKEntry {
-                    closure_ptr: ptr::null_mut(),
-                    fn_ptr: ptr::null_mut(),
-                };
-            }
-            stack_cell.set(stack);
-        });
-        depth_cell.set(depth - drop_count);
-    });
+    outer_post_arm_k_stack_api::drop_top(n);
 }
 
 // ---------------------------------------------------------------------
@@ -1562,7 +1629,7 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
 ) -> (*mut u8, *mut u8) {
     use crate::gc::sigil_alloc;
 
-    let depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    let depth = outer_post_arm_k_stack_api::current_depth();
     if depth == 0 {
         return (k_closure, k_fn);
     }
@@ -1595,18 +1662,7 @@ unsafe fn wrap_continuation_with_outer_post_arm_k(
     // outer arm chain; let them drain naturally on their
     // run_loop's terminal.
     let wrapper_fn_addr_check = sigil_k_continuation_wrapper as *mut u8;
-    let any_wrapper = OUTER_POST_ARM_K_STACK.with(|cell| {
-        let stack = cell.get();
-        let mut i = depth;
-        while i > entry_depth {
-            i -= 1;
-            if stack[i].fn_ptr == wrapper_fn_addr_check {
-                return true;
-            }
-        }
-        false
-    });
-    if any_wrapper {
+    if outer_post_arm_k_stack_api::has_fn_ptr_in_range(wrapper_fn_addr_check, entry_depth, depth) {
         return (k_closure, k_fn);
     }
 
@@ -2119,7 +2175,7 @@ pub unsafe extern "C" fn sigil_perform(
                 false
             };
             let (actual_k_closure, actual_k_fn) =
-                if crossed_is_multi_shot && OUTER_POST_ARM_K_DEPTH.with(|c| c.get()) > 0 {
+                if crossed_is_multi_shot && outer_post_arm_k_stack_api::current_depth() > 0 {
                     wrap_continuation_with_outer_post_arm_k(k_closure_ptr, k_fn_ptr)
                 } else {
                     (k_closure_ptr, k_fn_ptr)
@@ -2344,7 +2400,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
     // our local frame; restore at every return path below so
     // nested run_loops nest correctly via C-stack save/restore.
     let prior_run_loop_entry_depth = run_loop_entry_depth_get();
-    let entry_depth_for_wrap = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    let entry_depth_for_wrap = outer_post_arm_k_stack_api::current_depth();
     run_loop_entry_depth_set(entry_depth_for_wrap);
     // Stage-6.8-followup Layer 3c — snapshot OUTER_POST_ARM_K_DEPTH at
     // run_loop entry. On the DISCHARGED bypass terminal (introduced by
@@ -2354,7 +2410,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
     // chain don't leak across run_loop boundaries. The Bug-2-era
     // routing path naturally pops one entry per terminal; the bypass
     // skips that pop, hence the explicit drain.
-    let outer_post_arm_k_entry_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+    let outer_post_arm_k_entry_depth = outer_post_arm_k_stack_api::current_depth();
     loop {
         counters::incr(CounterId::TrampolineDispatchCount);
 
@@ -2368,7 +2424,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
             NEXT_STEP_TAG_DONE | NEXT_STEP_TAG_DISCHARGED => {
                 let v = (*current).value;
                 if trace_term() {
-                    let d = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                    let d = outer_post_arm_k_stack_api::current_depth();
                     eprintln!(
                         "[TERM-BRANCH] tag={} value={} depth={} entry_depth={}",
                         tag, v, d, outer_post_arm_k_entry_depth
@@ -2445,7 +2501,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                     // invariant; the assertion catches the upstream
                     // bug if the invariant is ever violated by a new
                     // codegen path.
-                    let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                    let current_depth = outer_post_arm_k_stack_api::current_depth();
                     debug_assert!(
                         current_depth >= outer_post_arm_k_entry_depth,
                         "sigil_run_loop terminal: outer_post_arm_k depth \
@@ -2453,7 +2509,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                          {outer_post_arm_k_entry_depth}); a codegen path \
                          popped entries belonging to an outer run_loop"
                     );
-                    OUTER_POST_ARM_K_DEPTH.with(|c| c.set(outer_post_arm_k_entry_depth));
+                    outer_post_arm_k_stack_api::set_depth(outer_post_arm_k_entry_depth);
                     crate::arena::sigil_arena_reset();
                     run_loop_entry_depth_set(prior_run_loop_entry_depth);
                     return v;
@@ -2488,7 +2544,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                 // then dereferences a null fn_ptr and segfaults. Cap
                 // try_pop at entry_depth so each run_loop only consumes
                 // entries it owns.
-                let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                let current_depth = outer_post_arm_k_stack_api::current_depth();
                 if current_depth > outer_post_arm_k_entry_depth {
                     if let Some(entry) = outer_post_arm_k_try_pop() {
                         // Reset the arena before allocating the new Call.
@@ -2527,7 +2583,7 @@ unsafe fn sigil_run_loop_impl(initial_step: *mut NextStep, out: *mut TerminalRes
                 // catches bypassed-leak; this assertion catches
                 // routing-asymmetry — symmetric coverage of the
                 // discipline.
-                let current_depth = OUTER_POST_ARM_K_DEPTH.with(|c| c.get());
+                let current_depth = outer_post_arm_k_stack_api::current_depth();
                 debug_assert!(
                     current_depth == outer_post_arm_k_entry_depth,
                     "sigil_run_loop DONE terminal: outer_post_arm_k depth \
@@ -3742,7 +3798,7 @@ mod tests {
         // thread. The runtime's OUTER_POST_ARM_K_DEPTH is reset on
         // unregister; tests that share a thread must clear between
         // iterations.
-        OUTER_POST_ARM_K_DEPTH.with(|d| d.set(0));
+        outer_post_arm_k_stack_api::set_depth(0);
     }
 
     // CPS-color terminal: returns Done(value-passed-in-args_ptr[0] + 1).
