@@ -2893,7 +2893,7 @@ mod tests {
         // matches a previously-added one — it may round ranges to its own
         // granularity and silently retain a partially-overlapping segment.
         // If such a retained root pointed into a buffer we then freed, the
-        // next collection (this test's, a later test's, or the process-exit
+        // next collection (a later test's, or the test binary's process-exit
         // sweep) would scan freed memory and SIGSEGV. Leaking the storage
         // means every extent we ever register points into permanently-mapped
         // memory, so even an imperfectly-removed root can never dereference
@@ -2962,15 +2962,18 @@ mod tests {
             "second move must advance the last-rooted extent to the third buffer"
         );
 
-        // Force a collection with the `third` extent registered: it (and
-        // every other extent we touched) is leaked-and-mapped, so the mark
-        // phase scans real memory and must complete cleanly.
-        unsafe {
-            crate::gc::GC_gcollect();
-        }
+        // NB: we deliberately do NOT force a collection here. Every test in
+        // this file that calls `GC_gcollect()` is isolated into a subprocess
+        // (`in_stress_subprocess` / `run_stress_in_subprocess`), because a
+        // forced stop-the-world collection in the shared cargo-test process
+        // is unsafe. This test exercises the helper's register/unregister
+        // calls and asserts the resulting tracker state — the testable proxy
+        // for the GC root set — without needing a live mark phase.
+        // `GC_add_roots`/`GC_remove_roots` themselves are safe in-process
+        // (every `GcThreadEnrolment`-based test relies on exactly that).
 
         // Drop the one tracked root and reset the tracker for hygiene. The
-        // leaked buffers make leftover roots harmless either way.
+        // leaked buffers make any leftover root harmless either way.
         unsafe {
             crate::gc::GC_remove_roots(third_start, third_end);
         }
