@@ -490,6 +490,13 @@ mod outer_post_arm_k_stack_api {
         OUTER_POST_ARM_K_DEPTH.with(|c| c.set(value));
     }
 
+    /// Set the last-rooted extent. Used to seed the tracker when the
+    /// initial root is registered so subsequent reallocations can unregister it.
+    #[inline]
+    pub(super) fn set_last_rooted(start: *mut c_void, end: *mut c_void) {
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.set((start as usize, end as usize)));
+    }
+
     /// Get the base pointer and capacity extent of the stack for GC rooting.
     /// The returned pair is (start, end) where end points one past the end.
     /// This returns the full *capacity* extent, not the current depth,
@@ -617,31 +624,26 @@ mod outer_post_arm_k_stack_api {
         /// Test the continuation stack re-rooting helper. Directly invoke
         /// it with two distinct extents and verify the GC root set updates
         /// (old removed, new present), and that the no-op path works when
-        /// the buffer pointer is unchanged. The test uses real allocated
-        /// buffers and asserts transitions in the tracked last-rooted extent.
+        /// the buffer pointer is unchanged. The test uses well-separated synthetic
+        /// addresses (not real memory) to verify the helper's TLS bookkeeping and
+        /// GC registration calls without allocating actual buffers.
         #[test]
         fn rereg_outer_post_arm_k_root_updates_gc_root_on_buffer_move() {
             let _guard = crate::test_support::gc_test_lock();
             crate::gc::sigil_gc_init();
             let _enrol = crate::test_support::GcThreadEnrolment::acquire();
 
-            // Allocate three real buffers to use as extent pairs.
-            let old_buf: Vec<u8> = vec![0u8; 256];
-            let new_buf: Vec<u8> = vec![0u8; 256];
-            let third_buf: Vec<u8> = vec![0u8; 256];
-
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
-            let old_base = old_buf.as_ptr() as *mut c_void;
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
-            let old_end = unsafe { (old_buf.as_ptr().add(old_buf.len())) as *mut c_void };
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
-            let new_base = new_buf.as_ptr() as *mut c_void;
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
-            let new_end = unsafe { (new_buf.as_ptr().add(new_buf.len())) as *mut c_void };
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr; capacity bounded; test scope).
-            let third_base = third_buf.as_ptr() as *mut c_void;
-            // SAFETY: gc-heap-ptr arithmetic (Vec data ptr + offset; capacity bounded; test scope).
-            let third_end = unsafe { (third_buf.as_ptr().add(third_buf.len())) as *mut c_void };
+            // Use well-separated page-aligned synthetic addresses (not real memory).
+            // These values won't correspond to actual heap allocations, which is
+            // safe because the test only verifies the helper's TLS tracking and
+            // the GC function calls (which safely ignore non-mapped addresses in this context).
+            const PAGE_SIZE: usize = 0x1000;
+            let old_base = (0x10000 as *mut c_void);
+            let old_end = ((0x10000 + PAGE_SIZE) as *mut c_void);
+            let new_base = (0x20000 as *mut c_void);
+            let new_end = ((0x20000 + PAGE_SIZE) as *mut c_void);
+            let third_base = (0x30000 as *mut c_void);
+            let third_end = ((0x30000 + PAGE_SIZE) as *mut c_void);
 
             // Register the old extent and seed OUTER_POST_ARM_K_LAST_ROOTED
             // so the unregister branch is exercised on the first call.
@@ -695,7 +697,7 @@ mod outer_post_arm_k_stack_api {
             }
 
             // Reset the TLS tracking cell to prevent stale-root dereferencing
-            // on the next GC collection after the buffers are freed.
+            // on the next GC collection.
             OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set((0, 0)));
         }
     }
@@ -939,6 +941,9 @@ pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut
         unsafe {
             crate::gc::GC_add_roots(start, end);
         }
+        // Seed the re-root tracker so the first reallocation can unregister
+        // the initial root when the buffer moves.
+        outer_post_arm_k_stack_api::set_last_rooted(start, end);
     }
     (start, end)
 }
