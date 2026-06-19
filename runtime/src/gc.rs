@@ -86,7 +86,8 @@ extern "C" {
     // a fresh thread per test under `--test-threads=N`; without
     // unregistration, stale ranges from finished test threads pile up
     // in Boehm's root list and segfault on the next collection).
-    #[cfg(test)]
+    // Also used by the re-root-on-realloc helper (unwired, dead_code).
+    #[allow(dead_code)]
     pub(crate) fn GC_remove_roots(start: *mut c_void, end: *mut c_void);
     // Force a full GC cycle. Used by GC stress tests to deterministically
     // exercise reachability — without it, a passing test under low

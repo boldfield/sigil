@@ -371,6 +371,10 @@ thread_local! {
     };
     static OUTER_POST_ARM_K_DEPTH: Cell<usize> = const { Cell::new(0) };
     static OUTER_POST_ARM_K_STACK_ROOTED: Cell<bool> = const { Cell::new(false) };
+    /// Last (base, end) extent registered with the GC for this thread's
+    /// OUTER_POST_ARM_K_STACK. Tracked so rereg_outer_post_arm_k_root can
+    /// unregister the old extent before registering the new one on reallocation.
+    static OUTER_POST_ARM_K_LAST_ROOTED: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 
     /// Current `sigil_run_loop`'s `outer_post_arm_k_entry_depth`
     /// snapshot. `wrap_continuation_with_outer_post_arm_k` reads
@@ -396,8 +400,8 @@ thread_local! {
 /// OUTER_POST_ARM_K_DEPTH thread-local state.
 mod outer_post_arm_k_stack_api {
     use super::{
-        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_STACK,
-        OUTER_POST_ARM_K_STACK_SIZE,
+        trace_opak, OuterPostArmKEntry, OUTER_POST_ARM_K_DEPTH, OUTER_POST_ARM_K_LAST_ROOTED,
+        OUTER_POST_ARM_K_STACK, OUTER_POST_ARM_K_STACK_SIZE,
     };
     use std::ffi::c_void;
 
@@ -487,6 +491,15 @@ mod outer_post_arm_k_stack_api {
         OUTER_POST_ARM_K_DEPTH.with(|c| c.set(value));
     }
 
+    /// Record the extent that was most recently registered as a GC root.
+    /// Called by `register_outer_post_arm_k_stack_root_for_calling_thread`
+    /// so that `rereg_outer_post_arm_k_root` can identify and remove the
+    /// old root when the backing buffer moves.
+    #[inline]
+    pub(super) fn set_last_rooted(start: *mut c_void, end: *mut c_void) {
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.set((start as usize, end as usize)));
+    }
+
     /// Get the base pointer and capacity extent of the stack for GC rooting.
     /// The returned pair is (start, end) where end points one past the end.
     /// This returns the full *capacity* extent, not the current depth,
@@ -559,6 +572,131 @@ mod outer_post_arm_k_stack_api {
             });
             depth_cell.set(depth - drop_count);
         });
+    }
+}
+
+/// Re-register the continuation stack's GC root when its backing buffer has
+/// moved (e.g., due to Vec reallocation). Unregisters the old extent and
+/// registers the new extent with the precise GC. No-op when the buffer
+/// pointer is unchanged (detected via the last-rooted extent tracked in
+/// `OUTER_POST_ARM_K_LAST_ROOTED`).
+///
+/// Not yet on the hot path — the Vec stays cap-256 and never reallocates.
+/// This helper is wired in the follow-on stack-growth task.
+#[allow(dead_code)]
+pub(crate) fn rereg_outer_post_arm_k_root(
+    old_start: *mut std::ffi::c_void,
+    old_end: *mut std::ffi::c_void,
+    new_start: *mut std::ffi::c_void,
+    new_end: *mut std::ffi::c_void,
+) {
+    let old_key = (old_start as usize, old_end as usize);
+    let new_key = (new_start as usize, new_end as usize);
+    let last_rooted = OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.get());
+
+    // No-op if the buffer pointer hasn't changed.
+    if last_rooted == new_key {
+        return;
+    }
+
+    // Unregister the old extent if non-null and matches what we last rooted.
+    if old_start as usize != 0 && last_rooted == old_key {
+        unsafe {
+            crate::gc::GC_remove_roots(old_start, old_end);
+        }
+    }
+
+    // Register the new extent if non-null.
+    if new_start as usize != 0 {
+        unsafe {
+            crate::gc::GC_add_roots(new_start, new_end);
+        }
+    }
+
+    OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set(new_key));
+}
+
+#[cfg(test)]
+mod outer_post_arm_k_rereg_tests {
+    use super::*;
+    use std::alloc::{dealloc, Layout};
+    use std::ffi::c_void;
+
+    /// Unit-test `rereg_outer_post_arm_k_root` by invoking it with three
+    /// distinct extents and asserting that `OUTER_POST_ARM_K_LAST_ROOTED`
+    /// transitions correctly (old removed / new added) and that the no-op
+    /// path fires when the extent is unchanged.
+    ///
+    /// `GcThreadEnrolment` is intentionally omitted: the helper never calls
+    /// `GC_gcollect` and never allocates GC objects, so `GcThreadEnrolment`
+    /// is not required (see `test_support` module doc for the rule).
+    /// Omitting it also ensures no OPAK/HS/ARENA roots are registered
+    /// concurrently with this test's extents — Boehm coalesces adjacent root
+    /// entries, and a GC_remove_roots on a sub-range of a coalesced entry
+    /// silently removes the entire merged range, leaving the OPAK root
+    /// unregistered and causing SIGSEGV at process-exit when Boehm's atexit
+    /// collection finds a stale root that predates the TLS Vec's lifetime.
+    #[test]
+    fn rereg_outer_post_arm_k_root_updates_gc_root_on_buffer_move() {
+        let _guard = crate::test_support::gc_test_lock();
+        crate::gc::sigil_gc_init();
+
+        // Page-aligned allocations guarantee each extent lands on its own
+        // page, making GC_add_roots / GC_remove_roots exact (no coalescing).
+        let page = 4096usize;
+        let layout = Layout::from_size_align(page, page)
+            .unwrap_or_else(|_| unreachable!("4096 is a valid power-of-two alignment"));
+        let new_base = unsafe { std::alloc::alloc_zeroed(layout) } as *mut c_void;
+        let new_end = unsafe { (new_base as *mut u8).add(page) as *mut c_void };
+        let third_base = unsafe { std::alloc::alloc_zeroed(layout) } as *mut c_void;
+        let third_end = unsafe { (third_base as *mut u8).add(page) as *mut c_void };
+
+        // LAST_ROOTED is (0,0) on this thread (no prior GcThreadEnrolment).
+        // Reset explicitly so the test does not depend on TLS initialisation order.
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set((0, 0)));
+
+        // First call: null old, registers new extent.
+        // No GC_remove_roots is issued (old_start == null).
+        rereg_outer_post_arm_k_root(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_base,
+            new_end,
+        );
+        assert_eq!(
+            OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.get()),
+            (new_base as usize, new_end as usize),
+            "last-rooted should update to new extent"
+        );
+
+        // Second call: same new extent — no-op; last-rooted unchanged.
+        rereg_outer_post_arm_k_root(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_base,
+            new_end,
+        );
+        assert_eq!(
+            OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.get()),
+            (new_base as usize, new_end as usize),
+            "last-rooted unchanged on no-op call"
+        );
+
+        // Third call: transition to third extent; removes new, registers third.
+        rereg_outer_post_arm_k_root(new_base, new_end, third_base, third_end);
+        assert_eq!(
+            OUTER_POST_ARM_K_LAST_ROOTED.with(|c| c.get()),
+            (third_base as usize, third_end as usize),
+            "last-rooted should update to third extent"
+        );
+
+        // Cleanup: unregister the final root, reset tracker, then free.
+        // GC_remove_roots BEFORE dealloc so no registered root points to freed memory.
+        unsafe { crate::gc::GC_remove_roots(third_base, third_end) };
+        OUTER_POST_ARM_K_LAST_ROOTED.with(|cell| cell.set((0, 0)));
+        // new_base was already unregistered by the third rereg call above.
+        unsafe { dealloc(new_base as *mut u8, layout) };
+        unsafe { dealloc(third_base as *mut u8, layout) };
     }
 }
 
@@ -800,6 +938,9 @@ pub(crate) fn register_outer_post_arm_k_stack_root_for_calling_thread() -> (*mut
         unsafe {
             crate::gc::GC_add_roots(start, end);
         }
+        // Seed the re-root tracker so the first reallocation can unregister
+        // this initial root when the backing buffer moves.
+        outer_post_arm_k_stack_api::set_last_rooted(start, end);
     }
     (start, end)
 }
