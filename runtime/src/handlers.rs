@@ -389,6 +389,12 @@ thread_local! {
     /// path from `wrap_continuation_with_outer_post_arm_k` cannot
     /// panic on a `RefCell` borrow.
     static RUN_LOOP_ENTRY_DEPTH: Cell<usize> = const { Cell::new(0) };
+
+    /// Tracks the last (base, capacity_bytes) extent registered with GC
+    /// for the OUTER_POST_ARM_K_STACK. Used by re_root_on_realloc to
+    /// detect when the Vec's backing buffer moves and unregister/register
+    /// the new extent.
+    static OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
 }
 
 /// Internal API for the outer post-arm-k continuation stack.
@@ -400,6 +406,9 @@ mod outer_post_arm_k_stack_api {
         OUTER_POST_ARM_K_STACK_SIZE,
     };
     use std::ffi::c_void;
+
+    #[cfg(test)]
+    use super::OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT;
 
     /// Push an entry onto the stack. Returns false if the stack is full
     /// (depth >= OUTER_POST_ARM_K_STACK_SIZE).
@@ -559,6 +568,112 @@ mod outer_post_arm_k_stack_api {
             });
             depth_cell.set(depth - drop_count);
         });
+    }
+
+    /// Re-root the continuation stack's GC root when its backing buffer
+    /// moves due to reallocation. Given the previously-rooted (base, len)
+    /// and the current (base, len), unregisters the old extent and
+    /// registers the new extent with the precise GC. If the base pointer
+    /// is unchanged, this is a no-op.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that:
+    /// - The old (base, len) matches the previously registered extent.
+    /// - The new (base, len) reflects the current Vec backing buffer.
+    /// - The Vec allocation is valid for the duration of the GC root.
+    #[cfg(test)]
+    pub(super) fn re_root_on_realloc(
+        old_base: *mut c_void,
+        old_len: usize,
+        new_base: *mut c_void,
+        new_len: usize,
+    ) {
+        let old_base_usize = old_base as usize;
+        let new_base_usize = new_base as usize;
+
+        if old_base_usize == new_base_usize {
+            return;
+        }
+
+        unsafe {
+            crate::gc::GC_remove_roots(old_base, (old_base as *mut u8).add(old_len) as *mut c_void);
+            crate::gc::GC_add_roots(new_base, (new_base as *mut u8).add(new_len) as *mut c_void);
+        }
+
+        OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT.with(|extent_cell| {
+            extent_cell.set((new_base_usize, new_len));
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn re_root_on_realloc_is_noop_when_base_unchanged() {
+            let _guard = crate::test_support::gc_test_lock();
+            crate::gc::sigil_gc_init();
+
+            let base = 0x1000usize as *mut c_void;
+            let len = 256;
+
+            re_root_on_realloc(base, len, base, len + 100);
+            let extent =
+                super::super::OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, 0,
+                "extent should not be updated when base is unchanged"
+            );
+            assert_eq!(
+                extent.1, 0,
+                "extent should not be updated when base is unchanged"
+            );
+        }
+
+        #[test]
+        fn re_root_on_realloc_updates_rooted_extent_on_move() {
+            let _guard = crate::test_support::gc_test_lock();
+            crate::gc::sigil_gc_init();
+
+            let old_base = 0x1000usize as *mut c_void;
+            let new_base = 0x2000usize as *mut c_void;
+            let capacity_bytes = 256 * std::mem::size_of::<OuterPostArmKEntry>();
+
+            re_root_on_realloc(old_base, capacity_bytes, new_base, capacity_bytes);
+
+            let extent =
+                super::super::OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT.with(|cell| cell.get());
+            assert_eq!(extent.0, new_base as usize, "new base should be tracked");
+            assert_eq!(extent.1, capacity_bytes, "new capacity should be tracked");
+        }
+
+        #[test]
+        fn re_root_on_realloc_with_gc_collection() {
+            let _guard = crate::test_support::gc_test_lock();
+            crate::gc::sigil_gc_init();
+            let _enrol = crate::test_support::GcThreadEnrolment::acquire();
+
+            let old_base = 0x1000usize as *mut c_void;
+            let new_base = 0x2000usize as *mut c_void;
+            let capacity_bytes = 256 * std::mem::size_of::<OuterPostArmKEntry>();
+
+            unsafe {
+                re_root_on_realloc(old_base, capacity_bytes, new_base, capacity_bytes);
+                crate::gc::GC_gcollect();
+            }
+
+            let extent =
+                super::super::OUTER_POST_ARM_K_STACK_LAST_ROOTED_EXTENT.with(|cell| cell.get());
+            assert_eq!(
+                extent.0, new_base as usize,
+                "new base should be tracked after GC"
+            );
+            assert_eq!(
+                extent.1, capacity_bytes,
+                "new capacity should be tracked after GC"
+            );
+        }
     }
 }
 
