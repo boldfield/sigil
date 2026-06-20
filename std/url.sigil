@@ -71,30 +71,30 @@ fn parse_url(s: String) -> Result[Url, String] ![] {
 
       // Parse host and port from authority
       let colon_idx: Int = string_index_of(authority, ":");
-      let hp_result: Result[(String, Int), String] = if colon_idx < 0 {
-        Ok((authority, default_port(scheme)))
+      let final_host: String = if colon_idx < 0 {
+        authority
       } else {
-        let host: String = string_substring(authority, 0, colon_idx);
+        string_substring(authority, 0, colon_idx)
+      };
+      let final_port: Int = if colon_idx < 0 {
+        default_port(scheme)
+      } else {
         let port_str: String = string_substring(authority, colon_idx + 1, string_length(authority));
         match string_to_int(port_str) {
-          Ok(p) => Ok((host, p)),
-          Err(_) => Err("invalid port"),
+          Ok(p) => p,
+          Err(_) => -1,
         }
       };
-
-      match hp_result {
-        Ok(hp) => {
-          let host: String = fst(hp);
-          let port: Int = snd(hp);
-          Ok({
-            scheme: scheme,
-            host: host,
-            port: port,
-            path: path,
-            query: query,
-          })
-        },
-        Err(e) => Err(e),
+      if final_port < 0 {
+        Err("invalid port")
+      } else {
+        Ok(Url {
+          scheme: scheme,
+          host: final_host,
+          port: final_port,
+          path: path,
+          query: query,
+        })
       }
     }
   }
