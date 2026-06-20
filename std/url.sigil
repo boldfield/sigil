@@ -5,9 +5,11 @@
 import std.result
 import std.string
 import std.byte_array
+import std.pair
 use std.result.{Ok, Err, Result};
 use std.string.{string_index_of, string_substring, string_to_int};
 use std.byte_array.{string_length};
+use std.pair.{fst, snd};
 
 type Url = {
   scheme: String,
@@ -63,30 +65,37 @@ fn parse_url(s: String) -> Result[Url, String] ![] {
     } else {
       // Parse path and query: what comes after authority
       let path_and_query_str: String = string_substring(rest, auth_end_idx, string_length(rest));
-      let (path, query): (String, String) = parse_path_and_query(path_and_query_str);
+      let pq: (String, String) = parse_path_and_query(path_and_query_str);
+      let path: String = fst(pq);
+      let query: String = snd(pq);
 
       // Parse host and port from authority
       let colon_idx: Int = string_index_of(authority, ":");
-      let (host, port): (String, Int) = if colon_idx < 0 {
-        (authority, default_port(scheme))
+      let hp_result: Result[(String, Int), String] ![] = if colon_idx < 0 {
+        Ok((authority, default_port(scheme)))
       } else {
         let host: String = string_substring(authority, 0, colon_idx);
         let port_str: String = string_substring(authority, colon_idx + 1, string_length(authority));
         match string_to_int(port_str) {
-          Ok(p) => (host, p),
-          Err(_) => {
-            return Err("invalid port");
-          },
+          Ok(p) => Ok((host, p)),
+          Err(_) => Err("invalid port"),
         }
       };
 
-      Ok({
-        scheme: scheme,
-        host: host,
-        port: port,
-        path: path,
-        query: query,
-      })
+      match hp_result {
+        Ok(hp) => {
+          let host: String = fst(hp);
+          let port: Int = snd(hp);
+          Ok({
+            scheme: scheme,
+            host: host,
+            port: port,
+            path: path,
+            query: query,
+          })
+        },
+        Err(e) => Err(e),
+      }
     }
   }
 }
