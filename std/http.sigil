@@ -3,21 +3,23 @@
 // std/http.sigil — HTTP types and utilities.
 
 import std.url
+import std.list
 use std.url.{Url};
+use std.list.{List};
 
 type Header = {
   key: String,
   value: String,
 }
 
-type Request[Unit] = {
+type Request = {
   method: String,
   url: Url,
   headers: List[Header],
   body: ByteArray,
 }
 
-type Response[Unit] = {
+type Response = {
   status: Int,
   reason: String,
   headers: List[Header],
@@ -25,7 +27,7 @@ type Response[Unit] = {
 }
 
 // `get(url, headers)` constructs a GET request for the given URL and headers.
-fn get(url: Url, headers: List[Header]) -> Request[Unit] ![] {
+fn get(url: Url, headers: List[Header]) -> Request ![] {
   Request {
     method: "GET",
     url: url,

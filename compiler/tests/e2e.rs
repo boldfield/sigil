@@ -24129,11 +24129,11 @@ fn std_http_get_builds_request() {
                import std.http\n\
                use std.io.{IO};\n\
                use std.url.{parse_url};\n\
-               use std.http.{get};\n\
+               use std.http.{get, Request};\n\
                fn main() -> Int ![IO] {\n\
                  match parse_url(\"http://example.com/path\") {\n\
                    Ok(url) => {\n\
-                     let req = get(url, Nil);\n\
+                     let req: Request = get(url, Nil);\n\
                      perform IO.println(req.method);\n\
                      perform IO.println(req.url.host);\n\
                      perform IO.println(req.url.path);\n\
@@ -24153,8 +24153,9 @@ fn std_http_response_construct() {
     let src = "import std.io\n\
                import std.http\n\
                use std.io.{IO};\n\
+               use std.http.{Response};\n\
                fn main() -> Int ![IO] {\n\
-                 let resp = std.http.Response {\n\
+                 let resp: Response = Response {\n\
                    status: 200,\n\
                    reason: \"OK\",\n\
                    headers: Nil,\n\
