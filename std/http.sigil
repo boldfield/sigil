@@ -7,27 +7,22 @@ import std.list
 use std.url.{Url};
 use std.list.{List};
 
-type Header = {
-  key: String,
-  value: String,
-}
-
 type Request = {
   method: String,
   url: Url,
-  headers: List[Header],
+  headers: List[(String, String)],
   body: ByteArray,
 }
 
 type Response = {
   status: Int,
   reason: String,
-  headers: List[Header],
+  headers: List[(String, String)],
   body: ByteArray,
 }
 
 // `get(url, headers)` constructs a GET request for the given URL and headers.
-fn get(url: Url, headers: List[Header]) -> Request ![] {
+fn get(url: Url, headers: List[(String, String)]) -> Request ![] {
   Request {
     method: "GET",
     url: url,
