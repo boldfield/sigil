@@ -24334,6 +24334,39 @@ fn std_http_parse_response_malformed() {
     assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
 }
 
+/// `parse_response` populates body when Content-Length is present.
+#[test]
+fn std_http_parse_response_with_body() {
+    let src = "import std.io\n\
+               import std.http\n\
+               import std.byte_array\n\
+               use std.io.{IO};\n\
+               use std.http.{parse_response};\n\
+               use std.byte_array.{string_to_bytes, byte_array_length};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let response_bytes: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Length: 5\\r\\n\\r\\nhello\");\n\
+                 match parse_response(response_bytes) {\n\
+                   Ok(resp) => {\n\
+                     let body_len: Int = byte_array_length(resp.body);\n\
+                     if body_len == 5 {\n\
+                       perform IO.println(\"OK\");\n\
+                       0\n\
+                     } else {\n\
+                       perform IO.println(\"body length mismatch\");\n\
+                       1\n\
+                     }\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     1\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_parse_response_with_body");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
+}
+
 // ===== record.field field access =======================================
 
 #[test]

@@ -19,13 +19,15 @@ import std.string
 import std.byte_array
 import std.int
 import std.result
+import std.ordering
 use std.list.{List, fold, reverse, Nil, Cons};
 use std.url.{Url};
 use std.string.{string_concat, string_split, string_substring, string_index_of, string_length, string_to_int};
-use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length, string_to_bytes, string_from_bytes, byte_array_slice, byte_array_slice_opt, byte_array_get};
+use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length, string_to_bytes, string_from_bytes, byte_array_slice, byte_array_slice_opt, byte_array_get, byte_truncate};
 use std.result.{Ok, Err};
 use std.int.{int_to_string};
 use std.option.{Some, None, Option};
+use std.ordering.{string_compare, Equal};
 
 type Header = {
   name: String,
@@ -68,7 +70,7 @@ fn find_blank_line_impl(bytes: ByteArray, pos: Int) -> Int ![Mem] {
     let b1: Byte = byte_array_get(bytes, pos + 1);
     let b2: Byte = byte_array_get(bytes, pos + 2);
     let b3: Byte = byte_array_get(bytes, pos + 3);
-    if b0 == 13 && b1 == 10 && b2 == 13 && b3 == 10 {
+    if b0 == byte_truncate(13) && b1 == byte_truncate(10) && b2 == byte_truncate(13) && b3 == byte_truncate(10) {
       pos
     } else {
       find_blank_line_impl(bytes, pos + 1)
@@ -80,13 +82,14 @@ fn find_content_length(headers: List[Header]) -> Option[Int] ![] {
   match headers {
     Nil => None,
     Cons(h, rest) => {
-      if h.name == "Content-Length" {
-        match string_to_int(h.value) {
-          Ok(len) => Some(len),
-          Err(_) => find_content_length(rest),
-        }
-      } else {
-        find_content_length(rest)
+      match string_compare(h.name, "Content-Length") {
+        Equal => {
+          match string_to_int(h.value) {
+            Ok(len) => Some(len),
+            Err(_) => find_content_length(rest),
+          }
+        },
+        _ => find_content_length(rest),
       }
     }
   }
