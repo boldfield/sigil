@@ -24256,42 +24256,29 @@ fn std_http_parse_response_valid() {
                use std.io.{IO};\n\
                use std.http.{Response, Header, parse_response};\n\
                use std.byte_array.{string_to_bytes, byte_array_concat};\n\
-               use std.list.{List};\n\
+               use std.list.{List, Cons, Nil};\n\
                fn main() -> Int ![IO, Mem] {\n\
                  let response_bytes: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nX-Custom: value\\r\\n\\r\\n\");\n\
                  match parse_response(response_bytes) {\n\
                    Ok(resp) => {\n\
-                     if resp.status == 200 && resp.reason == \"OK\" && resp.headers.len() == 2 {\n\
-                       match resp.headers.get(0) {\n\
-                         Some(h0) => {\n\
-                           if h0.name == \"Content-Type\" && h0.value == \"text/plain\" {\n\
-                             match resp.headers.get(1) {\n\
-                               Some(h1) => {\n\
-                                 if h1.name == \"X-Custom\" && h1.value == \"value\" {\n\
-                                   perform IO.println(\"OK\");\n\
-                                   0\n\
-                                 } else {\n\
-                                   perform IO.println(\"header1 mismatch\");\n\
-                                   1\n\
-                                 }\n\
-                               },\n\
-                               None => {\n\
-                                 perform IO.println(\"missing header1\");\n\
-                                 1\n\
-                               },\n\
-                             }\n\
+                     if resp.status == 200 && resp.reason == \"OK\" {\n\
+                       match resp.headers {\n\
+                         Cons(h0, Cons(h1, _)) => {\n\
+                           if h0.name == \"Content-Type\" && h0.value == \"text/plain\" && h1.name == \"X-Custom\" && h1.value == \"value\" {\n\
+                             perform IO.println(\"OK\");\n\
+                             0\n\
                            } else {\n\
-                             perform IO.println(\"header0 mismatch\");\n\
+                             perform IO.println(\"header mismatch\");\n\
                              1\n\
                            }\n\
                          },\n\
-                         None => {\n\
-                           perform IO.println(\"missing header0\");\n\
+                         _ => {\n\
+                           perform IO.println(\"header count mismatch\");\n\
                            1\n\
                          },\n\
                        }\n\
                      } else {\n\
-                       perform IO.println(\"status/reason/headers mismatch\");\n\
+                       perform IO.println(\"status/reason mismatch\");\n\
                        1\n\
                      }\n\
                    },\n\
