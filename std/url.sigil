@@ -1,0 +1,121 @@
+// sigil: 0.1
+//
+// std/url.sigil — URL parsing and representation.
+
+import std.result
+import std.string
+use std.result.{Ok, Err, Result};
+use std.string.{string_index_of, string_length, string_substring, string_concat, string_to_int_validate, string_to_int_parse};
+
+type Url = {
+  scheme: String,
+  host: String,
+  port: Int,
+  path: String,
+  query: String,
+}
+
+// `parse_url(s)` parses a URL string into its components.
+//
+// Format: `scheme://host[:port][/path][?query]`
+//
+// Examples:
+//   parse_url("http://h/p") → Ok({scheme: "http", host: "h", port: 80, path: "/p", query: ""})
+//   parse_url("https://h:8443/p?q=1") → Ok({scheme: "https", host: "h", port: 8443, path: "/p", query: "q=1"})
+//   parse_url("http://h") → Ok({scheme: "http", host: "h", port: 80, path: "/", query: ""})
+//
+// Errors on:
+//   - No scheme (no `://`)
+//   - Empty host
+fn parse_url(s: String) -> Result[Url, String] ![] {
+  let scheme_sep_idx: Int = string_index_of(s, "://");
+  if scheme_sep_idx < 0 {
+    Err("no scheme")
+  } else {
+    let scheme: String = string_substring(s, 0, scheme_sep_idx);
+    let rest_idx: Int = scheme_sep_idx + 3;
+    let rest: String = string_substring(s, rest_idx, string_length(s));
+
+    // Find the first `/` to separate authority from path+query
+    let slash_idx: Int = string_index_of(rest, "/");
+    let query_idx: Int = string_index_of(rest, "?");
+
+    let authority: String;
+    let path: String;
+    let query: String;
+
+    if slash_idx < 0 {
+      // No path, entire rest is authority
+      authority = rest;
+      path = "/";
+      query = "";
+    } else {
+      authority = string_substring(rest, 0, slash_idx);
+      let path_and_query: String = string_substring(rest, slash_idx, string_length(rest));
+
+      // Split path and query
+      let q_idx: Int = string_index_of(path_and_query, "?");
+      if q_idx < 0 {
+        path = path_and_query;
+        query = "";
+      } else {
+        path = string_substring(path_and_query, 0, q_idx);
+        query = string_substring(path_and_query, q_idx + 1, string_length(path_and_query));
+      }
+    }
+
+    if string_length(authority) == 0 {
+      Err("empty host")
+    } else {
+      // Parse authority for host and port
+      let colon_idx: Int = string_index_of(authority, ":");
+      let host: String;
+      let port: Int;
+
+      if colon_idx < 0 {
+        // No explicit port, use default
+        host = authority;
+        port = default_port(scheme);
+      } else {
+        host = string_substring(authority, 0, colon_idx);
+        let port_str: String = string_substring(authority, colon_idx + 1, string_length(authority));
+
+        match string_to_int(port_str) {
+          Ok(p) => port = p,
+          Err(_) => {
+            return Err("invalid port");
+          },
+        }
+      }
+
+      Ok({
+        scheme: scheme,
+        host: host,
+        port: port,
+        path: path,
+        query: query,
+      })
+    }
+  }
+}
+
+fn default_port(scheme: String) -> Int ![] {
+  if scheme == "https" {
+    443
+  } else {
+    if scheme == "http" {
+      80
+    } else {
+      80
+    }
+  }
+}
+
+fn string_to_int(s: String) -> Result[Int, String] ![] {
+  let code: Int = string_to_int_validate(s);
+  if code == 0 {
+    Ok(string_to_int_parse(s))
+  } else {
+    Err("invalid integer")
+  }
+}
