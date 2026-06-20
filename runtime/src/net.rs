@@ -6,7 +6,7 @@
 //! spec (TLS, send, recv, close to follow).
 
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{LazyLock, Mutex};
 
@@ -83,6 +83,28 @@ pub fn send(conn_id: i64, data: &[u8]) -> Result<usize, i64> {
     }
 }
 
+/// Rust-testable recv helper. Looks up the conn id in the registry,
+/// reads up to `max` bytes from the Plain TcpStream into a buffer,
+/// and returns Ok(Vec<u8>) (empty vec = EOF) or Err with the error code.
+#[allow(clippy::disallowed_methods)]
+pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
+    let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
+    match registry.map.get_mut(&conn_id) {
+        Some(Conn::Plain(stream)) => {
+            let mut buf = vec![0u8; max];
+            match stream.read(&mut buf) {
+                Ok(0) => Ok(Vec::new()),
+                Ok(n) => {
+                    buf.truncate(n);
+                    Ok(buf)
+                }
+                Err(_) => Err(NET_ERR_OTHER),
+            }
+        }
+        None => Err(NET_ERR_BADHANDLE),
+    }
+}
+
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.connect.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
 /// Uses conservative scanning (descriptor_index = u32::MAX) since this
@@ -111,6 +133,22 @@ unsafe fn build_net_send_result_tuple(
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, bytes_written as u64, error_msg as u64],
         0b100,
+        u32::MAX,
+    )
+}
+
+/// Build the 3-element `(Int, ByteArray, String)` result tuple for Net.recv.
+/// Bitmap = 0b110 (slots 1 & 2 are pointers; slot 0 is a scalar).
+/// Uses conservative scanning (descriptor_index = u32::MAX) since this
+/// shape (Int, Ptr, Ptr) is not pre-registered.
+unsafe fn build_net_recv_result_tuple(
+    error_tag: i64,
+    data: *mut u8,
+    error_msg: *mut u8,
+) -> *mut u8 {
+    crate::effect_helpers::alloc_tuple(
+        &[error_tag as u64, data as u64, error_msg as u64],
+        0b110,
         u32::MAX,
     )
 }
@@ -233,6 +271,60 @@ pub unsafe extern "C" fn sigil_net_send_arm(
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
+/// `Net.recv(conn_id: Int, max: Int) -> (Int, ByteArray, String)` arm fn.
+///
+/// # Safety
+///
+/// `args_len == 7` (2 user args + trailing quintuple). `in_args[0]` is a
+/// conn_id Int; `in_args[1]` is a max Int.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_net_recv_arm(
+    _closure_ptr: *const u8,
+    in_args: *const u64,
+    args_len: u32,
+    _terminal_out: *mut TerminalResult,
+) -> *mut NextStep {
+    debug_assert!(
+        args_len == 7,
+        "sigil_net_recv_arm: args_len {args_len} != 7"
+    );
+    debug_assert!(!in_args.is_null());
+
+    let conn_id = *in_args as i64;
+    let max = *in_args.add(1) as usize;
+    let k_closure = *in_args.add(2) as *mut u8;
+    let k_fn = *in_args.add(3) as *mut u8;
+
+    // Call the Rust recv helper.
+    let (error_tag, data_vec) = match recv(conn_id, max) {
+        Ok(vec) => (NET_OK, vec),
+        Err(code) => (code, Vec::new()),
+    };
+
+    // Allocate ByteArray and copy data into it.
+    let data_ptr = crate::byte_array::sigil_byte_array_alloc(data_vec.len() as u64, 0);
+    if !data_vec.is_empty() {
+        // SAFETY: gc-heap-ptr arithmetic (ByteArray payload starts at offset 16).
+        let payload = data_ptr.add(16);
+        // SAFETY: gc-heap-ptr arithmetic (data_vec is a Rust-owned Vec; payload is the ByteArray interior byte buffer at offset 16, bounds [16, 16+data_vec.len())).
+        std::ptr::copy_nonoverlapping(data_vec.as_ptr(), payload, data_vec.len());
+    }
+
+    let error_msg = if error_tag == NET_OK {
+        alloc_string_from_str("")
+    } else {
+        let msg = match error_tag {
+            NET_ERR_BADHANDLE => "Bad connection handle",
+            NET_ERR_OTHER => "Read error",
+            _ => "Recv error",
+        };
+        alloc_string_from_str(msg)
+    };
+
+    let tup = build_net_recv_result_tuple(error_tag, data_ptr, error_msg);
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -320,5 +412,69 @@ mod tests {
         let (buf, n) = receiver_thread.join().expect("receiver thread panicked");
         assert_eq!(n, 13, "listener should receive all bytes");
         assert_eq!(&buf[..n], test_data, "listener should receive correct data");
+    }
+
+    #[test]
+    fn recv_from_connected_stream_reads_bytes() {
+        let _g = gc_test_lock();
+        use std::io::Write;
+        use std::thread;
+
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Spawn a thread to accept the connection and write the data.
+        let writer_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let test_data = b"Hello, Recv!";
+            stream.write_all(test_data).expect("write to stream");
+            drop(stream);
+        });
+
+        // Connect to the listener.
+        let conn_id = connect("127.0.0.1", port).expect("connect should succeed");
+
+        // Recv data through the connection.
+        let result = recv(conn_id, 100);
+        assert!(result.is_ok(), "recv should succeed");
+        let data = result.unwrap();
+        assert_eq!(&data[..], b"Hello, Recv!", "should recv correct data");
+
+        // Wait for the writer thread.
+        writer_thread.join().expect("writer thread panicked");
+    }
+
+    #[test]
+    fn recv_from_closed_peer_yields_empty() {
+        let _g = gc_test_lock();
+        use std::thread;
+
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Spawn a thread to accept and immediately close the connection.
+        let closer_thread = thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept connection");
+            drop(_stream);
+        });
+
+        // Connect to the listener.
+        let conn_id = connect("127.0.0.1", port).expect("connect should succeed");
+
+        // Wait for the peer to close.
+        closer_thread.join().expect("closer thread panicked");
+
+        // Recv from the closed stream should return empty.
+        let result = recv(conn_id, 100);
+        assert!(result.is_ok(), "recv should succeed on closed stream");
+        let data = result.unwrap();
+        assert!(
+            data.is_empty(),
+            "recv should return empty on closed peer (EOF)"
+        );
     }
 }
