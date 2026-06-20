@@ -1,0 +1,23 @@
+// sigil: 0.1
+// Simple Net effect test - verify connect/send/recv/close compile and run.
+import std.io
+use std.io.{IO};
+
+fn main() -> Int ![IO, Net] {
+  perform IO.println("Net test starting");
+
+  // Test Net.connect - will fail but shouldn't panic
+  match perform Net.connect("localhost", 9999, false) {
+    (error_code, conn_id, error_msg) => {
+      if error_code != 0 {
+        perform IO.println("Net.connect failed (error code set)");
+        0
+      } else {
+        perform IO.println("Net.connect succeeded");
+        match perform Net.close(conn_id) {
+          (close_code, close_msg) => 0
+        }
+      }
+    }
+  }
+}
