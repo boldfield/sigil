@@ -295,6 +295,9 @@ pub(crate) struct RuntimeShapeIndices {
     /// `(Tag/Int, Ptr, Ptr)` tuple — fs-err 3-element shape.
     /// `(bitmap=0b110, count=3)`.
     pub tuple_int_ptr_ptr: u32,
+    /// `(Int, Int, Ptr)` tuple — net-connect/send result shape.
+    /// `(bitmap=0b100, count=3)`.
+    pub tuple_int_int_ptr: u32,
     /// `(Int, Int, Ptr, Ptr)` tuple — process-run result shape.
     /// `(bitmap=0b1100, count=4)`.
     pub tuple_int_int_ptr_ptr: u32,
@@ -428,6 +431,7 @@ fn append_runtime_shapes(descriptors: &mut Vec<usize>) -> RuntimeShapeIndices {
     let tuple_int_ptr = push(0b10, 2);
     let tuple_ptr_ptr = push(0b11, 2);
     let tuple_int_ptr_ptr = push(0b110, 3);
+    let tuple_int_int_ptr = push(0b100, 3);
     let tuple_int_int_ptr_ptr = push(0b1100, 4);
     let wrapper_continuation = push(0b01010, 5);
 
@@ -452,6 +456,7 @@ fn append_runtime_shapes(descriptors: &mut Vec<usize>) -> RuntimeShapeIndices {
         tuple_int_ptr,
         tuple_ptr_ptr,
         tuple_int_ptr_ptr,
+        tuple_int_int_ptr,
         tuple_int_int_ptr_ptr,
         wrapper_continuation,
         handler_frame,

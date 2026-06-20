@@ -119,49 +119,49 @@ pub fn close(conn_id: i64) -> Result<(), i64> {
 
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.connect.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
-/// Uses conservative scanning (descriptor_index = u32::MAX) since this
-/// shape (Int, Int, Ptr) is not pre-registered.
+/// Uses the pre-registered tuple_int_int_ptr shape index.
 unsafe fn build_net_connect_result_tuple(
     error_tag: i64,
     conn_id: i64,
     error_msg: *mut u8,
 ) -> *mut u8 {
+    let idx = crate::gc::runtime_shape_indices().tuple_int_int_ptr;
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, conn_id as u64, error_msg as u64],
         0b100,
-        u32::MAX,
+        idx,
     )
 }
 
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.send.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
-/// Uses conservative scanning (descriptor_index = u32::MAX) since this
-/// shape (Int, Int, Ptr) is not pre-registered.
+/// Uses the pre-registered tuple_int_int_ptr shape index.
 unsafe fn build_net_send_result_tuple(
     error_tag: i64,
     bytes_written: i64,
     error_msg: *mut u8,
 ) -> *mut u8 {
+    let idx = crate::gc::runtime_shape_indices().tuple_int_int_ptr;
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, bytes_written as u64, error_msg as u64],
         0b100,
-        u32::MAX,
+        idx,
     )
 }
 
 /// Build the 3-element `(Int, ByteArray, String)` result tuple for Net.recv.
 /// Bitmap = 0b110 (slots 1 & 2 are pointers; slot 0 is a scalar).
-/// Uses conservative scanning (descriptor_index = u32::MAX) since this
-/// shape (Int, Ptr, Ptr) is not pre-registered.
+/// Uses the pre-registered tuple_int_ptr_ptr shape index.
 unsafe fn build_net_recv_result_tuple(
     error_tag: i64,
     data: *mut u8,
     error_msg: *mut u8,
 ) -> *mut u8 {
+    let idx = crate::gc::runtime_shape_indices().tuple_int_ptr_ptr;
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, data as u64, error_msg as u64],
         0b110,
-        u32::MAX,
+        idx,
     )
 }
 
