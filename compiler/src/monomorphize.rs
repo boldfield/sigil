@@ -214,14 +214,20 @@ pub fn monomorphize(mut anf: AnfProgram) -> MonoProgram {
     // `new_types` and any cloned generic instantiation that
     // substitutes one of them as a field type (e.g. `Result[Int64,
     // FsError]` → `Ok` field is `Named("Int64")`) hits
-    // `build_layouts`'s "unresolved field type" panic. Preserve
-    // every non-generic-template entry from `anf.checked.types`
-    // before adding program-item types and synthetic builtin
-    // specializations.
+    // `build_layouts`'s "unresolved field type" panic.
+    //
+    // Generic templates (List, Option, Result …) are also preserved
+    // here — not for layout (build_layouts skips them via its own
+    // `!td.generic_params.is_empty()` guard) but so that
+    // `ty_from_type_expr` can resolve `Apply { "List", [Named("Header")] }`
+    // when building layouts for non-generic record types whose field
+    // TypeExprs were never rewritten by monomorphize (the rewriter
+    // only rewrites fn bodies and fn-level type annotations, not the
+    // TypeDecl AST nodes stored in `checked.types`). Without the
+    // generic template in the map, `types.get("List")` returns None
+    // and `build_layouts` panics with "unresolved field type".
     for (name, td) in &anf.checked.types {
-        if td.generic_params.is_empty() {
-            new_types.insert(name.clone(), td.clone());
-        }
+        new_types.insert(name.clone(), td.clone());
     }
     for item in &anf.checked.program.items {
         if let Item::Type(td) = item {
