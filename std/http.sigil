@@ -1,0 +1,36 @@
+// sigil: 0.1
+//
+// std/http.sigil — HTTP types and utilities.
+
+import std.url
+use std.url.{Url};
+
+// Header represents an HTTP header as a key-value pair.
+type Header = {
+  key: String,
+  value: String,
+}
+
+type Request = {
+  method: String,
+  url: Url,
+  headers: List[Header],
+  body: ByteArray,
+}
+
+type Response = {
+  status: Int,
+  reason: String,
+  headers: List[Header],
+  body: ByteArray,
+}
+
+// `get(url, headers)` constructs a GET request for the given URL and headers.
+fn get(url: Url, headers: List[Header]) -> Request ![] {
+  Request {
+    method: "GET",
+    url: url,
+    headers: headers,
+    body: byte_array_empty(),
+  }
+}
