@@ -161,29 +161,42 @@ pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
             }
         }
         Some(Conn::Tls(client_conn, stream)) => {
-            let mut encrypted_buf = vec![0u8; max];
-            match stream.read(&mut encrypted_buf) {
-                Ok(0) => Ok(Vec::new()),
-                Ok(n) => {
-                    encrypted_buf.truncate(n);
-                    match client_conn.read_tls(&mut encrypted_buf.as_slice()) {
-                        Ok(_) => {
-                            if client_conn.process_new_packets().is_err() {
-                                return Err(NET_ERR_OTHER);
+            const MIN_ENCRYPTED_BUF_SIZE: usize = 32768;
+            let mut encrypted_buf = vec![0u8; MIN_ENCRYPTED_BUF_SIZE];
+
+            loop {
+                match stream.read(&mut encrypted_buf) {
+                    Ok(0) => {
+                        let mut plaintext = vec![0u8; max];
+                        match client_conn.reader().read(&mut plaintext) {
+                            Ok(n) => {
+                                plaintext.truncate(n);
+                                return Ok(plaintext);
                             }
-                            let mut plaintext = Vec::with_capacity(max);
-                            match client_conn.reader().read_to_end(&mut plaintext) {
-                                Ok(_) => {
-                                    plaintext.truncate(max);
-                                    Ok(plaintext)
-                                }
-                                Err(_) => Err(NET_ERR_OTHER),
-                            }
+                            Err(_) => return Ok(Vec::new()),
                         }
-                        Err(_) => Err(NET_ERR_OTHER),
                     }
+                    Ok(n) => {
+                        if client_conn.read_tls(&mut &encrypted_buf[..n]).is_err() {
+                            return Err(NET_ERR_OTHER);
+                        }
+                        if client_conn.process_new_packets().is_err() {
+                            return Err(NET_ERR_OTHER);
+                        }
+
+                        let mut plaintext = vec![0u8; max];
+                        match client_conn.reader().read(&mut plaintext) {
+                            Ok(0) => continue,
+                            Ok(n) => {
+                                plaintext.truncate(n);
+                                return Ok(plaintext);
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                            Err(_) => return Err(NET_ERR_OTHER),
+                        }
+                    }
+                    Err(_) => return Err(NET_ERR_OTHER),
                 }
-                Err(_) => Err(NET_ERR_OTHER),
             }
         }
         None => Err(NET_ERR_BADHANDLE),
@@ -745,6 +758,82 @@ mod tests {
         assert!(
             registry.map.contains_key(&conn_id),
             "connection should be in registry"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn tls_recv_application_data() {
+        let _g = gc_test_lock();
+        use std::sync::Arc;
+        use std::thread;
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::ServerConfig;
+
+        // Generate a self-signed certificate for localhost.
+        let subject_alt_names = vec!["localhost".to_string()];
+
+        let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("generate self-signed cert");
+        let cert_der = certified_key.cert.der().to_vec();
+        let key_der = certified_key.key_pair.serialize_der();
+
+        // Parse certificate for server config.
+        let cert = CertificateDer::from(cert_der.clone());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("build server config"),
+        );
+
+        // Bind a listener for the TLS server.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Spawn a thread to run the TLS server.
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut conn = rustls::ServerConnection::new(server_config.clone())
+                    .expect("create server connection");
+                let _ = conn.complete_io(&mut stream);
+
+                let test_data = b"Hello from TLS server!";
+                let _ = conn.writer().write_all(test_data);
+                let mut pending = Vec::new();
+                let _ = conn.write_tls(&mut pending);
+                let _ = stream.write_all(&pending);
+            }
+        });
+
+        // Build a root store that trusts the self-signed cert.
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert = CertificateDer::from(cert_der);
+        root_store.add(cert).expect("add root cert");
+
+        // Connect with TLS.
+        let result = connect_with_root_store("localhost", port, true, root_store);
+        assert!(result.is_ok(), "TLS connect should succeed");
+        let conn_id = result.unwrap();
+
+        // Give server thread time to send data and write to the stream.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Recv the application data sent by the server.
+        let result = recv(conn_id, 100);
+        assert!(result.is_ok(), "recv should succeed");
+        let data = result.unwrap();
+        assert_eq!(
+            &data[..],
+            b"Hello from TLS server!",
+            "recv should get server data"
         );
 
         server_thread.join().expect("server thread panicked");
