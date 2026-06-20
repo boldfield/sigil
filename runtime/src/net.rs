@@ -6,7 +6,7 @@
 //! spec (TLS, send, recv, close to follow).
 
 use std::collections::BTreeMap;
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{LazyLock, Mutex};
 
@@ -41,6 +41,7 @@ const NET_OK: i64 = 0;
 const NET_ERR_RESOLVE_FAILED: i64 = 1;
 const NET_ERR_CONNECTION_REFUSED: i64 = 2;
 const NET_ERR_TLS_ERROR: i64 = 3;
+const NET_ERR_BADHANDLE: i64 = 4;
 const NET_ERR_OTHER: i64 = 5;
 
 /// Rust-testable connect helper. Does TcpStream::connect((host, port)),
@@ -67,6 +68,21 @@ pub fn connect(host: &str, port: u16) -> Result<i64, i64> {
     }
 }
 
+/// Rust-testable send helper. Looks up the conn id in the registry,
+/// writes the given bytes to the Plain TcpStream, and returns Ok(bytes_written)
+/// or Err with the error code.
+#[allow(clippy::disallowed_methods)]
+pub fn send(conn_id: i64, data: &[u8]) -> Result<usize, i64> {
+    let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
+    match registry.map.get_mut(&conn_id) {
+        Some(Conn::Plain(stream)) => match stream.write(data) {
+            Ok(n) => Ok(n),
+            Err(_) => Err(NET_ERR_OTHER),
+        },
+        None => Err(NET_ERR_BADHANDLE),
+    }
+}
+
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.connect.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
 /// Uses conservative scanning (descriptor_index = u32::MAX) since this
@@ -78,6 +94,22 @@ unsafe fn build_net_connect_result_tuple(
 ) -> *mut u8 {
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, conn_id as u64, error_msg as u64],
+        0b100,
+        u32::MAX,
+    )
+}
+
+/// Build the 3-element `(Int, Int, String)` result tuple for Net.send.
+/// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
+/// Uses conservative scanning (descriptor_index = u32::MAX) since this
+/// shape (Int, Int, Ptr) is not pre-registered.
+unsafe fn build_net_send_result_tuple(
+    error_tag: i64,
+    bytes_written: i64,
+    error_msg: *mut u8,
+) -> *mut u8 {
+    crate::effect_helpers::alloc_tuple(
+        &[error_tag as u64, bytes_written as u64, error_msg as u64],
         0b100,
         u32::MAX,
     )
@@ -150,6 +182,57 @@ pub unsafe extern "C" fn sigil_net_connect_arm(
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
+/// `Net.send(conn_id: Int, data: ByteArray) -> (Int, Int, String)` arm fn.
+///
+/// # Safety
+///
+/// `args_len == 7` (2 user args + trailing quintuple). `in_args[0]` is a
+/// conn_id Int; `in_args[1]` is a non-null `TAG_BYTEARRAY` pointer (data).
+#[no_mangle]
+pub unsafe extern "C" fn sigil_net_send_arm(
+    _closure_ptr: *const u8,
+    in_args: *const u64,
+    args_len: u32,
+    _terminal_out: *mut TerminalResult,
+) -> *mut NextStep {
+    debug_assert!(
+        args_len == 7,
+        "sigil_net_send_arm: args_len {args_len} != 7"
+    );
+    debug_assert!(!in_args.is_null());
+
+    let conn_id = *in_args as i64;
+    let data_ptr = *in_args.add(1) as *const u8;
+    let k_closure = *in_args.add(2) as *mut u8;
+    let k_fn = *in_args.add(3) as *mut u8;
+
+    // Read the ByteArray data.
+    let data_len = unsafe { crate::byte_array::sigil_byte_array_length(data_ptr) as usize };
+    // SAFETY: gc-heap-ptr arithmetic (ByteArray payload starts at offset 16; bounds [16, 16+data_len)).
+    let data_bytes = unsafe { data_ptr.add(16) };
+    let data_slice = unsafe { std::slice::from_raw_parts(data_bytes, data_len) };
+
+    // Call the Rust send helper.
+    let (error_tag, bytes_written) = match send(conn_id, data_slice) {
+        Ok(n) => (NET_OK, n as i64),
+        Err(code) => (code, 0),
+    };
+
+    let error_msg = if error_tag == NET_OK {
+        alloc_string_from_str("")
+    } else {
+        let msg = match error_tag {
+            NET_ERR_BADHANDLE => "Bad connection handle",
+            NET_ERR_OTHER => "Write error",
+            _ => "Send error",
+        };
+        alloc_string_from_str(msg)
+    };
+
+    let tup = build_net_send_result_tuple(error_tag, bytes_written, error_msg);
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -202,5 +285,40 @@ mod tests {
             registry.map.contains_key(&conn_id),
             "connection should be in registry"
         );
+    }
+
+    #[test]
+    fn send_to_connected_stream_writes_bytes() {
+        let _g = gc_test_lock();
+        use std::io::Read;
+        use std::thread;
+
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Spawn a thread to accept the connection and read the data.
+        let receiver_thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0u8; 13];
+            let n = stream.read(&mut buf).expect("read from stream");
+            (buf, n)
+        });
+
+        // Connect to the listener.
+        let conn_id = connect("127.0.0.1", port).expect("connect should succeed");
+
+        // Send data through the connection.
+        let test_data = b"Hello, World!";
+        let result = send(conn_id, test_data);
+        assert!(result.is_ok(), "send should succeed");
+        let bytes_written = result.unwrap();
+        assert_eq!(bytes_written, 13, "should write all bytes");
+
+        // Wait for the receiver thread and verify the data.
+        let (buf, n) = receiver_thread.join().expect("receiver thread panicked");
+        assert_eq!(n, 13, "listener should receive all bytes");
+        assert_eq!(&buf[..n], test_data, "listener should receive correct data");
     }
 }
