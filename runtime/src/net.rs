@@ -930,6 +930,8 @@ mod tests {
             "should recv the exact payload that was sent, encrypted then decrypted"
         );
 
+        // Close the connection so server's read_tls() sees EOF and loop breaks.
+        close(conn_id).expect("close should succeed");
         server_thread.join().expect("server thread panicked");
     }
 }
