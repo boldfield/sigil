@@ -15,8 +15,14 @@
 
 import std.list
 import std.url
-use std.list.{List};
+import std.string
+import std.byte_array
+import std.int
+use std.list.{List, fold};
 use std.url.{Url};
+use std.string.{string_concat, string_to_bytes, string_length};
+use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length};
+use std.int.{int_to_string};
 
 type Header = {
   name: String,
@@ -44,4 +50,50 @@ fn get(url: Url, headers: List[Header]) -> Request ![] {
     headers: headers,
     body: byte_array_empty(),
   }
+}
+
+fn serialize_request(req: Request) -> ByteArray ![Mem] {
+  let path_part: String = if string_length(req.url.query) > 0 {
+    string_concat(req.url.path, string_concat("?", req.url.query))
+  } else {
+    req.url.path
+  };
+  let request_line: String = string_concat(
+    req.method,
+    string_concat(" ", string_concat(path_part, " HTTP/1.1\r\n"))
+  );
+
+  let headers_with_host: ByteArray = byte_array_concat(
+    string_to_bytes(request_line),
+    string_to_bytes(string_concat("Host: ", string_concat(req.url.host, "\r\n")))
+  );
+
+  let body_len: Int = byte_array_length(req.body);
+  let headers_with_content_length: ByteArray = if body_len > 0 {
+    byte_array_concat(
+      headers_with_host,
+      string_to_bytes(string_concat("Content-Length: ", string_concat(int_to_string(body_len), "\r\n")))
+    )
+  } else {
+    headers_with_host
+  };
+
+  let headers_with_user: ByteArray = fold(
+    req.headers,
+    headers_with_content_length,
+    fn(acc: ByteArray, h: Header) -> ByteArray ![] {
+      byte_array_concat(
+        acc,
+        byte_array_concat(
+          string_to_bytes(string_concat(h.name, ": ")),
+          string_to_bytes(string_concat(h.value, "\r\n"))
+        )
+      )
+    }
+  );
+
+  let blank_line: ByteArray = string_to_bytes("\r\n");
+  let headers_complete: ByteArray = byte_array_concat(headers_with_user, blank_line);
+
+  byte_array_concat(headers_complete, req.body)
 }
