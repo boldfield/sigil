@@ -471,6 +471,9 @@ mod tests {
         let result = recv(conn_id, 100);
         assert!(result.is_ok(), "recv should succeed on closed stream");
         let data = result.unwrap();
-        assert!(data.is_empty(), "recv should return empty on closed peer (EOF)");
+        assert!(
+            data.is_empty(),
+            "recv should return empty on closed peer (EOF)"
+        );
     }
 }
