@@ -10,8 +10,8 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::{LazyLock, Mutex};
 
-use rustls::ClientConfig;
 use rustls::pki_types::ServerName;
+use rustls::ClientConfig;
 use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::effect_helpers::alloc_string_from_str;
@@ -49,18 +49,17 @@ const NET_ERR_TLS_ERROR: i64 = 3;
 const NET_ERR_BADHANDLE: i64 = 4;
 const NET_ERR_OTHER: i64 = 5;
 
-/// Rust-testable connect helper. Does TcpStream::connect((host, port)),
-/// optionally performs TLS handshake if tls=true, inserts the connection
-/// under a fresh i64 id, and returns Ok(id) or Err with the error code.
-/// DNS resolution happens during connect.
+/// Internal helper for TLS connection with custom root store.
 #[allow(clippy::disallowed_methods)]
-pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
+fn connect_with_root_store(
+    host: &str,
+    port: u16,
+    tls: bool,
+    root_store: rustls::RootCertStore,
+) -> Result<i64, i64> {
     match TcpStream::connect((host, port)) {
         Ok(mut stream) => {
             let conn = if tls {
-                let mut root_store = rustls::RootCertStore::empty();
-                root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
-
                 let config = std::sync::Arc::new(
                     ClientConfig::builder()
                         .with_root_certificates(root_store)
@@ -102,6 +101,17 @@ pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
     }
 }
 
+/// Rust-testable connect helper. Does TcpStream::connect((host, port)),
+/// optionally performs TLS handshake if tls=true, inserts the connection
+/// under a fresh i64 id, and returns Ok(id) or Err with the error code.
+/// DNS resolution happens during connect.
+#[allow(clippy::disallowed_methods)]
+pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+    connect_with_root_store(host, port, tls, root_store)
+}
+
 /// Rust-testable send helper. Looks up the conn id in the registry,
 /// writes the given bytes to the connection (Plain TcpStream or Tls), and returns Ok(bytes_written)
 /// or Err with the error code.
@@ -113,25 +123,21 @@ pub fn send(conn_id: i64, data: &[u8]) -> Result<usize, i64> {
             Ok(n) => Ok(n),
             Err(_) => Err(NET_ERR_OTHER),
         },
-        Some(Conn::Tls(client_conn, stream)) => {
-            match client_conn.writer().write(data) {
-                Ok(n) => {
-                    let mut pending = Vec::new();
-                    match client_conn.write_tls(&mut pending) {
-                        Ok(_) => {
-                            if !pending.is_empty() {
-                                if stream.write_all(&pending).is_err() {
-                                    return Err(NET_ERR_OTHER);
-                                }
-                            }
-                            Ok(n)
+        Some(Conn::Tls(client_conn, stream)) => match client_conn.writer().write(data) {
+            Ok(n) => {
+                let mut pending = Vec::new();
+                match client_conn.write_tls(&mut pending) {
+                    Ok(_) => {
+                        if !pending.is_empty() && stream.write_all(&pending).is_err() {
+                            return Err(NET_ERR_OTHER);
                         }
-                        Err(_) => Err(NET_ERR_OTHER),
+                        Ok(n)
                     }
+                    Err(_) => Err(NET_ERR_OTHER),
                 }
-                Err(_) => Err(NET_ERR_OTHER),
             }
-        }
+            Err(_) => Err(NET_ERR_OTHER),
+        },
         None => Err(NET_ERR_BADHANDLE),
     }
 }
@@ -162,6 +168,9 @@ pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
                     encrypted_buf.truncate(n);
                     match client_conn.read_tls(&mut encrypted_buf.as_slice()) {
                         Ok(_) => {
+                            if client_conn.process_new_packets().is_err() {
+                                return Err(NET_ERR_OTHER);
+                            }
                             let mut plaintext = Vec::with_capacity(max);
                             match client_conn.reader().read_to_end(&mut plaintext) {
                                 Ok(_) => {
@@ -696,7 +705,7 @@ mod tests {
         // Parse certificate for server config.
         let cert = CertificateDer::from(cert_der.clone());
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der)
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
         );
 
         let server_config = Arc::new(
@@ -720,29 +729,23 @@ mod tests {
             }
         });
 
-        // Build a client config that trusts the self-signed cert.
+        // Build a root store that trusts the self-signed cert.
         let mut root_store = rustls::RootCertStore::empty();
         let cert = CertificateDer::from(cert_der);
         root_store.add(cert).expect("add root cert");
 
-        let client_config = std::sync::Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth(),
+        // Test connect() with the custom root store (this exercises the production path).
+        let result = connect_with_root_store("localhost", port, true, root_store);
+        assert!(result.is_ok(), "connect_with_root_store should succeed");
+        let conn_id = result.unwrap();
+        assert!(conn_id > 0, "conn_id should be positive");
+
+        // Verify the connection is in the registry.
+        let registry = CONN_REGISTRY.lock().expect("lock registry");
+        assert!(
+            registry.map.contains_key(&conn_id),
+            "connection should be in registry"
         );
-
-        // Create a ClientConnection and perform the handshake.
-        let server_name =
-            ServerName::try_from("localhost".to_string()).expect("parse server name");
-        let mut client_conn =
-            rustls::ClientConnection::new(client_config, server_name)
-                .expect("create client connection");
-
-        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port))
-            .expect("connect to TLS server");
-        client_conn
-            .complete_io(&mut stream)
-            .expect("TLS handshake should succeed");
 
         server_thread.join().expect("server thread panicked");
     }
