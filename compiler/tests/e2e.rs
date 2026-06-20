@@ -24246,6 +24246,94 @@ fn std_http_serialize_request_with_body() {
     assert_eq!(stdout, expected, "stderr={stderr:?}");
 }
 
+/// `parse_response` parses a valid HTTP response with status line and headers.
+#[test]
+fn std_http_parse_response_valid() {
+    let src = "import std.io\n\
+               import std.http\n\
+               import std.byte_array\n\
+               import std.list\n\
+               import std.ordering\n\
+               use std.io.{IO};\n\
+               use std.http.{Response, Header, parse_response};\n\
+               use std.byte_array.{string_to_bytes, byte_array_concat};\n\
+               use std.list.{List, Cons, Nil};\n\
+               use std.ordering.{string_compare, Ordering};\n\
+               use std.ordering.{Equal, Less, Greater};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let response_bytes: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nX-Custom: value\\r\\n\\r\\n\");\n\
+                 match parse_response(response_bytes) {\n\
+                   Ok(resp) => {\n\
+                     match string_compare(resp.reason, \"OK\") {\n\
+                       Equal => {\n\
+                         if resp.status == 200 {\n\
+                           match resp.headers {\n\
+                             Cons(h0, Cons(h1, _)) => {\n\
+                               match (string_compare(h0.name, \"Content-Type\"), string_compare(h0.value, \"text/plain\"), string_compare(h1.name, \"X-Custom\"), string_compare(h1.value, \"value\")) {\n\
+                                 (Equal, Equal, Equal, Equal) => {\n\
+                                   perform IO.println(\"OK\");\n\
+                                   0\n\
+                                 },\n\
+                                 _ => {\n\
+                                   perform IO.println(\"header mismatch\");\n\
+                                   1\n\
+                                 },\n\
+                               }\n\
+                             },\n\
+                             _ => {\n\
+                               perform IO.println(\"header count mismatch\");\n\
+                               1\n\
+                             },\n\
+                           }\n\
+                         } else {\n\
+                           perform IO.println(\"status mismatch\");\n\
+                           1\n\
+                         }\n\
+                       },\n\
+                       _ => {\n\
+                         perform IO.println(\"reason mismatch\");\n\
+                         1\n\
+                       },\n\
+                     }\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     1\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_parse_response_valid");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
+}
+
+/// `parse_response` returns Err for malformed status line.
+#[test]
+fn std_http_parse_response_malformed() {
+    let src = "import std.io\n\
+               import std.http\n\
+               import std.byte_array\n\
+               use std.io.{IO};\n\
+               use std.http.{parse_response};\n\
+               use std.byte_array.{string_to_bytes};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 let response_bytes: ByteArray = string_to_bytes(\"GARBAGE\\r\\n\");\n\
+                 match parse_response(response_bytes) {\n\
+                   Ok(_) => {\n\
+                     perform IO.println(\"should have failed\");\n\
+                     1\n\
+                   },\n\
+                   Err(_) => {\n\
+                     perform IO.println(\"OK\");\n\
+                     0\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_parse_response_malformed");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
+}
+
 // ===== record.field field access =======================================
 
 #[test]
