@@ -165,16 +165,12 @@ unsafe fn build_net_recv_result_tuple(
     )
 }
 
-/// Build the 3-element `(Int, Int, String)` result tuple for Net.close.
-/// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
-/// Uses conservative scanning (descriptor_index = u32::MAX) since this
-/// shape (Int, Int, Ptr) is not pre-registered.
-unsafe fn build_net_close_result_tuple(error_tag: i64, unused: i64, error_msg: *mut u8) -> *mut u8 {
-    crate::effect_helpers::alloc_tuple(
-        &[error_tag as u64, unused as u64, error_msg as u64],
-        0b100,
-        u32::MAX,
-    )
+/// Build the 2-element `(Int, String)` result tuple for Net.close.
+/// Bitmap = 0b10 (slot 1 is a pointer; slot 0 is a scalar).
+/// Uses the pre-registered tuple_int_ptr shape index.
+unsafe fn build_net_close_result_tuple(error_tag: i64, error_msg: *mut u8) -> *mut u8 {
+    let idx = crate::gc::runtime_shape_indices().tuple_int_ptr;
+    crate::effect_helpers::alloc_tuple(&[error_tag as u64, error_msg as u64], 0b10, idx)
 }
 
 /// `Net.connect(host: String, port: Int, tls: Bool) -> (Int, Int, String)` arm fn.
@@ -349,7 +345,7 @@ pub unsafe extern "C" fn sigil_net_recv_arm(
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
-/// `Net.close(conn_id: Int) -> (Int, Int, String)` arm fn.
+/// `Net.close(conn_id: Int) -> (Int, String)` arm fn.
 ///
 /// # Safety
 ///
@@ -388,7 +384,7 @@ pub unsafe extern "C" fn sigil_net_close_arm(
         alloc_string_from_str(msg)
     };
 
-    let tup = build_net_close_result_tuple(error_tag, 0, error_msg);
+    let tup = build_net_close_result_tuple(error_tag, error_msg);
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
