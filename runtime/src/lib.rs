@@ -72,6 +72,7 @@ pub mod header;
 pub mod int64;
 pub mod io;
 pub mod mem;
+pub mod net;
 pub mod panic;
 pub mod process;
 pub mod profile;
