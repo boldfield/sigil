@@ -24849,3 +24849,82 @@ fn m4_vendored_deps_convention() {
         "deps. convention should resolve to deps/json5.sigil and exit with version 5; stderr={stderr:?}"
     );
 }
+
+/// Net e2e plaintext round-trip test.
+/// Starts a localhost TCP echo server on a random port, compiles+runs a Sigil program
+/// that connects, sends a payload, receives it back, and prints it. Asserts the
+/// output matches what was sent.
+#[test]
+fn net_plaintext_echo_roundtrip() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
+
+    // Start a TCP echo server on a random port (127.0.0.1:0)
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind TCP listener");
+    let addr = listener.local_addr().expect("get local address");
+    let port = addr.port();
+
+    // Spawn echo server thread that accepts one connection and echoes the data back
+    let _server_thread = thread::spawn(move || {
+        if let Ok((mut socket, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            if let Ok(n) = socket.read(&mut buf) {
+                let _ = socket.write_all(&buf[..n]);
+            }
+        }
+    });
+
+    // Small delay to ensure server is listening
+    thread::sleep(Duration::from_millis(50));
+
+    // Generate Sigil program that connects to the server, sends a message, and receives it back
+    let sigil_source = format!(
+        "import std.net\n\
+import std.io\n\
+import std.byte_array\n\
+use std.net.{{connect, send, recv_all, close}};\n\
+use std.io.{{IO}};\n\
+use std.byte_array.{{string_from_bytes}};\n\
+\n\
+fn main() -> Int ![IO, Net] {{\n\
+  let host: String = \"127.0.0.1\";\n\
+  let port: Int = {};\n\
+  match connect(host, port, false) {{\n\
+    Ok(conn) => {{\n\
+      let payload: ByteArray = string_to_bytes(\"hello, world\");\n\
+      match send(conn, payload) {{\n\
+        Ok(_) => {{\n\
+          match recv_all(conn) {{\n\
+            Ok(response) => {{\n\
+              match string_from_bytes(response) {{\n\
+                Some(s) => {{\n\
+                  perform IO.println(s);\n\
+                  match close(conn) {{\n\
+                    Ok(_) => 0,\n\
+                    Err(_) => 1,\n\
+                  }}\n\
+                }},\n\
+                None => 1,\n\
+              }}\n\
+            }},\n\
+            Err(_) => 1,\n\
+          }}\n\
+        }},\n\
+        Err(_) => 1,\n\
+      }}\n\
+    }},\n\
+    Err(_) => 1,\n\
+  }}\n\
+}}\n",
+        port
+    );
+
+    let (stdout, stderr, code) = compile_and_run(&sigil_source, "net_plaintext_echo");
+    assert_eq!(code, 0, "exit code should be 0; stderr={stderr:?}");
+    assert!(
+        stdout.contains("hello, world"),
+        "stdout should contain the echoed message; stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
