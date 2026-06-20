@@ -20,8 +20,8 @@ import std.byte_array
 import std.int
 use std.list.{List, fold};
 use std.url.{Url};
-use std.string.{string_concat, string_to_bytes, string_length};
-use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length};
+use std.string.{string_concat};
+use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length, string_to_bytes, string_length};
 use std.int.{int_to_string};
 
 type Header = {
@@ -81,15 +81,13 @@ fn serialize_request(req: Request) -> ByteArray ![Mem] {
   let headers_with_user: ByteArray = fold(
     req.headers,
     headers_with_content_length,
-    fn(acc: ByteArray, h: Header) -> ByteArray ![] {
+    fn(acc: ByteArray, h: Header) -> ByteArray ![] => byte_array_concat(
+      acc,
       byte_array_concat(
-        acc,
-        byte_array_concat(
-          string_to_bytes(string_concat(h.name, ": ")),
-          string_to_bytes(string_concat(h.value, "\r\n"))
-        )
+        string_to_bytes(string_concat(h.name, ": ")),
+        string_to_bytes(string_concat(h.value, "\r\n"))
       )
-    }
+    )
   );
 
   let blank_line: ByteArray = string_to_bytes("\r\n");
