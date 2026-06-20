@@ -208,6 +208,7 @@ pub unsafe extern "C" fn sigil_net_send_arm(
 
     // Read the ByteArray data.
     let data_len = unsafe { crate::byte_array::sigil_byte_array_length(data_ptr) as usize };
+    // SAFETY: gc-heap-ptr arithmetic (ByteArray payload starts at offset 16; bounds [16, 16+data_len)).
     let data_bytes = unsafe { data_ptr.add(16) };
     let data_slice = unsafe { std::slice::from_raw_parts(data_bytes, data_len) };
 
