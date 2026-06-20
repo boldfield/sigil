@@ -22,9 +22,10 @@ import std.result
 use std.list.{List, fold, reverse, Nil, Cons};
 use std.url.{Url};
 use std.string.{string_concat, string_split, string_substring, string_index_of, string_length, string_to_int};
-use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length, string_to_bytes, string_from_bytes};
+use std.byte_array.{byte_array_concat, byte_array_empty, byte_array_length, string_to_bytes, string_from_bytes, byte_array_slice, byte_array_slice_opt, byte_array_get};
 use std.result.{Ok, Err};
 use std.int.{int_to_string};
+use std.option.{Some, None, Option};
 
 type Header = {
   name: String,
@@ -51,6 +52,43 @@ fn get(url: Url, headers: List[Header]) -> Request ![] {
     url: url,
     headers: headers,
     body: byte_array_empty(),
+  }
+}
+
+fn find_blank_line(bytes: ByteArray) -> Int ![Mem] {
+  find_blank_line_impl(bytes, 0)
+}
+
+fn find_blank_line_impl(bytes: ByteArray, pos: Int) -> Int ![Mem] {
+  let len: Int = byte_array_length(bytes);
+  if pos + 4 > len {
+    -1
+  } else {
+    let b0: Byte = byte_array_get(bytes, pos);
+    let b1: Byte = byte_array_get(bytes, pos + 1);
+    let b2: Byte = byte_array_get(bytes, pos + 2);
+    let b3: Byte = byte_array_get(bytes, pos + 3);
+    if b0 == 13 && b1 == 10 && b2 == 13 && b3 == 10 {
+      pos
+    } else {
+      find_blank_line_impl(bytes, pos + 1)
+    }
+  }
+}
+
+fn find_content_length(headers: List[Header]) -> Option[Int] ![] {
+  match headers {
+    Nil => None,
+    Cons(h, rest) => {
+      if h.name == "Content-Length" {
+        match string_to_int(h.value) {
+          Ok(len) => Some(len),
+          Err(_) => find_content_length(rest),
+        }
+      } else {
+        find_content_length(rest)
+      }
+    }
   }
 }
 
@@ -99,14 +137,49 @@ fn serialize_request(req: Request) -> ByteArray ![Mem] {
 }
 
 fn parse_response(bytes: ByteArray) -> Result[Response, String] ![Mem] {
-  match string_from_bytes(bytes) {
-    None => Err("Invalid UTF-8 in response"),
-    Some(response_str) => {
-      let lines: List[String] = string_split(response_str, "\r\n");
-      match lines {
-        Nil => Err("Empty response"),
-        Cons(status_line, rest_lines) => {
-          parse_status_line(status_line, rest_lines)
+  match find_blank_line(bytes) {
+    -1 => Err("No blank line found in response"),
+    blank_pos => {
+      match byte_array_slice_opt(bytes, 0, blank_pos) {
+        None => Err("Invalid headers slice"),
+        Some(headers_bytes) => {
+          match string_from_bytes(headers_bytes) {
+            None => Err("Invalid UTF-8 in response headers"),
+            Some(response_str) => {
+              let lines: List[String] = string_split(response_str, "\r\n");
+              match lines {
+                Nil => Err("Empty response"),
+                Cons(status_line, rest_lines) => {
+                  match parse_status_line(status_line, rest_lines) {
+                    Ok(partial_response) => {
+                      let body_start: Int = blank_pos + 4;
+                      match find_content_length(partial_response.headers) {
+                        None => Ok(partial_response),
+                        Some(content_len) => {
+                          if content_len < 0 {
+                            Err("Invalid Content-Length")
+                          } else {
+                            match byte_array_slice_opt(bytes, body_start, body_start + content_len) {
+                              None => Err("Content-Length exceeds response size"),
+                              Some(body) => {
+                                Ok(Response {
+                                  status: partial_response.status,
+                                  reason: partial_response.reason,
+                                  headers: partial_response.headers,
+                                  body: body,
+                                })
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    Err(e) => Err(e),
+                  }
+                }
+              }
+            }
+          }
         }
       }
     }
