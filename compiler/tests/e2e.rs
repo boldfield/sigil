@@ -24133,7 +24133,7 @@ fn std_http_get_builds_request() {
                fn main() -> Int ![IO] {\n\
                  match parse_url(\"http://example.com/path\") {\n\
                    Ok(url) => {\n\
-                     let req: Request = get(url, []);\n\
+                     let req: Request = get(url, Nil);\n\
                      perform IO.println(req.method);\n\
                      perform IO.println(req.url.host);\n\
                      perform IO.println(req.url.path);\n\
@@ -24158,7 +24158,7 @@ fn std_http_response_construct() {
                  let resp: Response = Response {\n\
                    status: 200,\n\
                    reason: \"OK\",\n\
-                   headers: [],\n\
+                   headers: Nil,\n\
                    body: byte_array_empty(),\n\
                  };\n\
                  perform IO.println(resp.reason);\n\
