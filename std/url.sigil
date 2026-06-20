@@ -1,0 +1,129 @@
+// sigil: 0.1
+//
+// std/url.sigil — URL parsing and representation.
+
+import std.result
+import std.string
+import std.byte_array
+import std.pair
+use std.result.{Ok, Err, Result};
+use std.string.{string_index_of, string_substring, string_to_int};
+use std.byte_array.{string_length};
+use std.pair.{fst, snd};
+
+type Url = {
+  scheme: String,
+  host: String,
+  port: Int,
+  path: String,
+  query: String,
+}
+
+// `parse_url(s)` parses a URL string into its components.
+//
+// Format: `scheme://host[:port][/path][?query]`
+//
+// Examples:
+//   parse_url("http://h/p") → Ok({scheme: "http", host: "h", port: 80, path: "/p", query: ""})
+//   parse_url("https://h:8443/p?q=1") → Ok({scheme: "https", host: "h", port: 8443, path: "/p", query: "q=1"})
+//   parse_url("http://h") → Ok({scheme: "http", host: "h", port: 80, path: "/", query: ""})
+//
+// Errors on:
+//   - No scheme (no `://`)
+//   - Empty host
+fn parse_url(s: String) -> Result[Url, String] ![] {
+  let scheme_sep_idx: Int = string_index_of(s, "://");
+  if scheme_sep_idx < 0 {
+    Err("no scheme")
+  } else {
+    let scheme: String = string_substring(s, 0, scheme_sep_idx);
+    let rest_idx: Int = scheme_sep_idx + 3;
+    let rest: String = string_substring(s, rest_idx, string_length(s));
+
+    let slash_idx: Int = string_index_of(rest, "/");
+    let question_idx: Int = string_index_of(rest, "?");
+
+    // Determine where authority ends: at / or ? or end of string
+    let auth_end_idx: Int = if slash_idx < 0 {
+      if question_idx < 0 {
+        string_length(rest)
+      } else {
+        question_idx
+      }
+    } else {
+      if question_idx < 0 {
+        slash_idx
+      } else {
+        if question_idx < slash_idx { question_idx } else { slash_idx }
+      }
+    };
+
+    let authority: String = string_substring(rest, 0, auth_end_idx);
+
+    if string_length(authority) == 0 {
+      Err("empty host")
+    } else {
+      // Parse path and query: what comes after authority
+      let path_and_query_str: String = string_substring(rest, auth_end_idx, string_length(rest));
+      let pq: (String, String) = parse_path_and_query(path_and_query_str);
+      let path: String = fst(pq);
+      let query: String = snd(pq);
+
+      // Parse host and port from authority
+      let colon_idx: Int = string_index_of(authority, ":");
+      let final_host: String = if colon_idx < 0 {
+        authority
+      } else {
+        string_substring(authority, 0, colon_idx)
+      };
+      let final_port: Int = if colon_idx < 0 {
+        default_port(scheme)
+      } else {
+        let port_str: String = string_substring(authority, colon_idx + 1, string_length(authority));
+        match string_to_int(port_str) {
+          Ok(p) => p,
+          Err(_) => -1,
+        }
+      };
+      if final_port < 0 {
+        Err("invalid port")
+      } else {
+        Ok(Url {
+          scheme: scheme,
+          host: final_host,
+          port: final_port,
+          path: path,
+          query: query,
+        })
+      }
+    }
+  }
+}
+
+// Parse path and query from the string starting at the path component
+fn parse_path_and_query(s: String) -> (String, String) ![] {
+  let question_idx: Int = string_index_of(s, "?");
+  if question_idx < 0 {
+    if string_length(s) == 0 {
+      ("/", "")
+    } else {
+      (s, "")
+    }
+  } else {
+    let path: String = string_substring(s, 0, question_idx);
+    let query: String = string_substring(s, question_idx + 1, string_length(s));
+    if string_length(path) == 0 {
+      ("/", query)
+    } else {
+      (path, query)
+    }
+  }
+}
+
+fn default_port(scheme: String) -> Int ![] {
+  if scheme == "https" {
+    443
+  } else {
+    80
+  }
+}
