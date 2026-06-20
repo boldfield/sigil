@@ -888,6 +888,7 @@ pub const BUILTIN_EFFECT_NAMES: &[&str] = &[
     "Env",
     "Fs",
     "Process",
+    "Net",
 ];
 
 /// Plan B Task 57 — construct synthetic `EffectDecl`s for the
@@ -1002,6 +1003,11 @@ fn builtin_effects() -> Vec<EffectDecl> {
     let int64_ty = || TypeExpr::Named("Int64".to_string(), span.clone());
     let bool_ty = || TypeExpr::Named("Bool".to_string(), span.clone());
     let string_ty = || TypeExpr::Named("String".to_string(), span.clone());
+    let byte_array_ty = || TypeExpr::Apply {
+        name: "ByteArray".to_string(),
+        args: vec![],
+        span: span.clone(),
+    };
     let array_string_ty = || TypeExpr::Apply {
         name: "Array".to_string(),
         args: vec![string_ty()],
@@ -1037,6 +1043,21 @@ fn builtin_effects() -> Vec<EffectDecl> {
     let process_run_result_ty = || TypeExpr::Tuple {
         // (error_tag: Int, exit_code: Int, stdout: String, stderr: String)
         elems: vec![int_ty(), int_ty(), string_ty(), string_ty()],
+        span: span.clone(),
+    };
+    let int_string_tuple_ty_net = || TypeExpr::Tuple {
+        // (status: Int, msg: String) — used by Net.close
+        elems: vec![int_ty(), string_ty()],
+        span: span.clone(),
+    };
+    let int_int_string_tuple_ty = || TypeExpr::Tuple {
+        // (status: Int, value: Int, msg: String) — used by Net.connect and Net.send
+        elems: vec![int_ty(), int_ty(), string_ty()],
+        span: span.clone(),
+    };
+    let int_bytearray_string_tuple_ty = || TypeExpr::Tuple {
+        // (status: Int, data: ByteArray, msg: String) — used by Net.recv
+        elems: vec![int_ty(), byte_array_ty(), string_ty()],
         span: span.clone(),
     };
 
@@ -1203,6 +1224,50 @@ fn builtin_effects() -> Vec<EffectDecl> {
             return_type: process_run_result_ty(),
             span: span.clone(),
         }],
+        span: span.clone(),
+    });
+
+    // Net — network operations: connect, send, recv, close.
+    // Op IDs (alphabetical): close=0, connect=1, recv=2, send=3.
+    out.push(EffectDecl {
+        name: "Net".to_string(),
+        name_span: span.clone(),
+        generic_params: Vec::new(),
+        resumes_many: false,
+        ops: vec![
+            EffectOp {
+                name: "close".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![int_ty()],
+                return_type: int_string_tuple_ty_net(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "connect".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![string_ty(), int_ty(), bool_ty()],
+                return_type: int_int_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "recv".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![int_ty(), int_ty()],
+                return_type: int_bytearray_string_tuple_ty(),
+                span: span.clone(),
+            },
+            EffectOp {
+                name: "send".to_string(),
+                name_span: span.clone(),
+                generic_params: Vec::new(),
+                params: vec![int_ty(), byte_array_ty()],
+                return_type: int_int_string_tuple_ty(),
+                span: span.clone(),
+            },
+        ],
         span,
     });
 
@@ -6278,19 +6343,21 @@ impl Tc {
             for effect in &f.effects {
                 let name = effect.name.as_str();
                 // Plan C addendum (CLI external-system effects, EE1)
-                // — Env / Fs / Process get top-level handler frames
+                // — Env / Fs / Process / Net get top-level handler frames
                 // installed by the main shim alongside ArithError /
                 // IO. Mem is a marker effect (no shim handler).
-                let allowed =
-                    matches!(name, "IO" | "ArithError" | "Mem" | "Env" | "Fs" | "Process");
+                let allowed = matches!(
+                    name,
+                    "IO" | "ArithError" | "Mem" | "Env" | "Fs" | "Process" | "Net"
+                );
                 if !allowed {
                     self.push_error(
                         "E0041",
                         f.span.clone(),
                         format!(
                             "`fn main`'s effect row may only contain effects discharged by \
-                             the top-level shim (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, or \
-                             `Process`); saw `{name}`",
+                             the top-level shim (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, \
+                             `Process`, or `Net`); saw `{name}`",
                         ),
                     );
                 }
@@ -14433,26 +14500,27 @@ fn main() -> Int ![IO] {\n\
         // alphabetical order, **starting at `BUILTIN_EFFECT_NAMES.len()`**.
         // Plan C Task 66 added `Mem` as a third builtin. Plan C
         // addendum (CLI external-system effects) appended `Env` /
-        // `Fs` / `Process` (ids 3, 4, 5), bumping the user-id start
-        // to 6. Reserved low ids: 0 (`ArithError`), 1 (`IO`), 2
-        // (`Mem`), 3 (`Env`), 4 (`Fs`), 5 (`Process`).
+        // `Fs` / `Process` / `Net` (ids 3, 4, 5, 6), bumping the user-id start
+        // to 7. Reserved low ids: 0 (`ArithError`), 1 (`IO`), 2
+        // (`Mem`), 3 (`Env`), 4 (`Fs`), 5 (`Process`), 6 (`Net`).
         let src = "effect Zeta { z: () -> Int }\n\
                    effect Alpha { a: () -> Int }\n\
                    effect Mu { m: () -> Int }\n\
                    fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
-        // Builtins occupy 0..6.
+        // Builtins occupy 0..7.
         assert_eq!(cp.effect_ids.get("ArithError"), Some(&0));
         assert_eq!(cp.effect_ids.get("IO"), Some(&1));
         assert_eq!(cp.effect_ids.get("Mem"), Some(&2));
         assert_eq!(cp.effect_ids.get("Env"), Some(&3));
         assert_eq!(cp.effect_ids.get("Fs"), Some(&4));
         assert_eq!(cp.effect_ids.get("Process"), Some(&5));
-        // User effects start at 6 in alphabetical order.
-        assert_eq!(cp.effect_ids.get("Alpha"), Some(&6));
-        assert_eq!(cp.effect_ids.get("Mu"), Some(&7));
-        assert_eq!(cp.effect_ids.get("Zeta"), Some(&8));
+        assert_eq!(cp.effect_ids.get("Net"), Some(&6));
+        // User effects start at 7 in alphabetical order.
+        assert_eq!(cp.effect_ids.get("Alpha"), Some(&7));
+        assert_eq!(cp.effect_ids.get("Mu"), Some(&8));
+        assert_eq!(cp.effect_ids.get("Zeta"), Some(&9));
     }
 
     #[test]
@@ -14465,7 +14533,7 @@ fn main() -> Int ![IO] {\n\
         // Plan C addendum (CLI external-system effects, EE1) —
         // `IO.read_file` / `IO.write_file` removed; ops shift to
         // `print=0, println=1, read_line=2`. New effects `Env=3`,
-        // `Fs=4`, `Process=5` appended.
+        // `Fs=4`, `Process=5`, `Net=6` appended.
         let src = "fn main() -> Int ![] { 0 }\n";
         let (cp, errs) = pipeline_checked(src);
         assert!(errs.is_empty(), "expected clean typecheck; got: {errs:?}");
@@ -14475,6 +14543,7 @@ fn main() -> Int ![IO] {\n\
         assert_eq!(cp.effect_ids.get("Env"), Some(&3));
         assert_eq!(cp.effect_ids.get("Fs"), Some(&4));
         assert_eq!(cp.effect_ids.get("Process"), Some(&5));
+        assert_eq!(cp.effect_ids.get("Net"), Some(&6));
         // ArithError op_ids: div_by_zero (alphabetically first), mod_by_zero.
         assert_eq!(
             cp.op_ids
@@ -14532,6 +14601,23 @@ fn main() -> Int ![IO] {\n\
             cp.op_ids.get(&("Process".to_string(), "run".to_string())),
             Some(&0)
         );
+        // Net op_ids (alphabetical): close=0, connect=1, recv=2, send=3.
+        assert_eq!(
+            cp.op_ids.get(&("Net".to_string(), "close".to_string())),
+            Some(&0)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Net".to_string(), "connect".to_string())),
+            Some(&1)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Net".to_string(), "recv".to_string())),
+            Some(&2)
+        );
+        assert_eq!(
+            cp.op_ids.get(&("Net".to_string(), "send".to_string())),
+            Some(&3)
+        );
     }
 
     #[test]
@@ -14550,14 +14636,14 @@ fn main() -> Int ![IO] {\n\
     }
 
     /// Plan C addendum follow-up — when a user redeclares any builtin
-    /// effect (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, `Process`),
+    /// effect (`IO`, `ArithError`, `Mem`, `Env`, `Fs`, `Process`, `Net`),
     /// E0136 fires with a message that explicitly names the reserved
     /// builtin and suggests picking a different name. The plain
     /// `duplicate effect declaration` message was unhelpful when the
-    /// user didn't know `Env` / `Fs` / `Process` are stdlib-reserved.
+    /// user didn't know `Env` / `Fs` / `Process` / `Net` are stdlib-reserved.
     #[test]
     fn redeclaring_builtin_env_fs_process_mentions_reserved_in_message() {
-        for builtin in ["Env", "Fs", "Process", "IO", "ArithError", "Mem"] {
+        for builtin in ["Env", "Fs", "Process", "Net", "IO", "ArithError", "Mem"] {
             let src = format!(
                 "effect {builtin} {{ ping: () -> Int }}\n\
                  fn main() -> Int ![] {{ 0 }}\n"
@@ -17859,13 +17945,26 @@ fn main() -> Int ![IO] {\n\
     #[test]
     fn cli_main_row_allowed() {
         // Plan C addendum EE1 — main allow-list extended with
-        // Env / Fs / Process. Pin all three combinations.
+        // Env / Fs / Process / Net. Pin all combinations.
         let src = "import std.io\n\
                use std.io.{IO};\n\
-               fn main() -> Int ![IO, Env, Fs, Process] { 0 }\n\
+               fn main() -> Int ![IO, Env, Fs, Process, Net] { 0 }\n\
                ";
         let errs = pipeline(src);
         assert!(errs.is_empty(), "{errs:?}");
+    }
+
+    #[test]
+    fn net_connect_typechecks() {
+        // Net effect with perform Net.connect(...) should typecheck
+        // against the declared signature: connect(String, Int, Bool) -> (Int, Int, String).
+        let src = "fn main() -> Int ![Net] {\n\
+                   perform Net.connect(\"localhost\", 8080, false);\n\
+                   0\n\
+               }\n";
+        let (cp, errs) = pipeline_checked(src);
+        assert!(errs.is_empty(), "expected clean typecheck for Net.connect; got: {errs:?}");
+        assert_eq!(cp.effect_ids.get("Net"), Some(&6));
     }
 
     #[test]
