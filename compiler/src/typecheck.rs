@@ -17963,7 +17963,10 @@ fn main() -> Int ![IO] {\n\
                    0\n\
                }\n";
         let (cp, errs) = pipeline_checked(src);
-        assert!(errs.is_empty(), "expected clean typecheck for Net.connect; got: {errs:?}");
+        assert!(
+            errs.is_empty(),
+            "expected clean typecheck for Net.connect; got: {errs:?}"
+        );
         assert_eq!(cp.effect_ids.get("Net"), Some(&6));
     }
 
