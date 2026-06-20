@@ -45,15 +45,10 @@ const NET_ERR_OTHER: i64 = 5;
 
 /// Rust-testable connect helper. Does TcpStream::connect((host, port)),
 /// inserts the stream under a fresh i64 id, and returns Ok(id) or Err
-/// with the error code.
+/// with the error code. DNS resolution happens during connect.
 #[allow(clippy::disallowed_methods)]
 pub fn connect(host: &str, port: u16) -> Result<i64, i64> {
-    let addr = match format!("{}:{}", host, port).parse::<std::net::SocketAddr>() {
-        Ok(a) => a,
-        Err(_) => return Err(NET_ERR_RESOLVE_FAILED),
-    };
-
-    match TcpStream::connect(addr) {
+    match TcpStream::connect((host, port)) {
         Ok(stream) => {
             let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
             let id = registry.next_id;
@@ -63,6 +58,7 @@ pub fn connect(host: &str, port: u16) -> Result<i64, i64> {
         }
         Err(e) => {
             let code = match e.kind() {
+                io::ErrorKind::NotFound => NET_ERR_RESOLVE_FAILED,
                 io::ErrorKind::ConnectionRefused => NET_ERR_CONNECTION_REFUSED,
                 _ => NET_ERR_OTHER,
             };
@@ -91,7 +87,7 @@ unsafe fn build_net_connect_result_tuple(
 ///
 /// # Safety
 ///
-/// `args_len == 6` (3 user args + trailing pair). `in_args[0]` is a
+/// `args_len == 8` (3 user args + trailing quintuple). `in_args[0]` is a
 /// non-null `TAG_STRING` pointer (host); `in_args[1]` is a port Int;
 /// `in_args[2]` is a tls Bool.
 #[no_mangle]
@@ -102,8 +98,8 @@ pub unsafe extern "C" fn sigil_net_connect_arm(
     _terminal_out: *mut TerminalResult,
 ) -> *mut NextStep {
     debug_assert!(
-        args_len == 6,
-        "sigil_net_connect_arm: args_len {args_len} != 6"
+        args_len == 8,
+        "sigil_net_connect_arm: args_len {args_len} != 8"
     );
     debug_assert!(!in_args.is_null());
 
@@ -172,6 +168,31 @@ mod tests {
         // Try to connect to the listener.
         let result = connect("127.0.0.1", port);
         assert!(result.is_ok(), "connect should succeed");
+        let conn_id = result.unwrap();
+        assert!(conn_id > 0, "conn_id should be positive");
+
+        // Verify the connection is in the registry.
+        let registry = CONN_REGISTRY.lock().expect("lock registry");
+        assert!(
+            registry.map.contains_key(&conn_id),
+            "connection should be in registry"
+        );
+    }
+
+    #[test]
+    fn connect_with_localhost_hostname_resolves_dns() {
+        let _g = gc_test_lock();
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Try to connect using "localhost" hostname (requires DNS resolution).
+        let result = connect("localhost", port);
+        assert!(
+            result.is_ok(),
+            "connect to localhost should succeed with DNS resolution"
+        );
         let conn_id = result.unwrap();
         assert!(conn_id > 0, "conn_id should be positive");
 
