@@ -838,4 +838,98 @@ mod tests {
 
         server_thread.join().expect("server thread panicked");
     }
+
+    #[test]
+    fn tls_send_recv_roundtrip() {
+        let _g = gc_test_lock();
+        use std::sync::Arc;
+        use std::thread;
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::ServerConfig;
+
+        // Generate a self-signed certificate for localhost.
+        let subject_alt_names = vec!["localhost".to_string()];
+
+        let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("generate self-signed cert");
+        let cert_der = certified_key.cert.der().to_vec();
+        let key_der = certified_key.key_pair.serialize_der();
+
+        // Parse certificate for server config.
+        let cert = CertificateDer::from(cert_der.clone());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("build server config"),
+        );
+
+        // Bind a listener for the TLS server.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Spawn a thread to run the TLS echo server.
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut conn = rustls::ServerConnection::new(server_config.clone())
+                    .expect("create server connection");
+                let _ = conn.complete_io(&mut stream);
+
+                // Read client data and echo it back.
+                while conn.read_tls(&mut &stream).is_ok() {
+                    if conn.process_new_packets().is_err() {
+                        break;
+                    }
+                    let mut plaintext = vec![0u8; 1024];
+                    match conn.reader().read(&mut plaintext) {
+                        Ok(n) if n > 0 => {
+                            conn.writer().write_all(&plaintext[..n]).ok();
+                            let mut pending = Vec::new();
+                            conn.write_tls(&mut pending).ok();
+                            stream.write_all(&pending).ok();
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        });
+
+        // Build a root store that trusts the self-signed cert.
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert = CertificateDer::from(cert_der);
+        root_store.add(cert).expect("add root cert");
+
+        // Connect with TLS.
+        let result = connect_with_root_store("localhost", port, true, root_store);
+        assert!(result.is_ok(), "TLS connect should succeed");
+        let conn_id = result.unwrap();
+
+        // Send data through the TLS connection.
+        let test_payload = b"Round-trip test data";
+        let result = send(conn_id, test_payload);
+        assert!(result.is_ok(), "send should succeed");
+        let bytes_written = result.unwrap();
+        assert_eq!(bytes_written, test_payload.len(), "should send all bytes");
+
+        // Give server time to echo the data back.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Recv the echoed data.
+        let result = recv(conn_id, 100);
+        assert!(result.is_ok(), "recv should succeed");
+        let data = result.unwrap();
+        assert_eq!(
+            &data[..],
+            test_payload,
+            "should recv the exact payload that was sent, encrypted then decrypted"
+        );
+
+        server_thread.join().expect("server thread panicked");
+    }
 }
