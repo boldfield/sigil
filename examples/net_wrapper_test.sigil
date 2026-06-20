@@ -1,0 +1,11 @@
+// sigil: 0.1
+// Test std.net wrapper API
+import std.net
+import std.io
+use std.net.{connect, send, recv, close, recv_all, Conn, NetError};
+use std.io.{IO};
+
+fn main() -> Int ![IO, Net] {
+  perform IO.println("Net wrapper test starting");
+  0
+}
