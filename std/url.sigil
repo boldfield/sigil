@@ -5,7 +5,7 @@
 import std.result
 import std.string
 use std.result.{Ok, Err, Result};
-use std.string.{string_index_of, string_length, string_substring, string_concat, string_to_int_validate, string_to_int_parse};
+use std.string.{string_index_of, string_length, string_substring, string_to_int};
 
 type Url = {
   scheme: String,
@@ -36,57 +36,47 @@ fn parse_url(s: String) -> Result[Url, String] ![] {
     let rest_idx: Int = scheme_sep_idx + 3;
     let rest: String = string_substring(s, rest_idx, string_length(s));
 
-    // Find the first `/` to separate authority from path+query
     let slash_idx: Int = string_index_of(rest, "/");
-    let query_idx: Int = string_index_of(rest, "?");
+    let question_idx: Int = string_index_of(rest, "?");
 
-    let authority: String;
-    let path: String;
-    let query: String;
-
-    if slash_idx < 0 {
-      // No path, entire rest is authority
-      authority = rest;
-      path = "/";
-      query = "";
-    } else {
-      authority = string_substring(rest, 0, slash_idx);
-      let path_and_query: String = string_substring(rest, slash_idx, string_length(rest));
-
-      // Split path and query
-      let q_idx: Int = string_index_of(path_and_query, "?");
-      if q_idx < 0 {
-        path = path_and_query;
-        query = "";
+    // Determine where authority ends: at / or ? or end of string
+    let auth_end_idx: Int = if slash_idx < 0 {
+      if question_idx < 0 {
+        string_length(rest)
       } else {
-        path = string_substring(path_and_query, 0, q_idx);
-        query = string_substring(path_and_query, q_idx + 1, string_length(path_and_query));
+        question_idx
       }
-    }
+    } else {
+      if question_idx < 0 {
+        slash_idx
+      } else {
+        if question_idx < slash_idx { question_idx } else { slash_idx }
+      }
+    };
+
+    let authority: String = string_substring(rest, 0, auth_end_idx);
 
     if string_length(authority) == 0 {
       Err("empty host")
     } else {
-      // Parse authority for host and port
+      // Parse path and query: what comes after authority
+      let path_and_query_str: String = string_substring(rest, auth_end_idx, string_length(rest));
+      let (path, query): (String, String) = parse_path_and_query(path_and_query_str);
+
+      // Parse host and port from authority
       let colon_idx: Int = string_index_of(authority, ":");
-      let host: String;
-      let port: Int;
-
-      if colon_idx < 0 {
-        // No explicit port, use default
-        host = authority;
-        port = default_port(scheme);
+      let (host, port): (String, Int) = if colon_idx < 0 {
+        (authority, default_port(scheme))
       } else {
-        host = string_substring(authority, 0, colon_idx);
+        let host: String = string_substring(authority, 0, colon_idx);
         let port_str: String = string_substring(authority, colon_idx + 1, string_length(authority));
-
         match string_to_int(port_str) {
-          Ok(p) => port = p,
+          Ok(p) => (host, p),
           Err(_) => {
             return Err("invalid port");
           },
         }
-      }
+      };
 
       Ok({
         scheme: scheme,
@@ -99,23 +89,30 @@ fn parse_url(s: String) -> Result[Url, String] ![] {
   }
 }
 
-fn default_port(scheme: String) -> Int ![] {
-  if scheme == "https" {
-    443
-  } else {
-    if scheme == "http" {
-      80
+// Parse path and query from the string starting at the path component
+fn parse_path_and_query(s: String) -> (String, String) ![] {
+  let question_idx: Int = string_index_of(s, "?");
+  if question_idx < 0 {
+    if string_length(s) == 0 {
+      ("/", "")
     } else {
-      80
+      (s, "")
+    }
+  } else {
+    let path: String = string_substring(s, 0, question_idx);
+    let query: String = string_substring(s, question_idx + 1, string_length(s));
+    if string_length(path) == 0 {
+      ("/", query)
+    } else {
+      (path, query)
     }
   }
 }
 
-fn string_to_int(s: String) -> Result[Int, String] ![] {
-  let code: Int = string_to_int_validate(s);
-  if code == 0 {
-    Ok(string_to_int_parse(s))
+fn default_port(scheme: String) -> Int ![] {
+  if scheme == "https" {
+    443
   } else {
-    Err("invalid integer")
+    80
   }
 }

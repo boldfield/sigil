@@ -23978,6 +23978,132 @@ fn std_path_normalize() {
     );
 }
 
+/// `std.url` compiles and is importable (smoke test).
+#[test]
+fn std_url_import_is_noop() {
+    let src = "import std.io\n\
+               import std.url\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.println(\"ok\");\n\
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_url_import");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n", "stderr={stderr:?}");
+}
+
+/// `parse_url` parses `http://h/p` correctly.
+#[test]
+fn std_url_parse_http() {
+    let src = "import std.io\n\
+               import std.url\n\
+               use std.io.{IO};\n\
+               use std.url.{parse_url};\n\
+               fn main() -> Int ![IO] {\n\
+                 match parse_url(\"http://h/p\") {\n\
+                   Ok(url) => {\n\
+                     perform IO.println(url.scheme);\n\
+                     perform IO.println(url.host);\n\
+                     perform IO.println(url.path);\n\
+                     perform IO.println(url.query);\n\
+                     0\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     1\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_url_parse_http");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "http\nh\n/p\n\n", "stderr={stderr:?}");
+}
+
+/// `parse_url` parses `https://h:8443/p?q=1` with explicit port and query.
+#[test]
+fn std_url_parse_https_with_port_and_query() {
+    let src = "import std.io\n\
+               import std.int\n\
+               import std.url\n\
+               use std.io.{IO};\n\
+               use std.int.{int_to_string};\n\
+               use std.url.{parse_url};\n\
+               fn main() -> Int ![IO] {\n\
+                 match parse_url(\"https://h:8443/p?q=1\") {\n\
+                   Ok(url) => {\n\
+                     perform IO.println(url.scheme);\n\
+                     perform IO.println(url.host);\n\
+                     perform IO.println(int_to_string(url.port));\n\
+                     perform IO.println(url.path);\n\
+                     perform IO.println(url.query);\n\
+                     0\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     1\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_url_parse_https_port_query");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "https\nh\n8443\n/p\nq=1\n", "stderr={stderr:?}");
+}
+
+/// `parse_url` parses `http://h` with defaults for port and path.
+#[test]
+fn std_url_parse_no_path_defaults() {
+    let src = "import std.io\n\
+               import std.int\n\
+               import std.url\n\
+               use std.io.{IO};\n\
+               use std.int.{int_to_string};\n\
+               use std.url.{parse_url};\n\
+               fn main() -> Int ![IO] {\n\
+                 match parse_url(\"http://h\") {\n\
+                   Ok(url) => {\n\
+                     perform IO.println(url.scheme);\n\
+                     perform IO.println(url.host);\n\
+                     perform IO.println(int_to_string(url.port));\n\
+                     perform IO.println(url.path);\n\
+                     perform IO.println(url.query);\n\
+                     0\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     1\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_url_parse_http_defaults");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "http\nh\n80\n/\n\n", "stderr={stderr:?}");
+}
+
+/// `parse_url` returns Err for missing scheme.
+#[test]
+fn std_url_parse_err_no_scheme() {
+    let src = "import std.io\n\
+               import std.url\n\
+               use std.io.{IO};\n\
+               use std.url.{parse_url};\n\
+               fn main() -> Int ![IO] {\n\
+                 match parse_url(\"h/p\") {\n\
+                   Ok(_) => {\n\
+                     perform IO.println(\"unexpected ok\");\n\
+                     1\n\
+                   },\n\
+                   Err(e) => {\n\
+                     perform IO.println(e);\n\
+                     0\n\
+                   },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_url_parse_err");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "no scheme\n", "stderr={stderr:?}");
+}
+
 // ===== record.field field access =======================================
 
 #[test]

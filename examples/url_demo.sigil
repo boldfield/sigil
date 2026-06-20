@@ -1,0 +1,47 @@
+import std.io
+import std.int
+import std.url
+use std.io.{IO};
+use std.int.{int_to_string};
+use std.url.{parse_url};
+
+fn main() -> Int ![IO] {
+  match parse_url("http://h/p") {
+    Ok(url) => {
+      perform IO.println("http://h/p");
+      perform IO.println(url.scheme);
+      perform IO.println(url.host);
+      perform IO.println(int_to_string(url.port));
+      perform IO.println(url.path);
+      perform IO.println("");
+    },
+    Err(e) => { perform IO.println(e); },
+  };
+
+  match parse_url("https://h:8443/p?q=1") {
+    Ok(url) => {
+      perform IO.println("https://h:8443/p?q=1");
+      perform IO.println(url.scheme);
+      perform IO.println(url.host);
+      perform IO.println(int_to_string(url.port));
+      perform IO.println(url.path);
+      perform IO.println(url.query);
+      perform IO.println("");
+    },
+    Err(e) => { perform IO.println(e); },
+  };
+
+  match parse_url("http://h") {
+    Ok(url) => {
+      perform IO.println("http://h");
+      perform IO.println(url.scheme);
+      perform IO.println(url.host);
+      perform IO.println(int_to_string(url.port));
+      perform IO.println(url.path);
+      perform IO.println("");
+    },
+    Err(e) => { perform IO.println(e); },
+  };
+
+  0
+}
