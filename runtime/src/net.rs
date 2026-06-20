@@ -105,6 +105,18 @@ pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
     }
 }
 
+/// Rust-testable close helper. Looks up the conn id in the registry,
+/// removes it (which drops the TcpStream), and returns Ok(()) or Err
+/// with the error code.
+#[allow(clippy::disallowed_methods)]
+pub fn close(conn_id: i64) -> Result<(), i64> {
+    let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
+    match registry.map.remove(&conn_id) {
+        Some(_) => Ok(()),
+        None => Err(NET_ERR_BADHANDLE),
+    }
+}
+
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.connect.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
 /// Uses conservative scanning (descriptor_index = u32::MAX) since this
@@ -149,6 +161,18 @@ unsafe fn build_net_recv_result_tuple(
     crate::effect_helpers::alloc_tuple(
         &[error_tag as u64, data as u64, error_msg as u64],
         0b110,
+        u32::MAX,
+    )
+}
+
+/// Build the 3-element `(Int, Int, String)` result tuple for Net.close.
+/// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
+/// Uses conservative scanning (descriptor_index = u32::MAX) since this
+/// shape (Int, Int, Ptr) is not pre-registered.
+unsafe fn build_net_close_result_tuple(error_tag: i64, unused: i64, error_msg: *mut u8) -> *mut u8 {
+    crate::effect_helpers::alloc_tuple(
+        &[error_tag as u64, unused as u64, error_msg as u64],
+        0b100,
         u32::MAX,
     )
 }
@@ -325,6 +349,49 @@ pub unsafe extern "C" fn sigil_net_recv_arm(
     write_k_dispatch_value(k_closure, k_fn, tup as u64)
 }
 
+/// `Net.close(conn_id: Int) -> (Int, Int, String)` arm fn.
+///
+/// # Safety
+///
+/// `args_len == 6` (1 user arg + trailing quintuple). `in_args[0]` is a
+/// conn_id Int.
+#[no_mangle]
+pub unsafe extern "C" fn sigil_net_close_arm(
+    _closure_ptr: *const u8,
+    in_args: *const u64,
+    args_len: u32,
+    _terminal_out: *mut TerminalResult,
+) -> *mut NextStep {
+    debug_assert!(
+        args_len == 6,
+        "sigil_net_close_arm: args_len {args_len} != 6"
+    );
+    debug_assert!(!in_args.is_null());
+
+    let conn_id = *in_args as i64;
+    let k_closure = *in_args.add(1) as *mut u8;
+    let k_fn = *in_args.add(2) as *mut u8;
+
+    // Call the Rust close helper.
+    let error_tag = match close(conn_id) {
+        Ok(()) => NET_OK,
+        Err(code) => code,
+    };
+
+    let error_msg = if error_tag == NET_OK {
+        alloc_string_from_str("")
+    } else {
+        let msg = match error_tag {
+            NET_ERR_BADHANDLE => "Bad connection handle",
+            _ => "Close error",
+        };
+        alloc_string_from_str(msg)
+    };
+
+    let tup = build_net_close_result_tuple(error_tag, 0, error_msg);
+    write_k_dispatch_value(k_closure, k_fn, tup as u64)
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 mod tests {
@@ -475,6 +542,72 @@ mod tests {
         assert!(
             data.is_empty(),
             "recv should return empty on closed peer (EOF)"
+        );
+    }
+
+    #[test]
+    fn close_connected_stream_removes_from_registry() {
+        let _g = gc_test_lock();
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Connect to the listener.
+        let conn_id = connect("127.0.0.1", port).expect("connect should succeed");
+
+        // Verify the connection is in the registry.
+        {
+            let registry = CONN_REGISTRY.lock().expect("lock registry");
+            assert!(
+                registry.map.contains_key(&conn_id),
+                "connection should be in registry"
+            );
+        }
+
+        // Close the connection.
+        let result = close(conn_id);
+        assert!(result.is_ok(), "close should succeed");
+
+        // Verify the connection is no longer in the registry.
+        let registry = CONN_REGISTRY.lock().expect("lock registry");
+        assert!(
+            !registry.map.contains_key(&conn_id),
+            "connection should be removed from registry"
+        );
+    }
+
+    #[test]
+    fn close_unknown_id_returns_badhandle() {
+        let _g = gc_test_lock();
+        let result = close(999999);
+        assert!(result.is_err(), "close should fail for unknown id");
+        let err = result.unwrap_err();
+        assert_eq!(err, NET_ERR_BADHANDLE, "error should be BadHandle");
+    }
+
+    #[test]
+    fn close_same_id_twice_returns_badhandle_second_time() {
+        let _g = gc_test_lock();
+        // Bind a listener on 127.0.0.1:0 to get an available port.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Connect to the listener.
+        let conn_id = connect("127.0.0.1", port).expect("connect should succeed");
+
+        // Close the connection once (should succeed).
+        let result1 = close(conn_id);
+        assert!(result1.is_ok(), "first close should succeed");
+
+        // Close the same connection again (should fail with BadHandle).
+        let result2 = close(conn_id);
+        assert!(result2.is_err(), "second close should fail");
+        let err = result2.unwrap_err();
+        assert_eq!(
+            err, NET_ERR_BADHANDLE,
+            "second close should return BadHandle"
         );
     }
 }
