@@ -306,6 +306,7 @@ pub unsafe extern "C" fn sigil_net_recv_arm(
     if !data_vec.is_empty() {
         // SAFETY: gc-heap-ptr arithmetic (ByteArray payload starts at offset 16).
         let payload = data_ptr.add(16);
+        // SAFETY: gc-heap-ptr arithmetic (data_vec is a Rust-owned Vec; payload is the ByteArray interior byte buffer at offset 16, bounds [16, 16+data_vec.len())).
         std::ptr::copy_nonoverlapping(data_vec.as_ptr(), payload, data_vec.len());
     }
 
