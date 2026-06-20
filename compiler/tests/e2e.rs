@@ -24254,30 +24254,56 @@ fn std_http_parse_response_valid() {
                import std.byte_array\n\
                import std.list\n\
                use std.io.{IO};\n\
-               use std.http.{Response, parse_response};\n\
+               use std.http.{Response, Header, parse_response};\n\
                use std.byte_array.{string_to_bytes, byte_array_concat};\n\
                use std.list.{List};\n\
                fn main() -> Int ![IO, Mem] {\n\
                  let response_bytes: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nX-Custom: value\\r\\n\\r\\n\");\n\
                  match parse_response(response_bytes) {\n\
                    Ok(resp) => {\n\
-                     if resp.status == 200 {\n\
-                       perform IO.print(\"OK\");\n\
-                       0\n\
+                     if resp.status == 200 && resp.reason == \"OK\" && resp.headers.len() == 2 {\n\
+                       match resp.headers.get(0) {\n\
+                         Some(h0) => {\n\
+                           if h0.name == \"Content-Type\" && h0.value == \"text/plain\" {\n\
+                             match resp.headers.get(1) {\n\
+                               Some(h1) => {\n\
+                                 if h1.name == \"X-Custom\" && h1.value == \"value\" {\n\
+                                   perform IO.println(\"OK\");\n\
+                                   0\n\
+                                 } else {\n\
+                                   perform IO.println(\"header1 mismatch\");\n\
+                                   1\n\
+                                 }\n\
+                               },\n\
+                               None => {\n\
+                                 perform IO.println(\"missing header1\");\n\
+                                 1\n\
+                               },\n\
+                             }\n\
+                           } else {\n\
+                             perform IO.println(\"header0 mismatch\");\n\
+                             1\n\
+                           }\n\
+                         },\n\
+                         None => {\n\
+                           perform IO.println(\"missing header0\");\n\
+                           1\n\
+                         },\n\
+                       }\n\
                      } else {\n\
-                       perform IO.print(\"status mismatch\");\n\
+                       perform IO.println(\"status/reason/headers mismatch\");\n\
                        1\n\
                      }\n\
                    },\n\
                    Err(e) => {\n\
-                     perform IO.print(e);\n\
+                     perform IO.println(e);\n\
                      1\n\
                    },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_parse_response_valid");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "OK", "stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
 }
 
 /// `parse_response` returns Err for malformed status line.
@@ -24293,18 +24319,18 @@ fn std_http_parse_response_malformed() {
                  let response_bytes: ByteArray = string_to_bytes(\"GARBAGE\\r\\n\");\n\
                  match parse_response(response_bytes) {\n\
                    Ok(_) => {\n\
-                     perform IO.print(\"should have failed\");\n\
+                     perform IO.println(\"should have failed\");\n\
                      1\n\
                    },\n\
                    Err(_) => {\n\
-                     perform IO.print(\"OK\");\n\
+                     perform IO.println(\"OK\");\n\
                      0\n\
                    },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_parse_response_malformed");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert_eq!(stdout, "OK", "stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
 }
 
 // ===== record.field field access =======================================
