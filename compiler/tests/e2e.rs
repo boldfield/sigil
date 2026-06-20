@@ -24185,14 +24185,15 @@ fn std_http_serialize_request_get() {
                use std.io.{IO};\n\
                use std.url.{parse_url};\n\
                use std.http.{Request, get, serialize_request};\n\
-               use std.byte_array.{string_from_bytes};\n\
+               use std.byte_array.{string_from_bytes, byte_array_concat, string_to_bytes};\n\
                use std.list.{List};\n\
                fn main() -> Int ![IO, Mem] {\n\
                  match parse_url(\"http://example.com/p?q=1\") {\n\
                    Ok(u) => {\n\
                      let req: Request = get(u, Nil);\n\
                      let serialized: ByteArray = serialize_request(req);\n\
-                     match string_from_bytes(serialized) {\n\
+                     let with_newline: ByteArray = byte_array_concat(serialized, string_to_bytes(\"\\n\"));\n\
+                     match string_from_bytes(with_newline) {\n\
                        Some(s) => { perform IO.print(s); 0 },\n\
                        None => { perform IO.print(\"failed to convert bytes\"); 1 },\n\
                      }\n\
@@ -24202,7 +24203,7 @@ fn std_http_serialize_request_get() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_get");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    let expected = "GET /p?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    let expected = "GET /p?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n\n";
     assert_eq!(stdout, expected, "stderr={stderr:?}");
 }
 
@@ -24217,7 +24218,7 @@ fn std_http_serialize_request_with_body() {
                use std.io.{IO};\n\
                use std.url.{parse_url};\n\
                use std.http.{Request, serialize_request};\n\
-               use std.byte_array.{string_from_bytes, string_to_bytes};\n\
+               use std.byte_array.{string_from_bytes, string_to_bytes, byte_array_concat};\n\
                use std.list.{List};\n\
                fn main() -> Int ![IO, Mem] {\n\
                  match parse_url(\"http://example.com/api\") {\n\
@@ -24230,7 +24231,8 @@ fn std_http_serialize_request_with_body() {
                        body: body,\n\
                      };\n\
                      let serialized: ByteArray = serialize_request(req);\n\
-                     match string_from_bytes(serialized) {\n\
+                     let with_newline: ByteArray = byte_array_concat(serialized, string_to_bytes(\"\\n\"));\n\
+                     match string_from_bytes(with_newline) {\n\
                        Some(s) => { perform IO.print(s); 0 },\n\
                        None => { perform IO.print(\"failed to convert bytes\"); 1 },\n\
                      }\n\
@@ -24240,7 +24242,7 @@ fn std_http_serialize_request_with_body() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_body");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    let expected = "POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\n\r\n{}";
+    let expected = "POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2\r\n\r\n{}\n";
     assert_eq!(stdout, expected, "stderr={stderr:?}");
 }
 
