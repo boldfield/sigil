@@ -71,7 +71,7 @@ fn parse_url(s: String) -> Result[Url, String] ![] {
 
       // Parse host and port from authority
       let colon_idx: Int = string_index_of(authority, ":");
-      let hp_result: Result[(String, Int), String] ![] = if colon_idx < 0 {
+      let hp_result: Result[(String, Int), String] = if colon_idx < 0 {
         Ok((authority, default_port(scheme)))
       } else {
         let host: String = string_substring(authority, 0, colon_idx);
