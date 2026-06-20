@@ -24104,6 +24104,70 @@ fn std_url_parse_err_no_scheme() {
     assert_eq!(stdout, "no scheme\n", "stderr={stderr:?}");
 }
 
+// ===== std.http types and get() constructor ==============================
+
+/// `std.http` compiles and is importable (smoke test).
+#[test]
+fn std_http_import_is_noop() {
+    let src = "import std.io\n\
+               import std.http\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 perform IO.println(\"ok\");\n\
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_import");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "ok\n", "stderr={stderr:?}");
+}
+
+/// `get()` builds a Request and fields are readable via record.field access.
+#[test]
+fn std_http_get_builds_request() {
+    let src = "import std.io\n\
+               import std.url\n\
+               import std.http\n\
+               use std.io.{IO};\n\
+               use std.url.{parse_url};\n\
+               use std.http.{get};\n\
+               fn main() -> Int ![IO] {\n\
+                 match parse_url(\"http://example.com/path\") {\n\
+                   Ok(url) => {\n\
+                     let req: std.http.Request = get(url, []);\n\
+                     perform IO.println(req.method);\n\
+                     perform IO.println(req.url.host);\n\
+                     perform IO.println(req.url.path);\n\
+                     0\n\
+                   },\n\
+                   Err(_) => 1,\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_get_request");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "GET\nexample.com\n/path\n", "stderr={stderr:?}");
+}
+
+/// Response type can be constructed, ensuring List[Header] is monomorphized.
+#[test]
+fn std_http_response_construct() {
+    let src = "import std.io\n\
+               import std.http\n\
+               use std.io.{IO};\n\
+               fn main() -> Int ![IO] {\n\
+                 let resp: std.http.Response = std.http.Response {\n\
+                   status: 200,\n\
+                   reason: \"OK\",\n\
+                   headers: [],\n\
+                   body: byte_array_empty(),\n\
+                 };\n\
+                 perform IO.println(resp.reason);\n\
+                 0\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_response");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
+}
+
 // ===== record.field field access =======================================
 
 #[test]

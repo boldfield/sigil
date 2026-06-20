@@ -5,11 +5,8 @@
 import std.url
 use std.url.{Url};
 
-// Header represents an HTTP header as a key-value pair.
-type Header = {
-  key: String,
-  value: String,
-}
+// Header represents an HTTP header as a (key, value) tuple.
+type Header = | Header(String, String)
 
 type Request = {
   method: String,
