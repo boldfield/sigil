@@ -9978,6 +9978,26 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         )
         .map_err(|e| format!("declare sigil_process_run_arm: {e}"))?;
 
+    // Net arm fn declarations. All share the same CPS arm fn signature
+    // (io_println_arm_sig). Op IDs (alphabetical): close=0, connect=1,
+    // recv=2, send=3. Implementations live in `runtime/src/net.rs`.
+    let net_close_arm = module
+        .declare_function("sigil_net_close_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_net_close_arm: {e}"))?;
+    let net_connect_arm = module
+        .declare_function(
+            "sigil_net_connect_arm",
+            Linkage::Import,
+            &io_println_arm_sig,
+        )
+        .map_err(|e| format!("declare sigil_net_connect_arm: {e}"))?;
+    let net_recv_arm = module
+        .declare_function("sigil_net_recv_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_net_recv_arm: {e}"))?;
+    let net_send_arm = module
+        .declare_function("sigil_net_send_arm", Linkage::Import, &io_println_arm_sig)
+        .map_err(|e| format!("declare sigil_net_send_arm: {e}"))?;
+
     // Plan B Task 57 — sigil_arith_error_div_by_zero_arm and
     // sigil_arith_error_mod_by_zero_arm, the two runtime-side default
     // handler arm fns for `ArithError`. Same CPS arm fn ABI as
@@ -13992,6 +14012,10 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         let fs_remove_file_arm_ref = module.declare_func_in_func(fs_remove_file_arm, builder.func);
         let fs_write_file_arm_ref = module.declare_func_in_func(fs_write_file_arm, builder.func);
         let process_run_arm_ref = module.declare_func_in_func(process_run_arm, builder.func);
+        let net_close_arm_ref = module.declare_func_in_func(net_close_arm, builder.func);
+        let net_connect_arm_ref = module.declare_func_in_func(net_connect_arm, builder.func);
+        let net_recv_arm_ref = module.declare_func_in_func(net_recv_arm, builder.func);
+        let net_send_arm_ref = module.declare_func_in_func(net_send_arm, builder.func);
         let arith_div_arm_ref = module.declare_func_in_func(arith_error_div_arm, builder.func);
         let arith_mod_arm_ref = module.declare_func_in_func(arith_error_mod_arm, builder.func);
 
@@ -14000,13 +14024,14 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         // Register the main shim's own handler-frame shapes. These
         // contribute the 4 distinct shapes IO+Env share (`arm_count=3`,
         // deduplicated by `ShapeTable::register`) plus ArithError
-        // (`arm_count=2`), Fs (`arm_count=10`), and Process
-        // (`arm_count=1`).
+        // (`arm_count=2`), Fs (`arm_count=10`), Process (`arm_count=1`),
+        // and Net (`arm_count=4`).
         let arith_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(2);
         let io_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
         let env_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(3);
         let fs_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(10);
         let process_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(1);
+        let net_descriptor_idx = shape_table.borrow_mut().handler_frame_descriptor_index(4);
 
         // Materialise `SHAPE_DESCRIPTORS` before any user-code
         // allocation runs. The entry count N is the first u32 of
@@ -14214,6 +14239,38 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
         );
         builder.ins().call(handle_push_ref, &[process_frame_ptr]);
 
+        // ────── Net handler frame (effect_id=6, arm_count=4) ──────
+        // Op IDs (alphabetical): close=0, connect=1, recv=2, send=3.
+        let net_effect_id_v = builder.ins().iconst(types::I32, 6);
+        let net_arm_count_v = builder.ins().iconst(types::I32, 4);
+        let net_resumes_many_v = builder.ins().iconst(types::I32, 0);
+        let net_descriptor_idx_v = builder.ins().iconst(types::I32, net_descriptor_idx as i64);
+        let net_frame_ptr = lower_alloc_call(
+            &mut builder,
+            frame_new_ref,
+            &[
+                net_effect_id_v,
+                net_arm_count_v,
+                net_resumes_many_v,
+                net_descriptor_idx_v,
+            ],
+        );
+        let net_null_closure = builder.ins().iconst(pointer_ty, 0);
+        let install_net_arm =
+            |builder: &mut FunctionBuilder<'_>, op_id: i64, arm_fn_ref: FuncRef| {
+                let op_id_v = builder.ins().iconst(types::I32, op_id);
+                let arm_fn_ptr = builder.ins().func_addr(pointer_ty, arm_fn_ref);
+                builder.ins().call(
+                    frame_set_arm_ref,
+                    &[net_frame_ptr, op_id_v, arm_fn_ptr, net_null_closure],
+                );
+            };
+        install_net_arm(&mut builder, 0, net_close_arm_ref);
+        install_net_arm(&mut builder, 1, net_connect_arm_ref);
+        install_net_arm(&mut builder, 2, net_recv_arm_ref);
+        install_net_arm(&mut builder, 3, net_send_arm_ref);
+        builder.ins().call(handle_push_ref, &[net_frame_ptr]);
+
         // user-main takes the closure-calling-convention closure_ptr as
         // arg 0. The shim is not a closure entry point, so it passes a
         // null pointer; main's body never reads it.
@@ -14247,11 +14304,28 @@ pub fn emit_object(cc: &ClosureConvertedProgram, out_path: &Path) -> Result<(), 
             .ins()
             .call(user_main_ref, &[null_closure, terminal_out_v]);
 
-        // Pop in reverse order of push: Process, Fs, Env, IO,
+        // Pop in reverse order of push: Net, Process, Fs, Env, IO,
         // ArithError. In debug builds verify each pop matches the
         // corresponding frame pointer (local sanity check on each;
         // ArithError gets the discipline trap at the bottom — mirrors
         // Phase 4f's `Expr::Handle`-exit discipline).
+        let net_pop_call = builder.ins().call(handle_pop_ref, &[]);
+        if cfg!(debug_assertions) {
+            let popped_net = builder.inst_results(net_pop_call)[0];
+            let net_mismatch = builder
+                .ins()
+                .icmp(IntCC::NotEqual, popped_net, net_frame_ptr);
+            let ok = builder.create_block();
+            let bad = builder.create_block();
+            builder.ins().brif(net_mismatch, bad, &[], ok, &[]);
+            builder.switch_to_block(bad);
+            builder.seal_block(bad);
+            builder
+                .ins()
+                .trap(TrapCode::unwrap_user(TRAP_HANDLE_DISCIPLINE_VIOLATION));
+            builder.switch_to_block(ok);
+            builder.seal_block(ok);
+        }
         let process_pop_call = builder.ins().call(handle_pop_ref, &[]);
         if cfg!(debug_assertions) {
             let popped_process = builder.inst_results(process_pop_call)[0];
