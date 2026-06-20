@@ -85,4 +85,8 @@ run_invariant \
     "examples/fib_cps_forced.sigil" \
     "plan_b_invariant_selective_cps"
 
+say "GC cross-check: deep recursion path (10k-element JSON array parsing)"
+cargo test -p sigil-compiler --test e2e "cross_check_json_parse_large_array_no_abort" -- --exact --nocapture
+pass "GC cross-check: deep recursion path (JSON parser under SIGIL_GC_CROSS_CHECK=1)"
+
 say "OK — plan-b-invariants completed (SKIPs will convert to PASS as Stage 5/6 lands)"

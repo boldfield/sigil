@@ -23162,6 +23162,62 @@ fn precise_walker_deep_chain_under_cross_check() {
     assert_eq!(code, 0);
 }
 
+#[test]
+fn cross_check_json_parse_large_array_no_abort() {
+    // GC cross-check for deep-recursion path via large JSON parsing.
+    // Parses a 10,000 element JSON array (deep recursion in the
+    // JSON parser) under SIGIL_GC_CROSS_CHECK=1 to assert the
+    // precise walker's roots agree with conservative scan across
+    // continuation-stack growth. The cross-check fires at every
+    // alloc (~10,000 times during parsing) and verifies no roots
+    // diverge and no continuation pointers are missed.
+    let elements: Vec<String> = (0..10000).map(|i| i.to_string()).collect();
+    let json_string = format!("[{}]", elements.join(", "));
+    let escaped_json = json_string.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let src = format!(
+        "import std.byte_array\n\
+        import std.io\n\
+        import std.mem\n\
+        import std.string\n\
+        import std.json\n\
+        import std.result\n\
+        use std.byte_array.{{string_to_bytes}};\n\
+        use std.io.{{IO}};\n\
+        use std.json.{{json_parse}};\n\
+        use std.mem.{{Mem}};\n\
+        use std.result.{{Err, Ok}};\n\
+        use std.string.{{string_concat}};\n\
+        fn main() -> Int ![IO, Mem] {{\n\
+        match json_parse(string_to_bytes(\"{}\")) {{\n\
+        Ok(_) => perform IO.println(\"OK\"),\n\
+        Err(msg) => perform IO.println(string_concat(\"ERR: \", msg)),\n\
+        }};\n\
+        0\n\
+        }}\n",
+        escaped_json
+    );
+
+    let (stdout, stderr, code) = {
+        let src_path = std::env::temp_dir().join(format!(
+            "sigil_e2e_{}_{}.sigil",
+            "cross_check_json_parse_large_array",
+            std::process::id()
+        ));
+        std::fs::write(&src_path, &src).expect("write source");
+        let out = compile_file_and_run_with_env(
+            &src_path,
+            "cross_check_json_parse_large_array",
+            &[("SIGIL_GC_CROSS_CHECK", "1")],
+        );
+        let _ = std::fs::remove_file(&src_path);
+        out
+    };
+    assert_no_cross_check_abort("json_parse_large_array.sigil", &stderr, code);
+    assert_eq!(stdout.trim_end(), "OK");
+    assert_eq!(code, 0);
+}
+
 // ===== Plan A1 — Auto-CPS-promote non-tail self-recursive Sync fns =========
 //
 // The plan eliminates the silent OS-stack-overflow class for Sigil
