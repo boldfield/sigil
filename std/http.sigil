@@ -5,24 +5,27 @@
 import std.url
 use std.url.{Url};
 
-// Header is a tuple (key, value); represented inline in List[(String, String)].
+type Header = {
+  key: String,
+  value: String,
+}
 
-type Request = {
+type Request[Unit] = {
   method: String,
   url: Url,
-  headers: List[(String, String)],
+  headers: List[Header],
   body: ByteArray,
 }
 
-type Response = {
+type Response[Unit] = {
   status: Int,
   reason: String,
-  headers: List[(String, String)],
+  headers: List[Header],
   body: ByteArray,
 }
 
 // `get(url, headers)` constructs a GET request for the given URL and headers.
-fn get(url: Url, headers: List[(String, String)]) -> Request ![] {
+fn get(url: Url, headers: List[Header]) -> Request[Unit] ![] {
   Request {
     method: "GET",
     url: url,
