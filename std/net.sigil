@@ -1,0 +1,117 @@
+// sigil: 0.1
+//
+// std/net.sigil — Net effect wrapper following std/process.sigil pattern.
+//
+// User-facing wrapper around the `Net` effect's raw arms into a Result API.
+// The effect-op return is a tuple containing an error_tag (0 = success, >0 = error)
+// and operation-specific payloads. This wrapper translates to idiomatic
+// `Result[T, NetError]` returns.
+//
+// ## `NetError` variant tag mapping
+//
+// Keep the variant order aligned with the runtime tag mapping at
+// `runtime/src/net.rs`:
+//
+//   tag 0 → success (mapped to Ok)
+//   tag 1 → ResolveFailed
+//   tag 2 → ConnectionRefused
+//   tag 3 → TlsError(message)
+//   tag 4 → Closed
+//   tag 5+ → Other(message)
+
+import std.byte_array
+import std.list
+import std.result
+use std.byte_array.{ByteArray, byte_array_empty, byte_array_concat, byte_array_length};
+use std.list.{List, Nil, Cons};
+use std.result.{Err, Ok, Result};
+
+type Conn =
+  | Conn(Int)
+
+type NetError =
+  | ResolveFailed
+  | ConnectionRefused
+  | TlsError(String)
+  | Closed
+  | Other(String)
+
+// `connect(host, port, tls)` establishes a TCP connection.
+// Returns `Ok(Conn)` on success or `Err(NetError)` on failure.
+fn connect(host: String, port: Int, tls: Bool) -> Result[Conn, NetError] ![Net] {
+  match perform Net.connect(host, port, tls) {
+    (0, conn_id, _) => Ok(Conn(conn_id)),
+    (tag, _, msg) => Err(__tag_to_net_error(tag, msg)),
+  }
+}
+
+// `send(c, data)` sends bytes on the connection.
+// Returns `Ok(bytes_written)` or `Err(NetError)`.
+fn send(c: Conn, data: ByteArray) -> Result[Int, NetError] ![Net] {
+  match c {
+    Conn(conn_id) => {
+      match perform Net.send(conn_id, data) {
+        (0, bytes_written, _) => Ok(bytes_written),
+        (tag, _, msg) => Err(__tag_to_net_error(tag, msg)),
+      }
+    }
+  }
+}
+
+// `recv(c, max)` receives up to `max` bytes from the connection.
+// Empty ByteArray indicates EOF. Returns `Ok(ByteArray)` or `Err(NetError)`.
+fn recv(c: Conn, max: Int) -> Result[ByteArray, NetError] ![Net] {
+  match c {
+    Conn(conn_id) => {
+      match perform Net.recv(conn_id, max) {
+        (0, data, _) => Ok(data),
+        (tag, _, msg) => Err(__tag_to_net_error(tag, msg)),
+      }
+    }
+  }
+}
+
+// `close(c)` closes the connection.
+// Returns `Ok(())` or `Err(NetError)`.
+fn close(c: Conn) -> Result[Unit, NetError] ![Net] {
+  match c {
+    Conn(conn_id) => {
+      match perform Net.close(conn_id) {
+        (0, _) => Ok(()),
+        (tag, msg) => Err(__tag_to_net_error(tag, msg)),
+      }
+    }
+  }
+}
+
+// `recv_all(c)` receives data until EOF, concatenating all chunks.
+// Returns the full ByteArray or `Err(NetError)`.
+fn recv_all(c: Conn) -> Result[ByteArray, NetError] ![Net] {
+  __recv_all_loop(c, byte_array_empty())
+}
+
+// Internal loop for recv_all: accumulate received data until EOF.
+fn __recv_all_loop(c: Conn, acc: ByteArray) -> Result[ByteArray, NetError] ![Net] {
+  match recv(c, 4096) {
+    Ok(chunk) => {
+      if byte_array_length(chunk) == 0 {
+        Ok(acc)
+      } else {
+        __recv_all_loop(c, byte_array_concat(acc, chunk))
+      }
+    },
+    Err(e) => Err(e),
+  }
+}
+
+// Map a NetError tag to the corresponding variant.
+// `msg` is consumed by TlsError and Other variants; ignored otherwise.
+fn __tag_to_net_error(tag: Int, msg: String) -> NetError ![] {
+  match tag {
+    1 => ResolveFailed,
+    2 => ConnectionRefused,
+    3 => TlsError(msg),
+    4 => Closed,
+    _ => Other(msg),
+  }
+}
