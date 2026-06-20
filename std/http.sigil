@@ -1,0 +1,47 @@
+// sigil: 0.1
+//
+// std/http.sigil — HTTP types and request constructor.
+//
+// Types:
+//   - `Header = { name: String, value: String }` — a header name/value pair.
+//     (The spec uses tuple notation `(String, String)` but Sigil's `type`
+//     declaration grammar only accepts record `{…}` or sum `| Ctor…` forms;
+//     a record with named fields is the closest expressible equivalent.)
+//   - `Request = { method, url, headers, body }` — an outgoing HTTP request.
+//   - `Response = { status, reason, headers, body }` — an incoming HTTP response.
+//
+// Constructors:
+//   - `get(url, headers) -> Request` — builds a GET request with an empty body.
+
+import std.list
+import std.url
+use std.list.{List};
+use std.url.{Url};
+
+type Header = {
+  name: String,
+  value: String,
+}
+
+type Request = {
+  method: String,
+  url: Url,
+  headers: List[Header],
+  body: ByteArray,
+}
+
+type Response = {
+  status: Int,
+  reason: String,
+  headers: List[Header],
+  body: ByteArray,
+}
+
+fn get(url: Url, headers: List[Header]) -> Request ![] {
+  Request {
+    method: "GET",
+    url: url,
+    headers: headers,
+    body: byte_array_empty(),
+  }
+}
