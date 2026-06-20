@@ -95,6 +95,209 @@ fn find_content_length(headers: List[Header]) -> Option[Int] ![] {
   }
 }
 
+fn find_transfer_encoding_chunked(headers: List[Header]) -> Bool ![] {
+  match headers {
+    Nil => false,
+    Cons(h, rest) => {
+      match string_compare(h.name, "Transfer-Encoding") {
+        Equal => {
+          match string_compare(h.value, "chunked") {
+            Equal => true,
+            _ => find_transfer_encoding_chunked(rest),
+          }
+        },
+        _ => find_transfer_encoding_chunked(rest),
+      }
+    }
+  }
+}
+
+fn find_crlf(bytes: ByteArray, pos: Int) -> Int ![Mem] {
+  let len: Int = byte_array_length(bytes);
+  if pos + 2 > len {
+    -1
+  } else {
+    let b0: Byte = byte_array_get(bytes, pos);
+    let b1: Byte = byte_array_get(bytes, pos + 1);
+    if b0 == byte_truncate(13) && b1 == byte_truncate(10) {
+      pos
+    } else {
+      find_crlf(bytes, pos + 1)
+    }
+  }
+}
+
+fn hex_char_to_int(b: Byte) -> Option[Int] ![] {
+  if b == byte_truncate(48) {
+    Some(0)
+  } else {
+    if b == byte_truncate(49) {
+      Some(1)
+    } else {
+      if b == byte_truncate(50) {
+        Some(2)
+      } else {
+        if b == byte_truncate(51) {
+          Some(3)
+        } else {
+          if b == byte_truncate(52) {
+            Some(4)
+          } else {
+            if b == byte_truncate(53) {
+              Some(5)
+            } else {
+              if b == byte_truncate(54) {
+                Some(6)
+              } else {
+                if b == byte_truncate(55) {
+                  Some(7)
+                } else {
+                  if b == byte_truncate(56) {
+                    Some(8)
+                  } else {
+                    if b == byte_truncate(57) {
+                      Some(9)
+                    } else {
+                      if b == byte_truncate(97) {
+                        Some(10)
+                      } else {
+                        if b == byte_truncate(98) {
+                          Some(11)
+                        } else {
+                          if b == byte_truncate(99) {
+                            Some(12)
+                          } else {
+                            if b == byte_truncate(100) {
+                              Some(13)
+                            } else {
+                              if b == byte_truncate(101) {
+                                Some(14)
+                              } else {
+                                if b == byte_truncate(102) {
+                                  Some(15)
+                                } else {
+                                  if b == byte_truncate(65) {
+                                    Some(10)
+                                  } else {
+                                    if b == byte_truncate(66) {
+                                      Some(11)
+                                    } else {
+                                      if b == byte_truncate(67) {
+                                        Some(12)
+                                      } else {
+                                        if b == byte_truncate(68) {
+                                          Some(13)
+                                        } else {
+                                          if b == byte_truncate(69) {
+                                            Some(14)
+                                          } else {
+                                            if b == byte_truncate(70) {
+                                              Some(15)
+                                            } else {
+                                              None
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn hex_string_to_int(bytes: ByteArray, start: Int, end: Int) -> Option[Int] ![Mem] {
+  if start >= end {
+    None
+  } else {
+    hex_string_to_int_acc(bytes, start, end, 0)
+  }
+}
+
+fn hex_string_to_int_acc(bytes: ByteArray, pos: Int, end: Int, acc: Int) -> Option[Int] ![Mem] {
+  if pos >= end {
+    Some(acc)
+  } else {
+    let b: Byte = byte_array_get(bytes, pos);
+    match hex_char_to_int(b) {
+      None => None,
+      Some(digit) => {
+        let new_acc: Int = acc * 16 + digit;
+        hex_string_to_int_acc(bytes, pos + 1, end, new_acc)
+      }
+    }
+  }
+}
+
+fn parse_chunked_body(bytes: ByteArray, body_start: Int) -> Result[ByteArray, String] ![Mem] {
+  parse_chunked_body_acc(bytes, body_start, Nil)
+}
+
+fn parse_chunked_body_acc(bytes: ByteArray, pos: Int, chunks_rev: List[ByteArray]) -> Result[ByteArray, String] ![Mem] {
+  match find_crlf(bytes, pos) {
+    -1 => Err("Invalid chunked body: missing CRLF after chunk size"),
+    crlf_pos => {
+      match hex_string_to_int(bytes, pos, crlf_pos) {
+        None => Err("Invalid chunk size: not valid hex"),
+        Some(chunk_size) => {
+          if chunk_size == 0 {
+            let chunks: List[ByteArray] = reverse(chunks_rev);
+            match concat_chunks(chunks) {
+              Ok(body) => Ok(body),
+              Err(e) => Err(e),
+            }
+          } else {
+            if chunk_size < 0 {
+              Err("Invalid chunk size: negative")
+            } else {
+              let chunk_data_start: Int = crlf_pos + 2;
+              let chunk_data_end: Int = chunk_data_start + chunk_size;
+              match byte_array_slice_opt(bytes, chunk_data_start, chunk_data_end) {
+                None => Err("Invalid chunk: size exceeds response"),
+                Some(chunk_data) => {
+                  let chunk_end_crlf: Int = chunk_data_end;
+                  match find_crlf(bytes, chunk_end_crlf) {
+                    -1 => Err("Invalid chunked body: missing CRLF after chunk data"),
+                    next_crlf_pos => {
+                      let next_pos: Int = next_crlf_pos + 2;
+                      parse_chunked_body_acc(bytes, next_pos, Cons(chunk_data, chunks_rev))
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn concat_chunks(chunks: List[ByteArray]) -> Result[ByteArray, String] ![Mem] {
+  match chunks {
+    Nil => Ok(byte_array_empty()),
+    Cons(first, rest) => {
+      match concat_chunks(rest) {
+        Ok(rest_concat) => Ok(byte_array_concat(first, rest_concat)),
+        Err(e) => Err(e),
+      }
+    }
+  }
+}
+
 fn serialize_request(req: Request) -> ByteArray ![Mem] {
   let path_part: String = if string_length(req.url.query) > 0 {
     string_concat(req.url.path, string_concat("?", req.url.query))
@@ -156,21 +359,35 @@ fn parse_response(bytes: ByteArray) -> Result[Response, String] ![Mem] {
                   match parse_status_line(status_line, rest_lines) {
                     Ok(partial_response) => {
                       let body_start: Int = blank_pos + 4;
-                      match find_content_length(partial_response.headers) {
-                        None => Ok(partial_response),
-                        Some(content_len) => {
-                          if content_len < 0 {
-                            Err("Invalid Content-Length")
-                          } else {
-                            match byte_array_slice_opt(bytes, body_start, body_start + content_len) {
-                              None => Err("Content-Length exceeds response size"),
-                              Some(body) => {
-                                Ok(Response {
-                                  status: partial_response.status,
-                                  reason: partial_response.reason,
-                                  headers: partial_response.headers,
-                                  body: body,
-                                })
+                      if find_transfer_encoding_chunked(partial_response.headers) {
+                        match parse_chunked_body(bytes, body_start) {
+                          Ok(body) => {
+                            Ok(Response {
+                              status: partial_response.status,
+                              reason: partial_response.reason,
+                              headers: partial_response.headers,
+                              body: body,
+                            })
+                          },
+                          Err(e) => Err(e),
+                        }
+                      } else {
+                        match find_content_length(partial_response.headers) {
+                          None => Ok(partial_response),
+                          Some(content_len) => {
+                            if content_len < 0 {
+                              Err("Invalid Content-Length")
+                            } else {
+                              match byte_array_slice_opt(bytes, body_start, body_start + content_len) {
+                                None => Err("Content-Length exceeds response size"),
+                                Some(body) => {
+                                  Ok(Response {
+                                    status: partial_response.status,
+                                    reason: partial_response.reason,
+                                    headers: partial_response.headers,
+                                    body: body,
+                                  })
+                                }
                               }
                             }
                           }
