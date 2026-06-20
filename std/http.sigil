@@ -143,10 +143,20 @@ fn parse_status_line(status_line: String, rest_lines: List[String]) -> Result[Re
 }
 
 fn extract_reason(reason_parts: List[String]) -> String ![] {
+  extract_reason_acc(reason_parts, "")
+}
+
+fn extract_reason_acc(reason_parts: List[String], acc: String) -> String ![] {
   match reason_parts {
-    Nil => "",
-    Cons(first, Nil) => first,
-    Cons(first, rest) => string_concat(first, string_concat(" ", extract_reason(rest)))
+    Nil => acc,
+    Cons(first, rest) => {
+      let new_acc: String = if string_length(acc) == 0 {
+        first
+      } else {
+        string_concat(acc, string_concat(" ", first))
+      };
+      extract_reason_acc(rest, new_acc)
+    }
   }
 }
 
