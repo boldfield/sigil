@@ -4,8 +4,10 @@
 
 import std.result
 import std.string
+import std.byte_array
 use std.result.{Ok, Err, Result};
-use std.string.{string_index_of, string_length, string_substring, string_to_int};
+use std.string.{string_index_of, string_substring, string_to_int};
+use std.byte_array.{string_length};
 
 type Url = {
   scheme: String,
