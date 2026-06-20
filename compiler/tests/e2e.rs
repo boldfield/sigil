@@ -24193,11 +24193,11 @@ fn std_http_serialize_request_get() {
                      let req: Request = get(u, Nil);\n\
                      let serialized: ByteArray = serialize_request(req);\n\
                      match string_from_bytes(serialized) {\n\
-                       Some(s) => { perform IO.println(s); 0 },\n\
-                       None => { perform IO.println(\"failed to convert bytes\"); 1 },\n\
+                       Some(s) => { perform IO.print(s); 0 },\n\
+                       None => { perform IO.print(\"failed to convert bytes\"); 1 },\n\
                      }\n\
                    },\n\
-                   Err(e) => { perform IO.println(e); 1 },\n\
+                   Err(e) => { perform IO.print(e); 1 },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_get");
@@ -24231,11 +24231,11 @@ fn std_http_serialize_request_with_body() {
                      };\n\
                      let serialized: ByteArray = serialize_request(req);\n\
                      match string_from_bytes(serialized) {\n\
-                       Some(s) => { perform IO.println(s); 0 },\n\
-                       None => { perform IO.println(\"failed to convert bytes\"); 1 },\n\
+                       Some(s) => { perform IO.print(s); 0 },\n\
+                       None => { perform IO.print(\"failed to convert bytes\"); 1 },\n\
                      }\n\
                    },\n\
-                   Err(e) => { perform IO.println(e); 1 },\n\
+                   Err(e) => { perform IO.print(e); 1 },\n\
                  }\n\
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_body");
