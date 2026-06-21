@@ -24943,9 +24943,8 @@ fn main() -> Int ![IO, Net] {{\n\
 fn net_tls_echo_roundtrip() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
-    use std::time::Duration;
 
     use rustls::{pki_types::CertificateDer, ServerConfig};
 
@@ -24979,28 +24978,32 @@ fn net_tls_echo_roundtrip() {
     let addr = listener.local_addr().expect("get local address");
     let port = addr.port();
 
+    // Synchronization barrier: ensures server handshake completes before client sends.
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier_clone = barrier.clone();
+
     // Spawn TLS echo server thread.
     let _server_thread = thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
+        if let Ok((mut stream, _)) = listener.accept() {
             let mut conn = rustls::ServerConnection::new(server_config.clone())
                 .expect("create server connection");
-            if conn.complete_io(&mut &stream).is_ok() {
-                let mut buf = [0u8; 1024];
-                if let Ok(n) = conn.reader().read(&mut buf) {
-                    if n > 0 {
-                        let mut pending = Vec::new();
-                        let _ = conn.writer().write_all(&buf[..n]);
-                        let _ = conn.write_tls(&mut pending);
-                        let mut stream = stream;
-                        let _ = stream.write_all(&pending);
+            if conn.complete_io(&mut stream).is_ok() {
+                // Signal that handshake is complete and server is ready for data.
+                barrier_clone.wait();
+
+                // Read client data and echo it back.
+                if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
+                    let mut buf = [0u8; 1024];
+                    if let Ok(n) = conn.reader().read(&mut buf) {
+                        if n > 0 {
+                            let _ = conn.writer().write_all(&buf[..n]);
+                            let _ = conn.complete_io(&mut stream);
+                        }
                     }
                 }
             }
         }
     });
-
-    // Small delay to ensure server is listening.
-    thread::sleep(Duration::from_millis(50));
 
     // Generate Sigil program that connects to the TLS server.
     let sigil_source = format!(
@@ -25012,7 +25015,7 @@ use std.io.{{IO}};\n\
 use std.byte_array.{{string_from_bytes}};\n\
 \n\
 fn main() -> Int ![IO, Net] {{\n\
-  let host: String = \"127.0.0.1\";\n\
+  let host: String = \"localhost\";\n\
   let port: Int = {};\n\
   match connect(host, port, true) {{\n\
     Ok(conn) => {{\n\
@@ -25052,6 +25055,9 @@ fn main() -> Int ![IO, Net] {{\n\
     );
 
     let _ = std::fs::remove_file(&cert_temp_path);
+
+    // Wait for server thread to complete before asserting.
+    barrier.wait();
 
     assert_eq!(code, 0, "exit code should be 0; stderr={stderr:?}");
     assert!(
