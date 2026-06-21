@@ -217,6 +217,7 @@ pub fn close(conn_id: i64) -> Result<(), i64> {
 
 /// Test-only helper to set read timeout on a connection.
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 pub fn set_timeout(conn_id: i64, timeout_secs: u64) -> Result<(), i64> {
     let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
     match registry.map.get_mut(&conn_id) {
@@ -900,16 +901,14 @@ mod tests {
                 let _ = conn.complete_io(&mut stream);
 
                 // Read client data and echo it back (single round-trip, then exit).
-                if conn.read_tls(&mut &stream).is_ok() {
-                    if conn.process_new_packets().is_ok() {
-                        let mut plaintext = vec![0u8; 1024];
-                        if let Ok(n) = conn.reader().read(&mut plaintext) {
-                            if n > 0 {
-                                let _ = conn.writer().write_all(&plaintext[..n]);
-                                let mut pending = Vec::new();
-                                let _ = conn.write_tls(&mut pending);
-                                let _ = stream.write_all(&pending);
-                            }
+                if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
+                    let mut plaintext = vec![0u8; 1024];
+                    if let Ok(n) = conn.reader().read(&mut plaintext) {
+                        if n > 0 {
+                            let _ = conn.writer().write_all(&plaintext[..n]);
+                            let mut pending = Vec::new();
+                            let _ = conn.write_tls(&mut pending);
+                            let _ = stream.write_all(&pending);
                         }
                     }
                 }
