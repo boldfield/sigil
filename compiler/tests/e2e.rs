@@ -24943,10 +24943,10 @@ fn main() -> Int ![IO, Net] {{\n\
 fn net_tls_echo_roundtrip() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::process::Command;
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use std::process::Command;
 
     use rustls::{pki_types::CertificateDer, ServerConfig};
 
@@ -24999,27 +24999,18 @@ fn net_tls_echo_roundtrip() {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut conn = rustls::ServerConnection::new(server_config.clone())
                 .expect("create server connection");
-            if conn.complete_io(&mut stream).is_ok() {
-                // Read client data and echo it back.
-                // Keep reading until we get data (loop to handle multiple packets).
-                loop {
-                    if conn.read_tls(&mut &stream).is_err() {
-                        break;
-                    }
-                    if conn.process_new_packets().is_err() {
-                        break;
-                    }
-                    let mut buf = [0u8; 1024];
-                    match conn.reader().read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            // Echo the data back to the client
-                            if conn.writer().write_all(&buf[..n]).is_ok() {
-                                // Flush the response and send close_notify
-                                let _ = conn.complete_io(&mut stream);
-                            }
-                            break;
-                        }
-                        _ => break,
+            // Complete TLS handshake
+            if conn.complete_io(&mut stream).is_ok()
+                && conn.read_tls(&mut &stream).is_ok()
+                && conn.process_new_packets().is_ok()
+            {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = conn.reader().read(&mut buf) {
+                    if n > 0 {
+                        // Echo the data back to the client
+                        let _ = conn.writer().write_all(&buf[..n]);
+                        // Flush the response and send close_notify
+                        let _ = conn.complete_io(&mut stream);
                     }
                 }
             }
