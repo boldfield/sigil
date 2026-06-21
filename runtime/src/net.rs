@@ -215,6 +215,23 @@ pub fn close(conn_id: i64) -> Result<(), i64> {
     }
 }
 
+/// Test-only helper to set read timeout on a connection.
+#[cfg(test)]
+pub fn set_timeout(conn_id: i64, timeout_secs: u64) -> Result<(), i64> {
+    let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
+    match registry.map.get_mut(&conn_id) {
+        Some(Conn::Plain(stream)) => {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
+            Ok(())
+        }
+        Some(Conn::Tls(_, stream)) => {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
+            Ok(())
+        }
+        None => Err(NET_ERR_BADHANDLE),
+    }
+}
+
 /// Build the 3-element `(Int, Int, String)` result tuple for Net.connect.
 /// Bitmap = 0b100 (slot 2 is a pointer; slots 0 & 1 are scalars).
 /// Uses the pre-registered tuple_int_int_ptr shape index.
@@ -877,24 +894,23 @@ mod tests {
         // Spawn a thread to run the TLS echo server.
         let server_thread = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
                 let mut conn = rustls::ServerConnection::new(server_config.clone())
                     .expect("create server connection");
                 let _ = conn.complete_io(&mut stream);
 
-                // Read client data and echo it back.
-                while conn.read_tls(&mut &stream).is_ok() {
-                    if conn.process_new_packets().is_err() {
-                        break;
-                    }
-                    let mut plaintext = vec![0u8; 1024];
-                    match conn.reader().read(&mut plaintext) {
-                        Ok(n) if n > 0 => {
-                            conn.writer().write_all(&plaintext[..n]).ok();
-                            let mut pending = Vec::new();
-                            conn.write_tls(&mut pending).ok();
-                            stream.write_all(&pending).ok();
+                // Read client data and echo it back (single round-trip, then exit).
+                if conn.read_tls(&mut &stream).is_ok() {
+                    if conn.process_new_packets().is_ok() {
+                        let mut plaintext = vec![0u8; 1024];
+                        if let Ok(n) = conn.reader().read(&mut plaintext) {
+                            if n > 0 {
+                                let _ = conn.writer().write_all(&plaintext[..n]);
+                                let mut pending = Vec::new();
+                                let _ = conn.write_tls(&mut pending);
+                                let _ = stream.write_all(&pending);
+                            }
                         }
-                        _ => break,
                     }
                 }
             }
@@ -909,6 +925,9 @@ mod tests {
         let result = connect_with_root_store("localhost", port, true, root_store);
         assert!(result.is_ok(), "TLS connect should succeed");
         let conn_id = result.unwrap();
+
+        // Set read timeout on client socket to prevent deadlock.
+        let _ = set_timeout(conn_id, 2);
 
         // Send data through the TLS connection.
         let test_payload = b"Round-trip test data";
