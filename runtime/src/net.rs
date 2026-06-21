@@ -167,6 +167,24 @@ pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
             loop {
                 match stream.read(&mut encrypted_buf) {
                     Ok(0) => {
+                        // Stream hit EOF. Feed any remaining buffered encrypted data to rustls.
+                        loop {
+                            let mut remaining_buf = vec![0u8; MIN_ENCRYPTED_BUF_SIZE];
+                            match stream.read(&mut remaining_buf) {
+                                Ok(0) => break, // True EOF
+                                Ok(n) => {
+                                    if client_conn.read_tls(&mut &remaining_buf[..n]).is_err() {
+                                        return Err(NET_ERR_OTHER);
+                                    }
+                                    if client_conn.process_new_packets().is_err() {
+                                        return Err(NET_ERR_OTHER);
+                                    }
+                                }
+                                Err(_) => break, // Error or no more data
+                            }
+                        }
+
+                        // Now drain any plaintext left in the rustls reader.
                         let mut plaintext = vec![0u8; max];
                         match client_conn.reader().read(&mut plaintext) {
                             Ok(n) => {
@@ -860,7 +878,7 @@ mod tests {
     #[test]
     fn tls_send_recv_roundtrip() {
         let _g = gc_test_lock();
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
         use std::thread;
 
         use rustls::pki_types::CertificateDer;
@@ -892,13 +910,19 @@ mod tests {
         let addr = listener.local_addr().expect("get local addr");
         let port = addr.port();
 
+        // Synchronization barrier: ensures server handshake completes before client sends.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
         // Spawn a thread to run the TLS echo server.
         let server_thread = thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
                 let mut conn = rustls::ServerConnection::new(server_config.clone())
                     .expect("create server connection");
                 let _ = conn.complete_io(&mut stream);
+
+                // Signal that handshake is complete and server is ready for data.
+                barrier_clone.wait();
 
                 // Read client data and echo it back (single round-trip, then exit).
                 if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
@@ -923,8 +947,8 @@ mod tests {
         assert!(result.is_ok(), "TLS connect should succeed");
         let conn_id = result.unwrap();
 
-        // Set read timeout on client socket to prevent deadlock.
-        let _ = set_timeout(conn_id, 2);
+        // Wait for server to complete handshake before proceeding.
+        barrier.wait();
 
         // Send data through the TLS connection.
         let test_payload = b"Round-trip test data";
@@ -932,9 +956,6 @@ mod tests {
         assert!(result.is_ok(), "send should succeed");
         let bytes_written = result.unwrap();
         assert_eq!(bytes_written, test_payload.len(), "should send all bytes");
-
-        // Give server time to echo the data back.
-        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Recv the echoed data.
         let result = recv(conn_id, 100);
