@@ -906,9 +906,7 @@ mod tests {
                     if let Ok(n) = conn.reader().read(&mut plaintext) {
                         if n > 0 {
                             let _ = conn.writer().write_all(&plaintext[..n]);
-                            let mut pending = Vec::new();
-                            let _ = conn.write_tls(&mut pending);
-                            let _ = stream.write_all(&pending);
+                            let _ = conn.complete_io(&mut stream);
                         }
                     }
                 }
