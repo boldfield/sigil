@@ -24943,7 +24943,7 @@ fn main() -> Int ![IO, Net] {{\n\
 fn net_tls_echo_roundtrip() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::{Arc, Barrier};
+    use std::sync::Arc;
     use std::thread;
 
     use rustls::{pki_types::CertificateDer, ServerConfig};
@@ -24978,19 +24978,12 @@ fn net_tls_echo_roundtrip() {
     let addr = listener.local_addr().expect("get local address");
     let port = addr.port();
 
-    // Synchronization barrier: ensures server handshake completes before client sends.
-    let barrier = Arc::new(Barrier::new(2));
-    let barrier_clone = barrier.clone();
-
     // Spawn TLS echo server thread.
     let _server_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             let mut conn = rustls::ServerConnection::new(server_config.clone())
                 .expect("create server connection");
             if conn.complete_io(&mut stream).is_ok() {
-                // Signal that handshake is complete and server is ready for data.
-                barrier_clone.wait();
-
                 // Read client data and echo it back.
                 if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
                     let mut buf = [0u8; 1024];
@@ -25055,9 +25048,6 @@ fn main() -> Int ![IO, Net] {{\n\
     );
 
     let _ = std::fs::remove_file(&cert_temp_path);
-
-    // Wait for server thread to complete before asserting.
-    barrier.wait();
 
     assert_eq!(code, 0, "exit code should be 0; stderr={stderr:?}");
     assert!(

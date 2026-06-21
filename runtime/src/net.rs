@@ -119,9 +119,8 @@ pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
         if let Ok(cert_path) = std::env::var("SIGIL_TEST_TLS_CA_CERT") {
             if let Ok(cert_data) = std::fs::read(&cert_path) {
                 use rustls::pki_types::CertificateDer;
-                if let Ok(cert) = CertificateDer::try_from(cert_data.as_slice()) {
-                    let _ = root_store.add(cert);
-                }
+                let cert = CertificateDer::from(cert_data);
+                let _ = root_store.add(cert);
             }
         }
     }
