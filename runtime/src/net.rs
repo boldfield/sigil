@@ -167,6 +167,24 @@ pub fn recv(conn_id: i64, max: usize) -> Result<Vec<u8>, i64> {
             loop {
                 match stream.read(&mut encrypted_buf) {
                     Ok(0) => {
+                        // Stream hit EOF. Feed any remaining buffered encrypted data to rustls.
+                        loop {
+                            let mut remaining_buf = vec![0u8; MIN_ENCRYPTED_BUF_SIZE];
+                            match stream.read(&mut remaining_buf) {
+                                Ok(0) => break, // True EOF
+                                Ok(n) => {
+                                    if client_conn.read_tls(&mut &remaining_buf[..n]).is_err() {
+                                        return Err(NET_ERR_OTHER);
+                                    }
+                                    if client_conn.process_new_packets().is_err() {
+                                        return Err(NET_ERR_OTHER);
+                                    }
+                                }
+                                Err(_) => break, // Error or no more data
+                            }
+                        }
+
+                        // Now drain any plaintext left in the rustls reader.
                         let mut plaintext = vec![0u8; max];
                         match client_conn.reader().read(&mut plaintext) {
                             Ok(n) => {
@@ -211,6 +229,24 @@ pub fn close(conn_id: i64) -> Result<(), i64> {
     let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
     match registry.map.remove(&conn_id) {
         Some(_) => Ok(()),
+        None => Err(NET_ERR_BADHANDLE),
+    }
+}
+
+/// Test-only helper to set read timeout on a connection.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+pub fn set_timeout(conn_id: i64, timeout_secs: u64) -> Result<(), i64> {
+    let mut registry = CONN_REGISTRY.lock().expect("CONN_REGISTRY lock poisoned");
+    match registry.map.get_mut(&conn_id) {
+        Some(Conn::Plain(stream)) => {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
+            Ok(())
+        }
+        Some(Conn::Tls(_, stream)) => {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(timeout_secs)));
+            Ok(())
+        }
         None => Err(NET_ERR_BADHANDLE),
     }
 }
@@ -836,6 +872,103 @@ mod tests {
             "recv should get server data"
         );
 
+        server_thread.join().expect("server thread panicked");
+    }
+
+    #[test]
+    fn tls_send_recv_roundtrip() {
+        let _g = gc_test_lock();
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        use rustls::pki_types::CertificateDer;
+        use rustls::ServerConfig;
+
+        // Generate a self-signed certificate for localhost.
+        let subject_alt_names = vec!["localhost".to_string()];
+
+        let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+            .expect("generate self-signed cert");
+        let cert_der = certified_key.cert.der().to_vec();
+        let key_der = certified_key.key_pair.serialize_der();
+
+        // Parse certificate for server config.
+        let cert = CertificateDer::from(cert_der.clone());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+        );
+
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], key)
+                .expect("build server config"),
+        );
+
+        // Bind a listener for the TLS server.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("get local addr");
+        let port = addr.port();
+
+        // Synchronization barrier: ensures server handshake completes before client sends.
+        let barrier = Arc::new(Barrier::new(2));
+        let barrier_clone = barrier.clone();
+
+        // Spawn a thread to run the TLS echo server.
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut conn = rustls::ServerConnection::new(server_config.clone())
+                    .expect("create server connection");
+                let _ = conn.complete_io(&mut stream);
+
+                // Signal that handshake is complete and server is ready for data.
+                barrier_clone.wait();
+
+                // Read client data and echo it back (single round-trip, then exit).
+                if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
+                    let mut plaintext = vec![0u8; 1024];
+                    if let Ok(n) = conn.reader().read(&mut plaintext) {
+                        if n > 0 {
+                            let _ = conn.writer().write_all(&plaintext[..n]);
+                            let _ = conn.complete_io(&mut stream);
+                        }
+                    }
+                }
+            }
+        });
+
+        // Build a root store that trusts the self-signed cert.
+        let mut root_store = rustls::RootCertStore::empty();
+        let cert = CertificateDer::from(cert_der);
+        root_store.add(cert).expect("add root cert");
+
+        // Connect with TLS.
+        let result = connect_with_root_store("localhost", port, true, root_store);
+        assert!(result.is_ok(), "TLS connect should succeed");
+        let conn_id = result.unwrap();
+
+        // Wait for server to complete handshake before proceeding.
+        barrier.wait();
+
+        // Send data through the TLS connection.
+        let test_payload = b"Round-trip test data";
+        let result = send(conn_id, test_payload);
+        assert!(result.is_ok(), "send should succeed");
+        let bytes_written = result.unwrap();
+        assert_eq!(bytes_written, test_payload.len(), "should send all bytes");
+
+        // Recv the echoed data.
+        let result = recv(conn_id, 100);
+        assert!(result.is_ok(), "recv should succeed");
+        let data = result.unwrap();
+        assert_eq!(
+            &data[..],
+            test_payload,
+            "should recv the exact payload that was sent, encrypted then decrypted"
+        );
+
+        // Close the connection so server's read_tls() sees EOF and loop breaks.
+        close(conn_id).expect("close should succeed");
         server_thread.join().expect("server thread panicked");
     }
 }
