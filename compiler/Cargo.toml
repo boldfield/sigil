@@ -37,3 +37,6 @@ insta = { workspace = true }
 # `target/debug/libsigil_runtime.a`, which `link.rs` links against
 # during the end-to-end hello-world test.
 sigil-runtime = { path = "../runtime" }
+# TLS fixtures for e2e tests
+rustls = "0.23"
+rcgen = "0.13"

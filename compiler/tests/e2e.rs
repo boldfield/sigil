@@ -24928,3 +24928,131 @@ fn main() -> Int ![IO, Net] {{\n\
         "stdout should contain the echoed message; stdout={stdout:?}, stderr={stderr:?}"
     );
 }
+
+/// Net e2e TLS round-trip test.
+/// Starts a localhost TLS server with a self-signed cert, compiles+runs a Sigil
+/// program that connects with TLS, sends a payload, receives it back, and prints
+/// it. Uses the test-only custom-CA hook (SIGIL_TEST_TLS_CA_CERT environment
+/// variable) to inject the self-signed cert into the client's trusted roots.
+/// Asserts the round-trip succeeds over TLS.
+#[test]
+fn net_tls_echo_roundtrip() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use rustls::{ServerConfig, pki_types::CertificateDer};
+
+    // Generate a self-signed certificate for localhost.
+    let subject_alt_names = vec!["localhost".to_string()];
+    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
+        .expect("generate self-signed cert");
+    let cert_der = certified_key.cert.der().to_vec();
+    let key_der = certified_key.key_pair.serialize_der();
+
+    // Write the certificate to a temporary file so the test-only hook can read it.
+    let cert_temp_path = std::env::temp_dir()
+        .join(format!("sigil_tls_cert_{}.der", std::process::id()));
+    std::fs::write(&cert_temp_path, &cert_der)
+        .expect("write temp cert file");
+
+    // Parse certificate for server config.
+    let cert = CertificateDer::from(cert_der.clone());
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+    );
+
+    let server_config = Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("build server config"),
+    );
+
+    // Start a TLS echo server on a random port.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind TLS listener");
+    let addr = listener.local_addr().expect("get local address");
+    let port = addr.port();
+
+    // Spawn TLS echo server thread.
+    let _server_thread = thread::spawn(move || {
+        if let Ok((stream, _)) = listener.accept() {
+            let mut conn = rustls::ServerConnection::new(server_config.clone())
+                .expect("create server connection");
+            if conn.complete_io(&mut &stream).is_ok() {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = conn.reader().read(&mut buf) {
+                    if n > 0 {
+                        let mut pending = Vec::new();
+                        let _ = conn.writer().write_all(&buf[..n]);
+                        let _ = conn.write_tls(&mut pending);
+                        let mut stream = stream;
+                        let _ = stream.write_all(&pending);
+                    }
+                }
+            }
+        }
+    });
+
+    // Small delay to ensure server is listening.
+    thread::sleep(Duration::from_millis(50));
+
+    // Generate Sigil program that connects to the TLS server.
+    let sigil_source = format!(
+        "import std.net\n\
+import std.io\n\
+import std.byte_array\n\
+use std.net.{{connect, send, recv_all, close}};\n\
+use std.io.{{IO}};\n\
+use std.byte_array.{{string_from_bytes}};\n\
+\n\
+fn main() -> Int ![IO, Net] {{\n\
+  let host: String = \"127.0.0.1\";\n\
+  let port: Int = {};\n\
+  match connect(host, port, true) {{\n\
+    Ok(conn) => {{\n\
+      let payload: ByteArray = string_to_bytes(\"hello, tls\");\n\
+      match send(conn, payload) {{\n\
+        Ok(_) => {{\n\
+          match recv_all(conn) {{\n\
+            Ok(response) => {{\n\
+              match string_from_bytes(response) {{\n\
+                Some(s) => {{\n\
+                  perform IO.println(s);\n\
+                  match close(conn) {{\n\
+                    Ok(_) => 0,\n\
+                    Err(_) => 1,\n\
+                  }}\n\
+                }},\n\
+                None => 1,\n\
+              }}\n\
+            }},\n\
+            Err(_) => 1,\n\
+          }}\n\
+        }},\n\
+        Err(_) => 1,\n\
+      }}\n\
+    }},\n\
+    Err(_) => 1,\n\
+  }}\n\
+}}\n",
+        port
+    );
+
+    // Compile and run the Sigil program with the test-only custom-CA hook.
+    let (stdout, stderr, code) = compile_and_run_with_env(
+        &sigil_source,
+        "net_tls_echo",
+        &[("SIGIL_TEST_TLS_CA_CERT", cert_temp_path.to_str().unwrap())],
+    );
+
+    let _ = std::fs::remove_file(&cert_temp_path);
+
+    assert_eq!(code, 0, "exit code should be 0; stderr={stderr:?}");
+    assert!(
+        stdout.contains("hello, tls"),
+        "stdout should contain the echoed message over TLS; stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
