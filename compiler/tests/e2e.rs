@@ -24945,8 +24945,24 @@ fn net_tls_echo_roundtrip() {
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::thread;
+    use std::time::Duration;
+    use std::process::Command;
 
     use rustls::{pki_types::CertificateDer, ServerConfig};
+
+    // Rebuild runtime with tls-test-ca feature to ensure the custom-CA hook is compiled in.
+    // This is necessary because ensure_runtime_staticlib has an early-return guard that
+    // prevents rebuilding if the archive already exists. We force a rebuild here with the
+    // required feature flag.
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = Command::new(&cargo);
+    cmd.arg("build")
+        .arg("-p")
+        .arg("sigil-runtime")
+        .arg("--features")
+        .arg("tls-test-ca");
+    // Detect the profile from the running binary
+    let _ = cmd.current_dir(workspace_root()).output();
 
     // Generate a self-signed certificate for localhost.
     let subject_alt_names = vec!["localhost".to_string()];
@@ -24985,18 +25001,33 @@ fn net_tls_echo_roundtrip() {
                 .expect("create server connection");
             if conn.complete_io(&mut stream).is_ok() {
                 // Read client data and echo it back.
-                if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok() {
+                // Keep reading until we get data (loop to handle multiple packets).
+                loop {
+                    if conn.read_tls(&mut &stream).is_err() {
+                        break;
+                    }
+                    if conn.process_new_packets().is_err() {
+                        break;
+                    }
                     let mut buf = [0u8; 1024];
-                    if let Ok(n) = conn.reader().read(&mut buf) {
-                        if n > 0 {
-                            let _ = conn.writer().write_all(&buf[..n]);
-                            let _ = conn.complete_io(&mut stream);
+                    match conn.reader().read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            // Echo the data back to the client
+                            if conn.writer().write_all(&buf[..n]).is_ok() {
+                                // Flush the response and send close_notify
+                                let _ = conn.complete_io(&mut stream);
+                            }
+                            break;
                         }
+                        _ => break,
                     }
                 }
             }
         }
     });
+
+    // Small delay to ensure server is listening (same as plaintext test)
+    thread::sleep(Duration::from_millis(50));
 
     // Generate Sigil program that connects to the TLS server.
     let sigil_source = format!(
