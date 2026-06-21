@@ -50,6 +50,8 @@ const NET_ERR_BADHANDLE: i64 = 4;
 const NET_ERR_OTHER: i64 = 5;
 
 /// Internal helper for TLS connection with custom root store.
+/// Used by production connect() with webpki-roots, and by test-only
+/// connect_with_custom_root_store() for custom CAs.
 #[allow(clippy::disallowed_methods)]
 fn connect_with_root_store(
     host: &str,
@@ -105,10 +107,26 @@ fn connect_with_root_store(
 /// optionally performs TLS handshake if tls=true, inserts the connection
 /// under a fresh i64 id, and returns Ok(id) or Err with the error code.
 /// DNS resolution happens during connect.
+/// Production uses webpki-roots only.
 #[allow(clippy::disallowed_methods)]
 pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+    connect_with_root_store(host, port, tls, root_store)
+}
+
+/// Test-only hook: connect with a custom root certificate store.
+/// This allows TLS unit tests to inject trusted roots (e.g., self-signed certs
+/// for loopback fixtures) without affecting production TLS trust policy.
+/// Production connect() uses webpki-roots only and cannot be overridden.
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+pub fn connect_with_custom_root_store(
+    host: &str,
+    port: u16,
+    tls: bool,
+    root_store: rustls::RootCertStore,
+) -> Result<i64, i64> {
     connect_with_root_store(host, port, tls, root_store)
 }
 
@@ -783,9 +801,12 @@ mod tests {
         let cert = CertificateDer::from(cert_der);
         root_store.add(cert).expect("add root cert");
 
-        // Test connect() with the custom root store (this exercises the production path).
-        let result = connect_with_root_store("localhost", port, true, root_store);
-        assert!(result.is_ok(), "connect_with_root_store should succeed");
+        // Test connect_with_custom_root_store() with the custom root store.
+        let result = connect_with_custom_root_store("localhost", port, true, root_store);
+        assert!(
+            result.is_ok(),
+            "connect_with_custom_root_store should succeed"
+        );
         let conn_id = result.unwrap();
         assert!(conn_id > 0, "conn_id should be positive");
 
@@ -854,8 +875,8 @@ mod tests {
         let cert = CertificateDer::from(cert_der);
         root_store.add(cert).expect("add root cert");
 
-        // Connect with TLS.
-        let result = connect_with_root_store("localhost", port, true, root_store);
+        // Connect with TLS using custom root store.
+        let result = connect_with_custom_root_store("localhost", port, true, root_store);
         assert!(result.is_ok(), "TLS connect should succeed");
         let conn_id = result.unwrap();
 
@@ -942,8 +963,8 @@ mod tests {
         let cert = CertificateDer::from(cert_der);
         root_store.add(cert).expect("add root cert");
 
-        // Connect with TLS.
-        let result = connect_with_root_store("localhost", port, true, root_store);
+        // Connect with TLS using custom root store.
+        let result = connect_with_custom_root_store("localhost", port, true, root_store);
         assert!(result.is_ok(), "TLS connect should succeed");
         let conn_id = result.unwrap();
 
