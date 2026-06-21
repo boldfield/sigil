@@ -24997,22 +24997,49 @@ fn net_tls_echo_roundtrip() {
     // Spawn TLS echo server thread.
     let _server_thread = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
+            // Set read timeout to prevent indefinite blocking if the client stalls
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
             let mut conn = rustls::ServerConnection::new(server_config.clone())
                 .expect("create server connection");
-            // Complete TLS handshake
-            if conn.complete_io(&mut stream).is_ok()
-                && conn.read_tls(&mut &stream).is_ok()
-                && conn.process_new_packets().is_ok()
-            {
+            // Complete TLS handshake. This may also consume the client's first
+            // application-data record if it coalesces with the handshake flight.
+            if conn.complete_io(&mut stream).is_ok() {
+                // Read and echo loop: drain the incoming application data.
+                // Only call read_tls when rustls actually wants more data.
                 let mut buf = [0u8; 1024];
-                if let Ok(n) = conn.reader().read(&mut buf) {
-                    if n > 0 {
-                        // Echo the data back to the client
-                        let _ = conn.writer().write_all(&buf[..n]);
-                        // Flush the response and send close_notify
-                        let _ = conn.complete_io(&mut stream);
+                loop {
+                    // First try to read any buffered plaintext
+                    match conn.reader().read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            // Echo the data back
+                            let _ = conn.writer().write_all(&buf[..n]);
+                            // Flush the echo to the network
+                            let _ = conn.complete_io(&mut stream);
+                            // After sending the echo, break the loop
+                            break;
+                        }
+                        _ => {}
+                    }
+
+                    // If rustls wants more data from the network, read it
+                    if conn.wants_read() {
+                        if conn.read_tls(&mut &stream).is_ok() && conn.process_new_packets().is_ok()
+                        {
+                            // Continue the loop to drain buffered plaintext
+                            continue;
+                        }
+                        // If read_tls fails or process_new_packets fails, exit
+                        break;
+                    } else {
+                        // Nothing more to read and no plaintext arrived
+                        break;
                     }
                 }
+
+                // Send close_notify
+                conn.send_close_notify();
+                let _ = conn.complete_io(&mut stream);
             }
         }
     });
