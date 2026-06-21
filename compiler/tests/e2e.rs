@@ -111,7 +111,11 @@ fn ensure_runtime_staticlib(root: &Path, sigil_bin: &Path) {
     // unset (e.g. when running the test binary directly from disk).
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(cargo);
-    cmd.arg("build").arg("-p").arg("sigil-runtime");
+    cmd.arg("build")
+        .arg("-p")
+        .arg("sigil-runtime")
+        .arg("--features")
+        .arg("tls-test-ca");
     if profile == "release" {
         cmd.arg("--release");
     }
@@ -24943,26 +24947,25 @@ fn net_tls_echo_roundtrip() {
     use std::thread;
     use std::time::Duration;
 
-    use rustls::{ServerConfig, pki_types::CertificateDer};
+    use rustls::{pki_types::CertificateDer, ServerConfig};
 
     // Generate a self-signed certificate for localhost.
     let subject_alt_names = vec!["localhost".to_string()];
-    let certified_key = rcgen::generate_simple_self_signed(subject_alt_names)
-        .expect("generate self-signed cert");
+    let certified_key =
+        rcgen::generate_simple_self_signed(subject_alt_names).expect("generate self-signed cert");
     let cert_der = certified_key.cert.der().to_vec();
     let key_der = certified_key.key_pair.serialize_der();
 
     // Write the certificate to a temporary file so the test-only hook can read it.
-    let cert_temp_path = std::env::temp_dir()
-        .join(format!("sigil_tls_cert_{}.der", std::process::id()));
-    std::fs::write(&cert_temp_path, &cert_der)
-        .expect("write temp cert file");
+    let cert_temp_path =
+        std::env::temp_dir().join(format!("sigil_tls_cert_{}.der", std::process::id()));
+    std::fs::write(&cert_temp_path, &cert_der).expect("write temp cert file");
 
     // Parse certificate for server config.
     let cert = CertificateDer::from(cert_der.clone());
-    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
-    );
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+        key_der,
+    ));
 
     let server_config = Arc::new(
         ServerConfig::builder()

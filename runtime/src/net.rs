@@ -114,7 +114,7 @@ pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
 
-    #[cfg(test)]
+    #[cfg(feature = "tls-test-ca")]
     {
         if let Ok(cert_path) = std::env::var("SIGIL_TEST_TLS_CA_CERT") {
             if let Ok(cert_data) = std::fs::read(&cert_path) {
