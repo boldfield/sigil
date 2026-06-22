@@ -24465,7 +24465,7 @@ fn std_http_serialize_and_parse_roundtrip() {
                          perform IO.println(\"=== SERIALIZE ===\");\n\
                          perform IO.print(s);\n\
                          perform IO.println(\"=== PARSE_CONTENT_LENGTH ===\");\n\
-                         let cl_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 13\\r\\n\\r\\n{\\\"ok\\\":true}\");\n\
+                         let cl_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 11\\r\\n\\r\\n{\\\"ok\\\":true}\");\n\
                          match parse_response(cl_response) {\n\
                            Ok(resp1) => {\n\
                              if resp1.status == 200 {\n\
@@ -24473,7 +24473,7 @@ fn std_http_serialize_and_parse_roundtrip() {
                                  Cons(h0, _) => {\n\
                                    if string_compare(h0.name, \"Content-Type\") == Equal {\n\
                                      let body_len: Int = byte_array_length(resp1.body);\n\
-                                     if body_len == 13 {\n\
+                                     if body_len == 11 {\n\
                                        perform IO.println(\"Content-Length response OK\");\n\
                                        perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
                                      let chunked_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\nContent-Type: text/plain\\r\\n\\r\\n5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\");\n\
