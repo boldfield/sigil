@@ -24473,8 +24473,9 @@ fn std_http_serialize_and_parse_roundtrip() {
                                  Cons(h0, _) => {\n\
                                    if string_compare(h0.name, \"Content-Type\") == Equal {\n\
                                      let body_len: Int = byte_array_length(resp1.body);\n\
-                                     perform IO.println(\"Content-Length response OK\");\n\
-                                     perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
+                                     if body_len == 13 {\n\
+                                       perform IO.println(\"Content-Length response OK\");\n\
+                                       perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
                                      let chunked_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\nContent-Type: text/plain\\r\\n\\r\\n5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\");\n\
                                      match parse_response(chunked_response) {\n\
                                        Ok(resp2) => {\n\
@@ -24507,6 +24508,10 @@ fn std_http_serialize_and_parse_roundtrip() {
                                        },\n\
                                        Err(e) => { perform IO.println(e); 1 },\n\
                                      }\n\
+                                     } else {\n\
+                                       perform IO.println(\"cl body length mismatch\");\n\
+                                       1\n\
+                                     }\n\
                                    } else {\n\
                                      perform IO.println(\"cl header mismatch\");\n\
                                      1\n\
@@ -24533,10 +24538,22 @@ fn std_http_serialize_and_parse_roundtrip() {
                }\n";
     let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_parse_roundtrip");
     assert_eq!(code, 0, "exit code; stderr={stderr:?}");
-    assert!(stdout.contains("GET /test?query=1 HTTP/1.1"), "expected request line in stdout");
-    assert!(stdout.contains("Host: example.com"), "expected Host header in stdout");
-    assert!(stdout.contains("Content-Length response OK"), "expected Content-Length parse success");
-    assert!(stdout.contains("Chunked response OK"), "expected chunked parse success");
+    assert!(
+        stdout.contains("GET /test?query=1 HTTP/1.1"),
+        "expected request line in stdout"
+    );
+    assert!(
+        stdout.contains("Host: example.com"),
+        "expected Host header in stdout"
+    );
+    assert!(
+        stdout.contains("Content-Length response OK"),
+        "expected Content-Length parse success"
+    );
+    assert!(
+        stdout.contains("Chunked response OK"),
+        "expected chunked parse success"
+    );
 }
 
 // ===== record.field field access =======================================
