@@ -25104,3 +25104,97 @@ fn main() -> Int ![IO, Net] {{\n\
         "stdout should contain the echoed message over TLS; stdout={stdout:?}, stderr={stderr:?}"
     );
 }
+
+/// URL parsing e2e test.
+/// Tests parse_url with representative URLs: full URL with port+query, bare host, https default port.
+/// Compiles+runs a Sigil program that imports std.url, calls parse_url on different URLs,
+/// and prints the parsed fields. Asserts the parsed values match expectations.
+#[test]
+#[allow(clippy::needless_borrow)]
+fn std_url_parse_url() {
+    let sigil_source = "import std.url\n\
+import std.io\n\
+import std.int\n\
+use std.url.{parse_url};\n\
+use std.io.{IO};\n\
+use std.int.{int_to_string};\n\
+\n\
+fn main() -> Int ![IO] {\n\
+  // Test 1: Full URL with port and query\n\
+  match parse_url(\"https://example.com:8443/path?query=value\") {\n\
+    Ok(url) => {\n\
+      perform IO.println(\"Test1:\");\n\
+      perform IO.println(url.scheme);\n\
+      perform IO.println(url.host);\n\
+      perform IO.println(int_to_string(url.port));\n\
+      perform IO.println(url.path);\n\
+      perform IO.println(url.query);\n\
+    },\n\
+    Err(e) => {\n\
+      perform IO.println(\"Error in test 1: \");\n\
+      perform IO.println(e);\n\
+    },\n\
+  };\n\
+\n\
+  // Test 2: Bare host\n\
+  match parse_url(\"http://localhost\") {\n\
+    Ok(url) => {\n\
+      perform IO.println(\"Test2:\");\n\
+      perform IO.println(url.scheme);\n\
+      perform IO.println(url.host);\n\
+      perform IO.println(int_to_string(url.port));\n\
+      perform IO.println(url.path);\n\
+      perform IO.println(url.query);\n\
+    },\n\
+    Err(e) => {\n\
+      perform IO.println(\"Error in test 2: \");\n\
+      perform IO.println(e);\n\
+    },\n\
+  };\n\
+\n\
+  // Test 3: HTTPS default port\n\
+  match parse_url(\"https://example.com/p\") {\n\
+    Ok(url) => {\n\
+      perform IO.println(\"Test3:\");\n\
+      perform IO.println(url.scheme);\n\
+      perform IO.println(url.host);\n\
+      perform IO.println(int_to_string(url.port));\n\
+      perform IO.println(url.path);\n\
+      perform IO.println(url.query);\n\
+    },\n\
+    Err(e) => {\n\
+      perform IO.println(\"Error in test 3: \");\n\
+      perform IO.println(e);\n\
+    },\n\
+  };\n\
+  0\n\
+}\n";
+
+    let (stdout, stderr, code) = compile_and_run(&sigil_source, "std_url_parse_url");
+
+    assert_eq!(code, 0, "exit code should be 0; stderr={stderr:?}");
+    assert!(
+        stdout.contains("Test1:")
+            && stdout.contains("https")
+            && stdout.contains("example.com")
+            && stdout.contains("8443")
+            && stdout.contains("/path")
+            && stdout.contains("query=value"),
+        "Test1 should parse full URL correctly; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("Test2:")
+            && stdout.contains("http")
+            && stdout.contains("localhost")
+            && stdout.contains("80"),
+        "Test2 should parse bare host with default port 80; stdout={stdout:?}, stderr={stderr:?}"
+    );
+    assert!(
+        stdout.contains("Test3:")
+            && stdout.contains("https")
+            && stdout.contains("example.com")
+            && stdout.contains("443")
+            && stdout.contains("/p"),
+        "Test3 should parse HTTPS URL with default port 443; stdout={stdout:?}, stderr={stderr:?}"
+    );
+}
