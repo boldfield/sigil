@@ -24471,50 +24471,56 @@ fn std_http_serialize_and_parse_roundtrip() {
                              if resp1.status == 200 {\n\
                                match resp1.headers {\n\
                                  Cons(h0, _) => {\n\
-                                   if string_compare(h0.name, \"Content-Type\") == Equal {\n\
-                                     let body_len: Int = byte_array_length(resp1.body);\n\
-                                     if body_len == 11 {\n\
-                                       perform IO.println(\"Content-Length response OK\");\n\
-                                       perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
-                                     let chunked_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\nContent-Type: text/plain\\r\\n\\r\\n5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\");\n\
-                                     match parse_response(chunked_response) {\n\
-                                       Ok(resp2) => {\n\
-                                         if resp2.status == 200 {\n\
-                                           match resp2.headers {\n\
-                                             Cons(h1, _) => {\n\
-                                               if string_compare(h1.name, \"Transfer-Encoding\") == Equal {\n\
-                                                 let chunked_body_len: Int = byte_array_length(resp2.body);\n\
-                                                 if chunked_body_len == 11 {\n\
-                                                   perform IO.println(\"Chunked response OK\");\n\
-                                                   0\n\
-                                                 } else {\n\
-                                                   perform IO.println(\"chunked body length mismatch\");\n\
+                                   match string_compare(h0.name, \"Content-Type\") {\n\
+                                     Equal => {\n\
+                                       let body_len: Int = byte_array_length(resp1.body);\n\
+                                       if body_len == 11 {\n\
+                                         perform IO.println(\"Content-Length response OK\");\n\
+                                         perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
+                                         let chunked_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\nContent-Type: text/plain\\r\\n\\r\\n5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\");\n\
+                                         match parse_response(chunked_response) {\n\
+                                           Ok(resp2) => {\n\
+                                             if resp2.status == 200 {\n\
+                                               match resp2.headers {\n\
+                                                 Cons(h1, _) => {\n\
+                                                   match string_compare(h1.name, \"Transfer-Encoding\") {\n\
+                                                     Equal => {\n\
+                                                       let chunked_body_len: Int = byte_array_length(resp2.body);\n\
+                                                       if chunked_body_len == 11 {\n\
+                                                         perform IO.println(\"Chunked response OK\");\n\
+                                                         0\n\
+                                                       } else {\n\
+                                                         perform IO.println(\"chunked body length mismatch\");\n\
+                                                         1\n\
+                                                       }\n\
+                                                     },\n\
+                                                     _ => {\n\
+                                                       perform IO.println(\"chunked header mismatch\");\n\
+                                                       1\n\
+                                                     },\n\
+                                                   }\n\
+                                                 },\n\
+                                                 _ => {\n\
+                                                   perform IO.println(\"chunked headers missing\");\n\
                                                    1\n\
-                                                 }\n\
-                                               } else {\n\
-                                                 perform IO.println(\"chunked header mismatch\");\n\
-                                                 1\n\
+                                                 },\n\
                                                }\n\
-                                             },\n\
-                                             _ => {\n\
-                                               perform IO.println(\"chunked headers missing\");\n\
+                                             } else {\n\
+                                               perform IO.println(\"chunked status mismatch\");\n\
                                                1\n\
-                                             },\n\
-                                           }\n\
-                                         } else {\n\
-                                           perform IO.println(\"chunked status mismatch\");\n\
-                                           1\n\
+                                             }\n\
+                                           },\n\
+                                           Err(e) => { perform IO.println(e); 1 },\n\
                                          }\n\
-                                       },\n\
-                                       Err(e) => { perform IO.println(e); 1 },\n\
-                                     }\n\
-                                     } else {\n\
-                                       perform IO.println(\"cl body length mismatch\");\n\
+                                       } else {\n\
+                                         perform IO.println(\"cl body length mismatch\");\n\
+                                         1\n\
+                                       }\n\
+                                     },\n\
+                                     _ => {\n\
+                                       perform IO.println(\"cl header mismatch\");\n\
                                        1\n\
-                                     }\n\
-                                   } else {\n\
-                                     perform IO.println(\"cl header mismatch\");\n\
-                                     1\n\
+                                     },\n\
                                    }\n\
                                  },\n\
                                  _ => {\n\
