@@ -107,11 +107,24 @@ fn connect_with_root_store(
 /// optionally performs TLS handshake if tls=true, inserts the connection
 /// under a fresh i64 id, and returns Ok(id) or Err with the error code.
 /// DNS resolution happens during connect.
-/// Production uses webpki-roots only.
+/// Production uses webpki-roots only. Tests can set SIGIL_TEST_TLS_CA_CERT
+/// environment variable to inject additional CA certificates.
 #[allow(clippy::disallowed_methods)]
 pub fn connect(host: &str, port: u16, tls: bool) -> Result<i64, i64> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(TLS_SERVER_ROOTS.iter().cloned());
+
+    #[cfg(feature = "tls-test-ca")]
+    {
+        if let Ok(cert_path) = std::env::var("SIGIL_TEST_TLS_CA_CERT") {
+            if let Ok(cert_data) = std::fs::read(&cert_path) {
+                use rustls::pki_types::CertificateDer;
+                let cert = CertificateDer::from(cert_data);
+                let _ = root_store.add(cert);
+            }
+        }
+    }
+
     connect_with_root_store(host, port, tls, root_store)
 }
 

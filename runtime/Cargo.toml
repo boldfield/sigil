@@ -24,5 +24,10 @@ libc = { workspace = true }
 rustls = "0.23"
 webpki-roots = "0.26"
 
+[features]
+# Enable test-only TLS custom CA cert injection (SIGIL_TEST_TLS_CA_CERT env var).
+# Used by e2e tests to inject self-signed certs into the client's trusted roots.
+tls-test-ca = []
+
 [dev-dependencies]
 rcgen = "0.13"
