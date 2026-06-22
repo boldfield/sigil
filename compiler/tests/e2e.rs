@@ -24435,6 +24435,110 @@ fn std_http_parse_response_chunked_multi() {
     assert_eq!(stdout, "OK\n", "stderr={stderr:?}");
 }
 
+/// Comprehensive HTTP serialize + parse round-trip test.
+/// Serializes a GET request (asserting request-line and Host header),
+/// then parses both a Content-Length response and a chunked response
+/// (asserting status, a header, and decoded body for each).
+#[test]
+fn std_http_serialize_and_parse_roundtrip() {
+    let src = "import std.io\n\
+               import std.url\n\
+               import std.http\n\
+               import std.byte_array\n\
+               import std.list\n\
+               import std.ordering\n\
+               use std.io.{IO};\n\
+               use std.url.{parse_url};\n\
+               use std.http.{Request, Response, Header, get, serialize_request, parse_response};\n\
+               use std.byte_array.{string_from_bytes, string_to_bytes, byte_array_concat, byte_array_length};\n\
+               use std.list.{List, Cons, Nil};\n\
+               use std.ordering.{string_compare, Ordering};\n\
+               use std.ordering.{Equal};\n\
+               fn main() -> Int ![IO, Mem] {\n\
+                 match parse_url(\"http://example.com/test?query=1\") {\n\
+                   Ok(u) => {\n\
+                     let req: Request = get(u, Nil);\n\
+                     let serialized: ByteArray = serialize_request(req);\n\
+                     let with_newline: ByteArray = byte_array_concat(serialized, string_to_bytes(\"\\n\"));\n\
+                     match string_from_bytes(with_newline) {\n\
+                       Some(s) => {\n\
+                         perform IO.println(\"=== SERIALIZE ===\");\n\
+                         perform IO.print(s);\n\
+                         perform IO.println(\"=== PARSE_CONTENT_LENGTH ===\");\n\
+                         let cl_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: 13\\r\\n\\r\\n{\\\"ok\\\":true}\");\n\
+                         match parse_response(cl_response) {\n\
+                           Ok(resp1) => {\n\
+                             if resp1.status == 200 {\n\
+                               match resp1.headers {\n\
+                                 Cons(h0, _) => {\n\
+                                   if string_compare(h0.name, \"Content-Type\") == Equal {\n\
+                                     let body_len: Int = byte_array_length(resp1.body);\n\
+                                     perform IO.println(\"Content-Length response OK\");\n\
+                                     perform IO.println(\"=== PARSE_CHUNKED ===\");\n\
+                                     let chunked_response: ByteArray = string_to_bytes(\"HTTP/1.1 200 OK\\r\\nTransfer-Encoding: chunked\\r\\nContent-Type: text/plain\\r\\n\\r\\n5\\r\\nhello\\r\\n6\\r\\n world\\r\\n0\\r\\n\\r\\n\");\n\
+                                     match parse_response(chunked_response) {\n\
+                                       Ok(resp2) => {\n\
+                                         if resp2.status == 200 {\n\
+                                           match resp2.headers {\n\
+                                             Cons(h1, _) => {\n\
+                                               if string_compare(h1.name, \"Transfer-Encoding\") == Equal {\n\
+                                                 let chunked_body_len: Int = byte_array_length(resp2.body);\n\
+                                                 if chunked_body_len == 11 {\n\
+                                                   perform IO.println(\"Chunked response OK\");\n\
+                                                   0\n\
+                                                 } else {\n\
+                                                   perform IO.println(\"chunked body length mismatch\");\n\
+                                                   1\n\
+                                                 }\n\
+                                               } else {\n\
+                                                 perform IO.println(\"chunked header mismatch\");\n\
+                                                 1\n\
+                                               }\n\
+                                             },\n\
+                                             _ => {\n\
+                                               perform IO.println(\"chunked headers missing\");\n\
+                                               1\n\
+                                             },\n\
+                                           }\n\
+                                         } else {\n\
+                                           perform IO.println(\"chunked status mismatch\");\n\
+                                           1\n\
+                                         }\n\
+                                       },\n\
+                                       Err(e) => { perform IO.println(e); 1 },\n\
+                                     }\n\
+                                   } else {\n\
+                                     perform IO.println(\"cl header mismatch\");\n\
+                                     1\n\
+                                   }\n\
+                                 },\n\
+                                 _ => {\n\
+                                   perform IO.println(\"cl headers missing\");\n\
+                                   1\n\
+                                 },\n\
+                               }\n\
+                             } else {\n\
+                               perform IO.println(\"cl status mismatch\");\n\
+                               1\n\
+                             }\n\
+                           },\n\
+                           Err(e) => { perform IO.println(e); 1 },\n\
+                         }\n\
+                       },\n\
+                       None => { perform IO.println(\"failed to convert bytes\"); 1 },\n\
+                     }\n\
+                   },\n\
+                   Err(e) => { perform IO.println(e); 1 },\n\
+                 }\n\
+               }\n";
+    let (stdout, stderr, code) = compile_and_run(src, "std_http_serialize_parse_roundtrip");
+    assert_eq!(code, 0, "exit code; stderr={stderr:?}");
+    assert!(stdout.contains("GET /test?query=1 HTTP/1.1"), "expected request line in stdout");
+    assert!(stdout.contains("Host: example.com"), "expected Host header in stdout");
+    assert!(stdout.contains("Content-Length response OK"), "expected Content-Length parse success");
+    assert!(stdout.contains("Chunked response OK"), "expected chunked parse success");
+}
+
 // ===== record.field field access =======================================
 
 #[test]
