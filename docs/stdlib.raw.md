@@ -1,6 +1,6 @@
 # Sigil standard library — raw API reference
 
-Generated from `std/*.sigil` at Sigil v1.2.0. Import a module as
+Generated from `std/*.sigil` at Sigil v1.4.0. Import a module as
 `import std.<name>`; call qualified (`std.<name>.<fn>(...)`) or bind names
 with `use std.<name>.{<fn>};`. Builtin **effects** (IO, Fs, Env, ...) are
 invoked with `perform <Effect>.<op>(...)`. Signatures show parameter types,
@@ -134,6 +134,55 @@ fn remove_dir(p: String) -> Result[Unit, FsError] ![Fs]
 fn read_file(p: String) -> Result[String, FsError] ![Fs]
 fn remove_file(p: String) -> Result[Unit, FsError] ![Fs]
 fn write_file(p: String, data: String) -> Result[Unit, FsError] ![Fs]
+```
+
+## std.http
+
+HTTP types and request constructor.
+
+Types:
+```
+type Header = {
+  name: String,
+  value: String,
+}
+
+type Request = {
+  method: String,
+  url: Url,
+  headers: List[Header],
+  body: ByteArray,
+}
+
+type Response = {
+  status: Int,
+  reason: String,
+  headers: List[Header],
+  body: ByteArray,
+}
+```
+
+Functions:
+```
+fn get(url: Url, headers: List[Header]) -> Request ![]
+fn find_blank_line(bytes: ByteArray) -> Int ![Mem]
+fn find_blank_line_impl(bytes: ByteArray, pos: Int) -> Int ![Mem]
+fn find_content_length(headers: List[Header]) -> Option[Int] ![]
+fn find_transfer_encoding_chunked(headers: List[Header]) -> Bool ![]
+fn find_crlf(bytes: ByteArray, pos: Int) -> Int ![Mem]
+fn hex_char_to_int(b: Byte) -> Option[Int] ![]
+fn hex_string_to_int(bytes: ByteArray, start: Int, end: Int) -> Option[Int] ![Mem]
+fn hex_string_to_int_acc(bytes: ByteArray, pos: Int, end: Int, acc: Int) -> Option[Int] ![Mem]
+fn parse_chunked_body(bytes: ByteArray, body_start: Int) -> Result[ByteArray, String] ![Mem]
+fn parse_chunked_body_acc(bytes: ByteArray, pos: Int, chunks_rev: List[ByteArray]) -> Result[ByteArray, String] ![Mem]
+fn concat_chunks(chunks: List[ByteArray]) -> Result[ByteArray, String] ![Mem]
+fn serialize_request(req: Request) -> ByteArray ![Mem]
+fn parse_response(bytes: ByteArray) -> Result[Response, String] ![Mem]
+fn parse_status_line(status_line: String, rest_lines: List[String]) -> Result[Response, String] ![Mem]
+fn extract_reason(reason_parts: List[String]) -> String ![]
+fn extract_reason_acc(reason_parts: List[String], acc: String) -> String ![]
+fn parse_headers(lines: List[String], acc: List[Header]) -> Result[List[Header], String] ![Mem]
+fn parse_header(line: String) -> Result[Header, String] ![]
 ```
 
 ## std.int
@@ -272,6 +321,32 @@ Functions:
 ```
 fn mut_byte_array_get_opt(ba: MutByteArray, i: Int) -> Option[Byte] ![Mem]
 fn mut_byte_array_set_opt(ba: MutByteArray, i: Int, val: Byte) -> Option[Unit] ![Mem]
+```
+
+## std.net
+
+Net effect wrapper following std/process.sigil pattern.
+
+Types:
+```
+type Conn =
+  | Conn(Int)
+
+type NetError =
+  | ResolveFailed
+  | ConnectionRefused
+  | TlsError(String)
+  | Closed
+  | Other(String)
+```
+
+Functions:
+```
+fn connect(host: String, port: Int, tls: Bool) -> Result[Conn, NetError] ![Net]
+fn send(c: Conn, data: ByteArray) -> Result[Int, NetError] ![Net]
+fn recv(c: Conn, max: Int) -> Result[ByteArray, NetError] ![Net]
+fn close(c: Conn) -> Result[Unit, NetError] ![Net]
+fn recv_all(c: Conn) -> Result[ByteArray, NetError] ![Net]
 ```
 
 ## std.option
@@ -451,4 +526,26 @@ fn string_substring_opt(s: String, start: Int, end: Int) -> Option[String] ![]
 ## std.string_builder
 
 Listed in `compiler/src/imports.rs::BUILTIN_INJECTED` — `import std.string_builder` is a no-op at the resolver. The
+
+## std.url
+
+URL parsing and representation.
+
+Types:
+```
+type Url = {
+  scheme: String,
+  host: String,
+  port: Int,
+  path: String,
+  query: String,
+}
+```
+
+Functions:
+```
+fn parse_url(s: String) -> Result[Url, String] ![]
+fn parse_path_and_query(s: String) -> (String, String) ![]
+fn default_port(scheme: String) -> Int ![]
+```
 
