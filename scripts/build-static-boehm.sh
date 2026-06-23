@@ -69,8 +69,23 @@ use_homebrew_on_macos() {
     fi
 
     echo "Using Homebrew Boehm GC from ${brew_libgc}" >&2
+
+    # Repack with ar -D for determinism (no timestamps, uids, or file order nondeterminism)
+    local repack_dir="/tmp/sigil-boehm-repack-work"
+    rm -rf "$repack_dir"
+    mkdir -p "$repack_dir"
+    cd "$repack_dir"
+    ar -x "${brew_libgc}"
+
+    # Delete any existing archive and recreate deterministically
+    rm -f libgc.a
+    # Create the archive with deterministic mode (-D) using an explicit ordered list
+    ar -D crs libgc.a $(ls -1 *.o | sort)
+
+    # Install to destination
     mkdir -p "${DEST_DIR}"
-    cp "${brew_libgc}" "${DEST_DIR}/libgc.a"
+    cp libgc.a "${DEST_DIR}/libgc.a"
+    rm -rf "$repack_dir"
     return 0
 }
 
