@@ -34,7 +34,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          # Build the Linux binary on the OLDEST supported glibc so the
+          # released artifact runs on older hosts too. ubuntu-22.04 = GLIBC
+          # 2.35; a binary linked here runs on glibc >= 2.35 (incl. the
+          # fleet's 2.36 worker pods). Building on 24.04 (GLIBC 2.39) made
+          # the binary refuse to run anywhere with glibc < 2.39.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
