@@ -203,17 +203,22 @@ mod tests {
     /// place so both the default and search-path expectations stay in sync
     /// with `build_link_argv` under cfg.
     fn platform_suffix() -> Vec<OsString> {
-        #[allow(unused_mut)]
-        let mut suffix: Vec<OsString> = Vec::new();
         #[cfg(target_os = "linux")]
         {
-            suffix.push(OsString::from("-Wl,--build-id=none"));
-            suffix.push(OsString::from("-lgcc_s"));
-            suffix.push(OsString::from("-rdynamic"));
+            vec![
+                OsString::from("-Wl,--build-id=none"),
+                OsString::from("-lgcc_s"),
+                OsString::from("-rdynamic"),
+            ]
         }
         #[cfg(target_os = "macos")]
-        suffix.push(OsString::from("-Wl,-reproducible"));
-        suffix
+        {
+            vec![OsString::from("-Wl,-reproducible")]
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Vec::new()
+        }
     }
 
     #[test]
