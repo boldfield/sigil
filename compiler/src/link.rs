@@ -167,26 +167,32 @@ fn locate_runtime_lib() -> Option<PathBuf> {
 
 #[allow(dead_code)]
 fn locate_gc_lib() -> Option<PathBuf> {
-    // Explicit override wins.
+    locate_gc_lib_internal(None)
+}
+
+fn locate_gc_lib_internal(exe_dir_override: Option<PathBuf>) -> Option<PathBuf> {
+    // Explicit override wins — must be an absolute path and must exist.
     if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
         let path = PathBuf::from(p);
-        if path.exists() {
+        if path.is_absolute() && path.exists() {
             return Some(path);
         }
     }
 
     // Release-archive layout: libgc.a in ../lib/ relative to binary,
     // or flat layout (libgc.a beside the binary).
-    if let Ok(exe) = std::env::current_exe() {
-        let exe_dir = exe.parent().map(PathBuf::from);
+    let exe_dir = exe_dir_override.or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(PathBuf::from))
+    });
+
+    if let Some(exe_dir) = &exe_dir {
         let candidates = [
             // bin/sigil → ../lib/libgc.a
-            exe_dir
-                .as_ref()
-                .and_then(|d| d.parent())
-                .map(|p| p.join("lib").join("libgc.a")),
+            exe_dir.parent().map(|p| p.join("lib").join("libgc.a")),
             // flat: sigil + libgc.a in the same dir
-            exe_dir.as_ref().map(|d| d.join("libgc.a")),
+            Some(exe_dir.join("libgc.a")),
         ];
         for c in candidates.into_iter().flatten() {
             if c.exists() {
@@ -202,19 +208,6 @@ fn locate_gc_lib() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // CARGO_MANIFEST_DIR fallback if invoked from a subdir.
-    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
-        let base = Path::new(&manifest)
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        for profile in &["release", "debug"] {
-            let p = base.join("target").join(profile).join("libgc.a");
-            if p.exists() {
-                return Some(p);
-            }
-        }
-    }
     None
 }
 
@@ -223,9 +216,12 @@ fn locate_gc_lib() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
+
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn test_locate_gc_lib_env_override_wins() {
+    fn test_locate_gc_lib_env_override_absolute_path_wins() {
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let gc_lib = temp_dir.path().join("libgc.a");
         fs::write(&gc_lib, b"mock").expect("failed to write test file");
@@ -235,29 +231,52 @@ mod tests {
     }
 
     #[test]
-    fn test_locate_gc_lib_release_archive_with_manifest_dir() {
+    fn test_locate_gc_lib_env_override_rejects_relative_path() {
+        let _guard = EnvGuard::set("SIGIL_GC_LIB", "relative/path/libgc.a");
+        assert_eq!(locate_gc_lib(), None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_rejects_nonexistent_absolute() {
+        let _guard = EnvGuard::set("SIGIL_GC_LIB", "/nonexistent/absolute/path/libgc.a");
+        assert_eq!(locate_gc_lib(), None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_release_archive_layout() {
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
-        let target = temp_dir.path().join("target").join("release");
-        fs::create_dir_all(&target).expect("failed to create target dir");
-        let gc_lib = target.join("libgc.a");
+        // Simulate exe at bin/sigil, libgc.a at lib/libgc.a
+        let bin_dir = temp_dir.path().join("bin");
+        let lib_dir = temp_dir.path().join("lib");
+        fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+        fs::create_dir_all(&lib_dir).expect("failed to create lib dir");
+        let gc_lib = lib_dir.join("libgc.a");
         fs::write(&gc_lib, b"mock").expect("failed to write test file");
 
-        // CARGO_MANIFEST_DIR points to a subdir, so its parent is temp_dir
-        let manifest_dir = temp_dir.path().join("compiler");
-        fs::create_dir_all(&manifest_dir).expect("failed to create manifest dir");
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+        let exe_dir = bin_dir.clone();
+        let result = locate_gc_lib_internal(Some(exe_dir));
+        // Result is relative from the current directory perspective
+        // but the function should find ../lib/libgc.a relative to bin/
+        assert!(result.is_some() && result.unwrap().ends_with("libgc.a"));
+    }
 
-        let _guard = EnvGuard::set(
-            "CARGO_MANIFEST_DIR",
-            manifest_dir.to_str().expect("invalid path"),
-        );
-        let _guard2 = EnvGuard::clear("SIGIL_GC_LIB");
+    #[test]
+    fn test_locate_gc_lib_flat_layout() {
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        // Simulate exe at root, libgc.a beside it
+        let gc_lib = temp_dir.path().join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
 
-        let result = locate_gc_lib();
-        assert_eq!(result, Some(gc_lib));
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+        let exe_dir = temp_dir.path().to_path_buf();
+        let result = locate_gc_lib_internal(Some(exe_dir));
+        assert!(result.is_some() && result.unwrap().ends_with("libgc.a"));
     }
 
     #[test]
     fn test_locate_gc_lib_cargo_target_release() {
+        let _lock = GLOBAL_STATE_LOCK.lock();
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().join("release_test");
         let target = temp_path.join("target").join("release");
@@ -267,16 +286,16 @@ mod tests {
 
         let old_cwd = std::env::current_dir().expect("failed to get current dir");
         std::env::set_current_dir(&temp_path).expect("failed to change dir");
-        let _cwd_guard = CwdGuard::new(old_cwd.clone());
+        let _cwd_guard = CwdGuard::new(old_cwd);
         let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
-        let _env_guard2 = EnvGuard::clear("CARGO_MANIFEST_DIR");
 
-        let result = locate_gc_lib();
+        let result = locate_gc_lib_internal(None);
         assert_eq!(result, Some(PathBuf::from("target/release/libgc.a")));
     }
 
     #[test]
     fn test_locate_gc_lib_cargo_target_debug() {
+        let _lock = GLOBAL_STATE_LOCK.lock();
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().join("debug_test");
         let target = temp_path.join("target").join("debug");
@@ -286,28 +305,25 @@ mod tests {
 
         let old_cwd = std::env::current_dir().expect("failed to get current dir");
         std::env::set_current_dir(&temp_path).expect("failed to change dir");
-        let _cwd_guard = CwdGuard::new(old_cwd.clone());
+        let _cwd_guard = CwdGuard::new(old_cwd);
         let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
-        let _env_guard2 = EnvGuard::clear("CARGO_MANIFEST_DIR");
 
-        let result = locate_gc_lib();
+        let result = locate_gc_lib_internal(None);
         assert_eq!(result, Some(PathBuf::from("target/debug/libgc.a")));
     }
 
     #[test]
     fn test_locate_gc_lib_none_when_not_found() {
+        let _lock = GLOBAL_STATE_LOCK.lock();
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().to_path_buf();
         let old_cwd = std::env::current_dir().expect("failed to get current dir");
 
         std::env::set_current_dir(&temp_path).expect("failed to change dir");
-        let _cwd_guard = CwdGuard::new(old_cwd.clone());
+        let _cwd_guard = CwdGuard::new(old_cwd);
         let _guard = EnvGuard::clear("SIGIL_GC_LIB");
-        let _guard2 = EnvGuard::clear("CARGO_MANIFEST_DIR");
 
-        let result = locate_gc_lib();
-
-        // In a clean temp dir with no SIGIL_GC_LIB and no cargo layout, should be None
+        let result = locate_gc_lib_internal(None);
         assert_eq!(result, None);
     }
 
