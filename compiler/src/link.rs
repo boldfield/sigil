@@ -164,3 +164,223 @@ fn locate_runtime_lib() -> Option<PathBuf> {
     }
     None
 }
+
+#[allow(dead_code)]
+fn locate_gc_lib() -> Option<PathBuf> {
+    locate_gc_lib_internal(None)
+}
+
+fn locate_gc_lib_internal(exe_dir_override: Option<PathBuf>) -> Option<PathBuf> {
+    // Explicit override wins — must be an absolute path and must exist.
+    if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
+        let path = PathBuf::from(p);
+        if path.is_absolute() && path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Release-archive layout: libgc.a in ../lib/ relative to binary,
+    // or flat layout (libgc.a beside the binary).
+    let exe_dir = exe_dir_override.or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(PathBuf::from))
+    });
+
+    if let Some(exe_dir) = &exe_dir {
+        let candidates = [
+            // bin/sigil → ../lib/libgc.a
+            exe_dir.parent().map(|p| p.join("lib").join("libgc.a")),
+            // flat: sigil + libgc.a in the same dir
+            Some(exe_dir.join("libgc.a")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+
+    // cargo build places libgc.a under target/<profile>/.
+    for profile in &["release", "debug"] {
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::Mutex;
+
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_locate_gc_lib_env_override_absolute_path_wins() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let gc_lib = temp_dir.path().join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
+
+        let _guard = EnvGuard::set("SIGIL_GC_LIB", gc_lib.to_str().expect("invalid path"));
+        assert_eq!(locate_gc_lib(), Some(gc_lib));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_rejects_relative_path() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("SIGIL_GC_LIB", "relative/path/libgc.a");
+        assert_eq!(locate_gc_lib(), None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_rejects_nonexistent_absolute() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("SIGIL_GC_LIB", "/nonexistent/absolute/path/libgc.a");
+        assert_eq!(locate_gc_lib(), None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_release_archive_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        // Simulate exe at bin/sigil, libgc.a at lib/libgc.a
+        let bin_dir = temp_dir.path().join("bin");
+        let lib_dir = temp_dir.path().join("lib");
+        fs::create_dir_all(&bin_dir).expect("failed to create bin dir");
+        fs::create_dir_all(&lib_dir).expect("failed to create lib dir");
+        let gc_lib = lib_dir.join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
+
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+        let exe_dir = bin_dir.clone();
+        let result = locate_gc_lib_internal(Some(exe_dir));
+        // Result is relative from the current directory perspective
+        // but the function should find ../lib/libgc.a relative to bin/
+        assert!(result.is_some() && result.unwrap().ends_with("libgc.a"));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_flat_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        // Simulate exe at root, libgc.a beside it
+        let gc_lib = temp_dir.path().join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
+
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+        let exe_dir = temp_dir.path().to_path_buf();
+        let result = locate_gc_lib_internal(Some(exe_dir));
+        assert!(result.is_some() && result.unwrap().ends_with("libgc.a"));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_cargo_target_release() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let temp_path = temp_dir.path().join("release_test");
+        let target = temp_path.join("target").join("release");
+        fs::create_dir_all(&target).expect("failed to create target dir");
+        let gc_lib = target.join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
+
+        let old_cwd = std::env::current_dir().expect("failed to get current dir");
+        std::env::set_current_dir(&temp_path).expect("failed to change dir");
+        let _cwd_guard = CwdGuard::new(old_cwd);
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+
+        let result = locate_gc_lib_internal(None);
+        assert_eq!(result, Some(PathBuf::from("target/release/libgc.a")));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_cargo_target_debug() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let temp_path = temp_dir.path().join("debug_test");
+        let target = temp_path.join("target").join("debug");
+        fs::create_dir_all(&target).expect("failed to create target dir");
+        let gc_lib = target.join("libgc.a");
+        fs::write(&gc_lib, b"mock").expect("failed to write test file");
+
+        let old_cwd = std::env::current_dir().expect("failed to get current dir");
+        std::env::set_current_dir(&temp_path).expect("failed to change dir");
+        let _cwd_guard = CwdGuard::new(old_cwd);
+        let _env_guard = EnvGuard::clear("SIGIL_GC_LIB");
+
+        let result = locate_gc_lib_internal(None);
+        assert_eq!(result, Some(PathBuf::from("target/debug/libgc.a")));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_none_when_not_found() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
+        let temp_path = temp_dir.path().to_path_buf();
+        let old_cwd = std::env::current_dir().expect("failed to get current dir");
+
+        std::env::set_current_dir(&temp_path).expect("failed to change dir");
+        let _cwd_guard = CwdGuard::new(old_cwd);
+        let _guard = EnvGuard::clear("SIGIL_GC_LIB");
+
+        let result = locate_gc_lib_internal(None);
+        assert_eq!(result, None);
+    }
+
+    /// Guard that restores current directory on drop
+    struct CwdGuard {
+        old_cwd: PathBuf,
+    }
+
+    impl CwdGuard {
+        fn new(old_cwd: PathBuf) -> Self {
+            CwdGuard { old_cwd }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.old_cwd);
+        }
+    }
+
+    /// Guard that restores environment variable on drop
+    struct EnvGuard {
+        key: String,
+        old_value: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            EnvGuard {
+                key: key.to_string(),
+                old_value,
+            }
+        }
+
+        fn clear(key: &str) -> Self {
+            let old_value = std::env::var(key).ok();
+            std::env::remove_var(key);
+            EnvGuard {
+                key: key.to_string(),
+                old_value,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.old_value {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+}
