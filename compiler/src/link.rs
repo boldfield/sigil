@@ -242,6 +242,7 @@ mod tests {
         // Save and restore environment state
         let saved_sigil_gc_lib = std::env::var("SIGIL_GC_LIB").ok();
         let saved_cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok();
+        let saved_cwd = std::env::current_dir().ok();
 
         // Create a temporary test file for libgc.a
         let temp_gc_path = PathBuf::from("/tmp/sigil_test_libgc.a");
@@ -276,12 +277,16 @@ mod tests {
             "when static libgc.a is found, command should NOT include -lgc"
         );
 
-        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file and no libgc in workspace
-        // Create an isolated test by temporarily changing CARGO_MANIFEST_DIR to a temp dir
-        // with no libgc.a in target/{release,debug}/
-        std::env::set_var("SIGIL_GC_LIB", "/nonexistent/libgc.a");
-        // Point CARGO_MANIFEST_DIR to a directory with no target/ tree
-        std::env::set_var("CARGO_MANIFEST_DIR", "/tmp");
+        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file and isolated environment
+        // Create an isolated temp directory to ensure locate_gc_lib() won't find anything
+        let temp_dir = std::env::temp_dir().join("sigil_test_isolated");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Unset SIGIL_GC_LIB and set CARGO_MANIFEST_DIR to a temp dir with no target/
+        std::env::remove_var("SIGIL_GC_LIB");
+        std::env::set_var("CARGO_MANIFEST_DIR", &temp_dir);
+        // Change to temp dir to ensure relative path lookups don't find anything
+        let _ = std::env::set_current_dir(&temp_dir);
 
         let cmd = build_cc_command(&obj, &out, &runtime);
         found_dynamic_lgc = false;
@@ -300,6 +305,9 @@ mod tests {
         );
 
         // Clean up - restore original environment
+        if let Some(cwd) = saved_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
         match saved_sigil_gc_lib {
             Some(v) => std::env::set_var("SIGIL_GC_LIB", v),
             None => std::env::remove_var("SIGIL_GC_LIB"),
@@ -309,5 +317,6 @@ mod tests {
             None => std::env::remove_var("CARGO_MANIFEST_DIR"),
         }
         let _ = std::fs::remove_file(&temp_gc_path);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }
