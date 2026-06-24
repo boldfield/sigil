@@ -15,6 +15,7 @@
 //! That keeps the setup simple for development builds and for the e2e
 //! test which runs `cargo run` before invoking the compiler.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,49 +26,22 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let runtime = locate_runtime_lib()
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
 
-    let mut cmd = Command::new("cc");
-    cmd.arg(obj_path).arg(&runtime);
-
     // On macOS Homebrew installs libgc outside the default linker search
     // path. Query pkg-config for `-L` entries and pass them through before
     // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
     // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
     // where apt places libgc on the default path.
     // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
-    for search_path in pkg_config_search_paths("bdw-gc") {
-        cmd.arg(format!("-L{search_path}"));
+    let search_paths = pkg_config_search_paths("bdw-gc");
+    let argv = build_link_argv(obj_path, &runtime, out_path, &search_paths);
+
+    let mut cmd = Command::new("cc");
+    for arg in argv {
+        cmd.arg(arg);
     }
 
-    cmd.arg("-lgc")
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm")
-        .arg("-o")
-        .arg(out_path)
-        .env("TZ", "UTC")
+    cmd.env("TZ", "UTC")
         .env("SOURCE_DATE_EPOCH", "0");
-
-    #[cfg(target_os = "linux")]
-    {
-        cmd.arg("-Wl,--build-id=none");
-        // Rust staticlibs pull in panic_unwind -> _Unwind_* symbols; cc
-        // does not autolink libgcc_s when driving ld directly for a
-        // non-Rust object. Add it explicitly.
-        cmd.arg("-lgcc_s");
-        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
-        // exports defined symbols into `.dynsym` so the runtime's
-        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
-        // them at safepoint-cross-check time. Without it,
-        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
-        // function, the stackmap index has zero resolved records, and
-        // the cross-check goes silently vacuous on Linux (PR #163
-        // review M1). macOS doesn't need an equivalent — all global
-        // symbols in Mach-O binaries are dlsym-able by default.
-        cmd.arg("-rdynamic");
-    }
-
-    #[cfg(target_os = "macos")]
-    cmd.arg("-Wl,-reproducible");
 
     let output = cmd
         .output()
@@ -81,6 +55,58 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Build the cc argument vector for linking. Pure function suitable for testing.
+///
+/// Takes the object file path, runtime library path, output executable path,
+/// and pkg-config search paths for Boehm GC. Returns a vector of command-line
+/// arguments ready for execution by `cc`, including platform-specific flags.
+fn build_link_argv(
+    obj_path: &Path,
+    runtime: &Path,
+    out_path: &Path,
+    search_paths: &[String],
+) -> Vec<OsString> {
+    let mut argv = Vec::new();
+
+    argv.push(obj_path.as_os_str().to_owned());
+    argv.push(runtime.as_os_str().to_owned());
+
+    for search_path in search_paths {
+        argv.push(format!("-L{search_path}").into());
+    }
+
+    argv.push("-lgc".into());
+    argv.push("-lpthread".into());
+    argv.push("-ldl".into());
+    argv.push("-lm".into());
+    argv.push("-o".into());
+    argv.push(out_path.as_os_str().to_owned());
+
+    #[cfg(target_os = "linux")]
+    {
+        argv.push("-Wl,--build-id=none".into());
+        // Rust staticlibs pull in panic_unwind -> _Unwind_* symbols; cc
+        // does not autolink libgcc_s when driving ld directly for a
+        // non-Rust object. Add it explicitly.
+        argv.push("-lgcc_s".into());
+        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
+        // exports defined symbols into `.dynsym` so the runtime's
+        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
+        // them at safepoint-cross-check time. Without it,
+        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
+        // function, the stackmap index has zero resolved records, and
+        // the cross-check goes silently vacuous on Linux (PR #163
+        // review M1). macOS doesn't need an equivalent — all global
+        // symbols in Mach-O binaries are dlsym-able by default.
+        argv.push("-rdynamic".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    argv.push("-Wl,-reproducible".into());
+
+    argv
 }
 
 fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
@@ -163,4 +189,55 @@ fn locate_runtime_lib() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_link_argv_default() {
+        let obj = Path::new("test.o");
+        let runtime = Path::new("libsigil_runtime.a");
+        let out = Path::new("test");
+        let search_paths = vec![];
+
+        let argv = build_link_argv(obj, runtime, out, &search_paths);
+
+        let argv_strs: Vec<&str> = argv.iter().filter_map(|s| s.to_str()).collect();
+
+        assert!(argv_strs.contains(&"test.o"));
+        assert!(argv_strs.contains(&"libsigil_runtime.a"));
+        assert!(argv_strs.contains(&"-lgc"));
+        assert!(argv_strs.contains(&"-lpthread"));
+        assert!(argv_strs.contains(&"-ldl"));
+        assert!(argv_strs.contains(&"-lm"));
+        assert!(argv_strs.contains(&"-o"));
+        assert!(argv_strs.contains(&"test"));
+
+        #[cfg(target_os = "linux")]
+        {
+            assert!(argv_strs.contains(&"-Wl,--build-id=none"));
+            assert!(argv_strs.contains(&"-lgcc_s"));
+            assert!(argv_strs.contains(&"-rdynamic"));
+        }
+
+        #[cfg(target_os = "macos")]
+        assert!(argv_strs.contains(&"-Wl,-reproducible"));
+    }
+
+    #[test]
+    fn test_build_link_argv_with_search_paths() {
+        let obj = Path::new("test.o");
+        let runtime = Path::new("libsigil_runtime.a");
+        let out = Path::new("test");
+        let search_paths = vec!["/usr/local/lib".to_string(), "/opt/lib".to_string()];
+
+        let argv = build_link_argv(obj, runtime, out, &search_paths);
+
+        let argv_strs: Vec<&str> = argv.iter().filter_map(|s| s.to_str()).collect();
+
+        assert!(argv_strs.contains(&"-L/usr/local/lib"));
+        assert!(argv_strs.contains(&"-L/opt/lib"));
+    }
 }
