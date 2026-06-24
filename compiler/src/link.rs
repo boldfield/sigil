@@ -99,9 +99,7 @@ fn locate_gc_lib() -> Option<PathBuf> {
     // `cargo build` places libgc.a under target/<profile>/.
     // Walk a few candidate profile directories in preference order.
     for profile in &["release", "debug"] {
-        let p = PathBuf::from("target")
-            .join(profile)
-            .join("libgc.a");
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
         if p.exists() {
             return Some(p);
         }
@@ -236,12 +234,11 @@ mod tests {
         let runtime = root.join("libsigil_runtime.a");
 
         let cmd = build_cc_command(&obj, &out, &runtime);
-        let args: Vec<std::ffi::OsString> = cmd.get_args().cloned().collect();
 
         let mut found_libgc_archive = false;
         let mut found_dynamic_lgc = false;
 
-        for arg in &args {
+        for arg in cmd.get_args() {
             let arg_str = arg.to_string_lossy();
             if arg_str == "-lgc" {
                 found_dynamic_lgc = true;
