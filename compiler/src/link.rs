@@ -193,7 +193,13 @@ fn build_cc_command(obj_path: &Path, out_path: &Path, runtime: &Path) -> Command
     cmd.arg(obj_path).arg(runtime);
 
     if let Some(gc_lib) = locate_gc_lib() {
-        cmd.arg(gc_lib);
+        // Canonicalize the path to ensure it's absolute before passing to cc.
+        if let Ok(abs_path) = std::fs::canonicalize(&gc_lib) {
+            cmd.arg(abs_path);
+        } else {
+            // Fall back to the original path if canonicalization fails.
+            cmd.arg(gc_lib);
+        }
     } else {
         for search_path in pkg_config_search_paths("bdw-gc") {
             cmd.arg(format!("-L{search_path}"));
@@ -233,6 +239,10 @@ mod tests {
         let out = root.join("test");
         let runtime = root.join("libsigil_runtime.a");
 
+        // Save and restore environment state
+        let saved_sigil_gc_lib = std::env::var("SIGIL_GC_LIB").ok();
+        let saved_cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok();
+
         // Create a temporary test file for libgc.a
         let temp_gc_path = PathBuf::from("/tmp/sigil_test_libgc.a");
         let _ = std::fs::write(&temp_gc_path, b"fake libgc.a");
@@ -250,21 +260,28 @@ mod tests {
                 found_dynamic_lgc = true;
             }
             if arg_str.ends_with("libgc.a") {
-                found_libgc_archive = true;
+                // Verify it's an absolute path
+                if arg_str.starts_with("/") {
+                    found_libgc_archive = true;
+                }
             }
         }
 
         assert!(
             found_libgc_archive,
-            "when static libgc.a is found, command should include the archive path"
+            "when static libgc.a is found, command should include the absolute archive path"
         );
         assert!(
             !found_dynamic_lgc,
             "when static libgc.a is found, command should NOT include -lgc"
         );
 
-        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file
+        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file and no libgc in workspace
+        // Create an isolated test by temporarily changing CARGO_MANIFEST_DIR to a temp dir
+        // with no libgc.a in target/{release,debug}/
         std::env::set_var("SIGIL_GC_LIB", "/nonexistent/libgc.a");
+        // Point CARGO_MANIFEST_DIR to a directory with no target/ tree
+        std::env::set_var("CARGO_MANIFEST_DIR", "/tmp");
 
         let cmd = build_cc_command(&obj, &out, &runtime);
         found_dynamic_lgc = false;
@@ -282,8 +299,15 @@ mod tests {
             "when static libgc.a is NOT found, command should include -lgc"
         );
 
-        // Clean up
-        std::env::remove_var("SIGIL_GC_LIB");
+        // Clean up - restore original environment
+        match saved_sigil_gc_lib {
+            Some(v) => std::env::set_var("SIGIL_GC_LIB", v),
+            None => std::env::remove_var("SIGIL_GC_LIB"),
+        }
+        match saved_cargo_manifest_dir {
+            Some(v) => std::env::set_var("CARGO_MANIFEST_DIR", v),
+            None => std::env::remove_var("CARGO_MANIFEST_DIR"),
+        }
         let _ = std::fs::remove_file(&temp_gc_path);
     }
 }
