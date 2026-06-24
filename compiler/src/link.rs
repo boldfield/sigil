@@ -40,8 +40,7 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         cmd.arg(arg);
     }
 
-    cmd.env("TZ", "UTC")
-        .env("SOURCE_DATE_EPOCH", "0");
+    cmd.env("TZ", "UTC").env("SOURCE_DATE_EPOCH", "0");
 
     let output = cmd
         .output()
