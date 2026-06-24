@@ -233,8 +233,14 @@ mod tests {
         let out = root.join("test");
         let runtime = root.join("libsigil_runtime.a");
 
-        let cmd = build_cc_command(&obj, &out, &runtime);
+        // Create a temporary test file for libgc.a
+        let temp_gc_path = PathBuf::from("/tmp/sigil_test_libgc.a");
+        let _ = std::fs::write(&temp_gc_path, b"fake libgc.a");
 
+        // Test case 1: with SIGIL_GC_LIB set to a static archive
+        std::env::set_var("SIGIL_GC_LIB", &temp_gc_path);
+
+        let cmd = build_cc_command(&obj, &out, &runtime);
         let mut found_libgc_archive = false;
         let mut found_dynamic_lgc = false;
 
@@ -248,22 +254,36 @@ mod tests {
             }
         }
 
-        if std::path::Path::new("target/release/libgc.a").exists()
-            || std::path::Path::new("target/debug/libgc.a").exists()
-        {
-            assert!(
-                found_libgc_archive,
-                "when static libgc.a is found, command should include the archive path"
-            );
-            assert!(
-                !found_dynamic_lgc,
-                "when static libgc.a is found, command should NOT include -lgc"
-            );
-        } else {
-            assert!(
-                found_dynamic_lgc,
-                "when static libgc.a is NOT found, command should include -lgc"
-            );
+        assert!(
+            found_libgc_archive,
+            "when static libgc.a is found, command should include the archive path"
+        );
+        assert!(
+            !found_dynamic_lgc,
+            "when static libgc.a is found, command should NOT include -lgc"
+        );
+
+        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file
+        std::env::set_var("SIGIL_GC_LIB", "/nonexistent/libgc.a");
+
+        let cmd = build_cc_command(&obj, &out, &runtime);
+        found_dynamic_lgc = false;
+
+        for arg in cmd.get_args() {
+            let arg_str = arg.to_string_lossy();
+            if arg_str == "-lgc" {
+                found_dynamic_lgc = true;
+                break;
+            }
         }
+
+        assert!(
+            found_dynamic_lgc,
+            "when static libgc.a is NOT found, command should include -lgc"
+        );
+
+        // Clean up
+        std::env::remove_var("SIGIL_GC_LIB");
+        let _ = std::fs::remove_file(&temp_gc_path);
     }
 }
