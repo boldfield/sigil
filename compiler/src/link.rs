@@ -25,49 +25,7 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let runtime = locate_runtime_lib()
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
 
-    let mut cmd = Command::new("cc");
-    cmd.arg(obj_path).arg(&runtime);
-
-    // On macOS Homebrew installs libgc outside the default linker search
-    // path. Query pkg-config for `-L` entries and pass them through before
-    // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
-    // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
-    // where apt places libgc on the default path.
-    // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
-    for search_path in pkg_config_search_paths("bdw-gc") {
-        cmd.arg(format!("-L{search_path}"));
-    }
-
-    cmd.arg("-lgc")
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm")
-        .arg("-o")
-        .arg(out_path)
-        .env("TZ", "UTC")
-        .env("SOURCE_DATE_EPOCH", "0");
-
-    #[cfg(target_os = "linux")]
-    {
-        cmd.arg("-Wl,--build-id=none");
-        // Rust staticlibs pull in panic_unwind -> _Unwind_* symbols; cc
-        // does not autolink libgcc_s when driving ld directly for a
-        // non-Rust object. Add it explicitly.
-        cmd.arg("-lgcc_s");
-        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
-        // exports defined symbols into `.dynsym` so the runtime's
-        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
-        // them at safepoint-cross-check time. Without it,
-        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
-        // function, the stackmap index has zero resolved records, and
-        // the cross-check goes silently vacuous on Linux (PR #163
-        // review M1). macOS doesn't need an equivalent — all global
-        // symbols in Mach-O binaries are dlsym-able by default.
-        cmd.arg("-rdynamic");
-    }
-
-    #[cfg(target_os = "macos")]
-    cmd.arg("-Wl,-reproducible");
+    let mut cmd = build_cc_command(obj_path, out_path, &runtime);
 
     let output = cmd
         .output()
@@ -97,6 +55,69 @@ fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
         .filter_map(|token| token.strip_prefix("-L").map(str::to_owned))
         .filter(|path| !path.is_empty())
         .collect()
+}
+
+fn locate_gc_lib() -> Option<PathBuf> {
+    // Explicit override wins — release-archive consumers can
+    // `export SIGIL_GC_LIB=...` to use a custom libgc.a.
+    if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    // Release-archive layout: when the `sigil` binary ships in a
+    // tarball like
+    //
+    //   sigil-<version>-<triple>/
+    //     bin/sigil
+    //     lib/libgc.a
+    //     std/...
+    //
+    // walking up one level from the executable's parent and into
+    // `lib/` recovers the staticlib. Also try the flat-bundle layout
+    // (`libgc.a` next to the binary).
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().map(PathBuf::from);
+        let candidates = [
+            // bin/sigil → ../lib/libgc.a
+            exe_dir
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|p| p.join("lib").join("libgc.a")),
+            // flat: sigil + libgc.a in the same dir
+            exe_dir.as_ref().map(|d| d.join("libgc.a")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+
+    // `cargo build` places libgc.a under target/<profile>/.
+    // Walk a few candidate profile directories in preference order.
+    for profile in &["release", "debug"] {
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // CARGO_MANIFEST_DIR fallback if invoked from a subdir.
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let base = Path::new(&manifest)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for profile in &["release", "debug"] {
+            let p = base.join("target").join(profile).join("libgc.a");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn locate_runtime_lib() -> Option<PathBuf> {
@@ -163,4 +184,139 @@ fn locate_runtime_lib() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Internal helper to build the cc command without executing it. Used by
+/// the link function and exposed for testing.
+fn build_cc_command(obj_path: &Path, out_path: &Path, runtime: &Path) -> Command {
+    let mut cmd = Command::new("cc");
+    cmd.arg(obj_path).arg(runtime);
+
+    if let Some(gc_lib) = locate_gc_lib() {
+        // Canonicalize the path to ensure it's absolute before passing to cc.
+        if let Ok(abs_path) = std::fs::canonicalize(&gc_lib) {
+            cmd.arg(abs_path);
+        } else {
+            // Fall back to the original path if canonicalization fails.
+            cmd.arg(gc_lib);
+        }
+    } else {
+        for search_path in pkg_config_search_paths("bdw-gc") {
+            cmd.arg(format!("-L{search_path}"));
+        }
+        cmd.arg("-lgc");
+    }
+
+    cmd.arg("-lpthread")
+        .arg("-ldl")
+        .arg("-lm")
+        .arg("-o")
+        .arg(out_path)
+        .env("TZ", "UTC")
+        .env("SOURCE_DATE_EPOCH", "0");
+
+    #[cfg(target_os = "linux")]
+    {
+        cmd.arg("-Wl,--build-id=none");
+        cmd.arg("-lgcc_s");
+        cmd.arg("-rdynamic");
+    }
+
+    #[cfg(target_os = "macos")]
+    cmd.arg("-Wl,-reproducible");
+
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_cc_command_includes_static_libgc_when_found() {
+        let root = PathBuf::from(".");
+        let obj = root.join("test.o");
+        let out = root.join("test");
+        let runtime = root.join("libsigil_runtime.a");
+
+        // Save and restore environment state
+        let saved_sigil_gc_lib = std::env::var("SIGIL_GC_LIB").ok();
+        let saved_cargo_manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok();
+        let saved_cwd = std::env::current_dir().ok();
+
+        // Create a temporary test file for libgc.a
+        let temp_gc_path = PathBuf::from("/tmp/sigil_test_libgc.a");
+        let _ = std::fs::write(&temp_gc_path, b"fake libgc.a");
+
+        // Test case 1: with SIGIL_GC_LIB set to a static archive
+        std::env::set_var("SIGIL_GC_LIB", &temp_gc_path);
+
+        let cmd = build_cc_command(&obj, &out, &runtime);
+        let mut found_libgc_archive = false;
+        let mut found_dynamic_lgc = false;
+
+        for arg in cmd.get_args() {
+            let arg_str = arg.to_string_lossy();
+            if arg_str == "-lgc" {
+                found_dynamic_lgc = true;
+            }
+            if arg_str.ends_with("libgc.a") {
+                // Verify it's an absolute path
+                if arg_str.starts_with("/") {
+                    found_libgc_archive = true;
+                }
+            }
+        }
+
+        assert!(
+            found_libgc_archive,
+            "when static libgc.a is found, command should include the absolute archive path"
+        );
+        assert!(
+            !found_dynamic_lgc,
+            "when static libgc.a is found, command should NOT include -lgc"
+        );
+
+        // Test case 2: with SIGIL_GC_LIB pointing to non-existent file and isolated environment
+        // Create an isolated temp directory to ensure locate_gc_lib() won't find anything
+        let temp_dir = std::env::temp_dir().join("sigil_test_isolated");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        // Unset SIGIL_GC_LIB and set CARGO_MANIFEST_DIR to a temp dir with no target/
+        std::env::remove_var("SIGIL_GC_LIB");
+        std::env::set_var("CARGO_MANIFEST_DIR", &temp_dir);
+        // Change to temp dir to ensure relative path lookups don't find anything
+        let _ = std::env::set_current_dir(&temp_dir);
+
+        let cmd = build_cc_command(&obj, &out, &runtime);
+        found_dynamic_lgc = false;
+
+        for arg in cmd.get_args() {
+            let arg_str = arg.to_string_lossy();
+            if arg_str == "-lgc" {
+                found_dynamic_lgc = true;
+                break;
+            }
+        }
+
+        assert!(
+            found_dynamic_lgc,
+            "when static libgc.a is NOT found, command should include -lgc"
+        );
+
+        // Clean up - restore original environment
+        if let Some(cwd) = saved_cwd {
+            let _ = std::env::set_current_dir(cwd);
+        }
+        match saved_sigil_gc_lib {
+            Some(v) => std::env::set_var("SIGIL_GC_LIB", v),
+            None => std::env::remove_var("SIGIL_GC_LIB"),
+        }
+        match saved_cargo_manifest_dir {
+            Some(v) => std::env::set_var("CARGO_MANIFEST_DIR", v),
+            None => std::env::remove_var("CARGO_MANIFEST_DIR"),
+        }
+        let _ = std::fs::remove_file(&temp_gc_path);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
 }
