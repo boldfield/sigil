@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -48,6 +48,7 @@ fn main() {
 /// a `rustc-link-search` directive so the linker can satisfy `-lgc`.
 #[cfg(target_os = "linux")]
 fn try_add_libgc_so_stub() {
+    use std::path::Path;
     // If libgc.so is already reachable we do not need a stub.
     let search_dirs = [
         "/usr/lib/x86_64-linux-gnu",
