@@ -14,6 +14,12 @@
 //! the same `target/<profile>/` directory that built the compiler binary.
 //! That keeps the setup simple for development builds and for the e2e
 //! test which runs `cargo run` before invoking the compiler.
+//!
+//! When a static `libgc.a` is available (located via `SIGIL_GC_LIB` env
+//! var or the standard search paths), it is passed by absolute path after
+//! `libsigil_runtime.a` and `-lgc` is omitted. When no static archive is
+//! found, the original dynamic `-lgc` (+ macOS pkg-config `-L`) behavior
+//! is preserved exactly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,28 +30,57 @@ use std::process::Command;
 pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let runtime = locate_runtime_lib()
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
+    let gc_lib = locate_gc_lib();
 
-    let mut cmd = Command::new("cc");
-    cmd.arg(obj_path).arg(&runtime);
-
-    // On macOS Homebrew installs libgc outside the default linker search
-    // path. Query pkg-config for `-L` entries and pass them through before
-    // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
-    // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
-    // where apt places libgc on the default path.
-    // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
-    for search_path in pkg_config_search_paths("bdw-gc") {
-        cmd.arg(format!("-L{search_path}"));
-    }
-
-    cmd.arg("-lgc")
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm")
-        .arg("-o")
+    let mut cmd = build_cc_command(obj_path, &runtime, gc_lib.as_deref());
+    cmd.arg("-o")
         .arg(out_path)
         .env("TZ", "UTC")
         .env("SOURCE_DATE_EPOCH", "0");
+
+    let output = cmd
+        .output()
+        .map_err(|e| format!("cc invocation failed: {e}"))?;
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "cc exited {}: stdout={stdout} stderr={stderr}",
+            output.status
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `cc` invocation for linking. Separated from `link()` so
+/// tests can inspect the argv without running the linker.
+///
+/// `gc_lib` is a path returned by `locate_gc_lib()` — either a static
+/// `libgc.a` archive or a versioned shared library such as `libgc.so.1`
+/// — or `None` to fall back to the dynamic `-lgc` + pkg-config `-L`
+/// behavior.
+fn build_cc_command(obj_path: &Path, runtime: &Path, gc_lib: Option<&Path>) -> Command {
+    let mut cmd = Command::new("cc");
+    cmd.arg(obj_path).arg(runtime);
+
+    match gc_lib {
+        Some(gc_path) => {
+            // Pass the GC library by the path locate_gc_lib() returned.
+            // -lgc must not be emitted — the library is already provided.
+            cmd.arg(gc_path);
+        }
+        None => {
+            // Dynamic fallback: query pkg-config for macOS Homebrew -L
+            // paths, then emit -lgc. On Ubuntu libgc is on the default
+            // search path so pkg-config returns nothing and -lgc suffices.
+            for search_path in pkg_config_search_paths("bdw-gc") {
+                cmd.arg(format!("-L{search_path}"));
+            }
+            cmd.arg("-lgc");
+        }
+    }
+
+    cmd.arg("-lpthread").arg("-ldl").arg("-lm");
 
     #[cfg(target_os = "linux")]
     {
@@ -69,18 +104,7 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     cmd.arg("-Wl,-reproducible");
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("cc invocation failed: {e}"))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "cc exited {}: stdout={stdout} stderr={stderr}",
-            output.status
-        ));
-    }
-    Ok(())
+    cmd
 }
 
 fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
@@ -163,4 +187,132 @@ fn locate_runtime_lib() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Locate a GC library to link against, returning its canonicalized
+/// absolute path. Search order mirrors `locate_runtime_lib()`:
+///
+/// 1. `SIGIL_GC_LIB` env var (absolute path to a custom `libgc.a`).
+/// 2. Release-archive layout: `bin/sigil` → `../lib/libgc.a`.
+/// 3. Flat layout: `libgc.a` beside the `sigil` binary.
+/// 4. `target/{release,debug}/libgc.a` (emitted by `build-static-boehm.sh`).
+/// 5. (Linux) Versioned shared library `libgc.so.1` in common system
+///    paths — a fallback for environments where only the `libgc1` runtime
+///    package is installed without `libgc-dev`. Passing the versioned SO
+///    directly to cc produces a binary with `NEEDED: libgc.so.1`, identical
+///    in effect to dynamic `-lgc` but without requiring the unversioned
+///    `libgc.so` symlink that `libgc-dev` provides.
+///
+/// Returns `None` when no GC library is found; `link()` then falls
+/// back to the dynamic `-lgc` path.
+fn locate_gc_lib() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
+        let path = PathBuf::from(&p);
+        if path.exists() {
+            return Some(path.canonicalize().unwrap_or(path));
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().map(PathBuf::from);
+        let candidates = [
+            exe_dir
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|p| p.join("lib").join("libgc.a")),
+            exe_dir.as_ref().map(|d| d.join("libgc.a")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.exists() {
+                return Some(c.canonicalize().unwrap_or(c));
+            }
+        }
+    }
+
+    for profile in &["release", "debug"] {
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
+        if p.exists() {
+            return Some(p.canonicalize().unwrap_or(p));
+        }
+    }
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let base = Path::new(&manifest)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for profile in &["release", "debug"] {
+            let p = base.join("target").join(profile).join("libgc.a");
+            if p.exists() {
+                return Some(p.canonicalize().unwrap_or(p));
+            }
+        }
+    }
+
+    // Linux fallback: no static archive found; look for the versioned shared
+    // library installed by the `libgc1` runtime package.  This covers
+    // environments that have libgc1 but not libgc-dev (which provides the
+    // unversioned `libgc.so` symlink needed by plain `-lgc`).
+    #[cfg(target_os = "linux")]
+    for candidate in &[
+        "/lib/x86_64-linux-gnu/libgc.so.1",
+        "/usr/lib/x86_64-linux-gnu/libgc.so.1",
+        "/usr/lib/aarch64-linux-gnu/libgc.so.1",
+        "/usr/lib/libgc.so.1",
+        "/lib/libgc.so.1",
+    ] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// When locate_gc_lib() returns Some(path), build_cc_command must
+    /// include that path in the cc argv and must NOT emit -lgc.
+    #[test]
+    fn build_cc_command_includes_static_libgc_when_found() {
+        // Use a fixed absolute path — build_cc_command passes whatever
+        // path it receives straight through, so the file need not exist.
+        let gc_path = Path::new("/nonexistent/libgc.a");
+        let cmd = build_cc_command(
+            Path::new("foo.o"),
+            Path::new("libsigil_runtime.a"),
+            Some(gc_path),
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.iter().any(|a| a == "/nonexistent/libgc.a"),
+            "static libgc.a path must appear in cc argv; got: {args:?}"
+        );
+        assert!(
+            !args.contains(&"-lgc".to_string()),
+            "-lgc must not appear in cc argv when static archive is used; got: {args:?}"
+        );
+    }
+
+    /// When locate_gc_lib() returns None, build_cc_command must emit -lgc
+    /// for the dynamic fallback path.
+    #[test]
+    fn build_cc_command_dynamic_fallback_when_no_static_libgc() {
+        let cmd = build_cc_command(Path::new("foo.o"), Path::new("libsigil_runtime.a"), None);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            args.contains(&"-lgc".to_string()),
+            "-lgc must appear in cc argv when no static archive is available; got: {args:?}"
+        );
+    }
 }
