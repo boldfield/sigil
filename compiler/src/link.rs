@@ -222,6 +222,7 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_env_override_absolute_path_wins() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let gc_lib = temp_dir.path().join("libgc.a");
         fs::write(&gc_lib, b"mock").expect("failed to write test file");
@@ -232,18 +233,21 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_env_override_rejects_relative_path() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::set("SIGIL_GC_LIB", "relative/path/libgc.a");
         assert_eq!(locate_gc_lib(), None);
     }
 
     #[test]
     fn test_locate_gc_lib_env_override_rejects_nonexistent_absolute() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::set("SIGIL_GC_LIB", "/nonexistent/absolute/path/libgc.a");
         assert_eq!(locate_gc_lib(), None);
     }
 
     #[test]
     fn test_locate_gc_lib_release_archive_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         // Simulate exe at bin/sigil, libgc.a at lib/libgc.a
         let bin_dir = temp_dir.path().join("bin");
@@ -263,6 +267,7 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_flat_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         // Simulate exe at root, libgc.a beside it
         let gc_lib = temp_dir.path().join("libgc.a");
@@ -276,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_cargo_target_release() {
-        let _lock = GLOBAL_STATE_LOCK.lock();
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().join("release_test");
         let target = temp_path.join("target").join("release");
@@ -295,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_cargo_target_debug() {
-        let _lock = GLOBAL_STATE_LOCK.lock();
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().join("debug_test");
         let target = temp_path.join("target").join("debug");
@@ -314,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_locate_gc_lib_none_when_not_found() {
-        let _lock = GLOBAL_STATE_LOCK.lock();
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::TempDir::new().expect("failed to create temp dir");
         let temp_path = temp_dir.path().to_path_buf();
         let old_cwd = std::env::current_dir().expect("failed to get current dir");
