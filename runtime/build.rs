@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -24,11 +24,70 @@ fn main() {
     }
 
     // Dynamic fallback: query pkg-config for macOS Homebrew -L paths,
-    // then emit -lgc. On Ubuntu, libgc-dev drops libgc.so into the
+    // then emit -lgc. On Ubuntu with libgc-dev, libgc.so is on the
     // default search path so pkg-config returns nothing and -lgc suffices.
     // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
     emit_pkg_config_search_paths("bdw-gc");
+
+    // Linux only: when only the libgc1 runtime package is installed
+    // (no libgc-dev), `libgc.so` does not exist — only `libgc.so.1`.
+    // The `-lgc` emitted below would then fail at link time.  Work around
+    // this by creating a `libgc.so` stub symlink in OUT_DIR and adding it
+    // to the native link-search path so the linker finds it.  The resulting
+    // binary gets `NEEDED: libgc.so.1` (the SONAME embedded in the shared
+    // library) and resolves it at runtime via ld.so — same outcome as
+    // using `-lgc` with libgc-dev installed.
+    #[cfg(target_os = "linux")]
+    try_add_libgc_so_stub();
+
     println!("cargo:rustc-link-lib=gc");
+}
+
+/// On Linux: if `libgc.so` is not findable in the standard search paths but a
+/// versioned `libgc.so.1` exists, create a stub symlink in `OUT_DIR` and emit
+/// a `rustc-link-search` directive so the linker can satisfy `-lgc`.
+#[cfg(target_os = "linux")]
+fn try_add_libgc_so_stub() {
+    // If libgc.so is already reachable we do not need a stub.
+    let search_dirs = [
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+        "/usr/lib",
+        "/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/lib",
+    ];
+    if search_dirs
+        .iter()
+        .any(|d| Path::new(d).join("libgc.so").exists())
+    {
+        return;
+    }
+
+    // Look for the versioned library installed by the libgc1 runtime package.
+    let so1_candidates = [
+        "/lib/x86_64-linux-gnu/libgc.so.1",
+        "/usr/lib/x86_64-linux-gnu/libgc.so.1",
+        "/lib/aarch64-linux-gnu/libgc.so.1",
+        "/usr/lib/aarch64-linux-gnu/libgc.so.1",
+        "/usr/lib/libgc.so.1",
+        "/lib/libgc.so.1",
+    ];
+    let versioned = so1_candidates
+        .iter()
+        .find(|&&p| Path::new(p).exists())
+        .copied();
+    let Some(versioned) = versioned else { return };
+
+    let out_dir = match std::env::var("OUT_DIR") {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let stub = PathBuf::from(&out_dir).join("libgc.so");
+    if !stub.exists() {
+        let _ = std::os::unix::fs::symlink(versioned, &stub);
+    }
+    println!("cargo:rustc-link-search=native={out_dir}");
 }
 
 fn emit_pkg_config_search_paths(pkg: &str) {

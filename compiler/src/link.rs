@@ -55,16 +55,18 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
 /// Build the `cc` invocation for linking. Separated from `link()` so
 /// tests can inspect the argv without running the linker.
 ///
-/// `gc_lib` is the located static `libgc.a` archive (absolute path), or
-/// `None` to fall back to the dynamic `-lgc` + pkg-config `-L` behavior.
+/// `gc_lib` is a path returned by `locate_gc_lib()` — either a static
+/// `libgc.a` archive or a versioned shared library such as `libgc.so.1`
+/// — or `None` to fall back to the dynamic `-lgc` + pkg-config `-L`
+/// behavior.
 fn build_cc_command(obj_path: &Path, runtime: &Path, gc_lib: Option<&Path>) -> Command {
     let mut cmd = Command::new("cc");
     cmd.arg(obj_path).arg(runtime);
 
     match gc_lib {
         Some(gc_path) => {
-            // Static archive: pass by the path locate_gc_lib() returned
-            // (canonicalized to absolute), -lgc must not be emitted.
+            // Pass the GC library by the path locate_gc_lib() returned.
+            // -lgc must not be emitted — the library is already provided.
             cmd.arg(gc_path);
         }
         None => {
@@ -187,15 +189,21 @@ fn locate_runtime_lib() -> Option<PathBuf> {
     None
 }
 
-/// Locate a static `libgc.a` to link against, returning its canonicalized
+/// Locate a GC library to link against, returning its canonicalized
 /// absolute path. Search order mirrors `locate_runtime_lib()`:
 ///
 /// 1. `SIGIL_GC_LIB` env var (absolute path to a custom `libgc.a`).
 /// 2. Release-archive layout: `bin/sigil` → `../lib/libgc.a`.
 /// 3. Flat layout: `libgc.a` beside the `sigil` binary.
 /// 4. `target/{release,debug}/libgc.a` (emitted by `build-static-boehm.sh`).
+/// 5. (Linux) Versioned shared library `libgc.so.1` in common system
+///    paths — a fallback for environments where only the `libgc1` runtime
+///    package is installed without `libgc-dev`. Passing the versioned SO
+///    directly to cc produces a binary with `NEEDED: libgc.so.1`, identical
+///    in effect to dynamic `-lgc` but without requiring the unversioned
+///    `libgc.so` symlink that `libgc-dev` provides.
 ///
-/// Returns `None` when no static archive is found; `link()` then falls
+/// Returns `None` when no GC library is found; `link()` then falls
 /// back to the dynamic `-lgc` path.
 fn locate_gc_lib() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
@@ -239,6 +247,25 @@ fn locate_gc_lib() -> Option<PathBuf> {
             }
         }
     }
+
+    // Linux fallback: no static archive found; look for the versioned shared
+    // library installed by the `libgc1` runtime package.  This covers
+    // environments that have libgc1 but not libgc-dev (which provides the
+    // unversioned `libgc.so` symlink needed by plain `-lgc`).
+    #[cfg(target_os = "linux")]
+    for candidate in &[
+        "/lib/x86_64-linux-gnu/libgc.so.1",
+        "/usr/lib/x86_64-linux-gnu/libgc.so.1",
+        "/usr/lib/aarch64-linux-gnu/libgc.so.1",
+        "/usr/lib/libgc.so.1",
+        "/lib/libgc.so.1",
+    ] {
+        let p = Path::new(candidate);
+        if p.exists() {
+            return Some(p.to_path_buf());
+        }
+    }
+
     None
 }
 
