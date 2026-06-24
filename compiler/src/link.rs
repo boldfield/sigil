@@ -205,24 +205,25 @@ mod tests {
 
         let argv_strs: Vec<&str> = argv.iter().filter_map(|s| s.to_str()).collect();
 
-        assert!(argv_strs.contains(&"test.o"));
-        assert!(argv_strs.contains(&"libsigil_runtime.a"));
-        assert!(argv_strs.contains(&"-lgc"));
-        assert!(argv_strs.contains(&"-lpthread"));
-        assert!(argv_strs.contains(&"-ldl"));
-        assert!(argv_strs.contains(&"-lm"));
-        assert!(argv_strs.contains(&"-o"));
-        assert!(argv_strs.contains(&"test"));
+        // Build expected sequence: obj, runtime, -lgc, -lpthread, -ldl, -lm, -o, out, platform-specific
+        let mut expected = vec![
+            "test.o",
+            "libsigil_runtime.a",
+            "-lgc",
+            "-lpthread",
+            "-ldl",
+            "-lm",
+            "-o",
+            "test",
+        ];
 
         #[cfg(target_os = "linux")]
-        {
-            assert!(argv_strs.contains(&"-Wl,--build-id=none"));
-            assert!(argv_strs.contains(&"-lgcc_s"));
-            assert!(argv_strs.contains(&"-rdynamic"));
-        }
+        expected.extend(&["-Wl,--build-id=none", "-lgcc_s", "-rdynamic"]);
 
         #[cfg(target_os = "macos")]
-        assert!(argv_strs.contains(&"-Wl,-reproducible"));
+        expected.push("-Wl,-reproducible");
+
+        assert_eq!(argv_strs, expected);
     }
 
     #[test]
