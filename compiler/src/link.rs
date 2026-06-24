@@ -277,11 +277,7 @@ mod tests {
     /// for the dynamic fallback path.
     #[test]
     fn build_cc_command_dynamic_fallback_when_no_static_libgc() {
-        let cmd = build_cc_command(
-            Path::new("foo.o"),
-            Path::new("libsigil_runtime.a"),
-            None,
-        );
+        let cmd = build_cc_command(Path::new("foo.o"), Path::new("libsigil_runtime.a"), None);
         let args: Vec<String> = cmd
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
