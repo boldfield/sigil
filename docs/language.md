@@ -2303,6 +2303,7 @@ are effect ops (not regular fns) — see §7.
 | `std.path` | `path_splitext(p)` | `(String) -> (String, String)` | `(root, ext)`; `ext` includes the dot, `""` if none; a leading-dot dotfile has no ext. (No standalone "extension" fn — use `snd(path_splitext(p))`.) |
 | `std.path` | `path_normalize(p)` | `(String) -> String` | collapse `.` / `..` / duplicate slashes (posixpath `normpath`) |
 | `std.path` | `path_is_absolute(p)` | `(String) -> Bool` | does `p` start with `/` |
+| `std.url` | `parse_url(s)` | `(String) -> Result[Url, String]` | parse `scheme://host[:port][/path][?query]`; defaults: port 80 for http, 443 for https; path `/` |
 | `std.list` | `length(xs)` | `(List[A]) -> Int` | element count |
 | `std.list` | `range(start, end)` | `(Int, Int) -> List[Int]` | build `[start, end)` |
 | `std.list` | `map(xs, f)` | `(List[A], (A) -> B ![]) -> List[B]` | transform each |
