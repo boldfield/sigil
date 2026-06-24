@@ -689,6 +689,7 @@ dependencies = [
  "sigil-header-constants",
  "sigil-runtime",
  "target-lexicon",
+ "tempfile",
 ]
 
 [[package]]

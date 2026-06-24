@@ -40,3 +40,4 @@ sigil-runtime = { path = "../runtime" }
 # TLS fixtures for e2e tests
 rustls = "0.23"
 rcgen = "0.13"
+tempfile = "3"
