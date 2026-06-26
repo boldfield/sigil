@@ -36,7 +36,9 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let argv = build_link_argv(obj_path, out_path, &runtime, &search_paths);
 
     let mut cmd = Command::new("cc");
-    cmd.args(&argv).env("TZ", "UTC").env("SOURCE_DATE_EPOCH", "0");
+    cmd.args(&argv)
+        .env("TZ", "UTC")
+        .env("SOURCE_DATE_EPOCH", "0");
 
     let output = cmd
         .output()
@@ -204,19 +206,19 @@ mod tests {
     fn platform_suffix() -> Vec<OsString> {
         #[cfg(target_os = "linux")]
         {
-            return vec![
+            vec![
                 OsString::from("-Wl,--build-id=none"),
                 OsString::from("-lgcc_s"),
                 OsString::from("-rdynamic"),
-            ];
+            ]
         }
         #[cfg(target_os = "macos")]
         {
-            return vec![OsString::from("-Wl,-reproducible")];
+            vec![OsString::from("-Wl,-reproducible")]
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            return Vec::new();
+            Vec::new()
         }
     }
 
