@@ -15,6 +15,7 @@
 //! That keeps the setup simple for development builds and for the e2e
 //! test which runs `cargo run` before invoking the compiler.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,49 +26,19 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let runtime = locate_runtime_lib()
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
 
-    let mut cmd = Command::new("cc");
-    cmd.arg(obj_path).arg(&runtime);
-
     // On macOS Homebrew installs libgc outside the default linker search
     // path. Query pkg-config for `-L` entries and pass them through before
     // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
     // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
     // where apt places libgc on the default path.
     // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
-    for search_path in pkg_config_search_paths("bdw-gc") {
-        cmd.arg(format!("-L{search_path}"));
-    }
+    let search_paths = pkg_config_search_paths("bdw-gc");
+    let argv = build_link_argv(obj_path, out_path, &runtime, &search_paths);
 
-    cmd.arg("-lgc")
-        .arg("-lpthread")
-        .arg("-ldl")
-        .arg("-lm")
-        .arg("-o")
-        .arg(out_path)
+    let mut cmd = Command::new("cc");
+    cmd.args(&argv)
         .env("TZ", "UTC")
         .env("SOURCE_DATE_EPOCH", "0");
-
-    #[cfg(target_os = "linux")]
-    {
-        cmd.arg("-Wl,--build-id=none");
-        // Rust staticlibs pull in panic_unwind -> _Unwind_* symbols; cc
-        // does not autolink libgcc_s when driving ld directly for a
-        // non-Rust object. Add it explicitly.
-        cmd.arg("-lgcc_s");
-        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
-        // exports defined symbols into `.dynsym` so the runtime's
-        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
-        // them at safepoint-cross-check time. Without it,
-        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
-        // function, the stackmap index has zero resolved records, and
-        // the cross-check goes silently vacuous on Linux (PR #163
-        // review M1). macOS doesn't need an equivalent — all global
-        // symbols in Mach-O binaries are dlsym-able by default.
-        cmd.arg("-rdynamic");
-    }
-
-    #[cfg(target_os = "macos")]
-    cmd.arg("-Wl,-reproducible");
 
     let output = cmd
         .output()
@@ -81,6 +52,68 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Build the `cc` argument vector for the link step.
+///
+/// Pure helper — no I/O and no process spawning — so the exact emitted argv
+/// can be asserted in a unit test. The caller resolves the runtime archive
+/// and the pkg-config `-L` search paths and passes them in. The order is
+/// identical to the previous inline construction in `link()`:
+///
+///   <obj> <runtime> [-L<search>...] -lgc -lpthread -ldl -lm -o <out>
+///   (Linux:) -Wl,--build-id=none -lgcc_s -rdynamic
+///   (macOS:) -Wl,-reproducible
+///
+/// The `TZ`/`SOURCE_DATE_EPOCH` reproducibility env is applied by the caller
+/// on the `Command`, not part of the argv.
+fn build_link_argv(
+    obj_path: &Path,
+    out_path: &Path,
+    runtime: &Path,
+    search_paths: &[String],
+) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = vec![
+        obj_path.as_os_str().to_owned(),
+        runtime.as_os_str().to_owned(),
+    ];
+
+    for search_path in search_paths {
+        argv.push(OsString::from(format!("-L{search_path}")));
+    }
+
+    argv.extend([
+        OsString::from("-lgc"),
+        OsString::from("-lpthread"),
+        OsString::from("-ldl"),
+        OsString::from("-lm"),
+        OsString::from("-o"),
+        out_path.as_os_str().to_owned(),
+    ]);
+
+    #[cfg(target_os = "linux")]
+    argv.extend([
+        OsString::from("-Wl,--build-id=none"),
+        // Rust staticlibs pull in panic_unwind -> _Unwind_* symbols; cc
+        // does not autolink libgcc_s when driving ld directly for a
+        // non-Rust object. Add it explicitly.
+        OsString::from("-lgcc_s"),
+        // Plan E2 Phase 1 Task 5 — `-rdynamic` (`-Wl,--export-dynamic`)
+        // exports defined symbols into `.dynsym` so the runtime's
+        // `dlsym(RTLD_DEFAULT, "sigil_user_main")` lookup can resolve
+        // them at safepoint-cross-check time. Without it,
+        // `dlsym(RTLD_DEFAULT, ...)` returns NULL for every emitted
+        // function, the stackmap index has zero resolved records, and
+        // the cross-check goes silently vacuous on Linux (PR #163
+        // review M1). macOS doesn't need an equivalent — all global
+        // symbols in Mach-O binaries are dlsym-able by default.
+        OsString::from("-rdynamic"),
+    ]);
+
+    #[cfg(target_os = "macos")]
+    argv.push(OsString::from("-Wl,-reproducible"));
+
+    argv
 }
 
 fn pkg_config_search_paths(pkg: &str) -> Vec<String> {
@@ -163,4 +196,81 @@ fn locate_runtime_lib() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The platform-specific suffix appended after `-o <out>`.
+    fn platform_suffix() -> Vec<OsString> {
+        #[cfg(target_os = "linux")]
+        {
+            vec![
+                OsString::from("-Wl,--build-id=none"),
+                OsString::from("-lgcc_s"),
+                OsString::from("-rdynamic"),
+            ]
+        }
+        #[cfg(target_os = "macos")]
+        {
+            vec![OsString::from("-Wl,-reproducible")]
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn build_link_argv_default_emits_exact_vector() {
+        let obj = Path::new("/tmp/prog.o");
+        let out = Path::new("/tmp/prog");
+        let runtime = Path::new("/build/target/release/libsigil_runtime.a");
+
+        let argv = build_link_argv(obj, out, runtime, &[]);
+
+        let mut expected: Vec<OsString> = vec![
+            OsString::from("/tmp/prog.o"),
+            OsString::from("/build/target/release/libsigil_runtime.a"),
+            OsString::from("-lgc"),
+            OsString::from("-lpthread"),
+            OsString::from("-ldl"),
+            OsString::from("-lm"),
+            OsString::from("-o"),
+            OsString::from("/tmp/prog"),
+        ];
+        expected.extend(platform_suffix());
+
+        assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn build_link_argv_inserts_search_paths_before_lgc() {
+        let obj = Path::new("/tmp/prog.o");
+        let out = Path::new("/tmp/prog");
+        let runtime = Path::new("/build/target/release/libsigil_runtime.a");
+        let search_paths = vec![
+            "/opt/homebrew/lib".to_string(),
+            "/usr/local/lib".to_string(),
+        ];
+
+        let argv = build_link_argv(obj, out, runtime, &search_paths);
+
+        let mut expected: Vec<OsString> = vec![
+            OsString::from("/tmp/prog.o"),
+            OsString::from("/build/target/release/libsigil_runtime.a"),
+            OsString::from("-L/opt/homebrew/lib"),
+            OsString::from("-L/usr/local/lib"),
+            OsString::from("-lgc"),
+            OsString::from("-lpthread"),
+            OsString::from("-ldl"),
+            OsString::from("-lm"),
+            OsString::from("-o"),
+            OsString::from("/tmp/prog"),
+        ];
+        expected.extend(platform_suffix());
+
+        assert_eq!(argv, expected);
+    }
 }
