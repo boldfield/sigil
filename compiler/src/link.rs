@@ -205,15 +205,21 @@ mod tests {
     /// The platform-specific suffix appended after `-o <out>`.
     fn platform_suffix() -> Vec<OsString> {
         #[cfg(target_os = "linux")]
-        vec![
-            OsString::from("-Wl,--build-id=none"),
-            OsString::from("-lgcc_s"),
-            OsString::from("-rdynamic"),
-        ]
+        {
+            return vec![
+                OsString::from("-Wl,--build-id=none"),
+                OsString::from("-lgcc_s"),
+                OsString::from("-rdynamic"),
+            ];
+        }
         #[cfg(target_os = "macos")]
-        vec![OsString::from("-Wl,-reproducible")]
+        {
+            return vec![OsString::from("-Wl,-reproducible")];
+        }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        Vec::new()
+        {
+            return Vec::new();
+        }
     }
 
     #[test]
