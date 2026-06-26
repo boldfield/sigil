@@ -246,9 +246,7 @@ fn locate_gc_lib_internal(exe_path: Option<&Path>) -> Option<PathBuf> {
     // `cargo build` places libgc.a under target/<profile>/.
     // Walk a few candidate profile directories in preference order.
     for profile in &["release", "debug"] {
-        let p = PathBuf::from("target")
-            .join(profile)
-            .join("libgc.a");
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
         if p.exists() {
             return Some(p);
         }
