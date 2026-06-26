@@ -349,7 +349,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_env_override_absolute_path() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(&tmpdir).unwrap();
         let gc_path = tmpdir.join("libgc.a");
@@ -388,7 +389,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_cargo_target_release() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         let target_release = tmpdir.join("target").join("release");
         std::fs::create_dir_all(&target_release).unwrap();
@@ -407,7 +409,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_cargo_target_debug() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_dbg_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_dbg_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         let target_debug = tmpdir.join("target").join("debug");
         std::fs::create_dir_all(&target_debug).unwrap();
@@ -426,7 +429,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_none_when_not_found() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_empty_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_empty_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(&tmpdir).unwrap();
 
@@ -442,7 +446,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_release_archive_layout() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_arch_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_arch_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         let lib_dir = tmpdir.join("lib");
         std::fs::create_dir_all(&lib_dir).unwrap();
@@ -460,7 +465,8 @@ mod tests {
     #[test]
     fn test_locate_gc_lib_flat_layout() {
         let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmpdir = std::env::temp_dir().join(format!("sigil_test_flat_{}", std::process::id()));
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_flat_{}", pid));
         let _ = std::fs::remove_dir_all(&tmpdir);
         std::fs::create_dir_all(&tmpdir).unwrap();
         let gc_path = tmpdir.join("libgc.a");
