@@ -36,9 +36,7 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let argv = build_link_argv(obj_path, out_path, &runtime, &search_paths);
 
     let mut cmd = Command::new("cc");
-    cmd.args(&argv)
-        .env("TZ", "UTC")
-        .env("SOURCE_DATE_EPOCH", "0");
+    cmd.args(&argv).env("TZ", "UTC").env("SOURCE_DATE_EPOCH", "0");
 
     let output = cmd
         .output()
