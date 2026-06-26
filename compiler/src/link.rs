@@ -401,10 +401,12 @@ mod tests {
         let orig_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmpdir).unwrap();
         let result = locate_gc_lib();
+        let result_abs = result.and_then(|p| p.canonicalize().ok());
+        let gc_path_abs = gc_path.canonicalize().ok();
         std::env::set_current_dir(&orig_cwd).unwrap();
         let _ = std::fs::remove_dir_all(&tmpdir);
 
-        assert_eq!(result, Some(gc_path));
+        assert_eq!(result_abs, gc_path_abs);
     }
 
     #[test]
@@ -421,10 +423,12 @@ mod tests {
         let orig_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmpdir).unwrap();
         let result = locate_gc_lib();
+        let result_abs = result.and_then(|p| p.canonicalize().ok());
+        let gc_path_abs = gc_path.canonicalize().ok();
         std::env::set_current_dir(&orig_cwd).unwrap();
         let _ = std::fs::remove_dir_all(&tmpdir);
 
-        assert_eq!(result, Some(gc_path));
+        assert_eq!(result_abs, gc_path_abs);
     }
 
     #[test]
