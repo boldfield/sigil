@@ -268,6 +268,7 @@ fn locate_gc_lib_internal(exe_path: Option<&Path>) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
