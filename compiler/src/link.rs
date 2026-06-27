@@ -198,9 +198,82 @@ fn locate_runtime_lib() -> Option<PathBuf> {
     None
 }
 
+#[allow(dead_code)]
+fn locate_gc_lib() -> Option<PathBuf> {
+    // Explicit override wins — release-archive consumers who unpack to
+    // a non-standard prefix can `export SIGIL_GC_LIB=...` rather than
+    // restructure their tree to match a built-in lookup path.
+    // The override must be an absolute path that exists.
+    if let Ok(p) = std::env::var("SIGIL_GC_LIB") {
+        let path = PathBuf::from(&p);
+        if path.is_absolute() && path.exists() {
+            return Some(path);
+        }
+    }
+
+    let exe = std::env::current_exe().ok();
+    locate_gc_lib_internal(exe.as_deref())
+}
+
+fn locate_gc_lib_internal(exe_path: Option<&Path>) -> Option<PathBuf> {
+    // Release-archive layout: when libgc.a ships in a tarball like
+    //
+    //   sigil-<version>-<triple>/
+    //     bin/sigil
+    //     lib/libgc.a
+    //
+    // walking up one level from the executable's parent and into
+    // `lib/` recovers the archive. Also try the flat-bundle layout
+    // (`libgc.a` next to the binary).
+    if let Some(exe) = exe_path {
+        let exe_dir = exe.parent().map(PathBuf::from);
+        let candidates = [
+            // bin/sigil → ../lib/libgc.a
+            exe_dir
+                .as_ref()
+                .and_then(|d| d.parent())
+                .map(|p| p.join("lib").join("libgc.a")),
+            // flat: sigil + libgc.a in the same dir
+            exe_dir.as_ref().map(|d| d.join("libgc.a")),
+        ];
+        for c in candidates.into_iter().flatten() {
+            if c.exists() {
+                return Some(c);
+            }
+        }
+    }
+
+    // `cargo build` places libgc.a under target/<profile>/.
+    // Walk a few candidate profile directories in preference order.
+    for profile in &["release", "debug"] {
+        let p = PathBuf::from("target").join(profile).join("libgc.a");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    // CARGO_MANIFEST_DIR fallback if invoked from a subdir.
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        let base = Path::new(&manifest)
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for profile in &["release", "debug"] {
+            let p = base.join("target").join(profile).join("libgc.a");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
     /// The platform-specific suffix appended after `-o <out>`.
     fn platform_suffix() -> Vec<OsString> {
@@ -272,5 +345,141 @@ mod tests {
         expected.extend(platform_suffix());
 
         assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_absolute_path() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let gc_path = tmpdir.join("libgc.a");
+        std::fs::write(&gc_path, b"fake gc lib").unwrap();
+
+        std::env::set_var("SIGIL_GC_LIB", &gc_path);
+        let result = locate_gc_lib();
+        std::env::remove_var("SIGIL_GC_LIB");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result, Some(gc_path));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_relative_path_rejected() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var("SIGIL_GC_LIB", "relative/path/libgc.a");
+        let result = locate_gc_lib();
+        std::env::remove_var("SIGIL_GC_LIB");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_env_override_nonexistent_rejected() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        std::env::set_var("SIGIL_GC_LIB", "/nonexistent/path/libgc.a");
+        let result = locate_gc_lib();
+        std::env::remove_var("SIGIL_GC_LIB");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_cargo_target_release() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        let target_release = tmpdir.join("target").join("release");
+        std::fs::create_dir_all(&target_release).unwrap();
+        let gc_path = target_release.join("libgc.a");
+        std::fs::write(&gc_path, b"fake gc lib").unwrap();
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmpdir).unwrap();
+        let result = locate_gc_lib();
+        let result_abs = result.and_then(|p| p.canonicalize().ok());
+        let gc_path_abs = gc_path.canonicalize().ok();
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result_abs, gc_path_abs);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_cargo_target_debug() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_dbg_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        let target_debug = tmpdir.join("target").join("debug");
+        std::fs::create_dir_all(&target_debug).unwrap();
+        let gc_path = target_debug.join("libgc.a");
+        std::fs::write(&gc_path, b"fake gc lib").unwrap();
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmpdir).unwrap();
+        let result = locate_gc_lib();
+        let result_abs = result.and_then(|p| p.canonicalize().ok());
+        let gc_path_abs = gc_path.canonicalize().ok();
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result_abs, gc_path_abs);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_none_when_not_found() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_empty_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        let orig_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&tmpdir).unwrap();
+        let result = locate_gc_lib();
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_locate_gc_lib_release_archive_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_rel_arch_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        let lib_dir = tmpdir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let gc_path = lib_dir.join("libgc.a");
+        std::fs::write(&gc_path, b"fake gc lib").unwrap();
+
+        let exe_path = tmpdir.join("bin").join("sigil");
+        let result = locate_gc_lib_internal(Some(&exe_path));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result, Some(gc_path));
+    }
+
+    #[test]
+    fn test_locate_gc_lib_flat_layout() {
+        let _lock = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = std::process::id();
+        let tmpdir = std::env::temp_dir().join(format!("sigil_test_flat_{pid}"));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let gc_path = tmpdir.join("libgc.a");
+        std::fs::write(&gc_path, b"fake gc lib").unwrap();
+
+        let exe_path = tmpdir.join("sigil");
+        let result = locate_gc_lib_internal(Some(&exe_path));
+        let _ = std::fs::remove_dir_all(&tmpdir);
+
+        assert_eq!(result, Some(gc_path));
     }
 }

@@ -22349,6 +22349,18 @@ fn cpu_profile_resolves_libgc_symbols_via_dyld_fallback() {
     let run = Command::new(&bin_path)
         .env("SIGIL_CPU_PROFILE", profile_path.to_str().unwrap())
         .env("SIGIL_CPU_PROFILE_HZ", "999")
+        // Disable alloc elision and force a GC on every allocation so
+        // GC_* frames dominate the CPU profile. The alloc-elision
+        // optimisation (on by default since PR #186) dramatically reduces
+        // the number of heap allocations for fib_cps_perf, cutting the
+        // fraction of time spent inside libgc and making the GC_* frame
+        // assertion unreliable. SIGIL_ALLOC_ELIDE_WRAP=0 restores the
+        // full ~17 710 per-perform allocations that the test was written
+        // against. SIGIL_FORCE_GC_EVERY_N_ALLOCS=1 then ensures every
+        // alloc triggers a GC collection, so GC_* symbols occupy a large
+        // fraction of total CPU samples regardless of system load.
+        .env("SIGIL_ALLOC_ELIDE_WRAP", "0")
+        .env("SIGIL_FORCE_GC_EVERY_N_ALLOCS", "1")
         .output()
         .expect("execute compiled binary");
     let _ = std::fs::remove_file(&bin_path);
