@@ -26,14 +26,28 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     let runtime = locate_runtime_lib()
         .ok_or_else(|| "libsigil_runtime.a not found; build the runtime first".to_string())?;
 
+    let gc_lib = locate_gc_lib();
+
     // On macOS Homebrew installs libgc outside the default linker search
     // path. Query pkg-config for `-L` entries and pass them through before
     // `-lgc`. Graceful fallback: if pkg-config is missing or has no entry
     // for bdw-gc we proceed with the bare `-lgc`, which works on Ubuntu
     // where apt places libgc on the default path.
     // See PLAN_A1_DEVIATIONS.md ([Task 2, Task 13]) for the rationale.
-    let search_paths = pkg_config_search_paths("bdw-gc");
-    let argv = build_link_argv(obj_path, out_path, &runtime, &search_paths);
+    // However, if a static libgc.a is found (gc_lib is Some), we link it
+    // statically and skip the pkg-config search paths entirely.
+    let search_paths = if gc_lib.is_none() {
+        pkg_config_search_paths("bdw-gc")
+    } else {
+        Vec::new()
+    };
+    let argv = build_link_argv(
+        obj_path,
+        out_path,
+        &runtime,
+        &search_paths,
+        gc_lib.as_deref(),
+    );
 
     let mut cmd = Command::new("cc");
     cmd.args(&argv)
@@ -57,13 +71,17 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
 /// Build the `cc` argument vector for the link step.
 ///
 /// Pure helper — no I/O and no process spawning — so the exact emitted argv
-/// can be asserted in a unit test. The caller resolves the runtime archive
-/// and the pkg-config `-L` search paths and passes them in. The order is
-/// identical to the previous inline construction in `link()`:
+/// can be asserted in a unit test. The caller resolves the runtime archive,
+/// the pkg-config `-L` search paths, and the optional static gc archive,
+/// and passes them in. The order is:
 ///
-///   <obj> <runtime> [-L<search>...] -lgc -lpthread -ldl -lm -o <out>
+///   <obj> <runtime> [<gc_lib>] [-L<search>...] [-lgc] -lpthread -ldl -lm -o <out>
 ///   (Linux:) -Wl,--build-id=none -lgcc_s -rdynamic
 ///   (macOS:) -Wl,-reproducible
+///
+/// When gc_lib is Some(path), the absolute path to libgc.a is appended after
+/// the runtime archive and before the system -l libs, and -lgc is omitted.
+/// When gc_lib is None, the search paths and -lgc are emitted as before.
 ///
 /// The `TZ`/`SOURCE_DATE_EPOCH` reproducibility env is applied by the caller
 /// on the `Command`, not part of the argv.
@@ -72,18 +90,24 @@ fn build_link_argv(
     out_path: &Path,
     runtime: &Path,
     search_paths: &[String],
+    gc_lib: Option<&Path>,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = vec![
         obj_path.as_os_str().to_owned(),
         runtime.as_os_str().to_owned(),
     ];
 
-    for search_path in search_paths {
-        argv.push(OsString::from(format!("-L{search_path}")));
+    if let Some(gc) = gc_lib {
+        argv.push(gc.as_os_str().to_owned());
+    } else {
+        for search_path in search_paths {
+            argv.push(OsString::from(format!("-L{search_path}")));
+        }
+
+        argv.push(OsString::from("-lgc"));
     }
 
     argv.extend([
-        OsString::from("-lgc"),
         OsString::from("-lpthread"),
         OsString::from("-ldl"),
         OsString::from("-lm"),
@@ -198,7 +222,6 @@ fn locate_runtime_lib() -> Option<PathBuf> {
     None
 }
 
-#[allow(dead_code)]
 fn locate_gc_lib() -> Option<PathBuf> {
     // Explicit override wins — release-archive consumers who unpack to
     // a non-standard prefix can `export SIGIL_GC_LIB=...` rather than
@@ -301,7 +324,7 @@ mod tests {
         let out = Path::new("/tmp/prog");
         let runtime = Path::new("/build/target/release/libsigil_runtime.a");
 
-        let argv = build_link_argv(obj, out, runtime, &[]);
+        let argv = build_link_argv(obj, out, runtime, &[], None);
 
         let mut expected: Vec<OsString> = vec![
             OsString::from("/tmp/prog.o"),
@@ -328,7 +351,7 @@ mod tests {
             "/usr/local/lib".to_string(),
         ];
 
-        let argv = build_link_argv(obj, out, runtime, &search_paths);
+        let argv = build_link_argv(obj, out, runtime, &search_paths, None);
 
         let mut expected: Vec<OsString> = vec![
             OsString::from("/tmp/prog.o"),
@@ -345,6 +368,88 @@ mod tests {
         expected.extend(platform_suffix());
 
         assert_eq!(argv, expected);
+    }
+
+    #[test]
+    fn build_link_argv_with_static_gc_lib() {
+        let obj = Path::new("/tmp/prog.o");
+        let out = Path::new("/tmp/prog");
+        let runtime = Path::new("/build/target/release/libsigil_runtime.a");
+        let gc_lib = Path::new("/opt/sigil/lib/libgc.a");
+        let search_paths = vec![];
+
+        let argv = build_link_argv(obj, out, runtime, &search_paths, Some(gc_lib));
+
+        let mut expected: Vec<OsString> = vec![
+            OsString::from("/tmp/prog.o"),
+            OsString::from("/build/target/release/libsigil_runtime.a"),
+            OsString::from("/opt/sigil/lib/libgc.a"),
+            OsString::from("-lpthread"),
+            OsString::from("-ldl"),
+            OsString::from("-lm"),
+            OsString::from("-o"),
+            OsString::from("/tmp/prog"),
+        ];
+        expected.extend(platform_suffix());
+
+        assert_eq!(argv, expected);
+        assert!(!argv.iter().any(|arg| arg == "-lgc"));
+    }
+
+    #[test]
+    fn build_link_argv_with_static_gc_lib_ignores_search_paths() {
+        let obj = Path::new("/tmp/prog.o");
+        let out = Path::new("/tmp/prog");
+        let runtime = Path::new("/build/target/release/libsigil_runtime.a");
+        let gc_lib = Path::new("/opt/sigil/lib/libgc.a");
+        let search_paths = vec![
+            "/opt/homebrew/lib".to_string(),
+            "/usr/local/lib".to_string(),
+        ];
+
+        let argv = build_link_argv(obj, out, runtime, &search_paths, Some(gc_lib));
+
+        let mut expected: Vec<OsString> = vec![
+            OsString::from("/tmp/prog.o"),
+            OsString::from("/build/target/release/libsigil_runtime.a"),
+            OsString::from("/opt/sigil/lib/libgc.a"),
+            OsString::from("-lpthread"),
+            OsString::from("-ldl"),
+            OsString::from("-lm"),
+            OsString::from("-o"),
+            OsString::from("/tmp/prog"),
+        ];
+        expected.extend(platform_suffix());
+
+        assert_eq!(argv, expected);
+        assert!(!argv.iter().any(|arg| arg == "-lgc"));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.to_str().is_some_and(|s| s.starts_with("-L"))));
+    }
+
+    #[test]
+    fn build_link_argv_without_gc_lib() {
+        let obj = Path::new("/tmp/prog.o");
+        let out = Path::new("/tmp/prog");
+        let runtime = Path::new("/build/target/release/libsigil_runtime.a");
+
+        let argv = build_link_argv(obj, out, runtime, &[], None);
+
+        let mut expected: Vec<OsString> = vec![
+            OsString::from("/tmp/prog.o"),
+            OsString::from("/build/target/release/libsigil_runtime.a"),
+            OsString::from("-lgc"),
+            OsString::from("-lpthread"),
+            OsString::from("-ldl"),
+            OsString::from("-lm"),
+            OsString::from("-o"),
+            OsString::from("/tmp/prog"),
+        ];
+        expected.extend(platform_suffix());
+
+        assert_eq!(argv, expected);
+        assert!(argv.iter().any(|arg| arg == "-lgc"));
     }
 
     #[test]
