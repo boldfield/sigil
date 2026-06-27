@@ -425,7 +425,7 @@ mod tests {
         assert!(!argv.iter().any(|arg| arg == "-lgc"));
         assert!(!argv
             .iter()
-            .any(|arg| arg.to_str().map_or(false, |s| s.starts_with("-L"))));
+            .any(|arg| arg.to_str().is_some_and(|s| s.starts_with("-L"))));
     }
 
     #[test]
