@@ -41,7 +41,13 @@ pub fn link(obj_path: &Path, out_path: &Path) -> Result<(), String> {
     } else {
         Vec::new()
     };
-    let argv = build_link_argv(obj_path, out_path, &runtime, &search_paths, gc_lib.as_deref());
+    let argv = build_link_argv(
+        obj_path,
+        out_path,
+        &runtime,
+        &search_paths,
+        gc_lib.as_deref(),
+    );
 
     let mut cmd = Command::new("cc");
     cmd.args(&argv)
@@ -417,7 +423,9 @@ mod tests {
 
         assert_eq!(argv, expected);
         assert!(!argv.iter().any(|arg| arg == "-lgc"));
-        assert!(!argv.iter().any(|arg| arg.to_str().map_or(false, |s| s.starts_with("-L"))));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.to_str().map_or(false, |s| s.starts_with("-L"))));
     }
 
     #[test]
