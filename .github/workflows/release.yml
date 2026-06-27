@@ -73,7 +73,13 @@ jobs:
           cargo build --release -p sigil-runtime
           cargo build --release -p sigil-compiler
 
+      - name: build static Boehm GC
+        run: |
+          ./scripts/build-static-boehm.sh ./target/release/boehm
+
       - name: smoke (compile + run hello)
+        env:
+          SIGIL_GC_LIB: ${{ github.workspace }}/target/release/boehm/libgc.a
         run: |
           ./target/release/sigil examples/hello.sigil -o /tmp/sigil-release-hello
           /tmp/sigil-release-hello
@@ -100,6 +106,7 @@ jobs:
           mkdir -p "$STAGE/bin" "$STAGE/lib"
           cp target/release/sigil "$STAGE/bin/sigil"
           cp target/release/libsigil_runtime.a "$STAGE/lib/libsigil_runtime.a"
+          cp target/release/boehm/libgc.a "$STAGE/lib/libgc.a"
           cp LICENSE "$STAGE/LICENSE" 2>/dev/null || true
           # Minimal install / run notes that ship in the tarball.
           cat > "$STAGE/README.md" <<EOF
@@ -115,19 +122,10 @@ jobs:
           \`\`\`
           tar xzf sigil-${TAG}-${{ matrix.target }}.tar.gz
           export PATH="\$PWD/sigil-${TAG}-${{ matrix.target }}/bin:\$PATH"
-          # Or move bin/sigil + lib/libsigil_runtime.a into your prefix
-          # of choice. \`sigil\` finds the runtime via \`../lib/\` from
-          # its own directory; \`SIGIL_RUNTIME_LIB=/path/to/libsigil_runtime.a\`
-          # overrides if you need a non-standard layout.
+          # Or move bin/sigil + lib/ into your prefix of choice.
+          # \`sigil\` finds the runtime and GC libraries via \`../lib/\`
+          # from its own directory.
           \`\`\`
-
-          ## Prereqs (system libraries)
-
-          The compiled programs link against Boehm GC, which must be
-          present on the host:
-
-          - Ubuntu / Debian: \`sudo apt install libgc-dev\`
-          - macOS: \`brew install bdw-gc\`
 
           ## Quick start
 
