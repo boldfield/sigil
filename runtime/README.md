@@ -7,16 +7,19 @@ to precise GC via Cranelift stack maps.
 
 ## Boehm GC dependency
 
-v1 links against the system Boehm GC library (`libgc`) via direct C ABI
+v1 links against the Boehm GC library (`libgc`) via direct C ABI
 (`GC_init`, `GC_malloc`, `GC_size`). No Rust wrapper crate: one less
 dependency to pin, and Boehm's ABI is stable enough that direct FFI is the
 simplest option.
 
-Install requirements:
+**Build-time requirements** (required only when building the Sigil compiler and runtime from source):
 
 - **Linux (Debian/Ubuntu):** `sudo apt-get install -y libgc-dev pkg-config`
 - **macOS (Homebrew):** `brew install bdw-gc pkg-config` and add
   `$(brew --prefix)/opt/bdw-gc/lib/pkgconfig` to `PKG_CONFIG_PATH`.
+
+These are development libraries needed to compile the runtime crate. Users of a prebuilt Sigil
+release and the Sigil programs they compile do not require any host `libgc` installation.
 
 The compiler's linker driver (task 13) invokes `cc` with `-lgc` on both
 hosts.

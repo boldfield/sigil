@@ -4,7 +4,10 @@ Sigil is a compiled, statically-typed programming language designed to
 be reliably authored by large language models. Programs are parsed by
 a strict recursive-descent parser, type-checked by a Hindley–Milner
 checker extended with effect rows, lowered to Cranelift IR, and
-linked against a small Boehm-GC'd runtime.
+linked against a small Boehm-GC'd runtime. Building the Sigil compiler
+from source requires the Boehm GC development libraries (`libgc-dev` on
+Linux, `bdw-gc` on macOS); however, prebuilt releases and Sigil programs
+compiled from a prebuilt toolchain require no host `libgc` installation.
 
 This document is **examples-first**: fourteen worked examples
 (E1–E14) introduce the language by progressive elaboration. The
