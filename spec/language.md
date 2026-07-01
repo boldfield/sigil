@@ -2358,6 +2358,8 @@ The following limits are permanent v1 design choices:
 
 ### §15 — Build and run
 
+**Building the Sigil compiler from source** (required only to compile Sigil from the repository):
+
 ```shell
 # Linux
 sudo apt-get install -y libgc-dev pkg-config
@@ -2365,9 +2367,13 @@ sudo apt-get install -y libgc-dev pkg-config
 # macOS
 brew install bdw-gc pkg-config
 
-# Build
+# Build the compiler
 cargo build --release
+```
 
+**Compiling and running Sigil programs** (works with a prebuilt Sigil release or compiler):
+
+```shell
 # Compile
 ./target/release/sigil my_program.sigil -o my_program
 
@@ -2375,8 +2381,7 @@ cargo build --release
 ./my_program
 ```
 
-The compiler produces a self-contained native binary; no runtime
-installation is needed beyond the Boehm GC system library.
+The compiler produces a self-contained native binary that requires no host library installation.
 
 ### §16 — Profiling and instrumentation
 

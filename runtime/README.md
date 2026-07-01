@@ -21,8 +21,10 @@ simplest option.
 These are development libraries needed to compile the runtime crate. Users of a prebuilt Sigil
 release and the Sigil programs they compile do not require any host `libgc` installation.
 
-The compiler's linker driver (task 13) invokes `cc` with `-lgc` on both
-hosts.
+**Linking strategy:** The compiler's linker driver prefers static linking when `libgc.a` is 
+available (e.g., in a prebuilt release or when built locally). Only when the static archive 
+is not found does it fall back to dynamic linking via `-lgc`, which requires the system 
+libgc library to be installed.
 
 ## Standard library embedding
 
