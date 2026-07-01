@@ -4,7 +4,10 @@ Sigil is a compiled, statically-typed programming language designed to
 be reliably authored by large language models. Programs are parsed by
 a strict recursive-descent parser, type-checked by a Hindley–Milner
 checker extended with effect rows, lowered to Cranelift IR, and
-linked against a small Boehm-GC'd runtime.
+linked against a small Boehm-GC'd runtime. Building the Sigil compiler
+from source requires the Boehm GC development libraries (`libgc-dev` on
+Linux, `bdw-gc` on macOS); however, prebuilt releases and Sigil programs
+compiled from a prebuilt toolchain require no host `libgc` installation.
 
 This document is **examples-first**: fourteen worked examples
 (E1–E14) introduce the language by progressive elaboration. The
@@ -2355,6 +2358,8 @@ The following limits are permanent v1 design choices:
 
 ### §15 — Build and run
 
+**Building the Sigil compiler from source** (required only to compile Sigil from the repository):
+
 ```shell
 # Linux
 sudo apt-get install -y libgc-dev pkg-config
@@ -2362,9 +2367,13 @@ sudo apt-get install -y libgc-dev pkg-config
 # macOS
 brew install bdw-gc pkg-config
 
-# Build
+# Build the compiler
 cargo build --release
+```
 
+**Compiling and running Sigil programs** (works with a prebuilt Sigil release or compiler):
+
+```shell
 # Compile
 ./target/release/sigil my_program.sigil -o my_program
 
@@ -2372,8 +2381,7 @@ cargo build --release
 ./my_program
 ```
 
-The compiler produces a self-contained native binary; no runtime
-installation is needed beyond the Boehm GC system library.
+The compiler produces a self-contained native binary that requires no host library installation.
 
 ### §16 — Profiling and instrumentation
 
