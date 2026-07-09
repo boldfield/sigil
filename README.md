@@ -234,6 +234,8 @@ Native compilation only; the compiler emits for the host it runs on.
 
 ## Quickstart
 
+To build Sigil from source, install the development libraries for Boehm GC:
+
 ```shell
 # Linux
 sudo apt-get update && sudo apt-get install -y libgc-dev pkg-config
@@ -241,7 +243,12 @@ sudo apt-get update && sudo apt-get install -y libgc-dev pkg-config
 # macOS
 brew install bdw-gc pkg-config
 export PKG_CONFIG_PATH="$(brew --prefix)/opt/bdw-gc/lib/pkgconfig:$PKG_CONFIG_PATH"
+```
 
+These libraries are **required only to build the compiler and runtime from source**. Users of a
+prebuilt Sigil release and the Sigil programs they compile require no host `libgc` installation.
+
+```shell
 # Build + test
 cargo test --workspace
 
